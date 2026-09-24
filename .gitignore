@@ -1,0 +1,26 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 本地配置与密钥（真实 .env / 备份都不得入库——备份里含 MK_TOKEN_SECRET）
+.env
+.env.*
+.env.bak*
+!.env.example
+
+# 数据与附件（店主的经营数据只存在于本机）
+*.db
+*.db-wal
+*.db-shm
+data/
+attachments/
+uploads/
+.uploads/
+
+# 部署状态（deploy.sh 写在安装目录里：记下本套安装的服务名/端口，供 --update/--status/--health 复用）
+.deploy-state
+
+# 日志与临时产物
+*.log
+.tmp-*

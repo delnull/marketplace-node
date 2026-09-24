@@ -1,0 +1,29 @@
+{
+  "name": "marketplace-node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "BitYuan 联邦商城节点：任何人可部署的店铺 API 服务（Express + Node 内置 SQLite）",
+  "engines": {
+    "node": ">=23.4"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "test": "node --env-file-if-exists=.env.test --test test/*.test.js",
+    "reconcile": "node --env-file-if-exists=.env scripts/reconcile-ledger.js",
+    "check:integrity": "node --env-file-if-exists=.env scripts/check-integrity.js",
+    "e2e": "node --env-file-if-exists=.env scripts/e2e-mainnet.mjs"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "ethers": "^6.13.0",
+    "express": "^4.21.0"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
+  },
+  "devDependencies": {
+    "supertest": "^7.2.2"
+  }
+}
