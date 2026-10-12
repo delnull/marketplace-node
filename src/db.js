@@ -55,7 +55,7 @@ function migrate(d) {
       description_blocks TEXT NOT NULL DEFAULT '[]', -- 详情块 JSON：[{type:'text',text} | {type:'image',url}] —— 商品详情的权威内容，入快照
       images        TEXT NOT NULL DEFAULT '[]',      -- JSON 数组（图片 URL，可为 http(s) 外链或本站 /api/uploads/…）
       kind          TEXT NOT NULL CHECK (kind IN ('digital','physical','nft')),
-      shipping_fee_cny_fen INTEGER NOT NULL DEFAULT 0, -- 运费（CNY 分，**按单收取一次**；0=包邮）。仅实物商品可用，数字/NFT 恒 0；
+      shipping_fee_usdt_micro INTEGER NOT NULL DEFAULT 0, -- 运费（**微 USDT**，1 USDT = 1e6；**按单收取一次**；0=包邮）。仅实物商品可用，数字/NFT 恒 0；
                                                         -- 入快照：买家要能核验"锁定的运费没被事后改价"
       age_restricted INTEGER NOT NULL DEFAULT 0,       -- 未成年人禁止购买（机制：1=下单必须带买家显式确认 age_ack 才建单）；
                                                         -- 入快照：店主不能在上架后静默增删限制。
@@ -85,12 +85,11 @@ function migrate(d) {
       hold_qty      INTEGER NOT NULL DEFAULT 0,       -- 应占位件数（下单时商品限量且占位成功 = quantity；不限量/未占位 = 0；随行存续供释放/恢复记账）
       released_at   INTEGER,                          -- 占位释放时刻（非空=已释放；恢复占位时清空；释放幂等标记，防重复回补）
       amount_wei    TEXT NOT NULL,                    -- 应付原生 BTY wei（字符串，防精度丢失；= 单价×数量 + 运费）
-      cny_fen       INTEGER NOT NULL,                 -- 成交时 CNY 分（= 商品分 + 运费分，即本单应付总额）
-      shipping_fee_cny_fen INTEGER NOT NULL DEFAULT 0, -- 本单实际锁定的运费（CNY 分，按单收取一次）。
-                                                       -- 与 cny_fen 的关系：cny_fen = 商品金额 + 本列；数字/NFT 单恒 0。
+      usdt_micro       INTEGER NOT NULL,                 -- 成交时**微 USDT**（1 USDT = 1e6；= 商品金额 + 运费，即本单应付总额）
+      shipping_fee_usdt_micro INTEGER NOT NULL DEFAULT 0, -- 本单实际锁定的运费（微 USDT，按单收取一次）。
+                                                       -- 与 usdt_micro 的关系：usdt_micro = 商品金额 + 本列；数字/NFT 单恒 0。
                                                        -- 单列落库是为了让买家/流水/对账能看清"哪些是货款、哪些是运费"
-      bty_usdt_rate TEXT NOT NULL DEFAULT '0',        -- 锁定汇率快照（记录用）
-      usdt_cny_rate TEXT NOT NULL DEFAULT '0',
+      bty_usdt_rate TEXT NOT NULL DEFAULT '0',        -- 锁定汇率快照（记录用；标价单位已是 USDT，故只有 USDT→BTY 一条行情）
       status        TEXT NOT NULL DEFAULT 'draft'
                     CHECK (status IN ('draft','escrowed','shipped','confirmed','disputed','settled','refunded','expired','cancelled')),
       escrow_order_id TEXT,                           -- 链上 Escrow 订单 ID（keccak256 hex，含 UUID 唯一，一单一号）
@@ -261,7 +260,7 @@ function migrate(d) {
       product_id    INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
       sku_key       TEXT NOT NULL,                      -- 按 specs 声明顺序用 '|' 拼接；无规格商品为 ''
       specs_json    TEXT NOT NULL,                      -- 该组合的规格值；无规格为 {}
-      price_cny_fen INTEGER NOT NULL CHECK (price_cny_fen >= 0), -- 该组合单价（CNY 分）——不同 SKU 可不同价
+      price_usdt_micro INTEGER NOT NULL CHECK (price_usdt_micro >= 0), -- 该组合单价（微 USDT，1 USDT = 1e6）——不同 SKU 可不同价
       capacity      INTEGER,                            -- 该组合库存（NULL=不限量）
       committed     INTEGER NOT NULL DEFAULT 0 CHECK (committed >= 0), -- 该组合已占位件数（占位/释放的权威值）
       active        INTEGER NOT NULL DEFAULT 1,         -- 0=该组合停售（不影响其它组合）

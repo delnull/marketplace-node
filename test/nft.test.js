@@ -22,7 +22,7 @@ const NFT_CONTRACT = '0x' + '9'.repeat(40);
 const OTHER_CONTRACT = '0x' + '8'.repeat(40);
 
 function nftPayload(overrides = {}) {
-  const { priceCnyFen = 6600, capacity = null, specs, skus, ...rest } = overrides;
+  const { priceUsdtMicro = 66_000_000, capacity = null, specs, skus, ...rest } = overrides;
   return {
     title: '测试 NFT 藏品',
     description: '单测 NFT 商品：链上藏品交付。',
@@ -31,7 +31,7 @@ function nftPayload(overrides = {}) {
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出；无规格商品就是 key='' 的唯一组合
     specs: specs ?? [],
-    skus: skus ?? [{ key: '', priceCnyFen, capacity }],
+    skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
     ...rest,
   };
 }
@@ -101,7 +101,7 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
     kind: 'digital',
     description_blocks: '[]',
     specs: '[]',
-    skus: [{ sku_key: '', price_cny_fen: 100 }],
+    skus: [{ sku_key: '', price_usdt_micro: 100 }],
     nft_contract: '', // 非 NFT 商品 DB 中该列恒为空串
   };
   const snap = snapshotObject(rowLike);
@@ -109,7 +109,7 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
   assert.ok(!('nft_standard' in snap), '数字商品快照不得含 nft_standard 键');
   /*
     契约：无商品级价格（在 skus 里）；详情块 description_blocks 是权威内容，也入快照。
-    2026-09 契约版本 +1：**运费（shipping_fee_cny_fen）与年龄限制（age_restricted）**插入
+    2026-09 契约版本 +1：**运费（shipping_fee_usdt_micro）与年龄限制（age_restricted）**插入
     kind 之后、specs 之前（实物运费要能被买家核验"没被事后加价"；年龄限制要被锁定，
     防上架后静默增删）。键序同时改在 node 端 snapshotObject/computeSnapshotHash 与
     前端 utils/snapshot.ts —— 两端不同位就会让每个买家看到假的「商品内容已被修改」。
@@ -118,7 +118,7 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
   */
   const canonical = JSON.stringify({
     slug: 'p-abc', title: '旧商品', description: 'd', description_blocks: [], images: [], kind: 'digital',
-    shipping_fee_cny_fen: 0, age_restricted: 0,
+    shipping_fee_usdt_micro: 0, age_restricted: 0,
     specs: [], skus: [['', 100]],
   });
   const { ethers } = await import('ethers');

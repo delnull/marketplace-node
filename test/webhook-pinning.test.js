@@ -38,15 +38,14 @@ function insertOrder() {
   const now = Date.now();
   db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, cny_fen, bty_usdt_rate, usdt_cny_rate, status, escrow_order_id, created_at, updated_at)
+       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, created_at, updated_at)
      VALUES (?, 'p-x', '{}', '0x00', '', '0x00000000000000000000000000000000000000aa', '0x00000000000000000000000000000000000000bb',
-       '1000000000000000000', 100, '0.1', '7.2', 'draft', ?, ?, ?)`
+       '1000000000000000000', 1000000, '0.1', 'draft', ?, ?, ?)`
   ).run(id, `0x${String(seq).padStart(64, '0')}`, now, now);
   return { id };
 }
 
 test('地址钉死：整个投递只解析一次，交给发送器的是校验时那批地址（DNS 换答案进不来）', async () => {
-  const o = insertOrder();
   kvSet('mk:webhook_url', 'https://rebind.example.com/hook');
   const calls = [];
   setWebhookSender(async (url, init) => {
@@ -60,6 +59,8 @@ test('地址钉死：整个投递只解析一次，交给发送器的是校验�
     return lookups === 1 ? [{ address: '93.184.216.34' }] : [{ address: '127.0.0.1' }];
   });
   try {
+    // 夹具构造放在 try 内：写坏了要**快速失败**，不能把注入的解析器/发送器留在原地
+    const o = insertOrder();
     assert.equal(await notify('order.escrowed', o.id), true, '投递成功');
     assert.equal(lookups, 1, '一次投递只解析一次（校验那次），连接阶段不再问 DNS');
     assert.equal(calls.length, 1);
@@ -84,12 +85,12 @@ test('解析到内网地址时一个连接都不许发出（服务器侧零连�
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const port = server.address().port;
-  const o = insertOrder();
   try {
     /*
       URL 主机名用 `localhost`：它**真的**解析到 127.0.0.1（不依赖任何注入点），若校验被绕过或
       被挪到连接之后，这里就会实打实地连上服务器——"零连接"才是内容为真的断言。
     */
+    const o = insertOrder(); // 夹具在 try 内：写坏了要快速失败，不能让监听中的 socket 泄漏
     kvSet('mk:webhook_url', `http://localhost:${port}/hook`);
     setWebhookSender(null); // 默认路径：真实 socket
     notify('order.escrowed', o.id); // fire-and-forget（忽略返回的 Promise）

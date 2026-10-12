@@ -90,7 +90,8 @@ const pickInt = (min, max) => min + Math.floor(rnd() * (max - min + 1));
 // ════════════════════════════════════════════════════════════════════
 // 商品目录
 //
-// 每条：[品类, [品牌/平台…], [型号/系列…], 规格定义|null, 起价(分), 最高价(分), 自动交付?]
+// 每条：[品类, [品牌/平台…], [型号/系列…], 规格定义|null, 起价(微 USDT), 最高价(微 USDT), 自动交付?]
+// 金额单位是**微 USDT**（1 USDT = 1e6）：例如 `3299000000` = 3299 USDT。
 //
 // **规格必须按品类来，不能一律「颜色 × 尺寸」。** 这是演示数据最容易露馅的地方：
 // 固态硬盘的规格是容量、机械键盘是轴体 × 配列、视频会员是时长、软件授权是席位 × 年限、
@@ -102,31 +103,31 @@ const pickInt = (min, max) => min + Math.floor(rnd() * (max - min + 1));
 // 以及 NFT —— 每个 tokenId 是交付物而不是规格），用来保证「无规格商品」这条路也有样本。
 // ════════════════════════════════════════════════════════════════════
 const PHYSICAL_CATALOG = [
-  ['显卡', ['ASUS TUF', 'MSI 魔龙', '七彩虹 iGame', '影驰 星曜', '蓝宝石 超白金'], ['RTX 5080 16G', 'RTX 5090 24G', 'RX 9070 XT 16G', 'RTX 5070 Ti 12G'], null, 329900, 1599900],
-  ['显示器', ['AOC 宙斯盾', '戴尔 UltraSharp', 'HKC 猎鹰', 'KTC 战神'], ['27 寸 2K 180Hz', '32 寸 4K 144Hz', '34 寸带鱼屏 165Hz'], [{ name: '版本', options: ['标准版', '升降旋转支架版'] }], 89900, 459900],
-  ['机械键盘', ['渴创 Keychron', 'IQUNIX', '黑爵', '杜伽'], ['87 键 Gasket 套件', '75 键三模热插拔', '68 键铝坨坨'], [{ name: '轴体', options: ['红轴', '茶轴', '青轴', '静音红轴'] }, { name: '配列', options: ['68 键', '75 键', '87 键'] }], 19900, 129900],
-  ['固态硬盘', ['三星 990', '致态 TiPlus', '铠侠 EXCERIA', '英睿达 P3'], ['NVMe PCIe4.0', 'NVMe PCIe5.0', '移动固态'], [{ name: '容量', options: ['1TB', '2TB', '4TB'] }], 29900, 269900],
-  ['路由器', ['华硕 ROG', '小米 AX', 'TP-LINK 飞流', '网件 Nighthawk'], ['WiFi7 双频 6500M', '三频 Mesh', '电竞 6000M'], [{ name: '版本', options: ['标准版', 'Pro 增强版'] }, { name: '套装', options: ['单只', '两只装'] }], 19900, 189900],
-  ['人体工学椅', ['西昊', '永艺 撑腰椅', '保友 金豪'], ['网布透气款', '护腰旗舰款'], [{ name: '颜色', options: ['曜石黑', '云雾灰', '奶白'] }, { name: '配置', options: ['标准款', '带脚踏午休款'] }], 49900, 219900],
-  ['降噪耳机', ['索尼 WH', 'Bose QC', '声阔 Space'], ['头戴式主动降噪', '入耳式降噪 3.0'], [{ name: '颜色', options: ['曜石黑', '铂金银', '午夜蓝'] }], 39900, 259900],
-  ['保温杯', ['膳魔师', '虎牌', '象印'], ['316 不锈钢', '轻量款'], [{ name: '容量', options: ['350ml', '500ml', '750ml'] }, { name: '颜色', options: ['哑光黑', '云杉绿', '米白'] }], 9900, 36900],
-  ['香薰蜡烛', ['观夏', '野兽派', 'diptyque 风'], ['大豆蜡手工浇注'], [{ name: '香型', options: ['雪松与琥珀', '白茶与鼠尾草', '无花果'] }, { name: '规格', options: ['100g', '200g'] }], 7900, 49900],
-  ['卫衣', ['Champion 风', '国潮印花', '重磅纯棉'], ['连帽加绒 400g', '圆领落肩宽松'], [{ name: '颜色', options: ['黑', '燕麦', '雾霾蓝'] }, { name: '尺码', options: ['S', 'M', 'L', 'XL', 'XXL'] }], 8900, 39900],
-  ['双肩背包', ['小米 极简', 'Osprey 日光', 'Herschel 风'], ['通勤防泼水', '户外背负系统'], [{ name: '容量', options: ['20L', '30L'] }, { name: '颜色', options: ['黑', '军绿'] }], 12900, 79900],
-  ['单反相机', ['佳能 EOS', '尼康 Z', '索尼 Alpha'], ['全画幅微单'], null, 699900, 1899900],
-  ['咖啡豆', ['明谦', '三顿半', 'Manner 风'], ['耶加雪菲 水洗', '意式拼配'], [{ name: '烘焙度', options: ['浅烘', '中烘', '深烘'] }, { name: '规格', options: ['250g', '500g', '1kg'] }], 5800, 16800],
-  ['收纳箱', ['爱丽思', '天马', '宜家风'], ['可折叠', '透明抽屉式'], [{ name: '规格', options: ['单只', '三只装'] }], 4900, 19900],
-  ['台灯', ['小米 米家', '明基 护眼', '松下'], ['国AA 护眼无频闪', '屏幕挂灯 Pro'], [{ name: '颜色', options: ['月光白', '深空黑'] }], 9900, 89900],
+  ['显卡', ['ASUS TUF', 'MSI 魔龙', '七彩虹 iGame', '影驰 星曜', '蓝宝石 超白金'], ['RTX 5080 16G', 'RTX 5090 24G', 'RX 9070 XT 16G', 'RTX 5070 Ti 12G'], null, 3299000000, 15999000000],
+  ['显示器', ['AOC 宙斯盾', '戴尔 UltraSharp', 'HKC 猎鹰', 'KTC 战神'], ['27 寸 2K 180Hz', '32 寸 4K 144Hz', '34 寸带鱼屏 165Hz'], [{ name: '版本', options: ['标准版', '升降旋转支架版'] }], 899000000, 4599000000],
+  ['机械键盘', ['渴创 Keychron', 'IQUNIX', '黑爵', '杜伽'], ['87 键 Gasket 套件', '75 键三模热插拔', '68 键铝坨坨'], [{ name: '轴体', options: ['红轴', '茶轴', '青轴', '静音红轴'] }, { name: '配列', options: ['68 键', '75 键', '87 键'] }], 199000000, 1299000000],
+  ['固态硬盘', ['三星 990', '致态 TiPlus', '铠侠 EXCERIA', '英睿达 P3'], ['NVMe PCIe4.0', 'NVMe PCIe5.0', '移动固态'], [{ name: '容量', options: ['1TB', '2TB', '4TB'] }], 299000000, 2699000000],
+  ['路由器', ['华硕 ROG', '小米 AX', 'TP-LINK 飞流', '网件 Nighthawk'], ['WiFi7 双频 6500M', '三频 Mesh', '电竞 6000M'], [{ name: '版本', options: ['标准版', 'Pro 增强版'] }, { name: '套装', options: ['单只', '两只装'] }], 199000000, 1899000000],
+  ['人体工学椅', ['西昊', '永艺 撑腰椅', '保友 金豪'], ['网布透气款', '护腰旗舰款'], [{ name: '颜色', options: ['曜石黑', '云雾灰', '奶白'] }, { name: '配置', options: ['标准款', '带脚踏午休款'] }], 499000000, 2199000000],
+  ['降噪耳机', ['索尼 WH', 'Bose QC', '声阔 Space'], ['头戴式主动降噪', '入耳式降噪 3.0'], [{ name: '颜色', options: ['曜石黑', '铂金银', '午夜蓝'] }], 399000000, 2599000000],
+  ['保温杯', ['膳魔师', '虎牌', '象印'], ['316 不锈钢', '轻量款'], [{ name: '容量', options: ['350ml', '500ml', '750ml'] }, { name: '颜色', options: ['哑光黑', '云杉绿', '米白'] }], 99000000, 369000000],
+  ['香薰蜡烛', ['观夏', '野兽派', 'diptyque 风'], ['大豆蜡手工浇注'], [{ name: '香型', options: ['雪松与琥珀', '白茶与鼠尾草', '无花果'] }, { name: '规格', options: ['100g', '200g'] }], 79000000, 499000000],
+  ['卫衣', ['Champion 风', '国潮印花', '重磅纯棉'], ['连帽加绒 400g', '圆领落肩宽松'], [{ name: '颜色', options: ['黑', '燕麦', '雾霾蓝'] }, { name: '尺码', options: ['S', 'M', 'L', 'XL', 'XXL'] }], 89000000, 399000000],
+  ['双肩背包', ['小米 极简', 'Osprey 日光', 'Herschel 风'], ['通勤防泼水', '户外背负系统'], [{ name: '容量', options: ['20L', '30L'] }, { name: '颜色', options: ['黑', '军绿'] }], 129000000, 799000000],
+  ['单反相机', ['佳能 EOS', '尼康 Z', '索尼 Alpha'], ['全画幅微单'], null, 6999000000, 18999000000],
+  ['咖啡豆', ['明谦', '三顿半', 'Manner 风'], ['耶加雪菲 水洗', '意式拼配'], [{ name: '烘焙度', options: ['浅烘', '中烘', '深烘'] }, { name: '规格', options: ['250g', '500g', '1kg'] }], 58000000, 168000000],
+  ['收纳箱', ['爱丽思', '天马', '宜家风'], ['可折叠', '透明抽屉式'], [{ name: '规格', options: ['单只', '三只装'] }], 49000000, 199000000],
+  ['台灯', ['小米 米家', '明基 护眼', '松下'], ['国AA 护眼无频闪', '屏幕挂灯 Pro'], [{ name: '颜色', options: ['月光白', '深空黑'] }], 99000000, 899000000],
 ];
 
 const DIGITAL_CATALOG = [
-  ['Steam 充值卡', ['国区', '全球区'], ['官方直充'], [{ name: '面额', options: ['100 元', '200 元', '500 元'] }], 9500, 48000, true],
-  ['视频会员', ['腾讯视频', '爱奇艺', '优酷', 'B 站大会员'], ['官方兑换码'], [{ name: '时长', options: ['月卡', '季卡', '年卡'] }], 5800, 25800, true],
-  ['在线课程', ['Solidity 智能合约实战', 'Rust 系统编程入门', '大模型应用开发', 'Figma 高阶 UI'], ['正版授权'], [{ name: '版本', options: ['标准版', '训练营版（含作业批改）'] }], 19900, 89900, true],
-  ['设计素材包', ['2026 年度合集', '电商主图模板', '中文字体商用'], ['永久可用'], [{ name: '授权', options: ['个人授权', '企业授权'] }], 3900, 39900, true],
-  ['软件授权', ['JetBrains 全家桶', 'Affinity 三件套', 'Sketch 授权'], ['官方序列号'], [{ name: '席位', options: ['1 席', '5 席', '20 席'] }, { name: '时长', options: ['1 年', '3 年'] }], 29900, 199900, true],
-  ['电子书', ['《链上经济学》', '《分布式系统实践》', '《一人公司》'], ['作者签名版'], [{ name: '格式', options: ['电子版 PDF+EPUB', '纸质 + 电子套装'] }], 2900, 12900, false],
-  ['云服务器代金券', ['通用型', '计算型'], ['新用户专享'], [{ name: '面额', options: ['100 元', '500 元', '2000 元'] }], 9000, 45000, true],
+  ['Steam 充值卡', ['国区', '全球区'], ['官方直充'], [{ name: '面额', options: ['100 元', '200 元', '500 元'] }], 95000000, 480000000, true],
+  ['视频会员', ['腾讯视频', '爱奇艺', '优酷', 'B 站大会员'], ['官方兑换码'], [{ name: '时长', options: ['月卡', '季卡', '年卡'] }], 58000000, 258000000, true],
+  ['在线课程', ['Solidity 智能合约实战', 'Rust 系统编程入门', '大模型应用开发', 'Figma 高阶 UI'], ['正版授权'], [{ name: '版本', options: ['标准版', '训练营版（含作业批改）'] }], 199000000, 899000000, true],
+  ['设计素材包', ['2026 年度合集', '电商主图模板', '中文字体商用'], ['永久可用'], [{ name: '授权', options: ['个人授权', '企业授权'] }], 39000000, 399000000, true],
+  ['软件授权', ['JetBrains 全家桶', 'Affinity 三件套', 'Sketch 授权'], ['官方序列号'], [{ name: '席位', options: ['1 席', '5 席', '20 席'] }, { name: '时长', options: ['1 年', '3 年'] }], 299000000, 1999000000, true],
+  ['电子书', ['《链上经济学》', '《分布式系统实践》', '《一人公司》'], ['作者签名版'], [{ name: '格式', options: ['电子版 PDF+EPUB', '纸质 + 电子套装'] }], 29000000, 129000000, false],
+  ['云服务器代金券', ['通用型', '计算型'], ['新用户专享'], [{ name: '面额', options: ['100 元', '500 元', '2000 元'] }], 90000000, 450000000, true],
 ];
 
 /** NFT：每个 tokenId 是**交付物**而不是规格，所以一律无规格（限量由库存表达） */
@@ -238,18 +239,19 @@ function makeProducts(spec, shopKey) {
       let mult = 1;
       for (const dim of specs || []) {
         const pos = dim.options.indexOf(c.specs[dim.name]);
-        // 第一个选项为基准价，之后每个选项 +18%（四舍五入到元）
+        // 第一个选项为基准价，之后每个选项 +18%（四舍五入到 0.01 USDT = 1e4 微 USDT）
         mult *= 1 + 0.18 * pos;
       }
       const jitter = pickInt(-5, 6) / 100;
-      const priceCnyFen = Math.max(100, Math.round((basePrice * mult * (1 + jitter)) / 100) * 100);
+      // 下限 1 USDT：演示数据里不出现"几厘钱"的商品（微 USDT 是整数，写 1e6 = 1 USDT）
+      const priceUsdtMicro = Math.max(1_000_000, Math.round((basePrice * mult * (1 + jitter)) / 10_000) * 10_000);
       // 常规库存充足；少量组合给低余量（触发「仅剩 N 件」），极少数售罄
       const cap =
         idx === soldOutIdx ? 0 : rnd() < 0.16 ? pickInt(1, 3) : digital ? pickInt(50, 900) : pickInt(8, 80);
       return {
         key: c.key,
         specs: c.specs,
-        priceCnyFen,
+        priceUsdtMicro,
         capacity: cap,
         // 停售的组合给足库存，好让「有货但不可买」这个状态在页面上看得出来
         ...(idx === stopIdx ? { capacity: pickInt(5, 20), active: false } : {}),
@@ -267,6 +269,14 @@ function makeProducts(spec, shopKey) {
     const brand = brands[i % brands.length];
     const model = models[Math.floor(i / brands.length) % models.length];
     const price = pickInt(lo, hi);
+    /*
+      实物商品给**商品级固定运费**（按单收取一次，5 USDT；每三件留一件包邮做对照）。
+      为什么演示数据必须有它（源码评审 2026-10，P3）：此前所有演示商品都靠列默认值 0 = 包邮，
+      于是"商品 + 运费 = 应付"这条算式、商品页的「运费 X USDT（每单）」、结算页的运费行
+      在演示里**从来没有样本**——改口径时最容易漏掉的就是这条链路（真出问题只有真单能看到）。
+      刻意用 `i % 3` 而不是再抽一次 `rnd()`：不移动后续随机序列，演示数据集的其余部分保持不变。
+    */
+    const shippingFeeUsdtMicro = i % 3 === 0 ? 0 : 5_000_000;
     if (specs) {
       const skus = buildSkus(specs, price);
       return {
@@ -278,8 +288,9 @@ function makeProducts(spec, shopKey) {
         kind,
         specs,
         skus,
+        shippingFeeUsdtMicro,
         // 商品级起价 = 各组合最低价（与后端口径一致）
-        price: Math.min(...skus.map((s) => s.priceCnyFen)),
+        price: Math.min(...skus.map((s) => s.priceUsdtMicro)),
         capacity: null, // 有 SKU 时商品级容量无意义（权威值逐组合）
         autoDeliver: -1,
         stockAlertAt: pickInt(3, 8),
@@ -297,7 +308,9 @@ function makeProducts(spec, shopKey) {
       descriptionBlocks: blocks(slug, `${brand} ${model}`, '实物商品'),
       kind,
       specs: [],
-      skus: [{ key: '', specs: {}, priceCnyFen: price, capacity }],
+      skus: [{ key: '', specs: {}, priceUsdtMicro: price, capacity }],
+      // 与有规格的实物商品同款：商品级固定运费（5 USDT；每三件留一件包邮做对照），见上面的说明
+      shippingFeeUsdtMicro,
       price,
       capacity,
       autoDeliver: -1,
@@ -321,7 +334,7 @@ function makeProducts(spec, shopKey) {
       kind,
       specs,
       skus,
-      price: Math.min(...skus.map((s) => s.priceCnyFen)),
+      price: Math.min(...skus.map((s) => s.priceUsdtMicro)),
       capacity: null,
       autoDeliver: auto ? 1 : 0,
       stockAlertAt: pickInt(5, 20),
@@ -331,7 +344,7 @@ function makeProducts(spec, shopKey) {
 
   build('nft', spec.nft, NFT_CATALOG, ([cat, variants, desc], i, slug, kind) => {
     const variant = variants[i % variants.length];
-    const price = pickInt(9900, 88800);
+    const price = pickInt(99000000, 888000000); // 99.00 – 888 USDT（微 USDT）
     const capacity = pickInt(1, 20);
     /*
       NFT 合约地址必须是**真部署的合约**：节点交付时会按交易收据核验
@@ -350,7 +363,7 @@ function makeProducts(spec, shopKey) {
       kind,
       // NFT 无规格：每个 tokenId 是**交付物**而不是可选的规格维度
       specs: [],
-      skus: [{ key: '', specs: {}, priceCnyFen: price, capacity }],
+      skus: [{ key: '', specs: {}, priceUsdtMicro: price, capacity }],
       price,
       capacity,
       nftContract: contract || '',
@@ -451,16 +464,16 @@ const products = makeProducts(shop.products, shopKey);
 
 const insProduct = appDb.prepare(`
   INSERT INTO products (slug, title, description, description_blocks, images, kind, nft_contract, nft_standard,
-                        specs, snapshot_hash, auto_deliver,
+                        specs, snapshot_hash, auto_deliver, shipping_fee_usdt_micro,
                         stock_alert_at, active, created_at, updated_at)
   VALUES (@slug, @title, @description, @description_blocks, @images, @kind, @nft_contract, @nft_standard,
-          @specs, @snapshot_hash, @auto_deliver,
+          @specs, @snapshot_hash, @auto_deliver, @shipping_fee_usdt_micro,
           @stock_alert_at, @active, @created_at, @updated_at)
 `);
 const insSku = appDb.prepare(`
-  INSERT INTO product_skus (product_id, sku_key, specs_json, price_cny_fen, capacity, committed,
+  INSERT INTO product_skus (product_id, sku_key, specs_json, price_usdt_micro, capacity, committed,
                             active, created_at, updated_at)
-  VALUES (@product_id, @sku_key, @specs_json, @price_cny_fen, @capacity, 0, @active, @now, @now)
+  VALUES (@product_id, @sku_key, @specs_json, @price_usdt_micro, @capacity, 0, @active, @now, @now)
 `);
 
 const productRows = [];
@@ -469,7 +482,7 @@ const skusByProduct = new Map();
 let skuTotal = 0;
 for (const p of products) {
   // 快照与 DB 行同形：价格与库存只在 skus 上（见 products.js snapshotObject）
-  const skuRows = (p.skus || []).map((s) => ({ sku_key: s.key, price_cny_fen: s.priceCnyFen }));
+  const skuRows = (p.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro }));
   const row = {
     slug: p.slug,
     title: p.title,
@@ -483,6 +496,8 @@ for (const p of products) {
     specs: JSON.stringify(p.specs || []),
     description_blocks: JSON.stringify(p.descriptionBlocks || []),
     auto_deliver: p.autoDeliver,
+    // 实物商品才有运费语义（数字/NFT 恒 0，否则 validateProduct 会拒），入快照参与哈希
+    shipping_fee_usdt_micro: p.kind === 'physical' ? Number(p.shippingFeeUsdtMicro) || 0 : 0,
     stock_alert_at: p.stockAlertAt,
     active: p.active === false ? 0 : 1,
     created_at: p.createdAt,
@@ -499,7 +514,7 @@ for (const p of products) {
       product_id: saved.id,
       sku_key: s.key,
       specs_json: JSON.stringify(s.specs || {}),
-      price_cny_fen: s.priceCnyFen,
+      price_usdt_micro: s.priceUsdtMicro,
       capacity: s.capacity,
       active: s.active === false ? 0 : 1,
       now: p.createdAt,
@@ -508,7 +523,7 @@ for (const p of products) {
     list.push({
       sku_key: s.key,
       specs_json: JSON.stringify(s.specs || {}),
-      price_cny_fen: s.priceCnyFen,
+      price_usdt_micro: s.priceUsdtMicro,
       capacity: s.capacity,
       active: s.active !== false,
     });

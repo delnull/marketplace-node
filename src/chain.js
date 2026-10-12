@@ -123,7 +123,7 @@ export function weiToDecimal(wei, decimals = 18) {
   }
 }
 
-/** 小数（CNY 等）→ wei 字符串；入参为字符串避免浮点误差（内部用 BigInt 计算） */
+/** 小数（BTY 等）→ wei 字符串；入参为字符串避免浮点误差（内部用 BigInt 计算） */
 export function decimalToWei(decimalStr, decimals = 18) {
   const [intPart = '0', fracPart = ''] = String(decimalStr).split('.');
   const frac = (fracPart + '0'.repeat(decimals)).slice(0, decimals);

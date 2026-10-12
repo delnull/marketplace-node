@@ -26,9 +26,9 @@ function insertOrder(status = 'draft') {
   const now = Date.now();
   db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, cny_fen, bty_usdt_rate, usdt_cny_rate, status, escrow_order_id, created_at, updated_at)
+       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, created_at, updated_at)
      VALUES (?, 'p-x', '{}', '0x00', '', '0x00000000000000000000000000000000000000aa', '0x00000000000000000000000000000000000000bb',
-       '1000000000000000000', 100, '0.1', '7.2', ?, ?, ?, ?)`
+       '1000000000000000000', 1000000, '0.1', ?, ?, ?, ?)`
   ).run(id, status, orderIdHex, now, now);
   return { id, orderIdHex };
 }
@@ -545,14 +545,14 @@ test('order.hold_missing：投递失败不写标记（事件重放会重试）�
       .run(slug, now, now).lastInsertRowid
   );
   db.prepare(
-    `INSERT INTO product_skus (product_id, sku_key, specs_json, price_cny_fen, capacity, committed, created_at, updated_at)
-     VALUES (?, '', '{}', 8800, 1, 1, ?, ?)`
+    `INSERT INTO product_skus (product_id, sku_key, specs_json, price_usdt_micro, capacity, committed, created_at, updated_at)
+     VALUES (?, '', '{}', 88000000, 1, 1, ?, ?)`
   ).run(productId, now, now);
   db.prepare(
     `INSERT INTO orders (id, product_id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       quantity, hold_qty, released_at, amount_wei, cny_fen, bty_usdt_rate, usdt_cny_rate, status, escrow_order_id, paid_tx_hash, created_at, updated_at)
+       quantity, hold_qty, released_at, amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash, created_at, updated_at)
      VALUES (?, ?, ?, '{}', '0x00', '', '${GOOD_BUYER}', '${GOOD_SELLER}',
-       1, 1, ?, '1000000000000000000', 100, '0.1', '7.2', 'cancelled', ?, NULL, ?, ?)`
+       1, 1, ?, '1000000000000000000', 1000000, '0.1', 'cancelled', ?, NULL, ?, ?)`
   ).run(id, productId, slug, now, orderIdHex, now, now);
 
   const ackKey = `mk:escrow_hold_missing:${id}`;

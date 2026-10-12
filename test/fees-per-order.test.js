@@ -66,9 +66,9 @@ function insertIncome({ feeCollectorAtCreate = '', status = 'confirmed', amountW
   const now = Date.now();
   db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, cny_fen, bty_usdt_rate, usdt_cny_rate, status, escrow_order_id, paid_tx_hash,
+       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash,
        fee_bps, fee_collector_at_create, created_at, updated_at)
-     VALUES (?, 'p-fee', '{}', '0x00', '', ?, ?, ?, 100, '0.1', '7.2', ?, ?, NULL, ?, ?, ?, ?)`
+     VALUES (?, 'p-fee', '{}', '0x00', '', ?, ?, ?, 1000000, '0.1', ?, ?, NULL, ?, ?, ?, ?)`
   ).run(id, buyer.address.toLowerCase(), owner.address.toLowerCase(), amountWei, status, `0x${String(seq).padStart(64, '0')}`, feeBps, feeCollectorAtCreate, now, now);
   return id;
 }

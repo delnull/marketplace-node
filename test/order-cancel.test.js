@@ -67,7 +67,7 @@ test('托管单号唯一：重复 escrow_order_id 在写入时即被拒绝', () 
   const orderIdHex = '0x' + '5'.repeat(64);
   const ins = db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, cny_fen, status, escrow_order_id, created_at, updated_at)
+       amount_wei, usdt_micro, status, escrow_order_id, created_at, updated_at)
      VALUES (?, 'p-uniq', '{}', '0x00', '', ?, ?, '1000000000000000000', 100, 'draft', ?, ?, ?)`
   );
   ins.run(`uniq-a-${now}`, buyer.address.toLowerCase(), owner.address.toLowerCase(), orderIdHex, now, now);
@@ -79,7 +79,7 @@ test('托管单号唯一：重复 escrow_order_id 在写入时即被拒绝', () 
   // 唯一索引是**部分索引**：未上链草稿（escrow_order_id 为 NULL）不受约束
   const draftIns = db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, cny_fen, status, escrow_order_id, created_at, updated_at)
+       amount_wei, usdt_micro, status, escrow_order_id, created_at, updated_at)
      VALUES (?, 'p-uniq', '{}', '0x00', '', ?, ?, '1000000000000000000', 100, 'draft', NULL, ?, ?)`
   );
   draftIns.run(`uniq-c-${now}`, buyer.address.toLowerCase(), owner.address.toLowerCase(), now, now);

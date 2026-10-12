@@ -2,7 +2,7 @@
  * 卖家订单检索 q（GET /api/orders/seller?q=，UX 审计 P2；复查 a9926e9 转义修复）：
  *  - 正例：按买家地址精确命中（大小写不敏感）、按商品标题子串命中、与其它行互斥正确；
  *  - 反例：q='%' 必须按字面量处理（ESCAPE 转义）——修复前命中全部订单；
- *    注：'_' 因快照 JSON 键自带下划线（price_cny_fen 等）无法作区分用例，故用 % 作判别；
+ *    注：'_' 因快照 JSON 键自带下划线（price_usdt_micro 等）无法作区分用例，故用 % 作判别；
  *  - 校验：空白 q / 超 200 字符 → code=1 业务拒绝（本项目业务错误统一 HTTP 200+code）；
  *  - 角色：仅 staff（owner/operator）可用，买家 HTTP 403。
  */
@@ -33,7 +33,7 @@ before(async () => {
     const res = await request(app)
       .post('/api/products')
       .set('Authorization', `Bearer ${ownerToken}`)
-      .send(productPayload({ kind: 'physical', title, priceCnyFen: 8800 }))
+      .send(productPayload({ kind: 'physical', title, priceUsdtMicro: 88_000_000 }))
       .expect(200);
     assertOk(res);
     return res.body.data.slug;

@@ -157,29 +157,21 @@ const config = {
 
   rates: {
     /*
-      两条腿的缓存 TTL **分开**（2026-09）：BTY-USDT 与 USDT→CNY 是两种完全不同的上游，
-      合成一个 TTL 必然二选一地吃亏（要么把官方 ticker 缓存到 15 分钟，要么为跟紧 BTY 把
-      三家公共汇率接口打成每 3 分钟一轮）。
-        · btyTtlMs（MK_BTY_TTL_MS，默认 60 秒）：官方 mainnet.bityuan.com/tapi/ticker 是
-          **我们自己的**行情端点，且它直接决定"买家要付多少 BTY"，要跟得紧；
-        · usdtCnyTtlMs（MK_RATES_TTL_MS，默认 30 分钟）：USDT→CNY 要打 3 家**免密钥公共接口**
-          （Coinbase / er-api / frankfurter），缓存就是可用性——公共接口最容易因高频调用被限速，
-          而人民币汇率本身一天动不了几个点。TTL 就是"每源每天多少请求"的分母：
-          30 分钟 = 48 次/天，15 分钟 = 96 次/天，3 分钟 = 480 次/天（调小才容易被限速）。
-      两者都可解析为 0 = 该腿每次请求都刷新（排障用，注意会打满对应上游）。
+      只有一条腿（2026-10 标价单位由 CNY 改为 USDT 之后）：
+      USDT 标价 → 原生 BTY 应付，唯一的换算是「USDT → BTY」，数据源是官方
+      mainnet.bityuan.com/tapi/ticker（BTY-USDT）。它直接决定"买家要付多少 BTY"，要跟得紧，
+      所以 TTL 默认 60 秒（MK_BTY_TTL_MS）。
       解析器用 intEnvAllowZero 而不是 intEnv：后者把 0 当成"没给"并回退默认值，
-      于是 `MK_RATES_TTL_MS=0` 会**静默变成默认值**（历史真事，test/setup.mjs 里记过一笔）。
-      代价（明确记录）：USDT→CNY 最多滞后 30 分钟，行情剧烈波动时展示价与锁定价可能短期偏离；
-      下单时草稿会锁定当次汇率，最终以买家签名的金额为准。
+      于是 `MK_BTY_TTL_MS=0` 会**静默变成默认值**（历史真事，test/setup.mjs 里记过一笔）。
+      0 = 每次请求都刷新（排障用，注意会打满上游）。
+      已删除的键（旧实现里为"CNY 标价"服务的 USDT→CNY 法币腿）：
+      MK_RATES_TTL_MS、MK_FALLBACK_USDT_CNY——USDT 标价不再需要任何法币汇率。
     */
     btyTtlMs: intEnvAllowZero('MK_BTY_TTL_MS', 60000),
-    usdtCnyTtlMs: intEnvAllowZero('MK_RATES_TTL_MS', 1800000),
     // 手工兜底汇率（行情源不可用时回退，并标记 stale）
     fallback: {
       // 1 BTY = x USDT
       btyUsdt: Number(process.env.MK_FALLBACK_BTY_USDT || 0),
-      // 1 USDT = x CNY
-      usdtCny: Number(process.env.MK_FALLBACK_USDT_CNY || 0),
     },
   },
 

@@ -14,7 +14,8 @@
  *      足够 2 单固定支付/多单汇率支付；用完即弃——测试资金不回收，余额极小）。
  *
  * 用法（示例：node 起在 18080、注册 Registry）：
- *   node scripts/e2e-mainnet.mjs [--node http://127.0.0.1:18080] [--register] [--quantity 2] [--price-fen 10000]
+ *   node scripts/e2e-mainnet.mjs [--node http://127.0.0.1:18080] [--register] [--quantity 2] [--price-usdt-micro 100000000]
+ *   （--price-usdt-micro 是**微 USDT**：1 USDT = 1e6，默认 1e8 = 100 USDT）
  *   环境变量：MK_RPC_URL / MK_ESCROW_ADDRESS / MK_REGISTRY_ADDRESS（**后两者必填**：源码审计 2026-09 已
  *             移除内置的 v2 联调默认地址——那组地址是三段含 metaJson 签名的旧版 Registry，与当前
  *             ABI/签名规则不兼容，按默认值跑只会回滚；请指向上线重部署版地址，
@@ -46,7 +47,7 @@ const DO_REGISTER = args.includes('--register');
 const DO_DEREGISTER = args.includes('--deregister');
 const ENDPOINT = (argVal('--endpoint', '') || NODE_URL).replace(/\/+$/, '');
 const QUANTITY = Number(argVal('--quantity', '2'));
-const PRICE_FEN = Number(argVal('--price-fen', '10000'));
+const PRICE_MICRO = Number(argVal('--price-usdt-micro', '100000000')); // 1e8 微 = 100 USDT
 const FUND_WEI = args.includes('--skip-buyer-fund') ? 0n : BigInt(argVal('--fund-wei', '50000000000000000'));
 // 默认 0.05 BTY：BTY 主网要求余额 ≥ 10×gas 费，托管 0.001 + createOrder/confirm 两笔 tx 的 10 倍费 ≈ 0.027 BTY
 
@@ -190,7 +191,7 @@ async function main() {
   const ownerToken = await login(owner);
   const product = await api('POST', '/api/products', {
     title: `E2E 冒烟 ${tag}`, description: '主网全链路验收商品（脚本自动生成）',
-    images: [], kind: 'digital', priceCnyFen: PRICE_FEN,
+    images: [], kind: 'digital', priceUsdtMicro: PRICE_MICRO,
   }, ownerToken);
   console.log(`商品 ${product.slug} snapshotHash=${product.snapshotHash.slice(0, 18)}…`);
   const codes = Array.from({ length: 6 }, (_, i) => `E2E-${tag}-${i + 1}`);

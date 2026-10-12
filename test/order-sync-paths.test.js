@@ -224,9 +224,9 @@ function insertOrder({
   const now = Date.now();
   db.prepare(
     `INSERT INTO orders (id, product_id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       quantity, hold_qty, released_at, amount_wei, cny_fen, bty_usdt_rate, usdt_cny_rate, status, escrow_order_id,
+       quantity, hold_qty, released_at, amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id,
        paid_tx_hash, fee_bps, fee_collector_at_create, onchain_events, created_at, updated_at)
-     VALUES (?, ?, 'p-sync', '{}', '0x00', '', ?, ?, 1, ?, ?, ?, 100, '0.1', '7.2', ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, 'p-sync', '{}', '0x00', '', ?, ?, 1, ?, ?, ?, 1000000, '0.1', ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     productId,
@@ -449,7 +449,7 @@ test('/sync 恢复失败（限量售罄）时**不**把支付凭证写进 cancel
     .run(`p-soldout-${seq}`, '已售罄的限量商品', now, now);
   const productId = Number(prod.lastInsertRowid);
   db.prepare(
-    "INSERT INTO product_skus (product_id, sku_key, specs_json, price_cny_fen, capacity, committed, created_at, updated_at) VALUES (?, '', '{}', 100, 1, 1, ?, ?)"
+    "INSERT INTO product_skus (product_id, sku_key, specs_json, price_usdt_micro, capacity, committed, created_at, updated_at) VALUES (?, '', '{}', 100, 1, 1, ?, ?)"
   ).run(productId, now, now);
 
   // 草稿已被清扫成 cancelled（占位已释放），买家随后才完成链上支付；凭证此时为空
@@ -507,7 +507,7 @@ test('/sync 把 cancelled 恢复为 escrowed 时**在同一事务内**补写支�
   const productId = Number(prod.lastInsertRowid);
   // 库存仍有额度（committed=1 且 capacity 足够）⇒ restockOrder 能成功，迁移会真的发生
   db.prepare(
-    "INSERT INTO product_skus (product_id, sku_key, specs_json, price_cny_fen, capacity, committed, created_at, updated_at) VALUES (?, '', '{}', 100, 5, 1, ?, ?)"
+    "INSERT INTO product_skus (product_id, sku_key, specs_json, price_usdt_micro, capacity, committed, created_at, updated_at) VALUES (?, '', '{}', 100, 5, 1, ?, ?)"
   ).run(productId, now, now);
 
   const o = insertOrder({ status: 'cancelled', productId, holdQty: 1, releasedAt: now, paidTxHash: null });

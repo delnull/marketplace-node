@@ -9,6 +9,12 @@ import { assertOk, login, makeCtx, productPayload, rowLikeOf } from './setup.mjs
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
 
+/** 期望 wei：与节点同源（rates.usdtMicroToPayWei），避免在测试里手抄一遍汇率算式 */
+async function expectWei(usdtMicro) {
+  const { getRates, usdtMicroToPayWei } = await import('../src/rates.js');
+  return usdtMicroToPayWei(usdtMicro, await getRates());
+}
+
 // ── 店铺与健康检查 ──
 
 test('店铺信息与健康检查公开可读', async () => {
@@ -98,7 +104,7 @@ test('店主上架成功：返回快照哈希（keccak256 0x 前缀）', async (
   assertOk(res);
   const p = res.body.data;
   assert.ok(/^0x[0-9a-f]{64}$/.test(p.snapshotHash), 'snapshotHash 应为 64 位 hex');
-  assert.equal(p.priceCny, '88.00');
+  assert.equal(p.priceUsdt, '88', '展示串去净尾零：88 USDT 写作 88（不是 88.00）');
   assert.equal(p.kind, 'digital');
   productSlug = p.slug;
   productHash = p.snapshotHash;
@@ -115,7 +121,7 @@ test('上架参数校验：非法 kind / 非正价格被拒', async () => {
   const badPrice = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerLogin.token}`)
-    .send(productPayload({ priceCnyFen: -1 }))
+    .send(productPayload({ priceUsdtMicro: -1 }))
     .expect(200);
   assert.notEqual(badPrice.body.code, 0);
 });
@@ -144,7 +150,7 @@ test('改价后快照哈希变化；下架后不出现在公开列表', async ()
   const repriced = await request(app)
     .patch(`/api/products/${productSlug}`)
     .set('Authorization', `Bearer ${ownerLogin.token}`)
-    .send({ skus: [{ key: '', priceCnyFen: 9900, capacity: null }] })
+    .send({ skus: [{ key: '', priceUsdtMicro: 99_000_000, capacity: null }] })
     .expect(200);
   assertOk(repriced);
   assert.notEqual(repriced.body.data.snapshotHash, productHash, '改价应重算快照哈希');
@@ -161,7 +167,7 @@ test('改价后快照哈希变化；下架后不出现在公开列表', async ()
   await request(app)
     .patch(`/api/products/${productSlug}`)
     .set('Authorization', `Bearer ${ownerLogin.token}`)
-    .send({ active: true, skus: [{ key: '', priceCnyFen: 8800, capacity: null }] })
+    .send({ active: true, skus: [{ key: '', priceUsdtMicro: 88_000_000, capacity: null }] })
     .expect(200);
 });
 
@@ -187,10 +193,14 @@ test('买家创建订单草稿：锁定快照、汇率与应付金额（BTY wei 
   assert.equal(o.snapshotHash, productHash, '订单锁定下单时刻的商品快照哈希');
   assert.equal(o.seller.toLowerCase(), owner.address.toLowerCase());
   assert.equal(o.buyer.toLowerCase(), buyer.address.toLowerCase());
-  assert.equal(o.cnyFen, 8800);
-  // 兜底汇率 1 BTY=0.1USDT、1 USDT=7.2CNY → 1 CNY=1.388888…BTY → ¥88 ≈ 122.22 BTY
+  assert.equal(o.usdtMicro, 88_000_000, '商品单价（微 USDT）× 数量');
+  /*
+    应付 wei 与节点同源折算（不在这里手抄一遍汇率算式）：兜底汇率 1 BTY = 0.1 USDT
+    ⇒ 88 USDT = 880 BTY。向上取整的产物由 rates.usdtMicroToPayWei 负责。
+  */
+  assert.equal(o.amountWei, await expectWei(o.usdtMicro));
   const bty = Number(o.amountWei) / 1e18;
-  assert.ok(Math.abs(bty - 88 / 0.72) < 1e-9, `应付 BTY 应≈122.22，实际 ${bty}`);
+  assert.ok(Math.abs(bty - 880) < 1e-9, `应付 BTY 应≈880，实际 ${bty}`);
   assert.ok(o.amountDecimal.length > 0);
 });
 
@@ -294,9 +304,36 @@ test('汇率接口：公网不可用时回退兜底并标记 stale', async () =>
   assert.equal(res.body.data.available, true);
   assert.equal(res.body.data.stale, true);
   assert.equal(res.body.data.btyUsdt, 0.1);
-  assert.equal(res.body.data.usdtCny, 7.2);
-  // 换算系数 1 CNY = 1/(0.1*7.2) BTY
-  assert.ok(Math.abs(res.body.data.cnyToBty - 1 / 0.72) < 1e-12);
+  // 换算系数 1 USDT = 1 / 0.1 = 10 BTY
+  assert.ok(Math.abs(res.body.data.usdtToBty - 10) < 1e-12);
+  /*
+    `fallback:true` = 这个数**不是行情**，是 setup.mjs 配的 MK_FALLBACK_BTY_USDT 手工值。
+    它与"缓存里上一轮的实时值"对买家的含义完全不同（一个是店主填的数、一个是旧行情），
+    所以必须单独报出来——只报 `stale` 会让前端把两者写成同一句"缓存值（可能滞后）"
+    （源码评审 2026-10，P1）。
+  */
+  assert.equal(res.body.data.fallback, true, '手工兜底值必须与"缓存行情"分开报');
+  // 法币腿（USDT→CNY）已随标价单位改为 USDT 整条删除：对外快照里不该再有任何 CNY 字段
+  assert.deepEqual(
+    Object.keys(res.body.data).sort(),
+    ['available', 'btyUsdt', 'error', 'fallback', 'stale', 'updatedAt', 'usdtToBty'],
+    '只返回单腿 BTY-USDT 契约'
+  );
+  /*
+    降级分支（完全取不到行情）必须返回**同一组键**：形状随分支变化时，任何读 `error`/`stale`
+    的消费方会拿到 undefined 而毫无察觉，而前端 types 把这几项声明为非可选（源码评审 2026-10，P2）。
+    断言写成"两组键相等"而不是再抄一遍字面量：以后加字段只改一处。
+  */
+  const { UNAVAILABLE } = await import('../src/routes/rates.js');
+  assert.deepEqual(
+    Object.keys(UNAVAILABLE).sort(),
+    Object.keys(res.body.data).sort(),
+    '可用/不可用两个分支的键集合必须一致'
+  );
+  assert.equal(UNAVAILABLE.available, false);
+  assert.equal(UNAVAILABLE.stale, true);
+  assert.equal(UNAVAILABLE.btyUsdt, null);
+  assert.equal(UNAVAILABLE.usdtToBty, null);
 });
 
 // ── 未定义路由 ──

@@ -83,7 +83,7 @@ test('分组语义：外层事务内「置 cancelled + 释放占位」整体回�
   const p = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerToken}`)
-    .send(productPayload({ kind: 'physical', title: 'SAVEPOINT 回滚商品', capacity: 3, priceCnyFen: 9900 }))
+    .send(productPayload({ kind: 'physical', title: 'SAVEPOINT 回滚商品', capacity: 3, priceUsdtMicro: 99_000_000 }))
     .expect(200);
   assertOk(p);
   const slug = p.body.data.slug;

@@ -15,7 +15,7 @@ const buyers = [buyer, Wallet.createRandom(), Wallet.createRandom(), Wallet.crea
 let seq = 0;
 const payHash = () => '0x' + String(++seq).padStart(64, '0');
 
-/** 上架商品（¥66.00）→ 店主代买家下单 → 模拟 watcher/paid 回写 escrowed（落支付凭证），返回 { slug, order } */
+/** 上架商品（66 USDT）→ 店主代买家下单 → 模拟 watcher/paid 回写 escrowed（落支付凭证），返回 { slug, order } */
 async function settledEscrow(slug, who = buyer.address) {
   const ownerLogin = await login(ctx, owner);
   const res = await request(app)
@@ -47,7 +47,7 @@ test('买家确认收货后计入流水（confirmed）', async () => {
   const listed = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerLogin.token}`)
-    .send(productPayload({ title: '流水测试商品A', priceCnyFen: 6600 }))
+    .send(productPayload({ title: '流水测试商品A', priceUsdtMicro: 66_000_000 }))
     .expect(200);
   assertOk(listed);
   productSlug = listed.body.data.slug;
@@ -77,10 +77,17 @@ test('买家确认收货后计入流水（confirmed）', async () => {
   assert.equal(orders[0].id, o.id);
   assert.equal(orders[0].status, 'confirmed');
   assert.equal(summary.count, 1);
-  assert.equal(summary.cnyFen, 6600);
+  /*
+    微 USDT 汇总现在是**字符串**（与 wei 侧同款：节点用 BigInt 累加后 toString()）——
+    Number 累加在 9.007e15 以上 ulp 变成 2…16，而这是要拿去对账的整数金额（源码评审 2026-10，P2）。
+    断言用 `String(...)` 比较，这样"哪天有人又改回 Number"时这里只会在超出安全整数时红——
+    真正钉住的是**逐值相等**：132000000 微 = 132.00 USDT。
+  */
+  assert.equal(String(summary.usdtMicro), '66000000');
   assert.equal(summary.amountWei, o.amountWei, '累计金额应等于本单应付 wei（字符串精确）');
   assert.deepEqual(Object.keys(summary.byStatus), ['confirmed']);
   assert.equal(summary.byStatus.confirmed.count, 1);
+  assert.equal(String(summary.byStatus.confirmed.usdtMicro), '66000000');
   assert.equal(summary.byStatus.confirmed.amountWei, o.amountWei);
 });
 
@@ -106,7 +113,7 @@ test('超时释放计入流水（expired），退款订单不计入', async () =
   assertOk(ledger);
   const { summary } = ledger.body.data;
   assert.equal(summary.count, 2, 'confirmed + expired 两单入账，refunded 不计入');
-  assert.equal(summary.cnyFen, 6600 * 2);
+  assert.equal(String(summary.usdtMicro), String(66_000_000 * 2), '微 USDT 汇总同样是字符串（BigInt 累加）');
   assert.equal(summary.amountWei, (BigInt(createdWei[0]) + BigInt(o2.amountWei)).toString());
   assert.equal(summary.byStatus.expired.count, 1);
   assert.equal(summary.byStatus.expired.amountWei, o2.amountWei);

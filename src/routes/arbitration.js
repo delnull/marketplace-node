@@ -18,8 +18,8 @@ import { Router } from 'express';
 import { getDb } from '../db.js';
 import { ok, wrap, simpleRateLimit } from '../http.js';
 import { weiToDecimal } from '../chain.js';
-// 金额展示口径的唯一实现（yuanOf / goodsFenOf）——不要手写 (fen/100).toFixed(2)
-import { goodsFenOf, yuanOf } from '../money.js';
+// 金额展示口径的唯一实现（usdtOf / goodsMicroOf）——不要手写 (micro/1e6).toFixed(2)
+import { goodsMicroOf, usdtOf } from '../money.js';
 // 「已交付事实」的唯一实现（shipped_at / tracking_no / 交付行三要素）——不要在本文件重写判据
 import { hasDelivered } from '../returns.js';
 // 平台费**按单**判据的唯一实现（创建时收取方快照；见 src/fees.js）
@@ -62,19 +62,19 @@ function disputeToPublic(o) {
     quantity: o.quantity || 1,
     /*
       金额拆分（与 orders.js 的 orderToPublic 同口径，缺一不可）：
-        cnyFen            = 本单应付总额（商品 + 运费），也是链上锁定 amountWei 的 CNY 口径
-        shippingFeeCnyFen = 本单实际锁定的运费（按单收取一次；数字/NFT 单恒 0）
-        goodsCnyFen       = cnyFen − 运费 = 商品金额（单价 × 数量）
+        usdtMicro            = 本单应付总额（商品 + 运费），也是链上锁定 amountWei 的 USDT 口径
+        shippingFeeUsdtMicro = 本单实际锁定的运费（按单收取一次；数字/NFT 单恒 0）
+        goodsUsdtMicro       = usdtMicro − 运费 = 商品金额（单价 × 数量）
       仲裁人要判的是"退多少"，而商品金额与运费是两笔不同的钱：只给总额，
       前端任何「本单单价 = 总额 ÷ 数量」的换算都会把运费摊成商品价
-      （2 件 ¥10 + 运费 ¥5 → ¥12.50/件），裁决依据里就多出一个不存在的单价。
+      （2 件 10 USDT + 运费 5 USDT → 12.5 USDT/件），裁决依据里就多出一个不存在的单价。
     */
-    cnyFen: o.cny_fen,
-    cny: yuanOf(o.cny_fen),
-    shippingFeeCnyFen: o.shipping_fee_cny_fen || 0,
-    shippingFeeCny: yuanOf(o.shipping_fee_cny_fen),
-    goodsCnyFen: goodsFenOf(o.cny_fen, o.shipping_fee_cny_fen),
-    goodsCny: yuanOf(goodsFenOf(o.cny_fen, o.shipping_fee_cny_fen)),
+    usdtMicro: o.usdt_micro,
+    usdt: usdtOf(o.usdt_micro),
+    shippingFeeUsdtMicro: o.shipping_fee_usdt_micro || 0,
+    shippingFeeUsdt: usdtOf(o.shipping_fee_usdt_micro),
+    goodsUsdtMicro: goodsMicroOf(o.usdt_micro, o.shipping_fee_usdt_micro),
+    goodsUsdt: usdtOf(goodsMicroOf(o.usdt_micro, o.shipping_fee_usdt_micro)),
     amountWei: o.amount_wei,
     amountDecimal: weiToDecimal(o.amount_wei),
     /*

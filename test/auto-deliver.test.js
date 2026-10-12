@@ -186,7 +186,7 @@ test('无码池数字商品：保持 escrowed 等待卖家手动交付（交付�
 });
 
 test('实物商品：永不自动交付（需卖家后台填物流发货）', async () => {
-  const { slug } = await listDigital({ kind: 'physical', priceCnyFen: 8800 });
+  const { slug } = await listDigital({ kind: 'physical', priceUsdtMicro: 88_000_000 });
   const order = await escrowedOrder(slug);
   assert.equal(tryAutoDeliverById(order.id), false);
   assert.equal(rowOf(order.id).status, 'escrowed');

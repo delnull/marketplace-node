@@ -80,17 +80,20 @@ test('quantity 参数校验：非整数/越界（0、-1、100、1.5、非数字�
 
 // ── quantity 金额与限量占位 ──
 
-test('quantity=3 下单：金额与 CNY 均为 3 倍；限量商品按量占位（余量按件扣）', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '按量占位商品', priceCnyFen: 8800, capacity: 5 }));
+test('quantity=3 下单：金额与 USDT 展示串均为 3 倍；限量商品按量占位（余量按件扣）', async () => {
+  const p = await listProduct(productPayload({ kind: 'physical', title: '按量占位商品', priceUsdtMicro: 88_000_000, capacity: 5 }));
   const o = await createDraft(p.slug, 3);
 
   assert.equal(o.quantity, 3);
-  assert.equal(o.cnyFen, 8800 * 3, '锁定 CNY = 单价 × 数量');
-  // 汇率锁定口径：兜底汇率 1 BTY=0.1USDT、1 USDT=7.2CNY → 应付 ≈ ¥264/0.72 BTY（向上取整）
+  assert.equal(o.usdtMicro, 88_000_000 * 3, '锁定金额（微 USDT）= 单价 × 数量');
+  assert.equal(o.usdt, '264', '展示串去净尾零：264 USDT 写作 264（不是 264.00）');
+  // 汇率锁定口径：兜底汇率 1 BTY = 0.1 USDT ⇒ 264 USDT = 2640 BTY（向上取整）
   const bty = Number(o.amountWei) / 1e18;
-  assert.ok(Math.abs(bty - (8800 * 3) / 100 / 0.72) < 1e-9, `应付 BTY 应≈366.67，实际 ${bty}`);
-  // 数量为 3 时的应付应明显大于数量为 1 的单倍应付
-  assert.ok(BigInt(o.amountWei) > BigInt(Math.floor(((8800 / 100) / 0.72) * 1e18)) * 2n, '应付随数量放大');
+  assert.ok(Math.abs(bty - 2640) < 1e-9, `应付 BTY 应≈2640，实际 ${bty}`);
+  // 数量为 3 时的应付应明显大于数量为 1 的单倍应付（期望值同样取自节点自己的折算函数）
+  const { getRates, usdtMicroToPayWei } = await import('../src/rates.js');
+  const oneWei = BigInt(usdtMicroToPayWei(88_000_000, await getRates()));
+  assert.ok(BigInt(o.amountWei) > oneWei * 2n, '应付随数量放大');
   // 限量占位按件：capacity 5 − 3 = 2
   const r = skuInv(db, p.slug);
   assert.equal(r.committed, 3, '销量按 quantity 累加');
@@ -170,7 +173,7 @@ test('NFT quantity=2：同单 tokenId 重复申报 / 一次超量申报 → 链�
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出：无规格商品就是 key='' 的唯一组合
     specs: [],
-    skus: [{ key: '', priceCnyFen: 6600, capacity: null }],
+    skus: [{ key: '', priceUsdtMicro: 66_000_000, capacity: null }],
   });
   const importRes = await request(app)
     .post(`/api/products/${p.slug}/tokens`)
@@ -275,4 +278,39 @@ test('草稿占用合计上限：同买家同商品 99 件放行、100 件被拒
   // 上限之上哪怕 1 件也拒
   assert.match(blocked(await tryDraft(1)), /未支付草稿合计已达 99\/99/);
   assert.equal(db.isTransaction, false, '第二次拒绝后同样不得残留事务');
+});
+
+/*
+  ── 回归（源码评审 2026-10，P0）：合计越过 JS 安全整数的单必须被**明确拒掉**，而不是落库 ──
+
+  为什么这条值得一个用例：`orders.usdt_micro` 是 SQLite INTEGER 列，而 node:sqlite 读一个
+  > Number.MAX_SAFE_INTEGER(9.007e15) 的整数会**直接抛 RangeError**（实测 `SELECT *` 与
+  `SUM()` 都炸）——不是"算得不准"，而是这一行会让订单详情/列表/流水/两个 CSV/仲裁队列/通知
+  全部 500，且它已提交（txCommit 在 findOrder 之前）、`cancel` 也走 findOrder ⇒ 接口层无法自救。
+  商品侧上限（PRICE_MAX_MICRO）已收窄到"最坏合计仍在安全区内"，这里再用**直接改库**模拟
+  历史脏数据（绕过校验的旧行），验证下单路由那道 isSafeInteger 兜底闸真的拦得住。
+*/
+test('回归：SKU 单价被改成超过安全整数上限的脏数据时，下单必须被明确拒绝且不落库', async () => {
+  const p = await listProduct(productPayload({ title: '脏价格商品', capacity: null }));
+  // 直接改库模拟"绕过商品校验写进来的历史行"：1e15 微 = 1e9 USDT（旧上限），×99 件即越过 2^53
+  db.prepare('UPDATE product_skus SET price_usdt_micro = ? WHERE product_id = (SELECT id FROM products WHERE slug = ?)')
+    .run(1_000_000_000_000_000, p.slug);
+
+  const before = db.prepare('SELECT COUNT(*) AS c FROM orders WHERE product_slug = ?').get(p.slug).c;
+  const res = await request(app)
+    .post('/api/orders')
+    .set('Authorization', `Bearer ${buyerToken}`)
+    .send({ productSlug: p.slug, quantity: 99, buyer: buyer.address })
+    .expect(200);
+
+  const msg = blocked(res);
+  assert.match(msg, /超出可精确表示的上限/, `应给出可行动的中文原因，实际：${msg}`);
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS c FROM orders WHERE product_slug = ?').get(p.slug).c,
+    before,
+    '被拒的单不得落库（否则那一行会让所有 SELECT * 永久 500）'
+  );
+  assert.equal(db.isTransaction, false, '拒绝后不得残留打开的事务');
+  // 直接证明"这条脏价格确实会让 SELECT * 炸"——用例的前提成立，而不是在防一个不存在的情况
+  assert.equal(Number.isSafeInteger(1_000_000_000_000_000 * 99), false);
 });

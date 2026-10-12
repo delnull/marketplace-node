@@ -59,13 +59,13 @@ test('操作员可经营（商品/码池/发货/订单列表/状态计数），�
   const p = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${operatorToken}`)
-    .send(productPayload({ kind: 'physical', title: '操作员商品', priceCnyFen: 9900 }))
+    .send(productPayload({ kind: 'physical', title: '操作员商品', priceUsdtMicro: 99_000_000 }))
     .expect(200);
   assertOk(p);
   const patch = await request(app)
     .patch(`/api/products/${p.body.data.slug}`)
     .set('Authorization', `Bearer ${operatorToken}`)
-    .send({ priceCnyFen: 8800 })
+    .send({ priceUsdtMicro: 88_000_000 })
     .expect(200);
   assertOk(patch);
   const all = await request(app).get('/api/products/all').set('Authorization', `Bearer ${operatorToken}`).expect(200);
@@ -118,7 +118,7 @@ test('审计：staff 动作入账（detail 无码原文）；买家动作不入�
   await request(app)
     .patch(`/api/products/${slug}`)
     .set('Authorization', `Bearer ${operatorToken}`)
-    .send({ priceCnyFen: 5000 })
+    .send({ priceUsdtMicro: 50_000_000 })
     .expect(200);
 
   const audit = await request(app).get('/api/shop/audit?pageSize=100').set('Authorization', `Bearer ${ownerToken}`).expect(200);

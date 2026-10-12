@@ -65,7 +65,7 @@ const auditExport = (req, action, targetId, detail) =>
 const ORDER_COLUMNS = [
   'id', 'product_slug', 'status', 'quantity', 'amount_wei', 'refunded_wei', 'fee_wei', 'amount_net_wei',
   'fee_bps', 'fee_chargeable', 'fee_basis', 'accepted_partial_refund_wei',
-  'cny_fen', 'shipping_fee_cny_fen', 'invoice_needed',
+  'usdt_micro', 'shipping_fee_usdt_micro', 'invoice_needed',
   'buyer', 'shipping_name', 'shipping_phone', 'shipping_address', 'shipping_edited', 'note', 'escrow_order_id',
   'paid_tx_hash', 'refund_status', 'tracking_no', 'created_at', 'updated_at',
 ];
@@ -118,7 +118,7 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const headers = [
     'order_id', 'product_slug', 'income_status', 'quantity', 'amount_wei', 'refunded_wei', 'fee_wei', 'net_wei',
     'fee_bps', 'fee_chargeable', 'fee_basis', 'accepted_partial_refund_wei',
-    'cny_fen', 'income_at_ms', 'buyer', 'escrow_order_id', 'paid_tx_hash',
+    'usdt_micro', 'income_at_ms', 'buyer', 'escrow_order_id', 'paid_tx_hash',
   ];
   const csvRows = rows.map((o) => {
     // 已退金额参与净额：净额 = amount − refunded − fee（部分退款后只对未退部分计费）
@@ -132,7 +132,7 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
       o.id, o.product_slug, o.status, o.quantity || 1, o.amount_wei, refunded.toString(), fee.toString(),
       (base - fee).toString(),
       fc.bps, fc.chargeable, fc.basis, String(o.accepted_partial_refund_wei || '0'),
-      o.cny_fen, o.updated_at, o.buyer, o.escrow_order_id || '', o.paid_tx_hash || '',
+      o.usdt_micro, o.updated_at, o.buyer, o.escrow_order_id || '', o.paid_tx_hash || '',
     ];
   });
   auditExport(req, 'export.ledger', '-', { rows: rows.length, from: req.query.from || 'all', to: req.query.to || 'all' });
@@ -191,7 +191,7 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
       o.id, o.product_slug, o.status, o.quantity || 1, o.amount_wei,
       refunded.toString(), fee.toString(), (base - fee).toString(),
       fc.bps, fc.chargeable, fc.basis, String(o.accepted_partial_refund_wei || '0'),
-      o.cny_fen, o.shipping_fee_cny_fen ?? 0, o.invoice_needed ? 1 : 0,
+      o.usdt_micro, o.shipping_fee_usdt_micro ?? 0, o.invoice_needed ? 1 : 0,
       o.buyer, o.shipping_name, o.shipping_phone, o.shipping_address, o.shipping_edit_count ? '1' : '0', o.note || '',
       o.escrow_order_id || '', o.paid_tx_hash || '', o.refund_status || 'none',
       o.tracking_no || '', o.created_at, o.updated_at,
@@ -221,7 +221,7 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     if (!skuByProduct.has(s.product_id)) skuByProduct.set(s.product_id, []);
     skuByProduct.get(s.product_id).push(s);
   }
-  const headers = ['slug', 'title', 'kind', 'shipping_fee_cny_fen', 'age_restricted', 'specs', 'sku_key', 'sku_specs', 'price_cny_fen', 'capacity', 'committed', 'available', 'sku_active', 'active', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused'];
+  const headers = ['slug', 'title', 'kind', 'shipping_fee_usdt_micro', 'age_restricted', 'specs', 'sku_key', 'sku_specs', 'price_usdt_micro', 'capacity', 'committed', 'available', 'sku_active', 'active', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused'];
   const csvRows = [];
   for (const r of rows) {
     const skus = skuByProduct.get(r.id) || [];
@@ -235,9 +235,9 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     const list = skus.length ? skus : [null];
     for (const s of list) {
       csvRows.push([
-        r.slug, r.title, r.kind, r.shipping_fee_cny_fen ?? 0, r.age_restricted ? 1 : 0, specs,
+        r.slug, r.title, r.kind, r.shipping_fee_usdt_micro ?? 0, r.age_restricted ? 1 : 0, specs,
         s ? s.sku_key : '', s ? s.specs_json : '',
-        s ? s.price_cny_fen : '', s ? (s.capacity ?? '') : '', s ? s.committed || 0 : '',
+        s ? s.price_usdt_micro : '', s ? (s.capacity ?? '') : '', s ? s.committed || 0 : '',
         s ? (s.capacity === null ? '' : Math.max(0, s.capacity - (s.committed || 0))) : '',
         s ? (s.active ? 1 : 0) : '',
         r.active ? 1 : 0, r.auto_deliver, r.stock_alert_at ?? '', r.snapshot_hash,

@@ -43,8 +43,8 @@ function settle(id, status, at = Date.now(), feeBps = 0, refundedWei = null) {
 }
 
 test('overview：入账净额与退款并列、件数/买家/复购去重、确认率', async () => {
-  const p1 = await listProduct(productPayload({ kind: 'physical', title: '看板A', capacity: 99, priceCnyFen: 10000 }));
-  const p2 = await listProduct(productPayload({ kind: 'digital', title: '看板B', priceCnyFen: 20000 }));
+  const p1 = await listProduct(productPayload({ kind: 'physical', title: '看板A', capacity: 99, priceUsdtMicro: 100_000_000 }));
+  const p2 = await listProduct(productPayload({ kind: 'digital', title: '看板B', priceUsdtMicro: 200_000_000 }));
   // p1 两单（qty 2 + 1，费率 100bps 一单）→ confirmed + expired；p2 一单 confirmed
   const a1 = await createDraft(p1.slug, 2);
   const a2 = await createDraft(p1.slug);
@@ -62,7 +62,11 @@ test('overview：入账净额与退款并列、件数/买家/复购去重、确�
   const o30 = await request(app).get('/api/shop/stats/overview?days=30').set('Authorization', `Bearer ${ownerToken}`).expect(200);
   assertOk(o30);
   const s = o30.body.data;
-  // p1: 100元×2=200 元与 100 元（qty=1），费率 100bps 仅 a1 → a1 净额 198 元? priceCnyFen 10000=100元; a1 qty2 → 金额 2×(汇率换算…) 固定支付 0.001 忽略：金额与 fee 由 amount/fee 决定——用 DB 精确断言太绕，改用关系断言：
+  /*
+    p1 单价 100 USDT、p2 单价 200 USDT；a1 是 p1 的 qty=2 单且费率 100bps。
+    金额与手续费都由订单行的 amount_wei / fee_bps 决定，所以这里只做**关系断言**
+    （GMV 净额 = 窗口内三单 amount 之和 − a1 的手续费），不手抄汇率与费率算式。
+  */
   assert.equal(s.orders, 3, '窗口内入账 3 单（confirmed×2+expired×1）');
   assert.ok(s.units >= 4, '件数 = 2+1+1');
   assert.equal(s.refundOrders, 1);
@@ -111,7 +115,7 @@ test('trend：按天补零、退款额并入对应日', async () => {
 });
 
 test('products 排行：排序与分页；越权拒绝', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '排行商品', capacity: 99, priceCnyFen: 5000 }));
+  const p = await listProduct(productPayload({ kind: 'physical', title: '排行商品', capacity: 99, priceUsdtMicro: 50_000_000 }));
   for (let i = 0; i < 3; i++) {
     const o = await createDraft(p.slug);
     settle(o.id, 'confirmed');

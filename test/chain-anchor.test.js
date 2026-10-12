@@ -24,7 +24,7 @@ const KEY = 'mk:escrow_address';
 function insertInflight(seq, status = 'escrowed') {
   db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       quantity, hold_qty, amount_wei, cny_fen, status, escrow_order_id, paid_tx_hash, created_at, updated_at)
+       quantity, hold_qty, amount_wei, usdt_micro, status, escrow_order_id, paid_tx_hash, created_at, updated_at)
      VALUES (?, 'anchor-slug', '{}', '0x' + '00', '', ?, ?, 1, 0, '1000000000000000000', 100, ?, ?, ?, ?, ?)`
   ).run(
     `anchor-order-${seq}`,
@@ -115,7 +115,7 @@ test('草稿（未上链）与无单号行不计入在途链上单', () => {
   db.prepare("DELETE FROM orders WHERE id LIKE 'anchor-order-%'").run();
   db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       quantity, hold_qty, amount_wei, cny_fen, status, escrow_order_id, created_at, updated_at)
+       quantity, hold_qty, amount_wei, usdt_micro, status, escrow_order_id, created_at, updated_at)
      VALUES ('anchor-draft', 'anchor-slug', '{}', '0x' + '00', '', ?, ?, 1, 0, '1', 1, 'draft', NULL, ?, ?)`
   ).run(buyer.address.toLowerCase(), owner.address.toLowerCase(), Date.now(), Date.now());
   assert.equal(inflightChainOrders(), 0, '草稿从没上链，换址与它无关（不该拦启动）');

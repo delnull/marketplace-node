@@ -113,7 +113,7 @@ test('webhook payload 不含发票信息与年龄确认（新增个人字段不�
   sent.length = 0;
   setWebhookSender(makeSender());
   const p = await listProduct(
-    productPayload({ kind: 'physical', title: '通知运费/发票商品', capacity: 3, shippingFeeCnyFen: 900, ageRestricted: true })
+    productPayload({ kind: 'physical', title: '通知运费/发票商品', capacity: 3, shippingFeeUsdtMicro: 9_000_000, ageRestricted: true })
   );
   const order = await createDraft(p.slug, {
     ageAck: true,
@@ -132,9 +132,9 @@ test('webhook payload 不含发票信息与年龄确认（新增个人字段不�
   for (const k of noPrivacyKeys) assert.ok(!(k in body), `payload 不应含 ${k}`);
   // 金额口径：amountWei 是「商品 + 运费」的总额（运费按单收取一次）
   assert.equal(body.amountWei, order.amountWei);
-  assert.equal(order.goodsCnyFen, 8800, '商品金额 = productPayload 默认单价（¥88.00）');
-  assert.equal(order.shippingFeeCnyFen, 900);
-  assert.equal(order.cnyFen, order.goodsCnyFen + 900, '应付 = 商品 + 运费');
+  assert.equal(order.goodsUsdtMicro, 88_000_000, '商品金额 = productPayload 默认单价（88 USDT）');
+  assert.equal(order.shippingFeeUsdtMicro, 9_000_000);
+  assert.equal(order.usdtMicro, order.goodsUsdtMicro + 9_000_000, '应付 = 商品 88 + 运费 9 = 97 USDT');
 });
 
 test('本地动作触发：发货（手动交付）通知 order.shipped；取消通知 order.cancelled；评价 review.created', async () => {

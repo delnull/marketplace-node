@@ -26,7 +26,7 @@ const payHash = () => '0x' + String(++seq).padStart(64, '0');
 const NFT_CONTRACT = '0x' + '9'.repeat(40);
 
 function nftPayload(overrides = {}) {
-  const { priceCnyFen = 6600, capacity = null, specs, skus, ...rest } = overrides;
+  const { priceUsdtMicro = 66_000_000, capacity = null, specs, skus, ...rest } = overrides;
   return {
     title: '占位测试 NFT',
     description: 'capacity 占位单测 NFT 商品。',
@@ -35,7 +35,7 @@ function nftPayload(overrides = {}) {
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出；无规格商品就是 key='' 的唯一组合
     specs: specs ?? [],
-    skus: skus ?? [{ key: '', priceCnyFen, capacity }],
+    skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
     ...rest,
   };
 }

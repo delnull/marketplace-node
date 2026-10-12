@@ -64,7 +64,7 @@ const draftCount = () => db.prepare("SELECT COUNT(*) AS c FROM orders WHERE stat
 
 test('年龄限制商品：下单必须带买家显式确认；确认后留痕并写入快照', async () => {
   const p = await listProduct(
-    productPayload({ kind: 'physical', title: '年龄限制商品', priceCnyFen: 5000, capacity: 3, ageRestricted: true })
+    productPayload({ kind: 'physical', title: '年龄限制商品', priceUsdtMicro: 50_000_000, capacity: 3, ageRestricted: true })
   );
   assert.equal(p.ageRestricted, true, '公开投影回传年龄限制标记');
 
@@ -87,7 +87,7 @@ test('年龄限制商品：下单必须带买家显式确认；确认后留痕�
   assert.equal(o.ageAck, true, '订单记录买家确认');
   assert.equal(rowOf(o.id).age_ack, 1);
   assert.equal(o.productSnapshot.age_restricted, 1, '年龄限制写入订单锁定的商品快照');
-  assert.equal(o.productSnapshot.shipping_fee_cny_fen, 0, '未设运费时为 0（包邮）');
+  assert.equal(o.productSnapshot.shipping_fee_usdt_micro, 0, '未设运费时为 0（包邮）');
   // 店主代下单同样受门槛约束（门槛在商品上，不在调用方身份上）
   const ownerRes = await postOrder({ productSlug: p.slug, buyer: buyer.address }, ownerToken);
   assert.match(blocked(ownerRes), /未成年人禁止购买/);
@@ -97,7 +97,7 @@ test('年龄限制商品：下单必须带买家显式确认；确认后留痕�
 });
 
 test('非年龄限制商品：ageAck 断言被忽略（恒 0，不留误导性痕迹）', async () => {
-  const p = await listProduct(productPayload({ kind: 'digital', title: '普通商品，无年龄限制', priceCnyFen: 1000 }));
+  const p = await listProduct(productPayload({ kind: 'digital', title: '普通商品，无年龄限制', priceUsdtMicro: 10_000_000 }));
 
   const noAck = (await postOrder({ productSlug: p.slug })).body.data;
   assert.equal(noAck.ageAck, false);
@@ -113,7 +113,7 @@ test('非年龄限制商品：ageAck 断言被忽略（恒 0，不留误导性�
 test('年龄限制标记入快照：加/去限制必变哈希，同值保存哈希不变；校验拒绝非布尔', async () => {
   const { computeSnapshotHash, snapshotObject } = await import('../src/routes/products.js');
   const p = await listProduct(
-    productPayload({ kind: 'physical', title: '年龄限制快照商品', priceCnyFen: 2000, capacity: 5, shippingFeeCnyFen: 500 })
+    productPayload({ kind: 'physical', title: '年龄限制快照商品', priceUsdtMicro: 20_000_000, capacity: 5, shippingFeeUsdtMicro: 5_000_000 })
   );
   const base = p.snapshotHash;
   assert.equal(p.ageRestricted, false);
@@ -127,10 +127,10 @@ test('年龄限制标记入快照：加/去限制必变哈希，同值保存哈�
     description_blocks: JSON.stringify(restricted.descriptionBlocks || []),
     images: JSON.stringify(restricted.images),
     kind: restricted.kind,
-    shipping_fee_cny_fen: restricted.shippingFeeCnyFen,
+    shipping_fee_usdt_micro: restricted.shippingFeeUsdtMicro,
     age_restricted: restricted.ageRestricted ? 1 : 0,
     specs: JSON.stringify(restricted.specs || []),
-    skus: (restricted.skus || []).map((s) => ({ sku_key: s.key, price_cny_fen: s.priceCnyFen })),
+    skus: (restricted.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
   });
   assert.equal(snap.age_restricted, 1, '快照含 age_restricted');
   assert.equal(computeSnapshotHash(snap), restricted.snapshotHash, '快照哈希可复算');
@@ -153,7 +153,7 @@ test('年龄限制标记入快照：加/去限制必变哈希，同值保存哈�
 // ══ C：开票信息 ══
 
 test('开票信息：往返存读 + trim + 长度上限 + 类型校验；不影响金额', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '开票商品', priceCnyFen: 3300, capacity: 10, shippingFeeCnyFen: 600 }));
+  const p = await listProduct(productPayload({ kind: 'physical', title: '开票商品', priceUsdtMicro: 33_000_000, capacity: 10, shippingFeeUsdtMicro: 6_000_000 }));
 
   const withInvoice = await postOrder({
     productSlug: p.slug,
@@ -166,10 +166,10 @@ test('开票信息：往返存读 + trim + 长度上限 + 类型校验；不影�
   assert.equal(row.invoice_needed, 1);
   assert.equal(row.invoice_title, '某某科技有限公司');
   assert.equal(row.invoice_tax_no, '91310000MA1K35XXXX');
-  // 开票信息不是钱：金额仍 = 商品 + 运费
-  assert.equal(o.cnyFen, 3900);
-  assert.equal(o.goodsCnyFen, 3300);
-  assert.equal(o.shippingFeeCnyFen, 600);
+  // 开票信息不是钱：金额仍 = 商品 33 + 运费 6 = 39 USDT
+  assert.equal(o.usdtMicro, 39_000_000);
+  assert.equal(o.goodsUsdtMicro, 33_000_000);
+  assert.equal(o.shippingFeeUsdtMicro, 6_000_000);
 
   // 未提交 invoice：默认空对象，不误标 needed
   const none = (await postOrder({ productSlug: p.slug })).body.data;
@@ -210,7 +210,7 @@ test('开票信息：往返存读 + trim + 长度上限 + 类型校验；不影�
 });
 
 test('开票信息可见性：仅买家本人/店主可见（同收货信息矩阵），匿名与第三人恒 null', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '开票可见性商品', priceCnyFen: 1000, capacity: 5 }));
+  const p = await listProduct(productPayload({ kind: 'physical', title: '开票可见性商品', priceUsdtMicro: 10_000_000, capacity: 5 }));
   const o = (
     await postOrder({ productSlug: p.slug, invoice: { needed: true, title: '某某商贸行', taxNo: '91440300MA5FXXXXXX' } })
   ).body.data;

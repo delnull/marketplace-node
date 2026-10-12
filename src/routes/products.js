@@ -32,13 +32,13 @@
  *
  * **快照契约（唯一权威顺序）**：
  *   slug / title / description / description_blocks / images / kind /
- *   shipping_fee_cny_fen / age_restricted / specs / skus
+ *   shipping_fee_usdt_micro / age_restricted / specs / skus
  *   kind='nft' 时再追加 nft_contract、nft_standard（nft_contract 在前）。
  *   追加/改动键必须在**同一位置**同时改本文件与前端 utils/snapshot.ts，
  *   否则每个买家都会看到假的「商品内容已被修改」告警。
  *   运费与年龄限制必须在快照里：否则店主可以在买家下单前事后加价运费、
  *   或把限制商品悄悄摘掉限制，而买家手上的哈希不变。
- *   （历史契约曾把 nft 两键描述为"追加在 price_cny_fen 之后"——价格早已下沉到
+ *   （历史契约曾把 nft 两键描述为"追加在 price_usdt_micro 之后"——价格早已下沉到
  *   skus，该措辞已失效，此处按当前实现重写。）
  */
 import crypto from 'node:crypto';
@@ -55,10 +55,27 @@ import { roleOf, isStaff } from '../auth.js';
 import { newProductSlug } from '../ids.js';
 import { normalizeBlocks, deriveDescription, parseBlocks } from '../describeBlocks.js';
 import { tryAutoDeliverPendingForProduct } from '../autoDeliver.js';
-// 金额展示口径的唯一实现（yuanOf / goodsFenOf）——不要再手写 (fen/100).toFixed(2)
-import { yuanOf } from '../money.js';
+// 金额展示口径的唯一实现（usdtOf / goodsMicroOf）——不要再手写 (micro/1e6).toFixed(2)
+import { usdtOf } from '../money.js';
 // 订单状态集合的唯一出处（"在途需求"核算用的是"草稿+在途"那一套）
 import { DRAFT_OR_ACTIVE_IN } from '../orderStatus.js';
+
+/*
+  价格与运费的闸门（**微 USDT**，1 USDT = 1e6）。
+
+  单价上限 **1e13 微 = 1e7 USDT**。这个数不是随手取的（源码评审 2026-10，P0）：
+  订单的 `usdt_micro` 用 JS `Number` 承载，而 node:sqlite 读一个「整数列里 > Number.MAX_SAFE_INTEGER
+  (9.007e15)」的值会**直接抛 RangeError**（实测 `SELECT *` 与 `SUM()` 都炸）——不是静默算错：
+  一行这样的订单会让订单详情/列表/流水/导出/仲裁/通知**全部 500**，而该行已提交、只能人工改库。
+  一单最多 99 件（`orders.quantity` CHECK 1..99）、运费最多 1e9 微 ⇒ 最坏合计 = 单价 × 99 + 运费；
+  取 1e13 时最坏 9.9e14，离 9.007e15 还有 9 倍余量（改这个常量前先读 routes/orders.js 的同名兜底闸）。
+
+  运费上限 1e9 微 = 1000 USDT。
+*/
+export const PRICE_MAX_MICRO = 10_000_000_000_000; // 1e7 USDT
+export const SHIPPING_FEE_MAX_MICRO = 1_000_000_000; // 1000 USDT
+/** 给店主看的单价上限（USDT 整数串；报错文案里不要直接甩 1e13 这种微整数） */
+const PRICE_MAX_USDT = '10000000';
 
 /** 管理审计便捷包装（仅 staff 记录；detail 不含码原文/收货地址） */
 const audit = (req, action, targetType, targetId, detail) =>
@@ -83,13 +100,13 @@ function snapshotNonNegInt(v) {
 
 /** 快照规范化字段（顺序固定，勿改动）：
  *  slug / title / description / description_blocks / images / kind /
- *  shipping_fee_cny_fen / age_restricted / specs / skus；
+ *  shipping_fee_usdt_micro / age_restricted / specs / skus；
  *  kind='nft' 时追加 nft_contract、nft_standard（nft_contract 在前）。
  *  新键插在 kind 之后、specs 之前，前端 utils/snapshot.ts 必须同位置同键。
  *
- *  价格不在商品级 —— 每个组合的单价都在 skus 里（[[sku_key, price_cny_fen], …] 按 key 升序），
+ *  价格不在商品级 —— 每个组合的单价都在 skus 里（[[sku_key, price_usdt_micro], …] 按 key 升序），
  *  买家据此核验「所选规格的价格」没有被事后改动。
- *  运费（shipping_fee_cny_fen）与年龄限制（age_restricted）**必须**在快照里：
+ *  运费（shipping_fee_usdt_micro）与年龄限制（age_restricted）**必须**在快照里：
  *  前者是钱（事后加价运费等于改价），后者是商品属性（上架后静默增删限制，买家无从察觉）。 */
 export function snapshotObject(row) {
   let images = [];
@@ -108,14 +125,14 @@ export function snapshotObject(row) {
     description_blocks: parseBlocks(row.description_blocks),
     images,
     kind: row.kind,
-    // 运费（CNY 分，按单收取一次；0=包邮）——买家据此核验「锁定的运费」没被事后改价
-    shipping_fee_cny_fen: snapshotNonNegInt(row.shipping_fee_cny_fen),
+    // 运费（微 USDT，按单收取一次；0=包邮）——买家据此核验「锁定的运费」没被事后改价
+    shipping_fee_usdt_micro: snapshotNonNegInt(row.shipping_fee_usdt_micro),
     // 年龄限制（0/1）——买家据此核验「下单那一刻这件商品是否声明了未成年人禁止购买」
     age_restricted: row.age_restricted ? 1 : 0,
     specs: parseSpecsColumn(row),
     skus: [...skuRows]
       .sort((a, b) => (a.sku_key < b.sku_key ? -1 : a.sku_key > b.sku_key ? 1 : 0))
-      .map((s) => [s.sku_key, s.price_cny_fen]),
+      .map((s) => [s.sku_key, s.price_usdt_micro]),
   };
   if (row.kind === 'nft') {
     snap.nft_contract = String(row.nft_contract || '').toLowerCase();
@@ -135,9 +152,9 @@ export function computeSnapshotHash(snap) {
     kind: snap.kind,
     // 与 snapshotObject 同键同位（契约：见文件头快照契约）。手搓对象缺这两键时归一为默认值，
     // 保证「同一件商品」无论经哪条路径规范化都得到同一个哈希。
-    shipping_fee_cny_fen: snapshotNonNegInt(snap.shipping_fee_cny_fen),
+    shipping_fee_usdt_micro: snapshotNonNegInt(snap.shipping_fee_usdt_micro),
     age_restricted: snap.age_restricted ? 1 : 0,
-    // 价格不在商品级：每个组合的单价都在 skus 里（[[sku_key, price_cny_fen], …]，按 key 升序）
+    // 价格不在商品级：每个组合的单价都在 skus 里（[[sku_key, price_usdt_micro], …]，按 key 升序）
     specs: snap.specs,
     skus: snap.skus,
   };
@@ -231,9 +248,11 @@ function normalizeSkus(input, specs) {
       continue;
     }
     seen.add(key);
-    const price = Number(rawSku?.priceCnyFen);
-    if (!Number.isInteger(price) || price <= 0 || price > 100000000000) {
-      errors.push(`SKU「${key || '(默认)'}」价格需为 1..1e11 的整数（单位：分）`);
+    const price = Number(rawSku?.priceUsdtMicro);
+    if (!Number.isInteger(price) || price <= 0 || price > PRICE_MAX_MICRO) {
+      errors.push(
+        `SKU「${key || '(默认)'}」价格需为 1..${PRICE_MAX_MICRO} 的整数（单位：微 USDT，1 USDT = 1e6，即最多 ${PRICE_MAX_USDT} USDT）`
+      );
       continue;
     }
     let cap = null;
@@ -247,7 +266,7 @@ function normalizeSkus(input, specs) {
     // active=false 表示该组合停售 —— 与「售罄」是两回事：
     // 售罄可能补货，停售是店主不打算再卖。二者对买家的含义不同，故独立成字段。
     const active = rawSku?.active === undefined ? true : !!rawSku.active;
-    skus.push({ key, specs: expected.get(key), priceCnyFen: price, capacity: cap, active });
+    skus.push({ key, specs: expected.get(key), priceUsdtMicro: price, capacity: cap, active });
   }
   return { errors, skus };
 }
@@ -282,7 +301,7 @@ function saveSkus(productId, skus, now) {
   );
   db.prepare('DELETE FROM product_skus WHERE product_id = ?').run(productId);
   const ins = db.prepare(
-    'INSERT INTO product_skus (product_id, sku_key, specs_json, price_cny_fen, capacity, committed, active, created_at, updated_at) ' +
+    'INSERT INTO product_skus (product_id, sku_key, specs_json, price_usdt_micro, capacity, committed, active, created_at, updated_at) ' +
       'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
   );
   for (const s of skus) {
@@ -290,7 +309,7 @@ function saveSkus(productId, skus, now) {
       productId,
       s.key,
       JSON.stringify(s.specs),
-      s.priceCnyFen,
+      s.priceUsdtMicro,
       s.capacity,
       prev.get(s.key)?.committed || 0,
       s.active === false ? 0 : 1,
@@ -301,7 +320,7 @@ function saveSkus(productId, skus, now) {
 }
 
 /** DB 行 → 对外字段（camelCase）。价格与库存**一律来自 Skus**，商品级字段只是汇总值：
- *  - priceCnyFen/priceCny = 各组合最低价（列表页「起价」展示用；成交价一律取所选 SKU）
+ *  - priceUsdtMicro/priceUsdt = 各组合最低价（列表页「起价」展示用；成交价一律取所选 SKU）
  *  - capacity/committed    = 各组合之和；任一组合不限量则 capacity 为 null（整体视为不限量）
  *  - available             = null 或 总量 − 已占位
  *  行需先经 withSkus() 挂上 skus。 */
@@ -317,8 +336,8 @@ function rowToPublic(row) {
         return {};
       }
     })(),
-    priceCnyFen: s.price_cny_fen,
-    priceCny: yuanOf(s.price_cny_fen),
+    priceUsdtMicro: s.price_usdt_micro,
+    priceUsdt: usdtOf(s.price_usdt_micro),
     capacity: s.capacity,
     committed: s.committed || 0,
     available: s.capacity === null ? null : Math.max(0, s.capacity - (s.committed || 0)),
@@ -327,7 +346,7 @@ function rowToPublic(row) {
   const unlimited = skus.some((s) => s.capacity === null);
   const capacity = skus.length && !unlimited ? skus.reduce((n, s) => n + s.capacity, 0) : null;
   const committed = skus.reduce((n, s) => n + s.committed, 0);
-  const minFen = skus.length ? Math.min(...skus.map((s) => s.priceCnyFen)) : 0;
+  const minMicro = skus.length ? Math.min(...skus.map((s) => s.priceUsdtMicro)) : 0;
   return {
     slug: r.slug,
     title: r.title,
@@ -341,9 +360,9 @@ function rowToPublic(row) {
      * 数字 / NFT 商品恒为 0（运费列只对 physical 生效，见 validateProduct）。
      * 该值入快照——买家据此核验锁定的运费没被事后改价。
      */
-    shippingFeeCnyFen: r.shipping_fee_cny_fen || 0,
-    shippingFeeCny: yuanOf(r.shipping_fee_cny_fen),
-    freeShipping: !(r.shipping_fee_cny_fen > 0),
+    shippingFeeUsdtMicro: r.shipping_fee_usdt_micro || 0,
+    shippingFeeUsdt: usdtOf(r.shipping_fee_usdt_micro),
+    freeShipping: !(r.shipping_fee_usdt_micro > 0),
     /** 未成年人禁止购买（0/1）：下单必须带买家显式确认（ageAck）；入快照，上架后不可静默增删 */
     ageRestricted: !!r.age_restricted,
     nftContract: r.nft_contract || null,
@@ -351,9 +370,9 @@ function rowToPublic(row) {
     specs: parseSpecsColumn(r),
     skus,
     // 汇总口径（列表页展示；逐组合的权威值在 skus 里）
-    priceCnyFen: minFen,
-    priceCny: yuanOf(minFen),
-    priceFromFen: minFen,
+    priceUsdtMicro: minMicro,
+    priceUsdt: usdtOf(minMicro),
+    priceFromMicro: minMicro,
     unlimited,
     available: capacity === null ? null : Math.max(0, capacity - committed),
     capacity,
@@ -425,21 +444,23 @@ function validateProduct(v) {
   }
   const active = v.active === false || v.active === 0 ? 0 : 1;
   /*
-    运费（实物，按单收取一次，CNY 分）：
-     - 非负整数，上限 100000 分 = ¥1000（比价上限还高一个量级即为误填/攻击面，明确拒绝而不是截断）；
+    运费（实物，按单收取一次，微 USDT）：
+     - 非负整数，上限 1e9 微 = 1000 USDT（比价上限还高一个量级即为误填/攻击面，明确拒绝而不是截断）；
      - 只有实物商品有运费语义：数字/NFT 商品携带非 0 值**显式拒绝**（而不是静默归零）——
        静默归零会让店主以为"我设了运费"，实际一分钱没收到；
      - 空/未提交 = 0（包邮）。
   */
-  let shippingFeeCnyFen = 0;
-  if (v.shippingFeeCnyFen !== undefined && v.shippingFeeCnyFen !== null && v.shippingFeeCnyFen !== '') {
-    const fee = Number(v.shippingFeeCnyFen);
-    if (!Number.isInteger(fee) || fee < 0 || fee > 100000) {
-      errors.push('shippingFeeCnyFen（运费）需为 0..100000 的整数（单位：分，即 ¥0..¥1000；0 = 包邮）');
+  let shippingFeeUsdtMicro = 0;
+  if (v.shippingFeeUsdtMicro !== undefined && v.shippingFeeUsdtMicro !== null && v.shippingFeeUsdtMicro !== '') {
+    const fee = Number(v.shippingFeeUsdtMicro);
+    if (!Number.isInteger(fee) || fee < 0 || fee > SHIPPING_FEE_MAX_MICRO) {
+      errors.push(
+        `shippingFeeUsdtMicro（运费）需为 0..${SHIPPING_FEE_MAX_MICRO} 的整数（单位：微 USDT，即 0..1000 USDT；0 = 包邮）`
+      );
     } else if (kind !== 'physical' && fee > 0) {
       errors.push('仅实物商品可设置运费（数字 / NFT 商品运费恒为 0）');
     } else {
-      shippingFeeCnyFen = fee;
+      shippingFeeUsdtMicro = fee;
     }
   }
   /*
@@ -464,7 +485,7 @@ function validateProduct(v) {
       descriptionBlocks: blocks,
       images,
       kind,
-      shippingFeeCnyFen,
+      shippingFeeUsdtMicro,
       ageRestricted,
       nftContract,
       nftStandard,
@@ -661,25 +682,25 @@ router.post('/', staffOnly, wrap(async (req, res) => {
       description_blocks: JSON.stringify(value.descriptionBlocks),
       images: JSON.stringify(value.images),
       kind: value.kind,
-      shipping_fee_cny_fen: value.shippingFeeCnyFen,
+      shipping_fee_usdt_micro: value.shippingFeeUsdtMicro,
       age_restricted: value.ageRestricted,
       specs: JSON.stringify(value.specs),
-      // 快照与 DB 行同形（sku_key / price_cny_fen），便于同一套规范化逻辑复用
-      skus: value.skus.map((s) => ({ sku_key: s.key, price_cny_fen: s.priceCnyFen })),
+      // 快照与 DB 行同形（sku_key / price_usdt_micro），便于同一套规范化逻辑复用
+      skus: value.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
       nft_contract: value.nftContract,
       nft_standard: value.nftStandard,
     })
   );
   db.prepare(
-    'INSERT INTO products (slug, title, description, description_blocks, images, kind, shipping_fee_cny_fen, age_restricted, nft_contract, nft_standard, specs, auto_deliver, stock_alert_at, snapshot_hash, active, created_at, updated_at) ' +
+    'INSERT INTO products (slug, title, description, description_blocks, images, kind, shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, specs, auto_deliver, stock_alert_at, snapshot_hash, active, created_at, updated_at) ' +
       'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
   ).run(
     slug, value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.images),
-    value.kind, value.shippingFeeCnyFen, value.ageRestricted, value.nftContract, value.nftStandard,
+    value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard,
     JSON.stringify(value.specs), value.autoDeliver, value.stockAlertAt, hash, now, now
   );
   saveSkus(db.prepare('SELECT id FROM products WHERE slug = ?').get(slug).id, value.skus, now);
-  audit(req, 'product.create', 'product', slug, { kind: value.kind, skuCount: value.skus.length, specs: value.specs.map((s) => s.name), shippingFeeCnyFen: value.shippingFeeCnyFen, ageRestricted: value.ageRestricted });
+  audit(req, 'product.create', 'product', slug, { kind: value.kind, skuCount: value.skus.length, specs: value.specs.map((s) => s.name), shippingFeeUsdtMicro: value.shippingFeeUsdtMicro, ageRestricted: value.ageRestricted });
   ok(res, rowToPublic(db.prepare('SELECT * FROM products WHERE slug = ?').get(slug)), '上架成功');
 }));
 
@@ -695,11 +716,13 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
   }
   if (!slugs.length) return fail(res, 'slugs 需为非空数组（≤100）');
   const b = req.body?.patch || {};
-  if (typeof b !== 'object' || !Object.keys(b).length) return fail(res, 'patch 需为 {priceCnyFen?/active?/autoDeliver?/stockAlertAt?}');
+  if (typeof b !== 'object' || !Object.keys(b).length) return fail(res, 'patch 需为 {priceUsdtMicro?/active?/autoDeliver?/stockAlertAt?}');
   // 字段合法性（整体校验）
-  if (b.priceCnyFen !== undefined) {
-    const fen = Number(b.priceCnyFen);
-    if (!Number.isInteger(fen) || fen <= 0 || fen > 100000000000) return fail(res, 'priceCnyFen 需为 1..1e11 整数');
+  if (b.priceUsdtMicro !== undefined) {
+    const micro = Number(b.priceUsdtMicro);
+    if (!Number.isInteger(micro) || micro <= 0 || micro > PRICE_MAX_MICRO) {
+      return fail(res, `priceUsdtMicro 需为 1..${PRICE_MAX_MICRO} 整数（单位：微 USDT，即最多 ${PRICE_MAX_USDT} USDT）`);
+    }
   }
   if (b.active !== undefined && ![true, false, 0, 1].includes(b.active)) return fail(res, 'active 需为布尔');
   if (b.autoDeliver !== undefined && ![-1, 0, 1].includes(Number(b.autoDeliver))) return fail(res, 'autoDeliver 需为 -1/0/1');
@@ -719,16 +742,16 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
     const next = {
       // 批量改价：作用于该商品的**全部组合**（批量页不展开规格明细；
       // 需要逐组合定价时走单个 PATCH /:slug）
-      priceCnyFen: b.priceCnyFen !== undefined ? Number(b.priceCnyFen) : null,
+      priceUsdtMicro: b.priceUsdtMicro !== undefined ? Number(b.priceUsdtMicro) : null,
       active: b.active !== undefined ? (b.active === false || b.active === 0 ? 0 : 1) : row.active,
       autoDeliver: b.autoDeliver !== undefined ? Number(b.autoDeliver) : row.auto_deliver,
       stockAlertAt: b.stockAlertAt !== undefined ? (b.stockAlertAt === null || b.stockAlertAt === '' ? null : Number(b.stockAlertAt)) : row.stock_alert_at,
     };
     // 改价：逐组合写入；未指定价格时保持各组合原价
     const skuRows = loadSkus(row.id);
-    if (next.priceCnyFen !== null) {
-      const up = db.prepare('UPDATE product_skus SET price_cny_fen = ?, updated_at = ? WHERE product_id = ?');
-      up.run(next.priceCnyFen, Date.now(), row.id);
+    if (next.priceUsdtMicro !== null) {
+      const up = db.prepare('UPDATE product_skus SET price_usdt_micro = ?, updated_at = ? WHERE product_id = ?');
+      up.run(next.priceUsdtMicro, Date.now(), row.id);
     }
     // 快照哈希重算（价格属快照字段；其余 batch 字段不入快照）。
     // 运费/年龄限制取自**当前行**（batch 不改这两项）——漏传会被归一为 0，
@@ -740,11 +763,11 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
         description: row.description,
         images: row.images,
         kind: row.kind,
-        shipping_fee_cny_fen: row.shipping_fee_cny_fen,
+        shipping_fee_usdt_micro: row.shipping_fee_usdt_micro,
         age_restricted: row.age_restricted,
         specs: row.specs,
-        skus: next.priceCnyFen !== null
-          ? skuRows.map((s) => ({ sku_key: s.sku_key, price_cny_fen: next.priceCnyFen }))
+        skus: next.priceUsdtMicro !== null
+          ? skuRows.map((s) => ({ sku_key: s.sku_key, price_usdt_micro: next.priceUsdtMicro }))
           : skuRows,
         nft_contract: row.nft_contract,
         nft_standard: row.nft_standard,
@@ -781,7 +804,7 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     kind: b.kind !== undefined ? b.kind : row.kind,
     // 运费（按单收取一次；0=包邮）与年龄限制：未提交则沿用现值——它们是快照字段，
     // 漏传等于把商品悄悄改回包邮/无限制（买家手里的哈希随即对不上）
-    shippingFeeCnyFen: b.shippingFeeCnyFen !== undefined ? b.shippingFeeCnyFen : row.shipping_fee_cny_fen,
+    shippingFeeUsdtMicro: b.shippingFeeUsdtMicro !== undefined ? b.shippingFeeUsdtMicro : row.shipping_fee_usdt_micro,
     ageRestricted: b.ageRestricted !== undefined ? b.ageRestricted : row.age_restricted,
     nftContract: b.nftContract !== undefined ? b.nftContract : row.nft_contract,
     nftStandard: b.nftStandard !== undefined ? b.nftStandard : row.nft_standard,
@@ -797,14 +820,14 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
             }
           })(),
     // SKU 支持**部分更新**：只提交要改的组合即可（按 key 覆盖到现有列表上）；
-    // 省略 priceCnyFen / capacity 时沿用该组合的现值。
+    // 省略 priceUsdtMicro / capacity 时沿用该组合的现值。
     // 只改某组合库存时不必重发全部组合与价格——重发既啰嗦，也容易把别的组合写错。
     skus:
       b.skus !== undefined
         ? (() => {
             const base = loadSkus(row.id).map((s) => ({
               key: s.sku_key,
-              priceCnyFen: s.price_cny_fen,
+              priceUsdtMicro: s.price_usdt_micro,
               capacity: s.capacity,
               /*
                 **必须带上 active**（源码审计 2026-09 复审，P1）：漏掉它时 `prev.active` 是
@@ -819,10 +842,10 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
             const byKey = new Map(base.map((s) => [s.key, s]));
             for (const s of Array.isArray(b.skus) ? b.skus : []) {
               const key = String(s?.key ?? '').trim();
-              const prev = byKey.get(key) || { priceCnyFen: undefined, capacity: null, active: true };
+              const prev = byKey.get(key) || { priceUsdtMicro: undefined, capacity: null, active: true };
               byKey.set(key, {
                 key,
-                priceCnyFen: s?.priceCnyFen !== undefined ? s.priceCnyFen : prev.priceCnyFen,
+                priceUsdtMicro: s?.priceUsdtMicro !== undefined ? s.priceUsdtMicro : prev.priceUsdtMicro,
                 capacity: s?.capacity !== undefined ? s.capacity : prev.capacity,
                 // 停售：该组合不再可下单，但不影响其它组合（与「售罄」是两回事）
                 active: s?.active !== undefined ? !!s.active : (prev.active !== false),
@@ -834,7 +857,7 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
         : // 整体更新（未提交 skus）同样要带上 active：否则每个组合都被当成"要上架"
           loadSkus(row.id).map((s) => ({
             key: s.sku_key,
-            priceCnyFen: s.price_cny_fen,
+            priceUsdtMicro: s.price_usdt_micro,
             capacity: s.capacity,
             active: s.active !== 0,
           })),
@@ -994,22 +1017,22 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
       description_blocks: JSON.stringify(value.descriptionBlocks),
       images: JSON.stringify(value.images),
       kind: value.kind,
-      shipping_fee_cny_fen: value.shippingFeeCnyFen,
+      shipping_fee_usdt_micro: value.shippingFeeUsdtMicro,
       age_restricted: value.ageRestricted,
       specs: JSON.stringify(value.specs),
-      skus: value.skus.map((s) => ({ sku_key: s.key, price_cny_fen: s.priceCnyFen })),
+      skus: value.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
       nft_contract: value.nftContract,
       nft_standard: value.nftStandard,
     })
   );
   db.prepare(
-    'UPDATE products SET title = ?, description = ?, description_blocks = ?, images = ?, kind = ?, shipping_fee_cny_fen = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, specs = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, snapshot_hash = ?, updated_at = ? ' +
+    'UPDATE products SET title = ?, description = ?, description_blocks = ?, images = ?, kind = ?, shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, specs = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, snapshot_hash = ?, updated_at = ? ' +
       'WHERE id = ?'
-  ).run(value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.images), value.kind, value.shippingFeeCnyFen, value.ageRestricted, value.nftContract, value.nftStandard, JSON.stringify(value.specs), value.autoDeliver, value.stockAlertAt, value.active, hash, Date.now(), row.id);
+  ).run(value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.images), value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard, JSON.stringify(value.specs), value.autoDeliver, value.stockAlertAt, value.active, hash, Date.now(), row.id);
   // 写 SKU（保留同 key 的 committed，编辑商品不该把已售数量清零）
   saveSkus(row.id, value.skus, Date.now());
 
-  audit(req, 'product.update', 'product', row.slug, { fields: Object.keys(b).filter((k) => ['title','description','descriptionBlocks','specs','skus','autoDeliver','stockAlertAt','active','kind','shippingFeeCnyFen','ageRestricted'].includes(k)) });
+  audit(req, 'product.update', 'product', row.slug, { fields: Object.keys(b).filter((k) => ['title','description','descriptionBlocks','specs','skus','autoDeliver','stockAlertAt','active','kind','shippingFeeUsdtMicro','ageRestricted'].includes(k)) });
   ok(res, rowToPublic(db.prepare('SELECT * FROM products WHERE id = ?').get(row.id)), '已更新');
 }));
 

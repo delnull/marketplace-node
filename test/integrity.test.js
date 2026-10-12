@@ -27,7 +27,7 @@ function seed(orderId, { status = 'shipped', productId = PRODUCT_ID } = {}) {
   ).run(productId, `integrity-slug-${productId}`, `体检商品 ${productId}`, Date.now(), Date.now());
   db.prepare(
     `INSERT INTO orders (id, product_id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       quantity, hold_qty, amount_wei, cny_fen, status, created_at, updated_at)
+       quantity, hold_qty, amount_wei, usdt_micro, status, created_at, updated_at)
      VALUES (?, ?, ?, '{}', '0x' + '00', '', ?, ?, 1, 0, '1', 1, ?, ?, ?)`
   ).run(orderId, productId, `integrity-slug-${productId}`, buyer.address.toLowerCase(), owner.address.toLowerCase(), status, Date.now(), Date.now());
 }

@@ -18,7 +18,7 @@ let operatorToken;
 const DAY_MS = 24 * 3600 * 1000;
 
 const { computeReputation } = await import('../src/reputation.js');
-const { cnyFenToPayWei } = await import('../src/rates.js');
+const { usdtMicroToPayWei } = await import('../src/rates.js');
 
 before(async () => {
   ownerToken = (await login(ctx, owner)).token;
@@ -117,16 +117,23 @@ test('码池清空：需 confirm + 仅 owner；清空后可改商品类型', asy
 });
 
 test('汇率换算：纯整数向上取整（防少付），无死代码修正分支', () => {
-  const rates = { btyUsdt: 0.1, usdtCny: 7.2 }; // 1 BTY = 0.72 CNY
-  // 72 CNY（7200 分）→ 恰 100 BTY
-  assert.equal(cnyFenToPayWei(7200, rates), (100n * 10n ** 18n).toString());
-  // 0.01 CNY（1 分）→ ceil(0.01/0.72 BTY) = 13888888888888889 wei（整除余数无条件进位）
-  assert.equal(cnyFenToPayWei(1, rates), '13888888888888889');
-  // 不为 0 的整数保证
-  const v = BigInt(cnyFenToPayWei(1, rates));
-  const exact = (1n * 10n ** 18n * 100_000_000n) / (BigInt(Math.round(0.1 * 7.2 * 1e8)) * 100n);
-  assert.ok(v >= exact, '向上取整结果 ≥ 精确值');
-  assert.ok(v - exact <= 1n, '上取整最多 +1 wei');
+  // 唯一一条腿：1 BTY = x USDT（标价即 USDT，换算里不再乘任何法币汇率）
+  const rates = { btyUsdt: 0.1 };
+  // 10 USDT（10_000_000 微）→ 恰 100 BTY
+  assert.equal(usdtMicroToPayWei(10_000_000, rates), (100n * 10n ** 18n).toString());
+
+  /*
+    除不尽的汇率：结果必须是**不小于精确值的最小整数**（整除余数无条件进位）。
+    汇率在实现里被放大成整数 scaled = round(rate × 1e8)，于是 1 微 USDT 的精确应付
+    = 1e-6 USDT ÷ rate BTY/USDT × 1e18 wei = 1e20 / scaled wei。
+  */
+  const scaled = BigInt(Math.round(0.022778 * 1e8));
+  const num = 1n * 10n ** 20n;
+  assert.ok(num % scaled > 0n, '选这个汇率就是为了让除法除不尽——否则测不到"向上取整"');
+  const floor = num / scaled;
+  const v = BigInt(usdtMicroToPayWei(1, { btyUsdt: 0.022778 }));
+  assert.ok(v >= floor, '向上取整结果 ≥ 精确值（防少付）');
+  assert.equal(v, floor + 1n, '恰好是最小的可行整数（不是截断，也不多加）');
 });
 
 test('履约画像同源窗口：窗外创建、窗内确认的旧单不再污染窗内比率', () => {

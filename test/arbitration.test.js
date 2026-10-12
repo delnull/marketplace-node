@@ -139,7 +139,8 @@ test('待仲裁列表：仅 disputed 入列，摘要含裁决要素但不含交�
     assert.match(r.escrowOrderId, /^0x[0-9a-f]{64}$/, '链上 orderId 供裁决直调');
     assert.equal(r.buyer, buyer.address.toLowerCase());
     assert.equal(r.seller, owner.address.toLowerCase());
-    assert.equal(r.cny, '88.00');
+    assert.equal(r.usdtMicro, 88_000_000, '本单应付总额（微 USDT）');
+    assert.equal(r.usdt, '88', '展示串去净尾零：88 USDT 写作 88（不是 88.00）');
     assert.ok(BigInt(r.amountWei) > 0n, '托管金额可读');
     assert.ok(Array.isArray(r.onchainEvents), '链上事件史可溯源（公开信息）');
     assert.ok(r.onchainEvents.length >= 1, '至少含 DisputeRequested');

@@ -100,7 +100,9 @@ async function readJson(res) {
  * 建单前问一次店主的风控服务。
  *
  * @param {{buyer:string, seller:string, productSlug:string, skuKey?:string, quantity?:number,
- *          amountWei?:string, cnyFen?:number, shippingFeeCnyFen?:number, note?:string}} input
+ *          amountWei?:string, usdtMicro?:number, shippingFeeUsdtMicro?:number, note?:string}} input
+ *   金额口径：`amountWei` 是原生 BTY 的最小单位（wei）；`usdtMicro` / `shippingFeeUsdtMicro` 是
+ *   **微 USDT**（1 USDT = 1e6）——风控服务按这两个整数判限额，不要当"分"或"元"解读。
  * @returns {Promise<{ok:true} | {ok:false, reason:string}>}
  */
 export async function checkOrderGate({
@@ -110,8 +112,8 @@ export async function checkOrderGate({
   skuKey,
   quantity,
   amountWei,
-  cnyFen,
-  shippingFeeCnyFen,
+  usdtMicro,
+  shippingFeeUsdtMicro,
   note,
 } = {}) {
   // 默认部署（未配置 URL）：直接放行，无网络、无日志、无状态
@@ -142,8 +144,8 @@ export async function checkOrderGate({
     skuKey,
     quantity,
     amountWei,
-    cnyFen,
-    shippingFeeCnyFen,
+    usdtMicro,
+    shippingFeeUsdtMicro,
     at: Date.now(),
   };
   const body = JSON.stringify(payload);

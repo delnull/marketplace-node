@@ -62,7 +62,7 @@ test('码池读写鉴权：未登录 401，普通买家 403', async () => {
 });
 
 test('导入校验：physical 商品拒绝、非法入参拒绝', async () => {
-  const { ownerToken, slug: physSlug } = await listDigital({ kind: 'physical', priceCnyFen: 100 });
+  const { ownerToken, slug: physSlug } = await listDigital({ kind: 'physical', priceUsdtMicro: 1_000_000 });
   const onPhys = await request(app)
     .post(`/api/products/${physSlug}/codes`)
     .set('Authorization', `Bearer ${ownerToken}`)
@@ -310,7 +310,7 @@ test('删除未用码成功、已用码拒绝；码池删空后新单回到手�
 
 test('实物订单发货写 trackingNo 且不受码池逻辑影响', async () => {
   const ownerLogin = await login(ctx, owner);
-  const created = await listDigital({ kind: 'physical', priceCnyFen: 6600 });
+  const created = await listDigital({ kind: 'physical', priceUsdtMicro: 66_000_000 });
   const oid = await escrowedOrder(created.slug);
   const ship = await request(app)
     .post(`/api/orders/${oid}/ship`)

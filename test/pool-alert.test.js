@@ -50,7 +50,7 @@ const nftPayload = (overrides = {}) => ({
   kind: 'nft',
   nftContract: NFT_CONTRACT,
   specs: [],
-  skus: [{ key: '', priceCnyFen: 6600, capacity: null }],
+  skus: [{ key: '', priceUsdtMicro: 66_000_000, capacity: null }],
   ...overrides,
 });
 

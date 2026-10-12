@@ -29,10 +29,10 @@ function insertOrder(status = 'draft', paidTxHash = null) {
   const now = Date.now();
   db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, cny_fen, bty_usdt_rate, usdt_cny_rate, status, escrow_order_id,
+       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id,
        paid_tx_hash, created_at, updated_at)
      VALUES (?, 'p-x', '{}', '0x00', '', '0x00000000000000000000000000000000000000aa', '0x00000000000000000000000000000000000000bb',
-       '1000000000000000000', 100, '0.1', '7.2', ?, ?, ?, ?, ?)`
+       '1000000000000000000', 1000000, '0.1', ?, ?, ?, ?, ?)`
   ).run(id, status, orderIdHex, paidTxHash, now, now);
   return { id, orderIdHex };
 }

@@ -14,17 +14,16 @@ export async function makeCtx() {
   process.env.MK_SHOP_OWNER = owner.address;
   // 虚拟托管地址：仅用于"已接入链上托管"分支（paid 的链上校验不在单测覆盖）
   process.env.MK_ESCROW_ADDRESS = '0x2222222222222222222222222222222222222222';
-  process.env.MK_FALLBACK_BTY_USDT = '0.1'; // 1 BTY = 0.1 USDT
-  process.env.MK_FALLBACK_USDT_CNY = '7.2'; // 1 USDT = 7.2 CNY
+  process.env.MK_FALLBACK_BTY_USDT = '0.1'; // 1 BTY = 0.1 USDT（唯一的行情腿：USDT→BTY）
   process.env.MK_TOKEN_SECRET = 'unit-test-secret-0123456789abcdef';
   /*
     汇率 TTL 设 0 = **每次请求都刷新**（`config.js` 用 `intEnvAllowZero` 解析，0 是有效值）。
     本套件其实不依赖它：下面把 `globalThis.fetch` 禁掉之后汇率一律走 config 兜底值（stale=true），
-    刷新一次和刷一百次拿到的是同一组数字。留着 0 是为了让"禁用外部网络"这件事在语义上彻底
+    刷新一次和刷一百次拿到的是同一个数字。留着 0 是为了让"禁用外部网络"这件事在语义上彻底
     ——没有任何一条用例可能因为缓存命中的旧值而侥幸通过。要验缓存/降级行为请见
-    test/rates-sources.test.js（那里自己装可控的假上游）。
+    test/rates.test.js（那里自己装可控的假上游）。
   */
-  process.env.MK_RATES_TTL_MS = '0';
+  process.env.MK_BTY_TTL_MS = '0';
 
   // 禁用外部网络：汇率走兜底（stale=true）
   globalThis.fetch = async () => {
@@ -71,26 +70,29 @@ export function assertOk(res) {
 }
 
 /**
- * 商品入参样例（¥88.00）。
+ * 商品入参样例（88 USDT = 88000000 微 USDT）。
  *
  * 接口形状是「specs + skus」：价格与库存**逐组合**给出。
- * 为了不让每个用例都写一遍 skus，这里保留了 `priceCnyFen` / `capacity` 两个便捷键，
+ * 为了不让每个用例都写一遍 skus，这里保留了 `priceUsdtMicro` / `capacity` 两个便捷键，
  * 由本函数展开成「无规格商品的唯一组合（key=''）」—— 这是**测试侧的书写便利**，
  * 不是产品代码里的兼容分支：服务端只认 specs + skus。
  *
+ * 单位是**微 USDT**（1 USDT = 1e6 微）：88 USDT 写 88000000。
+ * 旧的 2 位小数标价单位已整体作废，数字不是"改个名字"那么轻——一律 ×10000。
+ *
  * 需要测多规格时直接传 specs + skus：
  *   productPayload({ specs: [{name:'颜色',options:['黑','白']}],
- *                    skus: [{key:'黑',priceCnyFen:8800},{key:'白',priceCnyFen:9900}] })
+ *                    skus: [{key:'黑',priceUsdtMicro:88000000},{key:'白',priceUsdtMicro:99000000}] })
  */
 export function productPayload(overrides = {}) {
-  const { priceCnyFen = 8800, capacity = null, specs, skus, ...rest } = overrides;
+  const { priceUsdtMicro = 88_000_000, capacity = null, specs, skus, ...rest } = overrides;
   return {
     title: '测试数字商品',
     description: '单测上架的商品描述，用于校验快照与下单流程。',
     images: ['https://example.com/a.jpg'],
     kind: 'digital',
     specs: specs ?? [],
-    skus: skus ?? [{ key: '', priceCnyFen, capacity }],
+    skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
     ...rest,
   };
 }
@@ -129,7 +131,7 @@ export function ageDrafts(db, ids, ms) {
  * 由 API 返回的商品构造「DB 行形状」的对象，供测试复算快照哈希。
  * 快照契约（**键序即契约**，两端必须逐字一致，见 node/src/routes/products.js 的 snapshotObject
  * 与 frontend/src/utils/snapshot.ts）：slug / title / description / description_blocks /
- * images / kind / shipping_fee_cny_fen / age_restricted / specs / skus（nft 商品在**末尾**
+ * images / kind / shipping_fee_usdt_micro / age_restricted / specs / skus（nft 商品在**末尾**
  * 追加 nft_contract、nft_standard）——价格不在商品级，每个组合的单价在 skus 里。
  */
 export function rowLikeOf(p) {
@@ -140,7 +142,7 @@ export function rowLikeOf(p) {
     images: JSON.stringify(p.images),
     kind: p.kind,
     specs: JSON.stringify(p.specs || []),
-    skus: (p.skus || []).map((s) => ({ sku_key: s.key, price_cny_fen: s.priceCnyFen })),
+    skus: (p.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
     nft_contract: p.nftContract || '',
     nft_standard: p.nftStandard || 'erc721',
   };

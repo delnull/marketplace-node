@@ -3,7 +3,7 @@
  * 环境变量经 `node --env-file-if-exists=.env` 注入（见 package.json scripts）。
  */
 import config from './config.js';
-import { initDb } from './db.js';
+import { initDb, getDb } from './db.js';
 import { startWatcher } from './escrowWatcher.js';
 import { startChainReconcile } from './chainReconcile.js';
 import { startOrderSweeper } from './orderSweeper.js';
@@ -16,6 +16,41 @@ import { orderGateEnabled } from './orderGate.js';
 import { applyEscrowAnchor } from './chainAnchor.js';
 
 initDb();
+
+/*
+  库结构自检（源码评审 2026-10，P1）：标价单位从 CNY（分）改成微 USDT 时**直接重写了建表语句**
+  ——本项目的约定就是"全新项目、无存量数据，不做兼容/迁移，删库重建"（见 db.js 文件头）。
+  但 `CREATE TABLE IF NOT EXISTS` 对**已存在**的表是空操作：拿旧库（Docker 命名卷里的
+  `/data/marketplace-node.db`、或宿主机上的 `marketplace-node.db`）跑新镜像时，表里没有
+  `*_usdt_micro` 列，而节点会"启动正常"：商品价格显示 0、起价下发 null、
+  所有商品快照校验失败（买家看到假的「商品内容已被修改」）、下单被一句与汇率无关的文案拒绝
+  ——故障现象与原因相隔十万八千里。这里按列名自检，缺列就拒绝启动并把"怎么办"写在日志里。
+*/
+const REQUIRED_COLUMNS = {
+  products: ['shipping_fee_usdt_micro'],
+  product_skus: ['price_usdt_micro'],
+  orders: ['usdt_micro', 'shipping_fee_usdt_micro'],
+};
+{
+  const db = getDb();
+  const missing = [];
+  for (const [table, cols] of Object.entries(REQUIRED_COLUMNS)) {
+    const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+    if (have.size === 0) {
+      missing.push(`${table}（表不存在）`);
+      continue;
+    }
+    for (const c of cols) if (!have.has(c)) missing.push(`${table}.${c}`);
+  }
+  if (missing.length) {
+    console.error(`[server] 本地库结构过旧，缺少列：${missing.join('、')}`);
+    console.error('[server] 标价单位已由 CNY（分）改为 USDT（微 USDT，1 USDT = 1e6），本项目不做存量迁移。');
+    console.error('[server] 请删库重建：停节点 → 删除数据库文件（默认 marketplace-node.db；Docker 部署在命名卷里）→ 重新启动。');
+    console.error('[server] 删库不可逆，先备份；步骤见 docs/OPS_RUNBOOK.md。');
+    process.exit(1);
+  }
+}
+
 startOrderSweeper();
 // 个人信息保留期擦除（MK_PII_RETENTION_DAYS，默认 180 天；显式 0 = 关闭自动擦除）：
 // 终局订单静置超期后自动擦除收货信息/备注/售后陈述正文/证据附件——"存着不删"本身
@@ -115,6 +150,22 @@ const LEGACY_ENV_KEYS = [
 for (const k of LEGACY_ENV_KEYS) {
   if (process.env[k] !== undefined && process.env[k] !== '') {
     console.warn(`[server] .env 含已废弃键 ${k}（配置极简后**节点**不再读取）：店名/公告/店员/通知请在卖家面板「店铺设置」网页维护，登记 endpoint 在开店向导填写${k === 'MK_NOTARY_ADDRESS' ? '；该键仍被部署脚本（scripts/deploy-mainnet.cjs）用于 ReviewNotary 的幂等跳过，若你不用部署脚本可以删掉这一行' : '——请删除该行，或运行 node scripts/deploy.mjs 重新生成 .env'}（见 docs/DECISIONS.md）`);
+  }
+}
+
+/*
+  已删除的**行情**键（2026-10 标价单位由 CNY 改为 USDT）：USDT→CNY 那条法币腿连同它的
+  缓存 TTL 与手工兜底汇率一起删掉了。残留这两行不会让节点报错，但会让运维以为
+  "我配过兜底汇率"——实际一个都不读，行情源挂掉时就是没有价格（无法下单）。
+  单独一条告警而不是混进上面那条：上面那句会把人指向"卖家面板的网页开关"，
+  而这两个键没有任何网页替代品（它们对应的功能已经不存在了）。
+*/
+const LEGACY_RATE_ENV_KEYS = ['MK_RATES_TTL_MS', 'MK_FALLBACK_USDT_CNY'];
+for (const k of LEGACY_RATE_ENV_KEYS) {
+  if (process.env[k] !== undefined && process.env[k] !== '') {
+    console.warn(
+      `[server] .env 含已删除键 ${k}（标价单位改为 USDT 后 USDT→CNY 汇率腿整体移除，节点不再读取任何法币汇率）：请删除该行；BTY 行情仍由 MK_BTY_TTL_MS / MK_FALLBACK_BTY_USDT 控制`
+    );
   }
 }
 

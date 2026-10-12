@@ -93,7 +93,7 @@ const blocked = (res) => {
 // ── 两级售后端到端（限量实物商品：占位 → 申请 → 理由/回复 → 拒绝 → 争议 → 卖家和解退款）──
 
 test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争议陈述→卖家同意退款（占位回补）', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '两级售后实物', capacity: 5, priceCnyFen: 8800 }));
+  const p = await listProduct(productPayload({ kind: 'physical', title: '两级售后实物', capacity: 5, priceUsdtMicro: 88_000_000 }));
   const order = await createDraft(p.slug, 2);
   assert.equal(
     skuInv(db, p.slug).committed,
@@ -278,8 +278,8 @@ test('applyRefundFlags：sync 反查按链上 getOrder 标记回填/清除 refun
   const now = Date.now();
   db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, cny_fen, bty_usdt_rate, usdt_cny_rate, status, escrow_order_id, paid_tx_hash, created_at, updated_at)
-     VALUES (?, 'p-x', '{}', '0x00', '', ?, ?, '1000000000000000000', 100, '0.1', '7.2', 'escrowed', ?, ?, ?, ?)`
+       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash, created_at, updated_at)
+     VALUES (?, 'p-x', '{}', '0x00', '', ?, ?, '1000000000000000000', 1000000, '0.1', 'escrowed', ?, ?, ?, ?)`
   ).run(id, buyer.address.toLowerCase(), owner.address.toLowerCase(), eid, payHash(), now, now);
 
   // 链上 refundRequested=true → 本地 requested（首次时刻保留）

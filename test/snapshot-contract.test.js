@@ -25,16 +25,16 @@ const { snapshotObject, computeSnapshotHash } = await import('../src/routes/prod
 const CROSS_LANG_FIXTURE = {
   canonical:
     '{"slug":"p-fix-1","title":"测试 \\"商品\\" & co","description":"desc\\nline2","description_blocks":[],' +
-    '"images":["https://a/b.png"],"kind":"physical","shipping_fee_cny_fen":500,"age_restricted":1,' +
+    '"images":["https://a/b.png"],"kind":"physical","shipping_fee_usdt_micro":5000000,"age_restricted":1,' +
     '"specs":[{"name":"颜色","options":["黑","白"]},{"name":"尺寸","options":["M"]}],' +
-    '"skus":[["尺寸=M|颜色=白",1200],["尺寸=M|颜色=黑",1000]]}',
-  hash: '0x6660c7ec0eccc51751d929b62ed90f732af6429c80355762e51aca25448a1cda',
+    '"skus":[["尺寸=M|颜色=白",12000000],["尺寸=M|颜色=黑",10000000]]}',
+  hash: '0xb5cc9b5c79191520830752e5bc148f5f87e3fe7e564b48f20918d817496eba54',
   /** NFT 单：两个键**追加在 skus 之后**（顺序错了哈希就变，而没人会报错） */
   nftCanonical:
     '{"slug":"p-fix-nft","title":"NFT 商品","description":"","description_blocks":[],"images":[],' +
-    '"kind":"nft","shipping_fee_cny_fen":0,"age_restricted":0,"specs":[],"skus":[["",300]],' +
+    '"kind":"nft","shipping_fee_usdt_micro":0,"age_restricted":0,"specs":[],"skus":[["",3000000]],' +
     '"nft_contract":"0xabc0000000000000000000000000000000000001","nft_standard":"erc1155"}',
-  nftHash: '0x2b8647765df6127becb6fcb5f278414826e148027fcc03e480370781452f0808',
+  nftHash: '0x5a85ba0a3cb3e84ff97a5152bc6fd40e32ed20f6fabc576328dbd8c68a33891a',
 };
 
 test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 keccak（两侧必须逐字节一致）', () => {
@@ -46,7 +46,7 @@ test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 
     description_blocks: '[]',
     images: JSON.stringify(['https://a/b.png']),
     kind: 'physical',
-    shipping_fee_cny_fen: 500, // 运费必须进快照（否则店主可在下单前事后加价）
+    shipping_fee_usdt_micro: 5_000_000, // 运费必须进快照（否则店主可在下单前事后加价）
     age_restricted: 1, // 年龄限制必须进快照
     // skus 故意乱序传入：实现必须按 sku_key 升序排（顺序影响哈希）
     specs: JSON.stringify([
@@ -54,8 +54,8 @@ test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 
       { name: '尺寸', options: ['M'] },
     ]),
     skus: [
-      { sku_key: '尺寸=M|颜色=白', price_cny_fen: 1200 },
-      { sku_key: '尺寸=M|颜色=黑', price_cny_fen: 1000 },
+      { sku_key: '尺寸=M|颜色=白', price_usdt_micro: 12_000_000 },
+      { sku_key: '尺寸=M|颜色=黑', price_usdt_micro: 10_000_000 },
     ],
   };
 
@@ -72,10 +72,10 @@ test('snapshot 契约：NFT 单的两键追加在 skus 之后（与前端同一 
     description_blocks: '[]',
     images: '[]',
     kind: 'nft',
-    shipping_fee_cny_fen: 0,
+    shipping_fee_usdt_micro: 0,
     age_restricted: 0,
     specs: '[]',
-    skus: [{ sku_key: '', price_cny_fen: 300 }],
+    skus: [{ sku_key: '', price_usdt_micro: 3_000_000 }],
     // 故意大写：实现必须归一成小写（否则同一件商品会得到两个哈希）
     nft_contract: '0xAbC0000000000000000000000000000000000001',
     nft_standard: 'erc1155',

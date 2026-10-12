@@ -182,9 +182,9 @@ function insertOrder({ status = 'escrowed', accepted = null, events = null } = {
   const now = Date.now();
   db.prepare(
     `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, cny_fen, bty_usdt_rate, usdt_cny_rate, status, escrow_order_id, paid_tx_hash,
+       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash,
        accepted_partial_refund_wei, onchain_events, created_at, updated_at)
-     VALUES (?, 'p-prc', '{}', '0x00', '', ?, ?, ?, 100, '0.1', '7.2', ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, 'p-prc', '{}', '0x00', '', ?, ?, ?, 1000000, '0.1', ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     BUYER,

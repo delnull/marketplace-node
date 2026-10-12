@@ -76,7 +76,7 @@ import { Router } from 'express';
 import { ethers } from 'ethers';
 import { getDb, txBegin, txCommit, txRollback } from '../db.js';
 import config from '../config.js';
-import { getRates, cnyFenToPayWei, isPayableAmount } from '../rates.js';
+import { getRates, usdtMicroToPayWei, isPayableAmount } from '../rates.js';
 // 订单状态集合的唯一出处（本文件是最大的使用者：入账/在途/已付款/草稿+在途 四套集合，见 src/orderStatus.js）
 import {
   INCOME_STATUS as ORDER_INCOME_STATUS,
@@ -95,8 +95,8 @@ import { loadSkus, snapshotObject } from './products.js';
 // 草稿 TTL 的单调锚点（唯一实现在 src/monotonicClock.js）：不受墙钟跳变影响的"这单过了多久"
 import { bootId, monotonicNow } from '../monotonicClock.js';
 import { ok, fail, wrap, bearerToken, makeAuthMiddleware, simpleRateLimit } from '../http.js';
-// 金额展示口径的唯一实现（yuanOf / goodsFenOf）——不要再手写 (fen/100).toFixed(2)
-import { goodsFenOf, yuanOf } from '../money.js';
+// 金额展示口径的唯一实现（usdtOf / goodsMicroOf）——不要再手写 (micro/1e6).toFixed(2)
+import { goodsMicroOf, usdtOf } from '../money.js';
 import { submitReview, replyReview, findReviewByOrder, reviewToPublic, reviewableAt } from '../reviews.js';
 import { reviewContentHash, evidenceContentHash } from '../notary.js';
 import { fetchReturnByOrder, returnToPublic } from '../returns.js';
@@ -331,22 +331,21 @@ function orderToPublic(o, opts = {}) {
         return o.amount_wei || '0';
       }
     })(),
-    cnyFen: o.cny_fen,
-    cny: yuanOf(o.cny_fen),
+    usdtMicro: o.usdt_micro,
+    usdt: usdtOf(o.usdt_micro),
     /*
       金额拆分（运费模型 = **按单收取一次**的实物运费，见 POST / 里的锁定逻辑）：
-        cnyFen            = 本单应付总额（商品 + 运费），也是链上锁定 amountWei 的 CNY 口径
-        shippingFeeCnyFen = 本单实际锁定的运费（数字/NFT 单恒 0）
-        goodsCnyFen       = cnyFen − 运费 = 商品金额（单价 × 数量）
+        usdtMicro            = 本单应付总额（商品 + 运费），也是链上锁定 amountWei 的 USDT 口径
+        shippingFeeUsdtMicro = 本单实际锁定的运费（数字/NFT 单恒 0）
+        goodsUsdtMicro       = usdtMicro − 运费 = 商品金额（单价 × 数量）
       三者一起给，前端才能把「商品金额 + 运费 = 应付」这条算式摆给买家核对。
       口径实现在 src/money.js（**唯一一份**，与 arbitration/products 共用）。
     */
-    shippingFeeCnyFen: o.shipping_fee_cny_fen || 0,
-    shippingFeeCny: yuanOf(o.shipping_fee_cny_fen),
-    goodsCnyFen: goodsFenOf(o.cny_fen, o.shipping_fee_cny_fen),
-    goodsCny: yuanOf(goodsFenOf(o.cny_fen, o.shipping_fee_cny_fen)),
+    shippingFeeUsdtMicro: o.shipping_fee_usdt_micro || 0,
+    shippingFeeUsdt: usdtOf(o.shipping_fee_usdt_micro),
+    goodsUsdtMicro: goodsMicroOf(o.usdt_micro, o.shipping_fee_usdt_micro),
+    goodsUsdt: usdtOf(goodsMicroOf(o.usdt_micro, o.shipping_fee_usdt_micro)),
     btyUsdtRate: o.bty_usdt_rate,
-    usdtCnyRate: o.usdt_cny_rate,
     status: o.status,
     escrowOrderId: o.escrow_order_id,
     paidTxHash: o.paid_tx_hash || null,
@@ -666,21 +665,34 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
     运费：**按单收取一次**（不随件数翻倍）。
     取舍理由：实物小店的实际快递成本按"一个包裹"计，一件与三件的快递费基本相同；
     算式也最简单——应付 = 单价 × 数量 + 运费。若逐件计费，多件订单会凭空多收 N 倍快递费，
-    而买家在下单页看到的"运费 ¥X"会与结算页金额不符（同一屏两套口径是最坏的体验）。
+    而买家在下单页看到的"运费 X USDT"会与结算页金额不符（同一屏两套口径是最坏的体验）。
     仅实物商品计运费：数字 / NFT 无需物流，恒 0（商品侧已禁止给非实物设运费，这里是第二道闸）。
   */
-  const shippingFeeFen =
-    product.kind === 'physical' && Number.isInteger(product.shipping_fee_cny_fen) && product.shipping_fee_cny_fen > 0
-      ? product.shipping_fee_cny_fen
+  const shippingFeeMicro =
+    product.kind === 'physical' && Number.isInteger(product.shipping_fee_usdt_micro) && product.shipping_fee_usdt_micro > 0
+      ? product.shipping_fee_usdt_micro
       : 0;
-  const goodsFen = sku.price_cny_fen * qty;
-  // cny_fen = 商品金额 + 运费（订单行的权威总额口径）；amountWei 由它折算，两者恒同源
-  const totalFen = goodsFen + shippingFeeFen;
-
-  // 支付币种固定为原生 BTY：CNY 标价×数量 + 运费按当前汇率折算锁定（wei，向上取整防少付）
-  const amountWei = cnyFenToPayWei(totalFen, rates);
+  const goodsMicro = sku.price_usdt_micro * qty;
+  // usdt_micro = 商品金额 + 运费（订单行的权威总额口径）；amountWei 由它折算，两者恒同源
+  const totalMicro = goodsMicro + shippingFeeMicro;
   /*
-    零金额草稿必须在这里拦住（源码评审 2026-09，P1）：`cnyFenToPayWei` 在汇率不可用时返回 '0'
+    合计必须落在**安全整数**内（源码评审 2026-10，P0）：`orders.usdt_micro` 是 INTEGER 列，
+    而 node:sqlite 读一个 > Number.MAX_SAFE_INTEGER(9.007e15) 的整数会**抛 RangeError**
+    （实测 `SELECT *` 与 `SUM(usdt_micro)` 都炸）。后果不是"算得不准"，而是：
+    这一行**已经提交**（txCommit 在 findOrder 之前），此后凡是 `SELECT *` 于 orders 的路径
+    ——订单详情/买家列表/店主列表/流水/两个 CSV/仲裁队列/通知/池告警——全部 500，
+    且 `cancel` 也走 findOrder ⇒ 接口层无法自救，只能人工改库。
+    商品侧上限（PRICE_MAX_MICRO = 1e13 微）× 数量 ≤99 + 运费 ≤1e9 本来就在安全区内，
+    这里再兜一道闸：任何绕过校验的历史数据或直连调用都写不出这种行。
+  */
+  if (!Number.isSafeInteger(totalMicro)) {
+    return fail(res, '本单应付合计超出可精确表示的上限（约 90 亿 USDT）：请拆单或下调单价后再试');
+  }
+
+  // 支付币种固定为原生 BTY：USDT 标价×数量 + 运费按当前 USDT→BTY 行情折算锁定（wei，向上取整防少付）
+  const amountWei = usdtMicroToPayWei(totalMicro, rates);
+  /*
+    零金额草稿必须在这里拦住（源码评审 2026-09，P1）：`usdtMicroToPayWei` 在汇率不可用时返回 '0'
     （rates.js 里 `scaled <= 0` 或非有限数就 return '0'），而它上游只判了 `!rates`（数据源**完全**
     拿不到）。于是"汇率链返回垃圾值/两项里有一项缺失"时，草稿会带着 amountWei='0' 落库——
     链上 `Escrow.createOrder` 有 `if (amount == 0) revert InvalidAmount()`，这笔支付**永远发不出去**，
@@ -709,7 +721,7 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
     而 `SELECT * FROM products` 出来的行没有该属性 → 快照里的 skus 会变成 []。
     那样订单快照与其 snapshot_hash 复算不一致：前端订单页会报假的「商品内容已被修改」，
     仲裁页（按快照 skus 反查所选组合的锁定价）也永远查不到价——快照核验的意义就没了。
-    这里显式挂上 loadSkus（形状与 rowToPublic 一致：sku_key / price_cny_fen）。
+    这里显式挂上 loadSkus（形状与 rowToPublic 一致：sku_key / price_usdt_micro）。
   */
   const snapshot = snapshotObject({ ...product, skus: loadSkus(product.id) });
   /*
@@ -733,8 +745,8 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
     skuKey: sku.sku_key,
     quantity: qty,
     amountWei,
-    cnyFen: totalFen,
-    shippingFeeCnyFen: shippingFeeFen,
+    usdtMicro: totalMicro,
+    shippingFeeUsdtMicro: shippingFeeMicro,
     note: noteText, // 刻意传了也不外发：orderGate.js 的白名单决定"发什么"，备注永不进 payload
   });
   if (!gate.ok) return fail(res, `本店风控未放行：${gate.reason}`, 403, 403);
@@ -825,16 +837,16 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
     db.prepare(
       `INSERT INTO orders
         (id, product_id, product_slug, product_snapshot, snapshot_hash, sku_key, sku_specs, buyer, seller,
-         quantity, hold_qty, amount_wei, cny_fen, shipping_fee_cny_fen, bty_usdt_rate, usdt_cny_rate, status, escrow_order_id,
+         quantity, hold_qty, amount_wei, usdt_micro, shipping_fee_usdt_micro, bty_usdt_rate, status, escrow_order_id,
          timeout_blocks, shipping_name, shipping_phone, shipping_address, note, age_ack,
          invoice_needed, invoice_title, invoice_tax_no, created_at, updated_at, created_boot, created_mono)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .run(
         id, product.id, product.slug, JSON.stringify(snapshot), product.snapshot_hash,
         sku.sku_key, sku.specs_json,
         target, owner,
-        qty, held ? qty : 0, amountWei, totalFen, shippingFeeFen, String(rates.btyUsdt), String(rates.usdtCny),
+        qty, held ? qty : 0, amountWei, totalMicro, shippingFeeMicro, String(rates.btyUsdt),
         orderIdHex, config.escrow.timeoutBlocks, shippingInfo.name, shippingInfo.phone, shippingInfo.address,
         noteText, product.age_restricted && ageAckAsserted ? 1 : 0,
         invoiceInfo.needed ? 1 : 0, invoiceInfo.title, invoiceInfo.taxNo, now, now,
@@ -1053,8 +1065,12 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
   }
   const rangeSql = range.length ? ` AND ${range.join(' AND ')}` : '';
 
-  // 汇总：仅扫金额相关列，避免全表字段开销。金额在 JS 侧 BigInt 累加——
-  // SQLite SUM 对 TEXT 金额/超 2^53 分会丢精度。
+  // 汇总：仅扫金额相关列，避免全表字段开销。金额在 JS 侧 **BigInt 累加**——
+  // SQLite SUM 对 TEXT 金额/超 2^53 会丢精度，而这里的 USD 侧金额（usdt_micro）同样不能用
+  // Number 累加：`9.007e15` 以上 ulp 变成 2…16，单次误差 ≤8 微但会随单数累积，
+  // 而累加结果是要当作**整数金额**报给店主对账的（源码评审 2026-10，P2）。
+  // 因此四个金额列一律 BigInt 进、字符串出；只有"单数"是普通计数。
+  //
   // 净额口径（与链上 Escrow._settle 一致，2026-09 起支持部分退款/拆分裁决）：
   //   卖家结算基数 = amount − refunded_amount_wei（已退买家的部分不参与结算、也不计费）
   //   平台费       = feeChargeableForOrder(fee_collector_at_create) ? 基数 × fee_bps/10000 : 0
@@ -1064,12 +1080,12 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
   // refunded_amount_wei 由 watcher/sync/paid 从链上 getOrder 补录；fee_collector_at_create 同批补录。
   const incomeRows = db
     .prepare(
-      `SELECT status, amount_wei, cny_fen, fee_bps, fee_collector_at_create, refunded_amount_wei FROM orders WHERE status IN (${marks})${rangeSql}`
+      `SELECT status, amount_wei, usdt_micro, fee_bps, fee_collector_at_create, refunded_amount_wei FROM orders WHERE status IN (${marks})${rangeSql}`
     )
     .all(...INCOME_STATUS, ...rangeParams);
   const byStatus = {};
   let totalCount = 0;
-  let cnyFen = 0;
+  let usdtMicro = 0n;
   let amountWei = 0n;
   let feeWei = 0n;
   let refundedWei = 0n;
@@ -1077,15 +1093,15 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
     const refunded = BigInt(r.refunded_amount_wei || '0');
     const base = BigInt(r.amount_wei || '0') - refunded;
     const fee = feeOf(base > 0n ? base : 0n, Number(r.fee_bps || 0), r.fee_collector_at_create);
-    const s = (byStatus[r.status] ??= { count: 0, cnyFen: 0, amountWei: '0', feeWei: '0', refundedWei: '0', amountWeiNet: '0' });
+    const s = (byStatus[r.status] ??= { count: 0, usdtMicro: '0', amountWei: '0', feeWei: '0', refundedWei: '0', amountWeiNet: '0' });
     s.count += 1;
-    s.cnyFen += r.cny_fen;
+    s.usdtMicro = (BigInt(s.usdtMicro) + BigInt(Math.trunc(Number(r.usdt_micro) || 0))).toString();
     s.amountWei = (BigInt(s.amountWei) + BigInt(r.amount_wei)).toString();
     s.feeWei = (BigInt(s.feeWei) + fee).toString();
     s.refundedWei = (BigInt(s.refundedWei) + refunded).toString();
     s.amountWeiNet = (BigInt(s.amountWei) - BigInt(s.refundedWei) - BigInt(s.feeWei)).toString();
     totalCount += 1;
-    cnyFen += r.cny_fen;
+    usdtMicro += BigInt(Math.trunc(Number(r.usdt_micro) || 0));
     amountWei += BigInt(r.amount_wei);
     feeWei += fee;
     refundedWei += refunded;
@@ -1115,7 +1131,8 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
     pageSize,
     summary: {
       count: totalCount,
-      cnyFen,
+      /* 微 USDT 汇总与 wei 侧同款：BigInt 累加、字符串出参（Number 累加在 9.007e15 以上会漂） */
+      usdtMicro: usdtMicro.toString(),
       amountWei: amountWei.toString(),
       feeWei: feeWei.toString(),
       refundedWei: refundedWei.toString(),
