@@ -42,7 +42,7 @@ import { AFTER_SALE_OPEN_SQL, afterSaleFieldsOf } from '../afterSale.js';
 // 队列等待读数（计数 + 最久等待）的唯一实现：本文件的两个列表与 /api/shop/metrics 共用
 import { queueWait } from '../opsMetrics.js';
 // 主图区缩略图的读取口径（图片取 url、视频取 poster）——**唯一实现**，卡片/订单/仲裁台共用
-import { firstMediaThumb } from '../../../shared/media.js';
+import { firstMediaThumb } from '../mediaKinds.js';
 
 const router = Router();
 

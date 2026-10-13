@@ -70,7 +70,7 @@ import {
   UPLOAD_URL_PREFIX,
   mediaUrlAllowed,
   normalizeMediaUrl,
-} from '../../../shared/media.js';
+} from '../mediaKinds.js';
 
 /*
   价格与运费的闸门（**微 USDT**，1 USDT = 1e6）。

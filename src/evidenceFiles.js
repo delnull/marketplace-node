@@ -20,7 +20,7 @@ import { getDb, txBegin, txCommit, txRollback } from './db.js';
 import config from './config.js';
 import { ACTIVE_STATUS } from './orderStatus.js';
 // 字节判据的唯一实现（商品媒体与证据附件共用；本文件的 ALLOWED 只决定"允许收哪几种"）
-import { sniffMediaMime } from '../../shared/media.js';
+import { sniffMediaMime } from './mediaKinds.js';
 // 确认收货后的售后案件：在途判据的唯一实现（本文件的阶段门控与退货窗口、仲裁队列共用）
 import { isAfterSaleOpen, hasAfterSaleHistory } from './afterSale.js';
 

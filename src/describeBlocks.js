@@ -12,7 +12,7 @@
  *    —— 商品搜索走 SQL LIKE，用户输入的是文字，不该去匹配 JSON 里的引号与 url
  *  - 块为空时，`description` 就是店主填的纯文本，前端直接按段落渲染（保持原有观感）
  */
-import { mediaUrlAllowed, normalizeMediaUrl } from '../../shared/media.js';
+import { mediaUrlAllowed, normalizeMediaUrl } from './mediaKinds.js';
 
 export const MAX_BLOCKS = 40;
 export const MAX_TEXT_LEN = 2000;

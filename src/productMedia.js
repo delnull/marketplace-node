@@ -31,7 +31,7 @@ import {
   UPLOAD_URL_PREFIX,
   mediaExt,
   sniffMediaMime,
-} from '../../shared/media.js';
+} from './mediaKinds.js';
 
 export { UPLOAD_URL_PREFIX };
 

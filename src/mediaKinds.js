@@ -1,13 +1,20 @@
 /**
  * 商品媒体（主图区的图片与视频）——**字节判据、类型上限与 URL 规则的唯一实现**。
  *
- * 为什么单独一份、放在 shared/：节点要拿它校验/落盘，前端要拿它做 `<input accept>`、
+ * 为什么单独一份、且**放在节点包里**：节点要拿它校验/落盘，前端要拿它做 `<input accept>`、
  * 提交前预检与上限提示。两边各写一份的下场在本仓已经出现过（图片白名单曾同时存在于
  * `node/src/productImages.js`、`node/src/evidenceFiles.js`、`frontend/src/pages/seller/shared.ts`
  * 与 `frontend/src/components/EvidenceModal.tsx` 四处），改一处漏一处就是"前端允许传、后端拒收"
- * 或反过来的静默漂移。这里与 `shared/shopCode.js` 同一取向：**规则只留一份**，
- * 前端 `src/**` 直接 import（见 `frontend/vite.config.ts` 的 `server.fs.allow`），
- * 测试侧读源码文本对拍（测试构建的 rootDir 出不了 frontend/，见 `tsconfig.test.json`）。
+ * 或反过来的静默漂移。所以**规则只留一份**，前端 `src/**` 直接 import 它
+ * （见 `frontend/vite.config.ts` 的 `server.fs.allow`；测试侧读源码文本对拍，因为测试构建的
+ * rootDir 出不了 frontend/，见 `tsconfig.test.json`）。
+ *
+ * ── 为什么这份规则住在节点包里，而不是放到本包之外去共用（2026-10 踩过并修回来）──
+ * 店主的部署形态是**把这个仓库克隆下来直接跑**（`deploy.sh` 打镜像、`node/` 就是仓库根）。
+ * 所以节点运行时的相对 import **一旦跨出本包**，在那种形态下就会解析到仓库外面——
+ * 文件明明在，却谁也 import 不到（症状：开发机与测试全绿，店主那份起不来）。
+ * 于是节点的共享规则一律放在 `node/src/` 里（本文件），前端跨包 import 它；
+ * 发布路径上还有一条机械守卫盯着"`node/src` 不许引用本包之外的东西"（见 `scripts/sync-node-repo.mjs`）。
  *
  * ── 两条口径 ────────────────────────────────────────────────────────────────
  *  1. **类型由字节判定，不由客户端声明的 MIME 决定**（`sniffMediaMime`）。
