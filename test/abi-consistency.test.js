@@ -83,9 +83,27 @@ guard('前端 ABI 声明了 MarketplaceRegistry 的每一个自定义错误', ()
   assert.deepEqual(missing, [], `frontend/src/chain.ts 未声明：${missing.join(', ')}`);
 });
 
+/**
+ * **Staking 也要走同一条判据**（2026-10 补）：前端会把保证金合约的 revert 展示给店主与管理员
+ * （申请/批准/驳回/直接释放、罚没、冻结），所以这些错误名同样必须在 ABI 里声明得出中文语义。
+ * 此前这条守卫的真值集只收了 Escrow + Registry，于是"前端声明了 Staking 错误"会被反向检查
+ * 误判成**死声明**——那是守卫的缺口，不是前端的错。
+ */
+guard('前端 ABI 声明了 Staking 的每一个自定义错误', () => {
+  const declared = errorsOf(STAKING_SOL);
+  assert.ok(declared.length >= 15, `只从 Staking.sol 抽到 ${declared.length} 个 error，正则或文件结构变了`);
+  const known = new Set(abiErrorsOf(FE_CHAIN));
+  const missing = declared.filter((e) => !known.has(e));
+  assert.deepEqual(
+    missing,
+    [],
+    `frontend/src/chain.ts 未声明这些 Staking 错误（店主/管理员只会看到 "unknown custom error"）：${missing.join(', ')}`
+  );
+});
+
 /** 反向：合约里删掉的 error 不该在前端留下"永远不会命中"的死声明 */
 guard('反向：前端 ABI 里的自定义错误都还在合约里（Ownable 等库错误除外）', () => {
-  const declared = new Set([...errorsOf(ESCROW_SOL), ...errorsOf(REGISTRY_SOL)]);
+  const declared = new Set([...errorsOf(ESCROW_SOL), ...errorsOf(REGISTRY_SOL), ...errorsOf(STAKING_SOL)]);
   const libraryErrors = new Set([
     'OwnableUnauthorizedAccount',
     'OwnableInvalidOwner',
@@ -94,7 +112,6 @@ guard('反向：前端 ABI 里的自定义错误都还在合约里（Ownable 等
   const stale = abiErrorsOf(FE_CHAIN).filter((e) => !declared.has(e) && !libraryErrors.has(e));
   assert.deepEqual(stale, [], `前端 ABI 里这些自定义错误在合约里已不存在（死声明）：${stale.join(', ')}`);
 });
-
 /**
  * `Staking.IEscrowMinimal.Order` 必须与 `Escrow.Order` **逐字段同名同序**：
  * 跨合约静态调用按位置解码，字段错位不报错、只读到错的字。

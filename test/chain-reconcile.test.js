@@ -28,11 +28,13 @@ const config = (await import('../src/config.js')).default;
 const {
   planChainRepair,
   reconcileChainOnce,
+  reconcileAfterSaleOnce,
   startChainReconcile,
   setChainOrderFetcher,
+  setAfterSaleCaseFetcher,
 } = await import('../src/chainReconcile.js');
 // 链上终局 → 本地终态的唯一实现（/sync 与对账共用；本文件直测纯函数口径）
-const { mapChainTerminal } = await import('../src/escrowWatcher.js');
+const { mapChainTerminal, readRefundedWei, settleByRefundSplit } = await import('../src/escrowWatcher.js');
 
 const BUYER = '0x00000000000000000000000000000000000000aa';
 const SELLER = '0x00000000000000000000000000000000000000bb';
@@ -144,9 +146,14 @@ test('planChainRepair：链上终局/争议 → 本地映射（与 watcher 同�
 /**
  * `mapChainTerminal` 是"链上终局 → 本地终态"的**唯一实现**（事件/对账/手动 sync 三条路径共用）。
  * 这里直测纯函数口径：链上状态自报 Refunded 时短路（连金额都不必看），否则按"退给买家的钱是否
- * 等于托管额"分岔；脏数据（NaN/垃圾串/负数/缺字段）一律按 0 处理，永不抛错。
+ * 等于托管额"分岔。
+ *
+ * **2026-10 生产化清理**：判据从"脏数据一律按 0"改成**三态**——
+ *   ① 读得到 → 照常比金额；② 链上状态自己就是结论（Refunded / Settled）→ 照常判，
+ *     缺的只是账本金额（调用方不许写 0）；③ 状态不足以判 **且** 金额读不到 → `null`（判不了）。
+ * 旧行为把 ③ 写成"全额判卖家"，等于替链上说了一句它没说过的话（账目不可逆地记反）。
  */
-test('mapChainTerminal：链上终局 → 本地终态的唯一实现（含脏数据容错）', () => {
+test('mapChainTerminal：链上终局 → 本地终态的唯一实现（含"读不到"第三态）', () => {
   const A = AMOUNT;
   // 链上自报全额退款：无论金额字段如何都落 refunded（链上状态是权威）
   assert.equal(mapChainTerminal('Refunded', A, A), 'refunded');
@@ -159,12 +166,23 @@ test('mapChainTerminal：链上终局 → 本地终态的唯一实现（含脏�
   // 参数类型稳健：string / number / bigint 均可
   assert.equal(mapChainTerminal('Settled', 1000, 1000n), 'refunded');
   assert.equal(mapChainTerminal('Settled', BigInt(999), '1000'), 'settled');
-  // 解析失败 / 缺字段 / 负数 → 按 0 处理，永不抛错
+  /*
+    状态自己就是结论 ⇒ 金额读不到也能判（缺的只是账本金额，`/sync` 与对账都**不写**那一列）：
+    `Settled` 在合约语义里等于"不是全额退款"（否则合约会发 Refunded）。
+  */
   for (const bad of ['garbage', '', '  ', NaN, null, undefined, -1, '1.5']) {
-    assert.equal(mapChainTerminal('Settled', bad, A), 'settled', `refundedAmount=${String(bad)} 应安全按 0 处理`);
+    assert.equal(
+      mapChainTerminal('Settled', bad, A),
+      'settled',
+      `链上状态 Settled 已足够判定；refundedAmount=${String(bad)} 读不到 ≠ 0（账本金额另行按读不到处理）`
+    );
   }
-  assert.equal(mapChainTerminal('Settled', A, 'garbage'), 'settled', '托管额脏数据 ⇒ 0 ⇒ 不判全额退');
-  assert.equal(mapChainTerminal(undefined, A, A), 'refunded', '状态缺失时仍按金额判定');
+  assert.equal(mapChainTerminal('Settled', A, 'garbage'), 'settled', '托管额脏数据：状态仍足以判 settled');
+  assert.equal(mapChainTerminal(undefined, A, A), 'refunded', '状态缺失时按金额判定');
+  // ③ 状态不足以判 + 金额读不到 ⇒ **判不了**（不许当成"全额判卖家"）
+  assert.equal(mapChainTerminal(undefined, 'garbage', A), null, '状态缺失且金额读不到 → null');
+  assert.equal(mapChainTerminal(undefined, A, 'garbage'), null, '状态缺失且托管额读不到 → null');
+  assert.equal(mapChainTerminal('Created', 'garbage', A), null, '非终局状态 + 金额读不到 → null');
   // 与 planChainRepair 同口径（后者就是调它）
   const local = { status: 'escrowed', amount_wei: A, paid_tx_hash: '0xaa' };
   for (const onchain of [
@@ -179,6 +197,57 @@ test('mapChainTerminal：链上终局 → 本地终态的唯一实现（含脏�
       `planChainRepair 必须直接复用 mapChainTerminal（${onchain.status}/${onchain.refundedAmount}）`
     );
   }
+});
+
+test('readRefundedWei：「读得到 / 确证为 0 / 读不到」必须分开', () => {
+  assert.equal(readRefundedWei('0'), 0n, "'0' 是确证为 0（一个具体结论）");
+  assert.equal(readRefundedWei(0), 0n);
+  assert.equal(readRefundedWei(123n), 123n);
+  assert.equal(readRefundedWei(' 42 '), 42n, '两侧空白照旧容忍');
+  for (const bad of [undefined, null, '', '  ', 'garbage', NaN, -1, '1.5', {}]) {
+    assert.equal(readRefundedWei(bad), null, `${String(bad)} 是"不知道"，不是 0`);
+  }
+});
+
+test('planChainRepair：链上已退金额读不到 ⇒ 不修（unreadable），绝不按 0 补', () => {
+  const local = { status: 'escrowed', amount_wei: AMOUNT, paid_tx_hash: '0xaa' };
+  for (const bad of [undefined, null, 'garbage', '']) {
+    const plan = planChainRepair(local, { status: 'Settled', refundedAmount: bad });
+    assert.equal(plan.action, 'none', `refundedAmount=${String(bad)} 时不该修状态`);
+    assert.equal(plan.unreadable, true, '必须带 unreadable 标记（调用方要把它说出来）');
+    assert.ok(!('refundedAmountWei' in plan), '不许给出一个编造的已退金额');
+  }
+  // 确证为 0 仍然照常修（这是真实结论：全额判卖家）
+  const ok = planChainRepair(local, { status: 'Settled', refundedAmount: '0' });
+  assert.equal(ok.action, 'repair');
+  assert.equal(ok.to, 'settled');
+  assert.equal(ok.refundedAmountWei, '0');
+});
+
+/**
+ * **事件路径**的同一个坑（比快照路径更危险）：`RefundApproved` / `Arbitrated` 事件里的
+ * `refundWei` 就是"全额退买家 还是 拆分/全额判卖家"的唯一依据。旧实现读不到就按 0 处理，
+ * 于是**全额退款会被写成 settled + refunded_amount_wei='0'**——买家钱的下落记反，不可逆。
+ * 现在必须抛出：抛出才会进 applyEvent 既有的失败处理（重试 → 连续失败转隔离清单），
+ * 而返回 0 会被当成"没有需要迁移的行"、事件算处理完成、游标继续前进，那单永远停在非终态。
+ */
+test('settleByRefundSplit：退款额读不到 ⇒ 抛出且一个字都不写（不许按 0 判成全额判卖家）', () => {
+  const row = insertOrder({ status: 'disputed' });
+  const before = rowOf(row.id);
+  for (const bad of [undefined, null, 'garbage', '']) {
+    assert.throws(
+      () => settleByRefundSplit(db, row.escrowOrderId, bad),
+      /退款额读不到/,
+      `refundWei=${String(bad)} 必须抛出（本轮不落地），而不是按 0 落终态`
+    );
+    const after = rowOf(row.id);
+    assert.equal(after.status, before.status, '抛出时状态不得被改动');
+    assert.equal(after.refunded_amount_wei, before.refunded_amount_wei, '抛出时已退金额不得被改动');
+  }
+  // 确证为 0 仍然照常判（真实结论：全额判卖家）
+  assert.equal(settleByRefundSplit(db, row.escrowOrderId, '0'), 1);
+  assert.equal(rowOf(row.id).status, 'settled');
+  assert.equal(rowOf(row.id).refunded_amount_wei, '0');
 });
 
 test('对账修复：链上已终局而本地滞留 → 改状态 + 记录已退金额 + Sync 镜像 + 每单告警一次（幂等）', async () => {
@@ -444,4 +513,117 @@ test('对账轮：链上 Created 且 refundRequested ⇒ 一并回填退款冻�
   assert.equal(statusOf(id), 'escrowed');
   assert.equal(rowOf(id).refund_status, 'requested', '链上已申请退款 ⇒ 本地镜像必须跟上');
   assert.ok(rowOf(id).refund_requested_at, '同时落申请时刻（多个资金闸按它判断）');
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   售后案件（确认收货后开的案）的对账回填 —— 主对账的候选面是"非终态订单"，
+   而案件只存在于**终局**单上，所以这是并列的一路（见 reconcileAfterSaleOnce）。
+
+   两个方向都要能修：链上已结案而本地仍 open（幽灵待办，店主以为随时会被罚没）、
+   链上有案件而本地 none（仲裁台看不见这一单、陈述与退货单全被门控拒掉）。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/** 售后案件链上真值桩：orderIdHex → fetchAfterSaleCase 形状（'THROW' = RPC 读取失败） */
+const caseState = new Map();
+let caseFetched = [];
+setAfterSaleCaseFetcher(async (orderIdHex) => {
+  caseFetched.push(orderIdHex);
+  const v = caseState.get(orderIdHex);
+  if (v === 'THROW') throw new Error('rpc down');
+  return v || { open: false, openedAtBlock: null, status: 'Settled', buyer: BUYER, seller: SELLER, amount: AMOUNT };
+});
+/** 直接插带售后案件镜像列的订单行（对账只看本地行 + 链上真值） */
+function insertCaseOrder({ status = 'settled', afterSaleStatus = 'none', openedAt = null, openedBlock = null, ageMs = 12 * HOUR, buyer = BUYER } = {}) {
+  seq += 1;
+  const id = `rc-af-${seq}`;
+  const escrowOrderId = `0x${String(seq).padStart(63, '9')}`;
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
+       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash,
+       after_sale_status, after_sale_opened_at, after_sale_opened_block, created_at, updated_at)
+     VALUES (?, 'p-x', '{}', '0x00', '', ?, ?, ?, 1000000, '0.1', ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, buyer, SELLER, AMOUNT, status, escrowOrderId, `0x${String(seq).padStart(64, 'f')}`, afterSaleStatus, openedAt, openedBlock, now, now - ageMs);
+  return { id, escrowOrderId };
+}
+const scanCases = () => {
+  kvSet('mk:chain_reconcile_after_sale_cursor', ''); // 用例内自定起点：每轮都从候选集开头复查
+  return reconcileAfterSaleOnce({ batch: 50 });
+};
+
+test('售后案件对账：链上已结案而本地仍 open ⇒ 关案 + Sync 镜像 + 告警一次（幂等）', async () => {
+  const o = insertCaseOrder({ afterSaleStatus: 'open', openedAt: Date.now() - 3 * HOUR, openedBlock: 4242 });
+  caseState.set(o.escrowOrderId, { open: false, openedAtBlock: null, status: 'Settled', buyer: BUYER, seller: SELLER, amount: AMOUNT });
+
+  const r = await scanCases();
+  assert.equal(r.repaired, 1, `本轮应关掉这一单（实际 ${JSON.stringify(r)}）`);
+  const row = rowOf(o.id);
+  assert.equal(row.after_sale_status, 'closed');
+  assert.equal(row.after_sale_note, null, '链上只读视图没有结案说明：如实留空，不编造');
+  assert.ok(row.after_sale_closed_at > 0);
+  assert.equal(row.status, 'settled', '案件回填不动订单状态');
+  assert.ok(eventNames(o.id).includes('Sync:after_sale_close'), '补 Sync 镜像（UI 能看出这一步是对账改的）');
+  await waitUntil(() => sent.some((s) => s.body.type === 'order.after_sale_repaired' && s.body.orderId === o.id));
+  assert.ok(
+    sent.some((s) => s.body.type === 'order.after_sale_repaired' && s.body.afterSale === 'closed'),
+    '关案要推一次告警（幽灵待办消失也得让店主知道）'
+  );
+
+  // 幂等：链上与本地已一致 ⇒ 不再改（因此也不再写事件史/告警）
+  const before = eventNames(o.id).length;
+  const again = await scanCases();
+  assert.equal(again.repaired, 0);
+  assert.equal(eventNames(o.id).length, before, '一致时不做噪音写');
+});
+
+test('售后案件对账：链上有案件而本地 none（漏扫 AfterSaleOpened）⇒ 补开案并落区块', async () => {
+  const o = insertCaseOrder({ afterSaleStatus: 'none' });
+  caseState.set(o.escrowOrderId, { open: true, openedAtBlock: 8888, status: 'Settled', buyer: BUYER, seller: SELLER, amount: AMOUNT });
+
+  const r = await scanCases();
+  assert.equal(r.repaired, 1, `本轮应补开案（实际 ${JSON.stringify(r)}）`);
+  const row = rowOf(o.id);
+  assert.equal(row.after_sale_status, 'open');
+  assert.equal(row.after_sale_opened_block, 8888, '开案区块来自链上 afterSaleOpenedAtBlock');
+  assert.ok(row.after_sale_opened_at > 0);
+  assert.equal(row.status, 'settled');
+  assert.ok(eventNames(o.id).includes('Sync:after_sale_open'));
+});
+
+test('售后案件对账的安全边界：读不到 / 链上查不到该单 / 诱饵单 ⇒ 一律不动本地案件状态', async () => {
+  // ① RPC 读失败：跳过本轮（绝不据此关案）
+  const a = insertCaseOrder({ afterSaleStatus: 'open', openedAt: Date.now() - HOUR });
+  caseState.set(a.escrowOrderId, 'THROW');
+  const ra = await scanCases();
+  assert.equal(ra.repaired, 0);
+  assert.equal(ra.skippedRows >= 1, true, '读失败计入 skipped（可见，不静默）');
+  assert.equal(rowOf(a.id).after_sale_status, 'open', '读不到 ≠ 没有案件');
+
+  // ② 链上查不到该托管单（status=None）：疑似 RPC/合约配置错误 → 不改本地
+  const b = insertCaseOrder({ afterSaleStatus: 'open', openedAt: Date.now() - HOUR });
+  caseState.set(b.escrowOrderId, { open: false, openedAtBlock: null, status: 'None', buyer: BUYER, seller: SELLER, amount: AMOUNT });
+  const rb = await scanCases();
+  assert.equal(rowOf(b.id).after_sale_status, 'open', '链上 None 时保留本地案件状态，交人工核实');
+  assert.equal(rb.repaired, 0);
+
+  // ③ 诱饵单（链上买家与本地锁定不符）：整单跳过
+  const c = insertCaseOrder({ afterSaleStatus: 'none' });
+  caseState.set(c.escrowOrderId, { open: true, openedAtBlock: 5000, status: 'Settled', buyer: '0x' + '11'.repeat(20), seller: SELLER, amount: AMOUNT });
+  await scanCases();
+  assert.equal(rowOf(c.id).after_sale_status, 'none', '买家不符 ⇒ 不按它改本地');
+});
+
+test('reconcileChainOnce 把两路候选都跑完（返回值/状态里能看见售后案件那一路）', async () => {
+  const o = insertCaseOrder({ afterSaleStatus: 'open', openedAt: Date.now() - 2 * HOUR, openedBlock: 77 });
+  caseState.set(o.escrowOrderId, { open: false, openedAtBlock: null, status: 'Settled', buyer: BUYER, seller: SELLER, amount: AMOUNT });
+  kvSet('mk:chain_reconcile_after_sale_cursor', '');
+  kvSet('mk:chain_reconcile_cursor', '');
+  const r = await reconcileChainOnce({ minAgeMs: 0, batch: 50 });
+  assert.ok(r.afterSaleScanned >= 1, `主入口必须带上售后案件那一路的读数：${JSON.stringify(r)}`);
+  assert.ok(r.afterSaleRepaired >= 1);
+  assert.equal(rowOf(o.id).after_sale_status, 'closed');
+  // /healthz 的只读快照也能看到（静默失效 = 镜像永久分叉而无人知晓）
+  const { chainReconcileStatus } = await import('../src/chainReconcile.js');
+  assert.ok(chainReconcileStatus().afterSaleScanDays >= 360, '扫描窗口取合约允许的最长售后窗口（360 天）');
+  assert.ok(caseFetched.length > 0, '售后案件的链上读取走的是可注入读取器（生产实现见 chainOrder.fetchAfterSaleFor）');
 });

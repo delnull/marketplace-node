@@ -32,6 +32,19 @@ export const ACTIVE_STATUS = Object.freeze(['escrowed', 'shipped', 'disputed']);
 /** 已付款但在途（含卖家尚未发货）——`/paid` 与 watcher 回写允许的来源集 */
 export const PRE_PAID_STATUS = Object.freeze(['draft', 'escrowed', 'shipped']);
 
+/**
+ * 链上**仍处 `Created`、可被 `releaseExpired` 释放**的本地镜像（托管超时读数用）。
+ *
+ * 为什么是这两个：`escrowed`（已托管未发货）与 `shipped`（已发货买家未确认）在链上都还停在
+ * `Created`——钱仍在托管里，超时窗口一到，**任何人**都能调 `releaseExpired` 把钱判给卖家。
+ * 刻意排除另外两个易混状态：
+ *  · `draft`    —— 本地草稿，链上根本没有单（无从谈释放）；
+ *  · `disputed` —— 合约 `releaseExpired` 明确要求 `status == Created`，争议单只能走 `arbitrate`。
+ * 判据的链上真值不是这一列，而是合约 `releaseNotBeforeBlock(orderId)`（见 src/opsMetrics.js）：
+ * 这里只用来圈定"要读谁"的候选面。
+ */
+export const ESCROW_RELEASABLE_STATUS = Object.freeze(['escrowed', 'shipped']);
+
 /** 草稿 + 在途：商品维度的"在途需求"核算、库存占位计数用 */
 export const DRAFT_OR_ACTIVE_STATUS = Object.freeze(['draft', 'escrowed', 'shipped', 'disputed']);
 
@@ -57,3 +70,4 @@ export const ACTIVE_IN = sqlIn(ACTIVE_STATUS);
 export const PRE_PAID_IN = sqlIn(PRE_PAID_STATUS);
 export const DRAFT_OR_ACTIVE_IN = sqlIn(DRAFT_OR_ACTIVE_STATUS);
 export const INCOME_IN = sqlIn(INCOME_STATUS);
+export const ESCROW_RELEASABLE_IN = sqlIn(ESCROW_RELEASABLE_STATUS);

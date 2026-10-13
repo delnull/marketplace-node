@@ -94,8 +94,10 @@ export const processClock = createClock();
  * 本次运行的标识（随机 uuid，进程内恒定）。
  *
  * 用途：单调读数只有**在同一次运行内**才可比。把「下单时的单调读数」落库后，清扫器必须先知道
- * 这一行是不是本次运行写的——`created_boot === bootId` 才敢用单调年龄，否则退回墙钟比较
- * （见 `src/orderSweeper.js` 与 `orders.created_boot/created_mono` 的列说明）。
+ * 这一行是不是本次运行写的——`created_boot === bootId` 才敢用单调年龄精确判定。
+ * **跨运行的行不退回墙钟**（2026-10 生产化清理）：墙钟在两次运行之间可能跳变，按它判"过期"会误关
+ * 正在付款的草稿并提前回补占位（⇒ 超卖）。改用**可证明的年龄下界** = 本进程已运行的单调时长
+ * （见 `src/orderSweeper.js`：够 TTL 才扫，不够就跳过并告警）。
  */
 export const bootId = randomUUID();
 

@@ -67,7 +67,7 @@ const ORDER_COLUMNS = [
   'fee_bps', 'fee_chargeable', 'fee_basis', 'accepted_partial_refund_wei',
   'usdt_micro', 'shipping_fee_usdt_micro', 'invoice_needed',
   'buyer', 'shipping_name', 'shipping_phone', 'shipping_address', 'shipping_edited', 'note', 'escrow_order_id',
-  'paid_tx_hash', 'refund_status', 'tracking_no', 'created_at', 'updated_at',
+  'paid_tx_hash', 'refund_status', 'tracking_no', 'carrier', 'created_at', 'updated_at',
 ];
 
 /** 收款流水导出（ownerOnly；入账口径与流水页一致 = 订单 updated_at 末次迁移时刻；
@@ -194,7 +194,7 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
       o.usdt_micro, o.shipping_fee_usdt_micro ?? 0, o.invoice_needed ? 1 : 0,
       o.buyer, o.shipping_name, o.shipping_phone, o.shipping_address, o.shipping_edit_count ? '1' : '0', o.note || '',
       o.escrow_order_id || '', o.paid_tx_hash || '', o.refund_status || 'none',
-      o.tracking_no || '', o.created_at, o.updated_at,
+      o.tracking_no || '', o.carrier || '', o.created_at, o.updated_at,
     ];
   });
   auditExport(req, 'export.orders', '-', { rows: rows.length, status: req.query.status || 'all' });

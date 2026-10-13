@@ -35,6 +35,12 @@ export const ESCROW_ABI = [
   // 买家对**具体金额**的部分退款授权（= 让"双方已谈拢的部分退款"不必绕道仲裁人）。
   // 授权不转移资金、不冻结订单、也不影响买家其它出口；重复授权直接覆盖旧值。
   'event PartialRefundAccepted(bytes32 indexed orderId, uint256 refundWei)',
+  // 确认收货后的**售后案件**（契约 2026-10 第二批；本地镜像的唯一判据见 src/afterSale.js）：
+  // 开案（仅买家、仅终局且窗口内）/ 结案（买家撤诉或仲裁人，note 为用户文本）。
+  // 它不动托管资金（钱早已结清），补偿只能来自卖家保证金 Staking.penalize 或线下转账，
+  // 因此也**不阻塞卖家撤资**（撤资闸只看 sellerOpenCases，案件不计入）。
+  'event AfterSaleOpened(bytes32 indexed orderId, address indexed buyer, address indexed seller)',
+  'event AfterSaleClosed(bytes32 indexed orderId, address indexed by, string note)',
   // 只读（字段顺序必须与 Escrow.Order **逐字段对应**：refundedAmount 在 status 之前；末尾两项是
   // 2026-09 审计新增——feeCollectorAtCreate（创建时的平台费收取方快照，决定本单扣不扣费）与
   // buyerConfirmed（买家本人确认过收货）。**少一项、错一位都会静默解码出垃圾**：ethers 用短 ABI 解长
@@ -53,6 +59,33 @@ export const ESCROW_ABI = [
   'function acceptPartialRefund(bytes32 orderId, uint256 refundWei)',
   // 买家已授权的部分退款额（0 = 未授权）；approveRefund 部分退款时的唯一合法取值来源
   'function acceptedPartialRefund(bytes32 orderId) view returns (uint256)',
+  /*
+    确认收货后的售后案件只读视图（`/sync` 与后台对账的链上真值；见 src/chainOrder.js 的
+    fetchAfterSaleFor）。刻意只读这两个、不读 settledAtBlock/afterSaleWindowBlocks：
+    "窗口还开着吗"由**合约**在 openAfterSale 里判（revert AfterSaleWindowClosed），
+    节点不重复实现一遍窗口算术——两套判据迟早漂移，而这里读它并没有任何本地决策要用。
+    链上事实源：afterSaleOpenedAtBlock != 0 ⇔ 有在途案件；结案会把它清零
+    （所以同一单在窗口内可以再次开案，本地镜像随之回到 open）。
+  */
+  'function afterSaleOpen(bytes32 orderId) view returns (bool)',
+  'function afterSaleOpenedAtBlock(bytes32 orderId) view returns (uint64)',
+  /*
+    托管超时的**链上阈值**（前端 utils/escrowCountdown 同判据）：
+    释放允许**当且仅当** `latestBlock > releaseNotBeforeBlock(orderId)`。刻意不自己用
+    `createdAtBlock + timeoutBlocks` 算一遍——合约在这之上还叠了"卖家拒绝退款后的释放静置期"
+    （加固 A），自己算会把静置期内的单误报成"已超时"。
+    ⚠️ 合约注释写明：若 `refundRequested` 仍为真，释放是被**永久**禁止的，此时本函数返回的 T
+    没有意义——调用方必须同时看退款申请状态（节点侧读本地镜像 refund_status）。
+    （原注释指向 `src/opsMetrics.js`，那个文件在仓库里**不存在**——2026-10 清理掉的死引用。）
+  */
+  'function releaseNotBeforeBlock(bytes32 orderId) view returns (uint64)',
+  /*
+    挂账余额（`_settle` 派发失败时改记到收款方名下，由其 withdrawPayout/withdrawFees 自领）。
+    **按地址计**：payouts 读店主地址、fees 读当前全局 feeCollector；合约按**每单创建时快照**的
+    收取方扣费，历史收取方的挂账不在这两个读数里（已知边界，见 opsMetrics.accruedReading）。
+  */
+  'function accruedPayouts(address to) view returns (uint256)',
+  'function accruedFees(address collector) view returns (uint256)',
   'function rejectRefund(bytes32 orderId)',
   'function arbiter() view returns (address)',
   'function feeBps() view returns (uint256)',
@@ -114,12 +147,27 @@ export function isAddress(v) {
   }
 }
 
-/** wei(字符串/大数) → 小数（按 decimals，默认 18），最多保留 6 位有效展示 */
+/**
+ * wei（十进制串 / bigint）→ 小数（按 decimals，默认 18）展示串；**读不到就返回 `null`**。
+ *
+ * 三态（2026-10 生产化清理，与前端 `utils/arbiterMoney.weiBig`、本仓 `readRefundedWei` 同一判据）：
+ * 只认 `/^\d+$/`（可带首尾空白）的十进制 wei；`null`/`undefined`/空串/畸形/负数/`0x…`/小数
+ * **一律 `null`** —— 不返回 `'0'`。
+ *
+ * 为什么不能返回 `'0'`：这些 `*Decimal` 字段直接进 DTO 给界面显示。返回 `'0'` 等于替链上说了一句
+ * 它没说过的话（"这笔钱是 0"），而调用方的来源里有一半是**RPC 解出来的值**（`stakingRisk` 的
+ * minStake/pool/shortfall、`opsMetrics` 的费率），没有 `NOT NULL` 那种库层门禁挡着 ⇒
+ * "读不到被印成 0 BTY" 这一类在别处照样可表达。返回 `null` 后，前端的三态渲染统一印 `—`。
+ *
+ * 与 `decimalToWei` 的关系：两者互逆，都只走这一处判据（不要在调用点各自 `try/catch` 折 0）。
+ */
 export function weiToDecimal(wei, decimals = 18) {
+  const raw = typeof wei === 'bigint' ? wei.toString() : String(wei ?? '').trim();
+  if (!/^\d+$/.test(raw)) return null;
   try {
-    return ethers.formatUnits(wei.toString(), decimals);
+    return ethers.formatUnits(raw, decimals);
   } catch {
-    return '0';
+    return null; // decimals 越界等：仍然是"读不到"，不是 0
   }
 }
 

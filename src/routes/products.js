@@ -59,6 +59,8 @@ import { tryAutoDeliverPendingForProduct } from '../autoDeliver.js';
 import { usdtOf } from '../money.js';
 // 订单状态集合的唯一出处（"在途需求"核算用的是"草稿+在途"那一套）
 import { DRAFT_OR_ACTIVE_IN } from '../orderStatus.js';
+// 商品标签（类目）的键/展示形/归一化 —— **唯一实现**（两个写入入口、列表筛选与标签清单共用，见 src/tags.js 文件头）
+import { normalizeTags, parseTagsColumn, tagKeyOf } from '../tags.js';
 
 /*
   价格与运费的闸门（**微 USDT**，1 USDT = 1e6）。
@@ -319,6 +321,27 @@ function saveSkus(productId, skus, now) {
   }
 }
 
+/** 写库：全量替换某商品的标签镜像行（`product_tags`）。
+ *
+ *  商品标签有**两份镜像**：`products.tags`（JSON 数组，**展示形**，供 DTO 直接下发）与
+ *  `product_tags`（一行一标签：键 `tag_key` + 展示形 `tag_display`，供按标签精确筛选与聚合——
+ *  避免对 title/description 做全表 LIKE）。两者必须**同批**写入：写法就是"紧随 products 行之后
+ *  调本函数"，不另设路径。否则"卡片上显示的标签"与"按它搜到的商品"会各说一套
+ *  （本仓"镜像同批对齐"纪律，与 saveSkus/product_skus 同款）。
+ *
+ *  入参 `tags` 必须是 src/tags.js `normalizeTags` 的输出（**展示形数组**）：键由本函数用同一个
+ *  模块的 `tagKeyOf` 现算——键与展示形同源，不会出现"库里两份形态对不上"。
+ *
+ *  写入入口只有两个：上架 `POST /`、编辑 `PATCH /:slug`——批量修改 `PATCH /batch` 的字段
+ *  子集是 {价格/上下架/自动交付/低库存阈值}，**不含标签**，它甚至不写这两处镜像的列，
+ *  因此不存在"第三个入口漏更新镜像"的可能。 */
+function saveTags(productId, tags) {
+  const db = getDb();
+  db.prepare('DELETE FROM product_tags WHERE product_id = ?').run(productId);
+  const ins = db.prepare('INSERT INTO product_tags (product_id, tag_key, tag_display) VALUES (?, ?, ?)');
+  for (const t of tags) ins.run(productId, tagKeyOf(t), t);
+}
+
 /** DB 行 → 对外字段（camelCase）。价格与库存**一律来自 Skus**，商品级字段只是汇总值：
  *  - priceUsdtMicro/priceUsdt = 各组合最低价（列表页「起价」展示用；成交价一律取所选 SKU）
  *  - capacity/committed    = 各组合之和；任一组合不限量则 capacity 为 null（整体视为不限量）
@@ -368,6 +391,16 @@ function rowToPublic(row) {
     nftContract: r.nft_contract || null,
     nftStandard: r.nft_standard || 'erc721',
     specs: parseSpecsColumn(r),
+    /**
+     * 商品标签（类目）：**恒为数组**，空数组 = 无标签（**不是 null**——标签本来就是可选项，
+     * "没有标签"与"读不出标签"对检索/展示的影响相同，故 DTO 契约恒定，消费方不必再判 null）。
+     * 下发的是**展示形**（店主写入时的原样：`RTX 5090` 就是 `RTX 5090`，不折小写；
+     * 只做过去控制/零宽、空白折叠、trim 的清洗，见 src/tags.js）。
+     * 而"是不是同一个标签"由**键**决定（ASCII 折小写），筛选与聚合都走键——
+     * 所以卡片上显示 `RTX 5090`，点它（或手输 `rtx 5090`）都能搜到同一批商品。
+     * 标签**不入快照**（理由与代价见 db.js 的 products.tags 列注释）。
+     */
+    tags: parseTagsColumn(r.tags),
     skus,
     // 汇总口径（列表页展示；逐组合的权威值在 skus 里）
     priceUsdtMicro: minMicro,
@@ -476,6 +509,17 @@ function validateProduct(v) {
       ageRestricted = v.ageRestricted === true || v.ageRestricted === 1 ? 1 : 0;
     }
   }
+  /*
+    商品标签（类目）：可选字段（`undefined`/`null` = 无标签）。归一化/上限/去重全部在
+    src/tags.js（**唯一实现**，上架与编辑两个写入入口共用），这里只负责把它的可读中文错
+    合并进 errors —— 与其它字段一致：**有错就整体拒绝**，不留半写状态（哪怕只有一个标签超长）。
+  */
+  let tags = [];
+  try {
+    tags = normalizeTags(v.tags);
+  } catch (e) {
+    errors.push(e.message);
+  }
   return {
     errors,
     value: {
@@ -491,6 +535,7 @@ function validateProduct(v) {
       nftStandard,
       specs,
       skus,
+      tags,
       autoDeliver,
       stockAlertAt,
       active,
@@ -502,10 +547,26 @@ function validateProduct(v) {
 
 /** 商品分页列表（仅上架商品；附汇率快照 rates，供前端统一换算展示）。
  *
- *  可选 q    ：标题/描述关键词搜索（SQL LIKE 参数化，%/_ 转义为字面量防通配放大）
+ *  可选 q    ：**本店检索**（"这一家店里有没有这个词"）——标题/描述的大小写不敏感包含匹配
+ *              （SQL LIKE，ASCII 大小写不敏感；中文按字面包含），SQL LIKE 参数化，
+ *              %/_ 转义为字面量防通配放大。
+ *              规则写清：先 `trim()`；**空串/纯空白 = 不按关键词过滤**（退化为全列表，与"没传"同义）；
+ *              长度上限 **60 字符**，超出按前 60 字符匹配（**刻意保留截断**：搜索是尽力而为的过滤、
+ *              不是写入形状，把它变成报错只会让"粘贴一整段话去搜"直接失败；写入侧的标签超限则必须报错，
+ *              见 src/tags.js）。**联邦跨店搜索由前端扇出**（对每家可达节点各发一次本接口），
+ *              节点**不代查**别家店——那是把"单节点=一家店"的边界抹掉。
+ *  可选 tag  ：按**标签键精确匹配**（先归一化入参成键，再走 `product_tags.tag_key` 索引；
+ *              不归一化就只能全表 LIKE，且 `GPU`/`gpu` 会各搜一半）。入参可以是**任意写法**：
+ *              卡片上的展示形（`RTX 5090`）、用户手输（`rtx 5090`）、多打了空格（`RTX  5090`）
+ *              都归一成同一个键，命中同一批商品。入参非法/超长**按"查不到"处理并说明**
+ *              （`tagError` + message，结果为空），既不静默忽略也不 500。
+ *              缺省/纯空白 = 不按标签过滤（与 q 同口径）。
  *  可选 order：asc（默认，保持既有行为）| desc（**最新上架优先**——聚合前端首屏
  *              必须用它，否则展示的是每家店最早上架的商品）
  *  可选 kind ：逗号分隔的商品类型分面（physical/digital/nft），非法值静默忽略
+ *
+ *  三个过滤维度（q / tag / kind）与光标分页、order **正交**：都是同一组 WHERE 条件，
+ *  每页都是过滤后的结果。
  *
  *  游标语义：两种方向都以 id 为 keyset 游标，只是比较方向相反——
  *  asc 用 `id > cursor`、desc 用 `id < cursor`；cursor=0 表示首屏无游标。
@@ -522,6 +583,30 @@ router.get('/', wrap(async (req, res) => {
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter((s) => PRODUCT_KINDS.has(s));
+  /*
+    标签入参归一成**键**：唯一实现在 src/tags.js（与写入侧同一个模块）——
+    所以"店主写进去的标签"与"买家搜的标签"必然落在同一个键上（展示形怎么写都不影响命中）。
+    三种失败都按"查不到"处理并把原因放在 tagError 里（不静默忽略、也不 500）：
+      · 抛错（超长/非字符串…）：把中文原因原样报出；
+      · 归一化后为空（纯控制字符等）：说明它不是一个可用标签；
+      · 重复给了多个 tag（`?tag=a&tag=b` ⇒ Express 给数组）：明确说"一次只能给一个"，
+        否则它会被当成一个名叫 "a,b" 的标签而静默查不到。
+  */
+  const rawTagParam = req.query.tag;
+  const rawTag = rawTagParam === undefined || rawTagParam === null ? '' : String(rawTagParam);
+  let tagKey = null;
+  let tagError = null;
+  if (Array.isArray(rawTagParam)) {
+    tagError = 'tag 一次只能给一个（多个标签请分次查询，或与 kind/q 组合）';
+  } else if (rawTag.trim() !== '') {
+    try {
+      const display = normalizeTags([rawTag])[0] ?? null; // 先过一遍写入侧同款校验（长度/空值口径一致）
+      if (display === null) tagError = '标签去掉控制字符与空白后为空，不是一个可用标签';
+      else tagKey = tagKeyOf(display);
+    } catch (e) {
+      tagError = e.message;
+    }
+  }
 
   const db = getDb();
   const where = ['active = 1'];
@@ -535,6 +620,21 @@ router.get('/', wrap(async (req, res) => {
     const like = `%${q.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
     where.push("(title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\')");
     args.push(like, like);
+  }
+  if (tagKey) {
+    // 标签走镜像表 + 索引（tagKey 已是规范形，`=` 即精确匹配；展示形怎么写都不影响）：
+    // 不对 title/description 做全表 LIKE
+    where.push('EXISTS (SELECT 1 FROM product_tags pt WHERE pt.product_id = products.id AND pt.tag_key = ?)');
+    args.push(tagKey);
+  }
+  if (tagError) {
+    /*
+      非法/超长标签 = **查不到**（空结果），但绝不静默：结果里带 tagError、message 里说明，
+      调用方不会把"标签写错了"误读成"这家店没有这个类目"。
+      空结果的实现方式是在 SQL 上加恒假条件（而不是提前 return）——保证响应形状与正常路径
+      完全一致（products/nextCursor/rates/tag/tagError 一个不少）。
+    */
+    where.push('0 = 1');
   }
   if (kinds.length) {
     where.push(`kind IN (${kinds.map(() => '?').join(',')})`);
@@ -577,7 +677,107 @@ router.get('/', wrap(async (req, res) => {
   // 形状与 GET /api/rates 对齐：列表接口的 rates 一旦非空即代表可用，
   // 因此显式补 available:true（此前缺失该键，消费方按 RatesData 类型判断
   // `rates.available` 时会误判为不可用而丢弃整个汇率快照）。
-  ok(res, { products, nextCursor: last, rates: rates ? { available: true, ...rates } : null });
+  ok(
+    res,
+    {
+      products,
+      nextCursor: last,
+      rates: rates ? { available: true, ...rates } : null,
+      // 本次实际生效的标签**键**（规范形，就是拿去做 `=` 匹配的那个字节）与未生效的原因：
+      // 三态纪律——"没按标签过滤"（null）与"按标签过滤了但查不到"（key 非空、结果空）
+      // 与"标签写错了"（tagError 非空）是三件事。回显的是**键**而不是展示形：
+      // 展示形可以有很多种写法，键才是这次查询真正使用的东西（调用方要用它做后续判断）。
+      tag: tagKey,
+      tagError,
+    },
+    tagError ? `标签未生效：${tagError}（本次结果为空，请改用合法标签）` : 'success'
+  );
+}));
+
+/**
+ * 本店在用标签清单（公开只读）：**只统计上架商品在用到的标签**，供目录页做筛选面。
+ *
+ * 口径（每一段都要说清，否则"少了一个标签"没法判断是实现错还是本来就该少）：
+ *  1. **只数上架商品**（`products.active = 1`）：下架商品不进筛选面，否则点进去必然空列表；
+ *  2. **不按 SKU 库存过滤**（售罄仍在架的商品标签照算）：库存是暂时的、类目不是——
+ *     售罄补货后标签不变，若按库存摘标签，同一标签搜到的集合会随库存抖动；
+ *  3. `count` = 用到该标签**键**的上架商品数（不是标签出现次数：一个商品同一个键在镜像表里
+ *     只有一行，主键就是 (product_id, tag_key)，重复计数在库里不可表达）；
+ *  4. 每项同时给 `key`（规范形，`?tag=` 匹配用的就是它）与 `tag`（**展示形**，界面直接显示）。
+ *
+ * **展示形的选取规则（必须确定、可复现）**：同一个键下可能同时存在多种写法
+ * （`RTX 5090` 与 `rtx 5090` 是同一个键），取
+ *   **出现次数最多的那种写法**（按用它作展示形的商品数计）；**并列时取字典序最小的那个**。
+ * 为什么这么定：
+ *   · 不能是"任意一条"——同一批数据每次查询必须给出同一个展示形，否则目录页的标签条
+ *     会在刷新之间跳来跳去（用户看到的标签自己改名）；
+ *   · 不能取 MIN()/最早一条——那样"多数商品怎么写"就没有发言权：一家店 5 个商品写 `iPhone`、
+ *     1 个写 `iphone`，界面却可能显示那个孤例；
+ *   · 并列时用字典序兜底，让"次数说不出谁更代表"时仍有唯一答案（同样可复现）。
+ *     这里的"字典序"= SQLite 默认的 BINARY 排序（UTF-8 字节序，**大写字母排在小写之前**）——
+ *     不引 collation，规则就完全可预期（`iPhone 15` 与 `iphone 15` 并列时展示 `iPhone 15`）。
+ * 排序：`count` 降序、同 count 按 **`key`** 升序（**稳定**：同库多次调用结果逐字相同）。
+ * 刻意不按展示形排序：展示形会随写法与次数变化，用它排序会让列表顺序随拼写漂移；
+ * 前端的联邦合并也是按**键**归并的（`utils/productTags.cmpTag`），两边顺序才对得上。
+ *
+ * 分页与三态：`limit` 缺省 {@link TAGS_LIMIT_DEFAULT}、上限 {@link TAGS_LIMIT_MAX}（非法值**明确拒绝**，
+ * 不静默钳制——调用方以为"这就是全部标签"而实际被截断是目录页最难发现的错）；
+ * 响应 `{ tags: [{ tag, key, count }], total, truncated }`：`total` = **按键去重后的在用标签总数**，
+ * `truncated` = 是否因 limit 未返回全部。裸数组会让界面静默少报（读不到 ≠ 0 ≠ 缺失）。
+ */
+const TAGS_LIMIT_DEFAULT = 100;
+const TAGS_LIMIT_MAX = 200;
+
+router.get('/tags', wrap(async (req, res) => {
+  const raw = req.query.limit;
+  const limit = raw === undefined || raw === '' ? TAGS_LIMIT_DEFAULT : Number(raw);
+  if (!Number.isInteger(limit) || limit < 1 || limit > TAGS_LIMIT_MAX) {
+    return fail(res, `limit 需为 1..${TAGS_LIMIT_MAX} 的整数（缺省 ${TAGS_LIMIT_DEFAULT}）`);
+  }
+  const db = getDb();
+  /*
+    一条 SQL 里做完"按键计数 + 选展示形"，与上面那段规则一一对应：
+      active  只取上架商品的 (键, 展示形) 行
+      counts  按 (键, 展示形) 各自计数
+      best    ROW_NUMBER() 按「次数降序、展示形升序」编号 ⇒ rn=1 即"多数写法，并列取字典序最小"
+      totals  按键求和 ⇒ count（= 用到该键的上架商品数）
+    多取一行做前瞻判定（与商品列表 nextCursor 同款）：省掉一次 COUNT(DISTINCT) 全表聚合。
+  */
+  const rows = db
+    .prepare(
+      `WITH active AS (
+         SELECT pt.tag_key AS tag_key, pt.tag_display AS tag_display
+           FROM product_tags pt JOIN products p ON p.id = pt.product_id
+          WHERE p.active = 1
+       ),
+       counts AS (
+         SELECT tag_key, tag_display, COUNT(*) AS c FROM active GROUP BY tag_key, tag_display
+       ),
+       best AS (
+         SELECT tag_key, tag_display,
+                ROW_NUMBER() OVER (PARTITION BY tag_key ORDER BY c DESC, tag_display ASC) AS rn
+           FROM counts
+       ),
+       totals AS (
+         SELECT tag_key, SUM(c) AS count FROM counts GROUP BY tag_key
+       )
+       SELECT b.tag_display AS tag, t.tag_key AS "key", t.count AS count
+         FROM totals t JOIN best b ON b.tag_key = t.tag_key AND b.rn = 1
+        ORDER BY count DESC, "key" ASC
+        LIMIT ?`
+    )
+    .all(limit + 1);
+  const truncated = rows.length > limit;
+  const tags = truncated ? rows.slice(0, limit) : rows;
+  // total 只在被截断时才需要（未截断时 total === tags.length），避免每次请求都多一次聚合
+  const total = truncated
+    ? db
+        .prepare(
+          'SELECT COUNT(DISTINCT pt.tag_key) AS c FROM product_tags pt JOIN products p ON p.id = pt.product_id WHERE p.active = 1'
+        )
+        .get().c
+    : tags.length;
+  ok(res, { tags, total, truncated });
 }));
 
 /** 店主全量列表（含已下架，卖家面板管理用；需 owner 登录）—— 必须在 /:slug 之前注册。
@@ -692,15 +892,18 @@ router.post('/', staffOnly, wrap(async (req, res) => {
     })
   );
   db.prepare(
-    'INSERT INTO products (slug, title, description, description_blocks, images, kind, shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, specs, auto_deliver, stock_alert_at, snapshot_hash, active, created_at, updated_at) ' +
-      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
+    'INSERT INTO products (slug, title, description, description_blocks, images, kind, shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, specs, tags, auto_deliver, stock_alert_at, snapshot_hash, active, created_at, updated_at) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
   ).run(
     slug, value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.images),
     value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard,
-    JSON.stringify(value.specs), value.autoDeliver, value.stockAlertAt, hash, now, now
+    JSON.stringify(value.specs), JSON.stringify(value.tags), value.autoDeliver, value.stockAlertAt, hash, now, now
   );
-  saveSkus(db.prepare('SELECT id FROM products WHERE slug = ?').get(slug).id, value.skus, now);
-  audit(req, 'product.create', 'product', slug, { kind: value.kind, skuCount: value.skus.length, specs: value.specs.map((s) => s.name), shippingFeeUsdtMicro: value.shippingFeeUsdtMicro, ageRestricted: value.ageRestricted });
+  const productId = db.prepare('SELECT id FROM products WHERE slug = ?').get(slug).id;
+  saveSkus(productId, value.skus, now);
+  // 标签镜像同批写入（products.tags 与 product_tags 必须一起落，见 saveTags 注释）
+  saveTags(productId, value.tags);
+  audit(req, 'product.create', 'product', slug, { kind: value.kind, skuCount: value.skus.length, specs: value.specs.map((s) => s.name), tags: value.tags, shippingFeeUsdtMicro: value.shippingFeeUsdtMicro, ageRestricted: value.ageRestricted });
   ok(res, rowToPublic(db.prepare('SELECT * FROM products WHERE slug = ?').get(slug)), '上架成功');
 }));
 
@@ -863,6 +1066,9 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
           })),
     autoDeliver: b.autoDeliver !== undefined ? b.autoDeliver : row.auto_deliver,
     stockAlertAt: b.stockAlertAt !== undefined ? b.stockAlertAt : row.stock_alert_at,
+    // 标签：未提交则沿用现有（DB 行 → 数组）；提交 `[]` = 显式清空（与 images 同款三态：
+    // 未提交=不动、提交空数组=清空）。归一化在 validateProduct → src/tags.js（唯一实现）
+    tags: b.tags !== undefined ? b.tags : parseTagsColumn(row.tags),
     active: b.active !== undefined ? b.active : !!row.active,
   };
   // 已建交付池的商品禁止跨类型变更（码池/tokenId 池与 kind 绑定，避免履约语义错乱）；
@@ -1026,13 +1232,15 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     })
   );
   db.prepare(
-    'UPDATE products SET title = ?, description = ?, description_blocks = ?, images = ?, kind = ?, shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, specs = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, snapshot_hash = ?, updated_at = ? ' +
+    'UPDATE products SET title = ?, description = ?, description_blocks = ?, images = ?, kind = ?, shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, specs = ?, tags = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, snapshot_hash = ?, updated_at = ? ' +
       'WHERE id = ?'
-  ).run(value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.images), value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard, JSON.stringify(value.specs), value.autoDeliver, value.stockAlertAt, value.active, hash, Date.now(), row.id);
+  ).run(value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.images), value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard, JSON.stringify(value.specs), JSON.stringify(value.tags), value.autoDeliver, value.stockAlertAt, value.active, hash, Date.now(), row.id);
   // 写 SKU（保留同 key 的 committed，编辑商品不该把已售数量清零）
   saveSkus(row.id, value.skus, Date.now());
+  // 标签镜像同批写入（与上面的 products.tags 列更新同一次提交；见 saveTags 注释）
+  saveTags(row.id, value.tags);
 
-  audit(req, 'product.update', 'product', row.slug, { fields: Object.keys(b).filter((k) => ['title','description','descriptionBlocks','specs','skus','autoDeliver','stockAlertAt','active','kind','shippingFeeUsdtMicro','ageRestricted'].includes(k)) });
+  audit(req, 'product.update', 'product', row.slug, { fields: Object.keys(b).filter((k) => ['title','description','descriptionBlocks','specs','skus','tags','autoDeliver','stockAlertAt','active','kind','shippingFeeUsdtMicro','ageRestricted'].includes(k)) });
   ok(res, rowToPublic(db.prepare('SELECT * FROM products WHERE id = ?').get(row.id)), '已更新');
 }));
 

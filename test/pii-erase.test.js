@@ -472,3 +472,41 @@ test('开票信息（抬头/税号）随 PII 擦除一并清空；invoice_needed
   assert.equal(rowOf(stale.id).invoice_title, '', '保留期通道同样清空开票抬头');
   assert.equal(rowOf(stale.id).invoice_tax_no, '');
 });
+
+test('保留期让路：有在途售后案件的终局单不自动擦除（证据要留给仲裁），结案后照常到期即擦', async () => {
+  /*
+    售后案件只存在于**终局**单上（链上要求 Settled），而终局单正是保留期扫描的候选面——
+    案件又往往在成交很久之后才被开出来（窗口上限 360 天），所以"到期就擦"会把双方刚提交的
+    after_sale 陈述正文、证据附件与收货信息一起销毁，而仲裁人还要靠它们裁决。
+    显式删除请求（erase-pii）不受影响：那是数据主体本人/店主明确要求删除（见 piiErase 的说明）。
+  */
+  const p = await listProduct(productPayload({ kind: 'physical', title: 'PII 案件让路商品' }));
+  const o = await createDraft(p.slug, { shipping: { name: '孙十二', phone: '13900000000', address: '成都市某路 10 号' }, note: '售后案件中' });
+  escrowed(o);
+  assert.equal(applyEvent('ReceiptConfirmed', { orderId: o.escrowOrderId }, { txHash: payHash(), block: 15 }), 1);
+  // 终局后买家开案（链上 openAfterSale 的本地镜像）
+  assert.equal(applyEvent('AfterSaleOpened', { orderId: o.escrowOrderId }, { block: 16 }), 1);
+  ageOrder(o.id, 200); // 成交已超保留期
+
+  const sweep = runPiiRetention({ days: 180 });
+  assert.ok(!sweep.orderIds.includes(o.id), '在途案件的单不进擦除清单');
+  assert.equal(rowOf(o.id).shipping_name, '孙十二', '收货信息保留（案件未了结）');
+  assert.equal(rowOf(o.id).note, '售后案件中');
+  assert.equal(rowOf(o.id).pii_erased_at, null, '没擦过就不该有擦除锚点');
+
+  // 显式删除请求不受这条让路约束：数据主体的删除要求照旧执行
+  const manual = await eraseViaApi(o.id);
+  assertOk(manual);
+  assert.equal(rowOf(o.id).shipping_name, '', '显式请求仍然擦除（案件不该被当成拒绝删除的理由）');
+
+  // 结案后回到正常保留期语义：到期即擦
+  const o2 = await createDraft(p.slug, { shipping: { name: '周十三', phone: '13800000000', address: '武汉市某路 11 号' } });
+  escrowed(o2);
+  assert.equal(applyEvent('ReceiptConfirmed', { orderId: o2.escrowOrderId }, { txHash: payHash(), block: 17 }), 1);
+  assert.equal(applyEvent('AfterSaleOpened', { orderId: o2.escrowOrderId }, { block: 18 }), 1);
+  assert.equal(applyEvent('AfterSaleClosed', { orderId: o2.escrowOrderId, note: '已线下和解' }, { block: 19 }), 1);
+  ageOrder(o2.id, 200);
+  const sweep2 = runPiiRetention({ days: 180 });
+  assert.ok(sweep2.orderIds.includes(o2.id), '结案后不再让路：到期即擦（保留期的最终效果不变）');
+  assert.equal(rowOf(o2.id).shipping_name, '');
+});

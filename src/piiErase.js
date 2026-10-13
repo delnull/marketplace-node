@@ -38,6 +38,8 @@ import { logAudit } from './audit.js';
 import { orderAttachDir, removeOrderAttachments } from './evidenceFiles.js';
 // 状态集合的唯一出处（见下方再导出说明）：本文件内部要用，所以先 import 再 export
 import { PII_ERASABLE_STATUS, PII_PROTECTED_STATUS } from './orderStatus.js';
+// 确认收货后的售后案件：在途判据的唯一实现（保留期扫描据此让路，见 runPiiRetention）
+import { AFTER_SALE_NOT_OPEN_SQL } from './afterSale.js';
 
 /** 陈述正文的墓碑（保留可读性：当事人看到的是"已删除"而不是空白/报错） */
 export const PII_TOMBSTONE = '[已按数据删除请求擦除]';
@@ -207,6 +209,9 @@ export function eraseOrderPii(orderId) {
  * @param {{days?:number, now?:number, limit?:number}} opts days 缺省取 config.pii.retentionDays
  * @returns {{days:number, disabled:boolean, candidates:number, erased:number, orderIds:string[],
  *            truncated:boolean, counts:object}}
+ *
+ * 候选面还额外排除**有在途售后案件**（after_sale_status='open'）的单：案件未了结时不销毁证据
+ * （理由与边界见下方 pick 处的说明；显式删除请求不受此限）。
  */
 export function runPiiRetention({ days = config.pii.retentionDays, now = Date.now(), limit = RETENTION_MAX_PER_RUN } = {}) {
   const n = Number(days);
@@ -219,8 +224,24 @@ export function runPiiRetention({ days = config.pii.retentionDays, now = Date.no
   const cutoff = now - Math.floor(n) * 86_400_000;
   const db = getDb();
   const marks = PII_ERASABLE_STATUS.map(() => '?').join(',');
+  /*
+    **有在途售后案件的单不自动擦除**（2026-10，契约第二批带来的新状态）。
+
+    为什么必须在这里让路：售后案件只存在于**终局**单上（链上要求 Settled），而终局单正是保留期
+    扫描的候选面——一条 settlement 后的案件（"收到货才发现是假货"）往往在成交 180 天后才被开出来
+    （窗口上限 360 天），扫到就擦等于**把双方刚提交的 after_sale 陈述正文、证据附件与收货信息
+    一起销毁**，而仲裁人还要靠它们裁决（罚没走 Staking.penalize）。这与 disputed 被排除在
+    可擦集之外是同一条理由：争议/救济未了结时不销毁证据。
+
+    边界（刻意的，别顺手改）：
+      · 只挡**自动**保留期扫描。显式删除请求（POST /api/shop/orders/:id/erase-pii）仍照旧执行
+        ——那是数据主体本人/店主明确要求删除，节点不该以"有案件"为由拒绝（要拒绝也该在业务层
+        说明理由，而不是让保留期定时器替他们决定）；
+      · 案件结案（closed）后这行立刻回到候选面，到期即擦，不改变保留期的最终效果。
+  */
   const pick = db.prepare(
-    `SELECT id FROM orders WHERE status IN (${marks}) AND MAX(COALESCE(pii_erased_at, 0), updated_at) <= ? ` +
+    `SELECT id FROM orders WHERE status IN (${marks}) AND ${AFTER_SALE_NOT_OPEN_SQL} ` +
+      `AND MAX(COALESCE(pii_erased_at, 0), updated_at) <= ? ` +
       `ORDER BY MAX(COALESCE(pii_erased_at, 0), updated_at) ASC LIMIT ?`
   );
   const counts = { ...empty };

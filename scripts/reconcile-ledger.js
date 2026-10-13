@@ -253,7 +253,12 @@ async function readOnchainOrderFacts(orderId) {
       feeCollectorAtCreate: r.feeCollectorAtCreate === undefined || r.feeCollectorAtCreate === null
         ? ''
         : String(r.feeCollectorAtCreate).toLowerCase(),
-      refundedAmount: BigInt(r.refundedAmount ?? 0n),
+      /*
+        退款额**不兜 0**：`?? 0n` 会把"这个字段读不到/元组缺列"写成"链上确证没退过款"，
+        而对账脚本的职责恰恰是把"读不到"报出来。缺字段时 BigInt 抛错 → 外层 catch 返回 null
+        → 该单走"读不到链上退款额"的分支并逐条标注（宁可吵，不要假绿）。
+      */
+      refundedAmount: BigInt(r.refundedAmount),
     };
   } catch {
     return null;
@@ -499,7 +504,10 @@ async function main() {
     onchainNet += base - (orderChargeable(snap, chargeable) ? nominalFeeOf(base, bps) : 0n);
   }
   if (feeSourceLocal > 0) {
-    console.log(`[reconcile] ⚠ ${feeSourceLocal} 单未能读到链上 feeBps（已退回本地快照，可能掩盖费率快照错误）`);
+    console.log(
+      `[reconcile] ⚠ ${feeSourceLocal} 单未能读到链上真值（feeBps / 已退金额都退回本地快照，可能掩盖费率或退款额错误）` +
+        '——**本次对账没有核对过这几单**，退出码会区分开（见文件末的退出码说明）'
+    );
   }
   if (snapSourceLocal > 0) {
     console.log(
@@ -555,8 +563,17 @@ async function main() {
     "一致"，对账脚本存在的意义（发现账目不符）正好被它自己抹掉。三类一律 exit 2。
     2026-09 复审补：`outOfWindow`（链上已终局、只是超出扫描区间）**不置 2** —— 它是覆盖不足，
     不是差异；把它算作差异会让任何营业超过回溯窗口的店恒定报红（见上面 A 段的说明）。
+    2026-10 生产化清理再补一类：**有单的链上真值读不到**（`feeSourceLocal > 0`，那几单退回本地快照）
+    ⇒ 单独 `exit 3`。它不是账目差异，但也**不是"一致"**——本轮根本没核对过那几单。
+    旧行为只在输出里 ⚠ 标注而退出码仍为 0，接监控的人读到"一致"：覆盖不足被自证成了没问题。
   */
-  process.exitCode = missing.length || extra.length || diff !== 0n ? 2 : 0;
+  if (feeSourceLocal > 0) {
+    console.log(
+      `\n⚠ 本轮有 ${feeSourceLocal} 单的**链上真值读不到**：这几单退回本地快照，**没有被核对过**（退出码 3）。` +
+        '请重跑；持续出现要查 RPC 与 ABI 是否同步。'
+    );
+  }
+  process.exitCode = missing.length || extra.length || diff !== 0n ? 2 : feeSourceLocal > 0 ? 3 : 0;
 }
 
 main().catch((e) => {

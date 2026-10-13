@@ -14,6 +14,8 @@ import { verifyToken, roleOf, isStaff } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { ok, fail, wrap, bearerToken, makeAuthMiddleware, simpleRateLimit, isProdLike } from '../http.js';
 import { getArbiterAddress } from '../chain.js';
+// 确认收货后的售后案件：在途判据的唯一实现（与订单详情的仲裁人视角共用同一处判断）
+import { isAfterSaleOpen } from '../afterSale.js';
 import {
   validateFileMeta,
   storeFiles,
@@ -100,7 +102,7 @@ router.post('/:id/evidence/:evidenceId/files', requireAuth, uploadLimiter, expre
   }
 }));
 
-/** 鉴权下载：可见矩阵与 evidence 一致（buyer/owner；arbiter 仅 disputed）；文件归属该校验 */
+/** 鉴权下载：可见矩阵与 evidence 一致（buyer/owner；arbiter 仅 disputed 或**有在途售后案件**）；文件归属该校验 */
 router.get('/:id/evidence/:evidenceId/files/:fileId', downloadLimiter, wrap(async (req, res) => {
   const order = findOrder(req.params.id);
   if (!order) return fail(res, '订单不存在', 404, 404);
@@ -121,9 +123,16 @@ router.get('/:id/evidence/:evidenceId/files/:fileId', downloadLimiter, wrap(asyn
   let allowed = false;
   if (auth) {
     if (auth.address === order.buyer || isStaff(auth.address)) allowed = true;
-    else if (order.status === 'disputed' && auth.address === (await getArbiterAddress())) allowed = true;
+    /*
+      仲裁人：争议单（disputed）**或**确认收货后有在途售后案件的终局单——
+      后者是契约 2026-10 第二批的裁决面：案件由仲裁人结案、罚没（Staking.penalize）的资格门槛
+      就是"案件在链上处于开启状态"，所以他必须能读到双方 after_sale 陈述的附件。
+      判据与订单详情的 `as='arbiter'`（routes/orders.js）**同一处**：afterSale.isAfterSaleOpen。
+      案件结案后立即收回（与 disputed 终局后收回同口径）。
+    */
+    else if ((order.status === 'disputed' || isAfterSaleOpen(order)) && auth.address === (await getArbiterAddress())) allowed = true;
   }
-  if (!allowed) return fail(res, '无权查看该附件（需买家本人/店主/操作员/争议仲裁人）', 403, 403);
+  if (!allowed) return fail(res, '无权查看该附件（需买家本人/店主/操作员/争议或售后案件的仲裁人）', 403, 403);
 
   const disk = fileDiskPath(file);
   if (!disk) return fail(res, '附件文件缺失（存储可能被清理）', 404, 404);

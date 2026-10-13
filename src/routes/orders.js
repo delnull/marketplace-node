@@ -34,7 +34,8 @@
  * `settled`（文案只讲"钱已结算给商家"）——映射实现在 escrowWatcher.mapChainTerminal（唯一实现）。
  *
  * 两级售后（v2，链上强制，watcher 四事件回写镜像）：
- *   escrowed/shipped --买家 requestRefund--> refund_status=requested（资金冻结、超时释放被禁）
+ *   escrowed/shipped --买家 requestRefund（**仅超时前受理**，2026-10 加固 B）--> refund_status=requested
+ *     │                （资金冻结、超时释放被禁；超时后合约报 RefundRequestTooLate，买家改走 requestDispute）
  *     ├--卖家 approveRefund(amount)--> refunded（**全额认赔**，不需要任何授权；全额退款时占位库存
  *     │                               按未交付行口径回补）
  *     ├--买家 acceptPartialRefund(wei) + 卖家 approveRefund(同额)--> settled
@@ -46,11 +47,32 @@
  *     └--卖家 rejectRefund--> refund_status=rejected --买家 requestDispute--> disputed
  *   disputed 中卖家仍可 approveRefund 全额和解退款（或按已授权金额部分和解）。被拒后合约不接受
  *   重复申请（防无限冻结循环，见 contracts/src/Escrow.sol requestRefund）——买家下一步即发起争议。
+ *   **拒绝还有一层链上后果（2026-10 加固 A）**：`rejectRefund` 会开启一段"释放静置期"
+ *   （合约 releaseExpired 的 RejectGraceActive），期内任何人调 releaseExpired 都被挡回——那是买家
+ *   "被拒 → 争议"的保证窗口。所以"拒绝之后超时就能收款"这句话只对**静置期已过**的单成立；
+ *   链上阈值以只读函数 releaseNotBeforeBlock(orderId) 为准（前端 utils/escrowCountdown 同判据）。
  *   仲裁人可**任意比例**拆分裁决（链上 arbitrate(orderId, refundWei)：refundWei 退买家、
  *   余额扣费后给卖家，本地落 settled 并记 refunded_amount_wei）——仲裁不受"买家授权"约束。
  *   sync 按链上 getOrder 的 refundRequested/refundRejected 权威回填本地 refund_status
  *   （事件漏扫/本地残留兜底，见 applyRefundFlags），并读只读视图 acceptedPartialRefund 补授权额
  *   （事件漏扫兜底；落列逻辑与 watcher 的 PartialRefundAccepted 分支共用 applyAcceptedPartialRefund）。
+ *
+ * **确认收货后的售后案件**（契约 2026-10 第二批；本地判据的唯一实现在 `src/afterSale.js`）：
+ *   终局（链上 Settled，钱已判给卖家）——买家在窗口内（默认 180 天/上限 360 天，自结算块起算）
+ *   链上 `openAfterSale(orderId)` 开案 --> 本地 after_sale_status=open（**orders.status 不变**：
+ *   订单仍旧是 confirmed/settled/expired）
+ *     ├--双方在 `phase='after_sale'` 提交售后陈述（有在途案件时才受理，见 evidenceFiles.js）
+ *     ├--卖家线下换货/转账和解（软件不介入），或仲裁人裁决后 `Staking.penalize` 从卖家保证金补偿买家
+ *     └--买家撤诉或仲裁人 `closeAfterSale(orderId, note)` --> after_sale_status=closed（+说明）
+ *   它与**退款/争议**的关系（三者互不替代，别混着用）：
+ *     · **不动托管资金**——该单托管早已按终局结清，售后案件不冻结、不退还任何托管额；
+ *       补偿只能来自卖家保证金（罚没）或卖家线下转账；
+ *     · **不阻塞卖家撤资**——撤资闸只看链上 `Escrow.sellerOpenCases`（退款申请/争议），
+ *       售后案件不计入；能追罚的口子由窗口长度限制（没有窗口就等于作废"买家点过头的单不再被追罚"）；
+ *     · 它**不是** disputed：争议单资金仍在托管里、仲裁走 `Escrow.arbitrate`；案件走的是保证金。
+ *   三条回填路径同源：事件（watcher 的 AfterSaleOpened/Closed）、本文件的 `/sync`
+ *   （读 afterSaleOpen/afterSaleOpenedAtBlock）、后台对账（chainReconcile 的售后案件复查）——
+ *   都经 `applyAfterSaleOpened`/`applyAfterSaleClosed`/`applyAfterSaleFromChain` 落列。
  *
  * 支付凭证不变量：escrowed 及以上状态必有 paid_tx_hash（链上规范哈希）——
  * watcher（OrderCreated 日志 transactionHash）/paid（收据规范哈希）/sync（按创建块
@@ -103,13 +125,18 @@ import { fetchReturnByOrder, returnToPublic } from '../returns.js';
 import {
   filesOfEvidenceMany,
   evidencePhaseError,
+  statementFieldsOf,
   EVIDENCE_PHASES,
   EVIDENCE_LIMIT_BY_PHASE as EVIDENCE_LIMIT_BY_PHASE_OF,
   EVIDENCE_PHASE_LABEL as EVIDENCE_PHASE_LABEL_OF,
 } from '../evidenceFiles.js';
 // 链上终局 → 本地终态的唯一实现（事件路径与快照路径共用；见 escrowWatcher 的 mapChainTerminal）
 // + 授权额落列的唯一实现（事件路径与 /sync 快照路径共用；同上）
-import { mapChainTerminal, applyAcceptedPartialRefund } from '../escrowWatcher.js';
+import { mapChainTerminal, applyAcceptedPartialRefund, readRefundedWei } from '../escrowWatcher.js';
+// 确认收货后的售后案件：DTO 字段与链上真值回填的**唯一实现**（watcher/对账/sync 同源）
+import { afterSaleFieldsOf, isAfterSaleOpen, applyAfterSaleFromChain, AFTER_SALE_OPEN_SQL } from '../afterSale.js';
+// 售后案件的链上只读读数（可注入；与后台对账共用同一个读取器，见 chainOrder.js）
+import { fetchAfterSaleCase } from '../chainOrder.js';
 import { notify } from '../webhook.js';
 // 下单风控闸（可选，默认关闭）：店主自配的建单前准入服务——见 orderGate.js 的边界说明
 import { checkOrderGate } from '../orderGate.js';
@@ -118,6 +145,10 @@ import { refreshFeeCollector, feeStatus, feeOf, feeChargeableForOrder, feeSnapsh
 // 面板 poolEmpty 与托管落定后的 order.pool_empty webhook 用同一个 poolShortfallOf，
 // 避免"面板说缺货但没告警"这类两处口径漂移
 import { isPoolEmpty, alertPoolEmptyForOrder } from '../poolAlert.js';
+// 承运方名称的归一（trim/控制字符/上限/空串→null）：三个发货/退货写入入口共用的唯一实现
+import { normalizeCarrier } from '../shipping.js';
+// 卖家待办计数（**唯一实现**）：本文件的徽标端点与 /api/shop/metrics 读同一份谓词与 SQL
+import { sellerTodoCounts } from '../opsMetrics.js';
 
 const router = Router();
 const requireAuth = makeAuthMiddleware(verifyToken);
@@ -157,8 +188,9 @@ const EVIDENCE_LIMIT_BY_PHASE = EVIDENCE_LIMIT_BY_PHASE_OF;
 const EVIDENCE_PHASE_LABEL = EVIDENCE_PHASE_LABEL_OF;
 /**
  * 订单详情一次最多返回多少条陈述行（**展示上限，不删数据**）：
- * 写入侧已按 (角色×阶段) 限条，正常单最多 10+10+20×2 = 60 条；这里给 100 的余量，
- * 只为兜住"老版本无上限时期写下的脏数据"——详情页对每行都要拼附件元数据，
+ * 写入侧已按 (角色×阶段) 限条——退款理由/回复各 10、仲裁陈述与售后陈述各 20——所以最坏情况
+ * （一单先走完争议、终局后又被开售后案件）是 10+10+20+20+20+20 = 100 条，正好等于本上限；
+ * 再多只可能是老版本无上限时期写下的脏数据。详情页对每行都要拼附件元数据，
  * 行数无界就是一次 O(N) 的查询放大（原实现还是逐行 filesOfEvidence 的 N+1）。
  * 超出的行不丢：`evidenceCount` 给总数、`evidenceTruncated` 置真，前端据此提示"仅展示最近 N 条"。
  */
@@ -310,25 +342,44 @@ function orderToPublic(o, opts = {}) {
     shippingEdited: shippingVisible ? !!o.shipping_edit_count : null,
     amountWei: o.amount_wei,
     amountDecimal: weiToDecimal(o.amount_wei),
-    /** 已退给买家的金额（部分退款/拆分裁决；0=未退，= amountWei 表示全额退款） */
-    refundedAmountWei: o.refunded_amount_wei || '0',
-    refundedAmountDecimal: weiToDecimal(o.refunded_amount_wei || '0'),
+    /**
+     * 已退给买家的金额（部分退款/拆分裁决；'0' = 链上确证没退过，= amountWei 表示全额退款）。
+     *
+     * **读不到与确证为 0 是两件事**（2026-10 修复）：db.js 里这两列是
+     * `TEXT NOT NULL DEFAULT '0'`（建表语句即最终结构、无存量迁移），所以 `'0'` 只可能来自
+     * "写入时确实是 0"；这里**不再** `|| '0'` 把"这一行根本没有该列 / 值为空"（读不到）
+     * 说成"链上确证没退过款"——那会让卖家净额虚高、把一次已获授权的部分退款显示成未授权。
+     * 缺列本身已由 server.js 的 REQUIRED_COLUMNS 启动门禁拒绝启动（本清单覆盖所有
+     * "缺列即静默错位"的列）；这里的 pass-through 是同一口径的最后一道：DTO 不制造结论，
+     * 读不到就下发 null，由前端三态消费（utils/refundAuth、utils/orderVault、utils/receipt）。
+     */
+    refundedAmountWei: o.refunded_amount_wei ?? null,
+    refundedAmountDecimal: weiToDecimal(o.refunded_amount_wei),
     /*
-      买家**已授权**的部分退款额（链上 acceptedPartialRefund(orderId) 的镜像；'0' = 未授权）。
+      买家**已授权**的部分退款额（链上 acceptedPartialRefund(orderId) 的镜像；'0' = 确证未授权，
+      null = 读不到）。
       为什么下发（源码审计 2026-09）：契约收紧后 approveRefund 只接受「全额」或「买家精确授权过的
       那个数」，卖家面板必须先把授权额显示出来，店主才可能给出一个链上真的会接受的金额——
       否则他只能凭空试数字，吃链上那条晦涩的 revert（RefundAmountNotAccepted）。
-      与 refundedAmountWei 同口径：字符串 wei + BTY 小数展示（weiToDecimal），防止精度丢失。
+      与 refundedAmountWei 同口径：字符串 wei + BTY 小数展示（weiToDecimal），防止精度丢失；
+      同一条三态纪律：读不到 ⇒ null（前端 refundAuth.authorizedRefundOf 按 source='unknown'
+      处理并在签名前直读链上复核），绝不与 '0'（确证未授权）合并。
     */
-    acceptedPartialRefundWei: o.accepted_partial_refund_wei || '0',
-    acceptedPartialRefundDecimal: weiToDecimal(o.accepted_partial_refund_wei || '0'),
-    /** 尚未退款的结算基数 = 托管额 − 已退（卖家侧口径，平台费按它计） */
+    acceptedPartialRefundWei: o.accepted_partial_refund_wei ?? null,
+    acceptedPartialRefundDecimal: weiToDecimal(o.accepted_partial_refund_wei),
+    /**
+     * 尚未退款的结算基数 = 托管额 − 已退（卖家侧口径，平台费按它计）。
+     * **读不到就不给数**：任一列缺失或不是十进制 wei 串（BigInt 抛错）⇒ null（下游按"—/读不到"显示）。
+     * 旧实现在 catch 里退回**毛额**（`amount_wei`，不减已退）——那是把"读不到"说成一个看着正常、
+     * 却**偏大**的数：卖家以为这笔钱全能到账，实际其中一部分已经退回买家。
+     */
     settledBaseWei: (() => {
+      if (o.amount_wei == null || o.refunded_amount_wei == null) return null;
       try {
-        const base = BigInt(o.amount_wei || '0') - BigInt(o.refunded_amount_wei || '0');
+        const base = BigInt(o.amount_wei) - BigInt(o.refunded_amount_wei);
         return (base > 0n ? base : 0n).toString();
       } catch {
-        return o.amount_wei || '0';
+        return null;
       }
     })(),
     usdtMicro: o.usdt_micro,
@@ -360,12 +411,43 @@ function orderToPublic(o, opts = {}) {
       （合规上不构成补救），所以必须在**返回口**挡住。
     */
     trackingNo: shippingVisible ? o.tracking_no || null : null,
+    /*
+      承运方名称（店主发货时填；可空）。**与 trackingNo 同一可见矩阵**：只有运单号时"拼查询链接"
+      只能靠单号前缀猜，纯数字号段（中通/圆通/申通/韵达）完全猜不出，所以名称是让买家/店主
+      能真的查到件的那一半信息——承运方名称本身不算隐私，但它和运单号是同一件事的两半，
+      一个过门控、另一个裸奔就是"可见矩阵漏了一个字段"的老毛病（2026-09 修复过 trackingNo）。
+      NULL = 店主没填（三态：不是空串、更不是"其他"）。
+    */
+    carrier: shippingVisible ? o.carrier || null : null,
     shippedAt: o.shipped_at || null, // 发货标记时刻（含自提/空单号交付——后前端"已交付"判定依据）
     deliveries,
     deliveredAt,
     refundStatus: o.refund_status || 'none',
     refundRequestedAt: o.refund_requested_at || null,
     refundRejectedAt: o.refund_rejected_at || null,
+    /*
+      确认收货后的**售后案件**（契约 2026-10 第二批；字段口径与写入口都在 src/afterSale.js）：
+        afterSaleStatus      none（从未开案）/ open（在途）/ closed（已结案；窗口内可再开新案）
+        afterSaleOpenedAt    开案落库时刻（近似开案时刻）
+        afterSaleOpenedBlock 链上开案区块（仲裁人/运维可据此去链上核对）
+        afterSaleClosedAt    结案时刻
+        afterSaleNote        结案说明（链上事件里的**用户文本**）
+      ⚠️ afterSaleNote 是陌生人可控的文本：节点只在 JSON 里下发，**渲染端必须按纯文本输出**
+      （不拼 HTML、不用 innerHTML）。长度已在唯一写入口截断到 500（见 afterSale.js），
+      这里不再截一次——那样只会让"到底以谁为准"变成两个地方各说一套。
+      与 status/refundStatus 的关系：**案件在途时 status 仍是终局**（见本文件头的说明）。
+    */
+    ...afterSaleFieldsOf(o),
+    /*
+      陈述时限（双方举证窗口；`MK_DISPUTE_STATEMENT_DAYS`，0 = 关闭）的**举证截止时刻**——
+      **唯一出处**是 evidenceFiles.statementFieldsOf（与门控同一份窗口计算）：
+      `statementDeadlineAt`（unix ms）**null = 未开启该规则**（配置关闭 / 此刻没有争议也没有在途案件），
+      不是"已过期"；已过期由 `deadlineAt <= now` 表达。前端契约在
+      `frontend/src/types.ts`（Order.statementDeadlineAt）与 `utils/statementDeadline.ts`（倒计时 + 提交门），
+      两端的阶段作用域（只有争议陈述与售后陈述受约束）与起算点完全同源。
+      界面据此显示"还能举证多久"，不必自己拿 updated_at 再算一遍（那样必然与门控漂移）。
+    */
+    ...statementFieldsOf(o),
     feeBps: o.fee_bps || 0,
     /**
      * 链上**创建订单时**的平台费收取方快照（小写；'' = 未补录/未知 → null）。
@@ -895,41 +977,11 @@ router.get('/', wrap(async (req, res) => {
   ok(res, { orders, total, page, pageSize });
 }));
 
-/** 店主待处理计数（卖家面板徽标：待发货/退款待处理/争议中等；单表聚合毫秒级） */
+/** 店主待处理计数（卖家面板徽标：待发货/退款待处理/争议中等）。
+ *  **谓词与实现在 opsMetrics.sellerTodoCounts（唯一实现）**：运营读数端点 `/api/shop/metrics`
+ *  读的是同一份——徽标与指标各写一遍 SQL 必然漂移（徽标说 3 单、列表翻出 4 单）。 */
 router.get('/seller/status-counts', staffOnly, wrap(async (req, res) => {
-  const db = getDb();
-  const rows = db.prepare('SELECT status, COUNT(*) AS c FROM orders GROUP BY status').all();
-  const byStatus = Object.fromEntries(rows.map((r) => [r.status, r.c]));
-  // 待处理退款：与 /seller?refund=requested 筛选用同一谓词（跨 escrowed/shipped/disputed——
-  // 此前漏 disputed 使徽标数 < 列表行数）
-  const pendingRefund = db
-    .prepare(`SELECT COUNT(*) AS c FROM orders WHERE refund_status = 'requested' AND status IN ${ACTIVE_IN}`)
-    .get().c;
-  // 可发货：escrowed 且有链上支付凭证（无凭证异常行不计入"待发货"——需先同步/取消）；
-  // 退款冻结行不可发（/ship、batch-ship 均拒）——此前计入造成徽标虚高
-  const shipReady = db
-    .prepare("SELECT COUNT(*) AS c FROM orders WHERE status = 'escrowed' AND paid_tx_hash IS NOT NULL AND refund_status != 'requested'")
-    .get().c;
-  const pendingDispute = byStatus.disputed || 0;
-  // P 评审扩展（卖家待办聚合）：退货回收 / 待回复评价 / 低库存
-  const pendingReturns = db.prepare("SELECT COUNT(*) AS c FROM order_returns WHERE status IN ('open','shipped')").get().c;
-  const returnsToConfirm = db.prepare("SELECT COUNT(*) AS c FROM order_returns WHERE status = 'shipped'").get().c;
-  const pendingReviewReply = db
-    .prepare(
-      "SELECT COUNT(*) AS c FROM reviews r JOIN orders o ON o.id = r.order_id WHERE r.reply_content = '' AND o.status IN ('confirmed','settled','expired')"
-    )
-    .get().c;
-  // 低库存按「商品」计数：任一组合余量 ≤ 商品级阈值即计入（卖家务必要一并看那些组合）
-  const lowStockProducts = db
-    .prepare(
-      `SELECT COUNT(DISTINCT s.product_id) AS c
-         FROM product_skus s
-         JOIN products p ON p.id = s.product_id
-        WHERE s.capacity IS NOT NULL AND p.stock_alert_at IS NOT NULL
-          AND (s.capacity - s.committed) <= p.stock_alert_at`
-    )
-    .get().c;
-  ok(res, { byStatus, shipReady, pendingRefund, pendingDispute, pendingReturns, returnsToConfirm, pendingReviewReply, lowStockProducts });
+  ok(res, sellerTodoCounts());
 }));
 
 /** 店主批量发货（P1-②：实物同物流单号；仅 physical ∧ escrowed ∧ 有凭证 ∧ 非退款冻结）。
@@ -941,6 +993,9 @@ router.post('/seller/batch-ship', staffOnly, wrap(async (req, res) => {
   // 超限直接拒绝而非静默截断——跨页勾选 >50 时截断会让卖家误以为全部已发（卖家侧审计 ①）
   if (ids.length > 50) return fail(res, `单次批量发货最多 50 单（当前勾选 ${ids.length} 单）：请减少勾选后分批提交`);
   const trackingNo = String(req.body?.trackingNo ?? '').trim().slice(0, 100);
+  // 承运方名称：与单笔发货**同一归一**（src/shipping.js）——批量勾选的通常是同一家承运，
+  // 所以整批写同一个值；留空同样落 NULL（未填），不留空串
+  const carrier = normalizeCarrier(req.body?.carrier);
   // 空单号允许（= 自提/线下交付，与单发 POST /:id/ship 同口径，复查批2发现此前硬拒与 UI
   //「可留空表示自提/线下交付」矛盾）；写空串 + shipped_at 发货标记维持已交付判定
 
@@ -970,11 +1025,11 @@ router.post('/seller/batch-ship', staffOnly, wrap(async (req, res) => {
   if (okIds.length) {
     const now = Date.now();
     const upMarks = okIds.map(() => '?').join(',');
-    db.prepare(`UPDATE orders SET status = 'shipped', tracking_no = ?, shipped_at = ?, updated_at = ? WHERE id IN (${upMarks}) AND status = 'escrowed'`)
-      .run(trackingNo, now, now, ...okIds);
+    db.prepare(`UPDATE orders SET status = 'shipped', tracking_no = ?, carrier = ?, shipped_at = ?, updated_at = ? WHERE id IN (${upMarks}) AND status = 'escrowed'`)
+      .run(trackingNo, carrier, now, now, ...okIds);
     for (const id of okIds) notify('order.shipped', id); // 逐单通知（P0-3 语义）
   }
-  audit(req, 'order.batch_ship', 'order', okIds.join(',') || '-', { shipped: okIds.length, failed: failed.length });
+  audit(req, 'order.batch_ship', 'order', okIds.join(',') || '-', { shipped: okIds.length, failed: failed.length, carrierFilled: !!carrier });
   ok(res, { shipped: okIds, failed }, okIds.length ? `已批量发货 ${okIds.length} 单` : '无符合批量发货条件的订单');
 }));
 
@@ -1005,6 +1060,18 @@ router.get('/seller', staffOnly, wrap(async (req, res) => {
       能由店主表态的只有 escrowed / shipped / disputed 这三种状态。
     */
     if (r === 'requested') where += ` AND status IN ${ACTIVE_IN}`;
+  }
+  /*
+    售后案件维度筛选（确认收货后开的案）：afterSale=open 直达"在途案件"视图，closed 查历史。
+    为什么必须有：徽标（status-counts 的 pendingAfterSale）只告诉店主"有几单"，
+    而这些单的 status 是**终局**（settled/confirmed/expired）——按状态筛选永远找不到它们
+    （案子不改订单状态，见 src/afterSale.js）。没有这个筛选，徽标上的数字就没有可点进去的入口。
+    谓词与徽标/仲裁队列/退货窗口/证据门控**同一处**（AFTER_SALE_OPEN_SQL / 同一列语义）。
+  */
+  if (req.query.afterSale) {
+    const a = String(req.query.afterSale);
+    if (!['open', 'closed'].includes(a)) return fail(res, 'afterSale 需为 open / closed');
+    where += a === 'open' ? ` AND ${AFTER_SALE_OPEN_SQL}` : " AND after_sale_status = 'closed'";
   }
   // 卖家检索买家来询时按地址/单号/商品无从查起——q 走买家地址精确/
   // 本地单号前缀/商品标题·slug 模糊；SQLite LIKE 对 UUID 前缀查询足够）
@@ -1161,7 +1228,11 @@ router.get('/:id', wrap(async (req, res) => {
     else if (isStaff(auth.address)) as = 'owner';
     // 争议裁决证据开放：仅 disputed 单对仲裁人开码（正常在途单的交付码不属于裁决证据，
     // 仲裁人无查看必要——收紧隐私面；配置/RPC 失败则 null，不开放）
-    else if (order.status === 'disputed' && auth.address === (await getArbiterAddress())) as = 'arbiter';
+    // + 确认收货后的**售后案件**同样对仲裁人开放：案件由仲裁人结案、罚没（Staking.penalize）
+    //   的资格门槛就是"案件在链上处于开启状态"，他必须能看到双方的 after_sale 陈述与附件才谈得上裁决；
+    //   这类单的 status 是终局（settled/confirmed/expired），所以判据只能看案件在途标记
+    //   （与附件下载端点 routes/evidenceFiles.js 的同一道判据共用 isAfterSaleOpen）。
+    else if ((order.status === 'disputed' || isAfterSaleOpen(order)) && auth.address === (await getArbiterAddress())) as = 'arbiter';
   }
   const body = { ...orderToPublic(order, { as }), poolEmpty: isPoolEmpty(order) };
   // 售后/争议陈述（dispute_evidence 时间线）：当事人（买家/店主）与争议裁决人（arbiter）可见，
@@ -1326,8 +1397,11 @@ router.post('/:id/paid', requireAuth, paidLimiter, wrap(async (req, res) => {
   // 订单级 feeBps + 已退金额 + **创建时收取方**快照补录（链上 getOrder 权威；供收款流水净额/退款口径。
   // 合约按 `feeCollectorAtCreate` 决定这单扣不扣费（详见 src/fees.js），故两列必须同批落库——
   // 只写 fee_bps 会让账本退回全局口径，与这单的链上事实可能相反。
-  // RPC 失败静默——费率默认 0、已退默认 '0'、收取方默认 ''（未知，账本退回保守口径），
-  // 且 watcher/sync 路径会再补）
+  //
+  // 补录失败**不改控制流**（链上那笔钱已经锁在托管里，这里绝不能变成 500 把买家拦在"托管已确认"
+  // 之外），但也**不再完全静默**（2026-10）：读不到链上 getOrder 时这几列会留在默认值上
+  //（fee_bps=0、refunded_amount_wei='0'、fee_collector_at_create=''=未知），本单的口径因此
+  // 退回保守默认，直到 watcher/sync 路径再补——这件事必须留下一条可查的痕。
   try {
     const onchain = await fetchOnchainOrder(order.escrow_order_id);
     const snap = feeSnapshotOf(onchain);
@@ -1337,8 +1411,12 @@ router.post('/:id/paid', requireAuth, paidLimiter, wrap(async (req, res) => {
       String(onchain.refundedAmount || '0'),
       order.id
     );
-  } catch {
-    /* 忽略：fee_bps 默认 0、refunded_amount_wei 默认 '0'、fee_collector_at_create 默认 ''（未知） */
+  } catch (e) {
+    console.warn(
+      `[paid] 链上补录失败（order=${order.id} escrowOrderId=${String(order.escrow_order_id).slice(0, 18)}…）：${e?.message || e}——` +
+        `本单的 fee_bps/refunded_amount_wei/fee_collector_at_create 仍是默认值（口径退回保守默认），` +
+        `订单状态不受影响；后续由 escrowWatcher / POST /:id/sync 补录`
+    );
   }
   // 卡密自动交付：数字商品且码池有未用码 → 自动发码置 shipped（买家立即可见兑换码）。
   // 通知顺序：escrowed（托管成功）先于 shipped（自动交付）——与 watcher 路径一致。
@@ -1469,7 +1547,7 @@ router.post('/:id/ship', staffOnly, wrap(async (req, res) => {
       audit(req, 'order.ship', 'order', order.id, { kind: 'digital', manual: true });
       ok(
         res,
-        { id: order.id, status: 'shipped', deliveries: r.codes.map((c) => ({ kind: 'code', value: c })), trackingNo: null },
+        { id: order.id, status: 'shipped', deliveries: r.codes.map((c) => ({ kind: 'code', value: c })), trackingNo: null, carrier: null },
         '已交付（兑换码已发送给买家）'
       );
       return;
@@ -1486,26 +1564,28 @@ router.post('/:id/ship', staffOnly, wrap(async (req, res) => {
     audit(req, 'order.ship', 'order', order.id, { kind: 'digital', pool: true });
     ok(
       res,
-      { id: order.id, status: 'shipped', deliveries: r.codes.map((c) => ({ kind: 'code', value: c })), trackingNo: null },
+      { id: order.id, status: 'shipped', deliveries: r.codes.map((c) => ({ kind: 'code', value: c })), trackingNo: null, carrier: null },
       '已发货：兑换码已从码池分配并发送给买家'
     );
     return;
   }
 
-  // 实物：记录物流单号（数量见订单 quantity）。条件更新（status + 凭证不变量双守卫）：
+  // 实物：记录物流单号与承运方名称（数量见订单 quantity）。条件更新（status + 凭证不变量双守卫）：
   // 与数字/NFT/批量发货同规约——防并发/多进程下对已迁出 escrowed 的行误写
   const trackingNo = String(req.body?.trackingNo || '').slice(0, 100);
+  // 承运方名称的归一（trim/控制字符/上限/空串→null）只有一处实现，见 src/shipping.js
+  const carrier = normalizeCarrier(req.body?.carrier);
   const moved = db
     .prepare(
-      "UPDATE orders SET status = 'shipped', tracking_no = ?, shipped_at = ?, updated_at = ? WHERE id = ? AND status = 'escrowed' AND paid_tx_hash IS NOT NULL"
+      "UPDATE orders SET status = 'shipped', tracking_no = ?, carrier = ?, shipped_at = ?, updated_at = ? WHERE id = ? AND status = 'escrowed' AND paid_tx_hash IS NOT NULL"
     )
-    .run(trackingNo, now, now, order.id);
+    .run(trackingNo, carrier, now, now, order.id);
   if (moved.changes !== 1) {
     return fail(res, `当前状态(${order.status})不可发货，需买家托管成功`);
   }
   notify('order.shipped', order.id); // 卖家通知：实物发货
-  audit(req, 'order.ship', 'order', order.id, { kind: 'physical', trackingNo });
-  ok(res, { id: order.id, status: 'shipped', trackingNo, deliveries: [] }, '已标记发货');
+  audit(req, 'order.ship', 'order', order.id, { kind: 'physical', trackingNo, carrierFilled: !!carrier });
+  ok(res, { id: order.id, status: 'shipped', trackingNo, carrier, deliveries: [] }, '已标记发货');
 }));
 
 /**
@@ -1992,6 +2072,36 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
     } catch {
       /* 见上：读不到就保持本地原值（不写 '0'，那会抹掉面板上一条有效授权） */
     }
+    /*
+      确认收货后的**售后案件**按链上真值回填（契约 2026-10 第二批）。
+
+      为什么必须在这里：售后案件由 AfterSaleOpened/Closed 事件回写，而事件漏扫（节点停机跨过扫描窗口、
+      RPC 抖动、事件被隔离清单跳过）时，本地会与链上永久分叉，两个方向的后果都不轻：
+        · 链上有案件、本地 none ⇒ 仲裁台队列里看不到这一单（买家开了案却没人处理）、
+          售后陈述提交被门控拒掉、退货单建不了——买家的救济路径整条静默失效；
+        · 链上已结案、本地 open ⇒ 队列永远挂着一条幽灵待办，店主反复看到"可能被罚没"。
+      人工 sync 是这两条分叉的即时补救入口（后台对账是自动兜底，见 chainReconcile）。
+
+      口径与 watcher/对账**同源**：读数走 chainOrder.fetchAfterSaleCase（与对账同一个读取器），
+      落列走 afterSale.applyAfterSaleFromChain（唯一写入口）。刻意只做这两件事：
+      不迁移 orders.status（案件不改变资金口径）、不动 updated_at（那是入账窗口锚点）。
+      读不到（RPC 抖动/合约未升级）时**不阻断同步**：保持本地原值，watcher/对账还会再补。
+      已知信息损失（如实写明）：链上只读视图里**没有**结案说明，所以这条路径关案时 note 为 null，
+      要拿到说明只能等 AfterSaleClosed 事件。
+      ⚠️ 必须在任何 txBegin 之前 await（事务区段内不得 await，见 db.js 的事务原语说明）。
+    */
+    try {
+      const truth = await fetchAfterSaleCase(order.escrow_order_id);
+      const applied = applyAfterSaleFromChain(order.escrow_order_id, truth);
+      // 人工/对账改的是**镜像列**而不是链上事件，故不写进链上事件史，只留一条服务端日志
+      if (applied.changed > 0) {
+        console.warn(
+          `[orders] /sync 按链上真值回填售后案件：order=${order.id.slice(0, 8)}… → ${applied.to}（事件漏扫兜底）`
+        );
+      }
+    } catch {
+      /* 见上：读不到就保持本地原值（watcher 事件/后台对账仍会补） */
+    }
   }
   // 同步前状态（用于回报「是否真的发生了迁移」——源码审计 2026-09：此前无论是否变更
   // 都回「已按链上状态同步」，本地 cancelled 遇到链上 Disputed 这类 from 集未覆盖的组合
@@ -1999,7 +2109,14 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
   const statusBeforeSync = String(order.status || '');
   // 本地锁定的托管额（终局映射的比对基准；与链上 amount 比对过，见上方"防伪托管"段）
   const localAmountWei = String(order.amount_wei || '0');
-  const chainRefundedWei = String(onchain.refundedAmount || '0');
+  /*
+    链上已退金额：`'0'` 是"确证为 0"，**读不到是"不知道"**——两者不能先用 `|| '0'` 抹平
+    （2026-10 生产化清理）：把"不知道"写成 0 等于替链上说了一句它没说过的话（"没退过款"），
+    账目记反且不可逆，而且事后两边同错、对账自证一致。读不到时下面既不判终态含义、
+    也不改动账本金额，并在响应里说明。
+  */
+  const chainRefunded = readRefundedWei(onchain.refundedAmount); // bigint | null
+  const chainRefundedWei = chainRefunded === null ? null : chainRefunded.toString();
   switch (onchain.status) {
     case 'Created': {
       // 误取消/草稿超时被关闭（cancelled）的单若链上确有托管（已支付未回写），
@@ -2115,9 +2232,12 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
           appendSyncMirrorEvent(order.id, settledTarget, { block: onchain.createdAtBlock });
         }
         // 拆分结算的已退金额按链上真值回填（链上 Settled 也可能是「仲裁拆分：部分退款 +
-        // 部分结算」，refundedAmount 是账本净额/退款口径的唯一依据；未退款时写入 0 幂等）
-        db.prepare('UPDATE orders SET refunded_amount_wei = ? WHERE escrow_order_id = ?')
-          .run(chainRefundedWei, order.escrow_order_id);
+        // 部分结算」，refundedAmount 是账本净额/退款口径的唯一依据；未退款时写入 0 幂等）。
+        // **读不到就不写**：拿 0 覆盖等于把"不知道"写成"没退过款"，而这一列是账本净额的唯一依据。
+        if (chainRefundedWei !== null) {
+          db.prepare('UPDATE orders SET refunded_amount_wei = ? WHERE escrow_order_id = ?')
+            .run(chainRefundedWei, order.escrow_order_id);
+        }
         // D1：成交终局但退货已确认收货/放弃追索（received_at 非空，货已实际回到卖家侧可再售）→
         // 占位回补（watcher 同规则；本行幂等，sync 重复触发不二次扣减，见 releaseHoldsForReturnReceived）
         releaseHoldsForReturnReceived(order.escrow_order_id);
@@ -2153,9 +2273,12 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
           releaseRefundedEscrow(order.escrow_order_id);
           appendSyncMirrorEvent(order.id, refundedTarget, { block: onchain.createdAtBlock });
         }
-        // 已退金额按链上真值回填（全额退款时 = amount；仍有退款则账本据此扣减）
-        db.prepare('UPDATE orders SET refunded_amount_wei = ? WHERE escrow_order_id = ?')
-          .run(chainRefundedWei, order.escrow_order_id);
+        // 已退金额按链上真值回填（全额退款时 = amount；仍有退款则账本据此扣减）。
+        // 同上：**读不到就不写**，绝不用 0 冒充"链上确证没退过款"。
+        if (chainRefundedWei !== null) {
+          db.prepare('UPDATE orders SET refunded_amount_wei = ? WHERE escrow_order_id = ?')
+            .run(chainRefundedWei, order.escrow_order_id);
+        }
         // 终态：售后标记回 none（订单状态已表达退款结果，陈述时间线仍在 evidence 中可溯）
         db.prepare("UPDATE orders SET refund_status = 'none' WHERE escrow_order_id = ? AND refund_status != 'none'")
           .run(order.escrow_order_id);
@@ -2182,9 +2305,12 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
   ok(
     res,
     orderToPublic(findOrder(order.id), { as: req.auth.address === order.buyer ? 'buyer' : 'owner' }),
-    syncMoved
+    (syncMoved
       ? `已按链上状态同步（${statusBeforeSync} → ${statusAfterSync}）`
-      : `本地状态与链上一致（当前 ${statusAfterSync}）——本次无需变更`
+      : `本地状态与链上一致（当前 ${statusAfterSync}）——本次无需变更`) +
+      (chainRefundedWei === null
+        ? '；但链上"已退买家金额"这次没读到，账本金额**未被改动**（下次同步/对账会补）'
+        : '')
   );
 }));
 

@@ -274,6 +274,19 @@ export function typeForChainEvent(name, args = {}) {
       return 'refund.rejected';
     case 'RefundApproved':
       return 'order.refunded';
+    /*
+      确认收货后的售后案件（契约 2026-10 第二批）：**必须通知店主**——它不是"什么都没发生"的事件。
+      买家在确认收货之后开案，意味着这笔已结清的钱可能被仲裁人从**卖家保证金**里罚没给买家
+      （Staking.penalize 的资格门槛正是"本案在链上处于开启状态"），店主需要知道并去处理
+      （线下换货/转账和解，或等仲裁）。与 PartialRefundAccepted 的区别正在于此：那个只是挂一个
+      可选数字，这个改变的是"店主必须处理的事"。
+      结案同样通知：案件从"可能被罚没"变成"已了结"，店主面板上的待办要能收敛。
+      payload 走 buildPayload 的字段白名单（不含结案说明与收货信息），说明请到订单详情看。
+    */
+    case 'AfterSaleOpened':
+      return 'order.after_sale_opened';
+    case 'AfterSaleClosed':
+      return 'order.after_sale_closed';
     default:
       return null;
   }

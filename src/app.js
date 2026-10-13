@@ -75,9 +75,12 @@ export function createApp() {
       **仲裁面也必须在列**（源码评审 2026-09 补）：`/api/arbitration/pending` 是**匿名可读**的
       （仲裁台要不登录就能看到待办队列），而它含**完整买卖双方地址**与争议要素——
       既不在公开可缓存白名单里，也没有 no-store，等于把"要不要缓存"交给了中间层的默认行为。
+      **运营三端点同样在列**（2026-10）：`/api/shop/buyer-signal`（某买家在本店的退款/争议历史）、
+      `/metrics`、`/sla` 都是 ownerOnly 的经营数据——默认无 Cache-Control 就等于交给中间层，
+      而这三个端点的响应里带着"谁在这家店退过款、哪些单压着没发"。
     */
     if (
-      /^\/(api\/orders|api\/shop\/settings|api\/shop\/orders|api\/shop\/retention|api\/auth|api\/shop\/export|api\/shop\/audit|api\/shop\/stats|api\/orders\/seller|api\/products\/all|api\/products\/[^/]+\/codes|api\/products\/[^/]+\/tokens|api\/arbitration)(\/|$)/.test(
+      /^\/(api\/orders|api\/shop\/(settings|orders|retention|export|audit|stats|metrics|sla|buyer-signal)|api\/auth|api\/products\/all|api\/products\/[^/]+\/(codes|tokens)|api\/arbitration)(\/|$)/.test(
         req.path || ''
       )
     ) {

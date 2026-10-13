@@ -34,12 +34,18 @@ router.post('/:id/return', staffOnly, wrap(async (req, res) => {
   ok(res, returnToPublic(r.data), r.data.status === 'open' && r.data.created_at >= Date.now() - 5000 ? '退货单已创建' : '退货单已存在');
 }));
 
-/** 买家回填退回物流单号 */
+/** 买家回填退回物流单号（可带承运方名称；归一与上限见 src/returns.js → src/shipping.js） */
 router.post('/:id/return/tracking', requireAuth, wrap(async (req, res) => {
   const order = findOrder(req.params.id);
   if (!order) return fail(res, '订单不存在', 404, 404);
   const returnRow = getDb().prepare('SELECT * FROM order_returns WHERE order_id = ?').get(order.id);
-  const r = setReturnTracking({ order, returnRow, buyer: req.auth.address, trackingNo: req.body?.trackingNo });
+  const r = setReturnTracking({
+    order,
+    returnRow,
+    buyer: req.auth.address,
+    trackingNo: req.body?.trackingNo,
+    carrier: req.body?.carrier,
+  });
   if (r.error) return fail(res, r.error, r.forbidden ? 403 : 1, r.forbidden ? 403 : 200);
   ok(res, returnToPublic(r.data), '已记录退回物流单号');
 }));

@@ -15,7 +15,8 @@
  * 说明：better-sqlite3 需要 node-gyp 编译，为"人人可部署"目标改用
  * Node 内置 sqlite；所有 API 均同步执行（内置驱动 API 特性）。
  * 建表策略：**全新项目、无线上数据，不做任何兼容/迁移** —— 直接建最终结构；
- * 表结构变更后删库重建即可（演示库用 node scripts/dev-seed-demo.mjs 重新生成）。
+ * 表结构变更后删库重建即可（演示用的假店/假商品夹具不属于节点包，由本地开发脚本单独生成，
+ * 店主部署时不需要它们）。
  */
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
@@ -63,6 +64,16 @@ function migrate(d) {
       nft_contract  TEXT NOT NULL DEFAULT '',          -- NFT 合约地址（kind='nft' 必填，小写）
       nft_standard  TEXT NOT NULL DEFAULT 'erc721' CHECK (nft_standard IN ('erc721','erc1155')), -- NFT 标准（交付核验按此选择事件签名；ERC721A 用 erc721）
       specs         TEXT NOT NULL DEFAULT '[]',       -- 规格定义 JSON：[{ name, options[] }]；空数组=无规格（此时 product_skus 只有一条 sku_key='' 的默认组合）
+      tags          TEXT NOT NULL DEFAULT '[]',       -- 商品标签（类目）JSON 数组，元素是**展示形**（店主写入时的大小写原样，
+                                                      -- 只做清洗：去控制/零宽字符、空白折叠、trim；见 src/tags.js）。
+                                                      -- 空数组 = 无标签（**不是 NULL**：标签本来就是可选项，DTO 契约恒为数组）。
+                                                      -- 为什么下发展示形而库里另存一份键：索引镜像 product_tags 用
+                                                      -- tag_key 保证"RTX 与 rtx 是同一个标签"（唯一性），本列则保证
+                                                      -- 买家看到的是店主写的那个写法（体验）。两处同批写入。
+                                                      -- 为什么不入快照：标签是**检索维度**，不改变交付物/价格/限制，而快照契约是
+                                                      -- node↔frontend 的跨语言键序对拍（见 routes/products.js 文件头），为一个检索
+                                                      -- 字段动它就得前端同批改键位。代价（如实写）：店主可事后改标签而买家手上的
+                                                      -- 快照哈希不变——这是刻意的，标签不影响"买到的是什么"。
       snapshot_hash TEXT NOT NULL,                    -- 商品快照 keccak256（前端可校验）
       auto_deliver  INTEGER NOT NULL DEFAULT -1 CHECK (auto_deliver IN (-1,0,1)), -- 数字商品自动交付：-1 跟随全局 MK_AUTO_DELIVER / 0 关 / 1 开（不入快照）
       stock_alert_at INTEGER,                         -- 低库存提醒阈值（余量 ≤ 阈值时卖家面板警示；NULL=不提醒）
@@ -94,6 +105,11 @@ function migrate(d) {
                     CHECK (status IN ('draft','escrowed','shipped','confirmed','disputed','settled','refunded','expired','cancelled')),
       escrow_order_id TEXT,                           -- 链上 Escrow 订单 ID（keccak256 hex，含 UUID 唯一，一单一号）
       tracking_no   TEXT,                             -- 物流单号（physical 商品，单值）
+      carrier       TEXT,                             -- **承运方名称**（physical 商品；店主在发货时填，可空）
+                                                       -- 为什么单列一列：只有运单号时"拼查询链接"只能靠单号前缀猜，
+                                                       -- 中通/圆通/申通/韵达这类**纯数字单号完全猜不出**（前端 utils/shipTrack
+                                                       -- 的判据正是"名称优先、号段其次"）。NULL = 店主没填，**不是空串、也不是"其他"**
+                                                       -- （三态纪律：没填就是没有这个事实）。归一/上限见 src/shipping.js（唯一实现）
       shipped_at    INTEGER,                          -- 发货标记时刻（任意交付形态首次落 shipped/交付行时写入；
                                                        -- 与 tracking_no/交付行共同构成「已交付事实」证据——自提/线下
                                                        -- 交付（空单号发货）也须据此判已交付，防退款/超时误回补占位）
@@ -123,6 +139,28 @@ function migrate(d) {
                                                        -- 为什么必须有这一列：合约 2026-09 起 approveRefund 只接受「全额」或「买家精确授权过的那个数」，
                                                        -- 卖家 UI 必须先知道"买家授权了多少"才能给出一个链上真的会接受的金额；否则店主只能拿
                                                        -- RefundAmountNotAccepted 那条晦涩的 revert 去试错（且他无从知道该填多少）
+      /*
+        确认收货后的**售后案件**（契约 2026-10 第二批：Escrow.openAfterSale/closeAfterSale）。
+
+        为什么是**叠加在终局之上的第二层**，而不是又一个 orders.status：
+        链上那笔托管在该单终局时就已经结清（钱判给卖家或已退买家），售后案件**不动任何托管资金**，
+        补偿只能来自卖家保证金（Staking.penalize）或卖家线下转账，也因此**不阻塞卖家撤资**
+        （撤资闸只看 Escrow.sellerOpenCases，售后案件不计入）。链上事实源是
+        afterSaleOpenedAtBlock(orderId) —— Escrow.Order.status 全程停在 Settled。
+        所以这里用独立列表达"这一个终局单上有没有在途案件"，orders.status 仍旧是 confirmed/settled/
+        expired（谁把它改写成 disputed 就等于把一笔已结清的钱重新拉回在途：流水窗口、库存占位、
+        发货闸、争议队列全都会跟着错）。语义与写入口的唯一实现在 src/afterSale.js。
+
+        代价（如实写）：多一层状态就多一处必须同步的镜像——事件（watcher）、人工 /sync、
+        后台对账三条路径都写这几列，判据同源（src/afterSale.js），见 docs/ARCHITECTURE.md 的事件表。
+      */
+      after_sale_status TEXT NOT NULL DEFAULT 'none'
+                    CHECK (after_sale_status IN ('none','open','closed')), -- none=从未开案 / open=在途案件 / closed=已结案（可再开新案）
+      after_sale_opened_at INTEGER,                   -- 开案时刻（事件落库时刻 unix ms；又=仲裁队列"最久等待"的起点）
+      after_sale_opened_block INTEGER,                -- 开案区块（链上 afterSaleOpenedAtBlock 的镜像；重开案会覆盖）
+      after_sale_closed_at INTEGER,                   -- 结案时刻（unix ms）
+      after_sale_note   TEXT,                         -- 结案说明（链上 AfterSaleClosed 的用户文本，写入口截断到 500 字符；
+                                                       -- 仅作 JSON 字段下发，前端必须按**纯文本**渲染——节点不做 HTML 转义）
       paid_tx_hash  TEXT,                             -- 买家托管支付交易哈希（paid 确认时写入）
       onchain_events TEXT,                            -- 链上事件史 JSON [{name,txHash,block,at}]（watcher 回写时 append）
       pii_erased_at INTEGER,                          -- **PII 擦除锚点**（2026-09 复审新增）：保留期扫描按
@@ -142,8 +180,10 @@ function migrate(d) {
         宿主机时钟向前跳（NTP step / 快照恢复 / 手改时间）会让所有在途草稿瞬间"看起来早就过期"，
         于是买家正在付款的单子被取消、限量占位被提前回补 ⇒ 同一件货可以再卖一次（超卖）。
         有了这两列，**同一次运行内**创建的草稿可以用单调年龄精确判定（墙钟怎么跳都不影响）；
-        created_boot 与当前进程不同的行（上一次运行留下的、或旧版本写的空值）没有可用的单调
-        读数，只能退回 created_at 的墙钟比较——这是本机制唯一照不到的角落，已在清扫器里写明。
+        created_boot 与当前进程不同的行（上一次运行留下的、或旧版本写的空值）**不再退回墙钟比较**
+        （2026-10 生产化清理）：墙钟在两次运行之间同样可能跳变，按它判"过期"会误关正在付款的草稿。
+        现在改用**可证明的年龄下界** = 本进程已运行的单调时长（够 TTL 才扫，不够就跳过并告警）——
+        代价是同一批遗留行最多晚一个 TTL 收敛，已在清扫器文件头写明。
         （本段注释刻意不用反引号：它整块位于 db.exec 的模板字符串里，反引号会提前结束模板。）
       */
       created_boot  TEXT NOT NULL DEFAULT '',
@@ -158,6 +198,9 @@ function migrate(d) {
     CREATE INDEX IF NOT EXISTS idx_orders_product ON orders(product_id, status);
     -- 保留期扫描索引：候选/排序都走 COALESCE(pii_erased_at, updated_at)（见 piiErase.runPiiRetention）
     CREATE INDEX IF NOT EXISTS idx_orders_pii_anchor ON orders(pii_erased_at, updated_at);
+    -- 售后案件（在途队列 + 对账复查）索引：仲裁台列表、退货单窗口、保留期保护、对账轮转都按它过滤。
+    -- 部分索引（只收非 none 的行）：绝大多数订单从未开案，索引应当只为真正有案件的行付费。
+    CREATE INDEX IF NOT EXISTS idx_orders_after_sale ON orders(after_sale_status, after_sale_opened_at) WHERE after_sale_status != 'none';
     -- 支付交易哈希唯一：同一笔链上支付只能确认一个订单（对应用层预检的最终兜底）。
     -- BTY EVM 交易存在 Chain33TxId/EvmTxId 双哈希（落库统一取收据/日志规范哈希），部分索引：未支付单不受约束。
     CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_paid_tx ON orders(paid_tx_hash) WHERE paid_tx_hash IS NOT NULL AND paid_tx_hash != '';
@@ -183,12 +226,13 @@ function migrate(d) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_nft_tx_value
       ON order_delivery_items(tx_hash, value) WHERE tx_hash IS NOT NULL AND kind = 'nft';
 
-    -- 售后证据（v2 两级流程）：买家退款理由 / 卖家回复 / 仲裁阶段双方陈述，仲裁人裁决证据面
+    -- 售后证据（v2 两级流程 + 确认收货后的售后案件）：买家退款理由 / 卖家回复 / 仲裁阶段双方陈述 /
+    -- 售后陈述（phase='after_sale'，仅在 after_sale_status='open' 期间受理），仲裁人裁决证据面
     CREATE TABLE IF NOT EXISTS dispute_evidence (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       order_id      TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
       role          TEXT NOT NULL CHECK (role IN ('buyer','seller')),
-      phase         TEXT NOT NULL CHECK (phase IN ('refund_request','refund_reply','arbitration')),
+      phase         TEXT NOT NULL CHECK (phase IN ('refund_request','refund_reply','arbitration','after_sale')),
       content       TEXT NOT NULL,
       created_at    INTEGER NOT NULL
     );
@@ -250,10 +294,33 @@ function migrate(d) {
       address       TEXT NOT NULL DEFAULT '',     -- 退货收货地址（卖家填，买家可见）
       note          TEXT NOT NULL DEFAULT '',     -- 退货说明/规则（≤1000）
       tracking_no   TEXT,                         -- 买家回填退回物流单号（≤100）
+      carrier       TEXT,                         -- 买家回填退回承运方名称（可空；NULL = 未填，口径与 orders.carrier 同源，
+                                                  -- 归一在 src/shipping.js——同一条路不留半条）
       created_at    INTEGER NOT NULL,
       updated_at    INTEGER NOT NULL,
       received_at   INTEGER                       -- 卖家确认收到时刻（占位释放凭据）
     );
+
+    -- 商品标签的**镜像行**（一行一标签）：与 products.tags 是同一份事实的两种形状——
+    -- products.tags（JSON 数组，**展示形**）供 DTO 直接下发；本表供"按标签精确筛选"（键匹配 + 索引）
+    -- 与"在库标签聚合"（GROUP BY 键），避免对 title/description 做全表 LIKE。两者**同批写入**
+    -- （唯一写入点见 routes/products.js 的 saveTags，紧随 products 行之后）。
+    --
+    -- 为什么键与展示形**分两列**（而不是只存一种）：
+    --   · tag_key（规范形，ASCII 折小写、去控制/零宽、空白折叠）是**身份**——"=" 匹配、唯一索引、
+    --     GROUP BY 全认它，所以"大小写只差一点的两个标签"在库里**不可表达**（不会出现 RTX 与 rtx 两行）；
+    --   · tag_display 是店主**写入时的原样**（只清洗、不折大小写）——对外展示用它，
+    --     否则 RTX 5090 会显示成 rtx 5090（商城浏览里这是可见的体验缺陷）。
+    -- 一个键下可以有多种展示形（不同商品各写各的），对外展示用哪一种由**查询期**规则决定：
+    -- 出现次数最多的写法优先、并列取字典序最小者（见 routes/products.js 的 GET /api/products/tags）。
+    CREATE TABLE IF NOT EXISTS product_tags (
+      product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      tag_key     TEXT NOT NULL,   -- 规范形（匹配/去重/唯一/GROUP BY 只认它；唯一实现在 src/tags.js）
+      tag_display TEXT NOT NULL,   -- 展示形（写入时原样，不折大小写）
+      PRIMARY KEY (product_id, tag_key)
+    );
+    -- 按标签筛选走它（key → product_id）；聚合（GROUP BY tag_key）也能用同一索引的前缀。
+    CREATE INDEX IF NOT EXISTS idx_product_tags_key ON product_tags(tag_key, product_id);
 
     CREATE TABLE IF NOT EXISTS product_skus (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -314,6 +381,41 @@ function migrate(d) {
       updated_at    INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_reviews_product ON reviews(product_id, created_at DESC);
+
+    /*
+      店铺身份自主声明（shop claim）：店主用钱包**对一段规范消息签名**，把外部身份
+      （domain / github / x / telegram）绑定到店铺地址上。
+
+      为什么单独一张表而不是塞进 kv：一个店主可以同时声明多个身份（域名 + GitHub + X + Telegram），
+      且每条声明都要能**单独撤销**、单独列出、单独离线核验——kv 只有"一个键一个值"，
+      表达不了"多条、可撤销、每条带签名与时间"。
+
+      code（店铺编号）解决"唯一"，不解决"哪个才是官方那家"：编号本身不带任何外部身份信息。
+      本表存的是**可离线核验的声明**：第三方拿 message + signature 重算一次
+      ethers.verifyMessage(message, signature)，与 address（以及 message 内的 operator 行）比对即可，
+      **不需要信任节点**。节点只做存储与转发。
+
+      ⚠️ 它证明"某个地址签过这句话"（且该地址是 message 里 code 对应店铺的 operator），
+      **不证明**域名/GitHub 账号真的属于他——归属核验（DNS 记录/gist/OAuth）不在本机制内，
+      故对外**不得**标成"已认证/官方"（口径写在 src/claims.js 文件头与 routes/shop.js）。
+
+      建表策略同全库：新列/新表直接写进建表语句，存量库删库重建（本仓 greenfield，无迁移框架）。
+    */
+    CREATE TABLE IF NOT EXISTS shop_claims (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind       TEXT NOT NULL CHECK (kind IN ('domain','github','x','telegram')),
+      value      TEXT NOT NULL,             -- 声明值（**规范形**：归一与上限的唯一实现在 src/claims.js）
+      address    TEXT NOT NULL,             -- 签名者地址（小写；= 本店 operator，见 Registry.codeOf）
+      message    TEXT NOT NULL,             -- 规范消息**逐字节原样**（离线核验的唯一输入，勿再加工）
+      signature  TEXT NOT NULL,             -- 65 字节 personal_sign 签名（0x hex，原样存储与下发）
+      created_at INTEGER NOT NULL,          -- unix ms（重新声明/撤销后再次声明时会刷新为新的声明时刻）
+      revoked_at INTEGER                    -- NULL = 有效；非空 = 已撤销（公开列表只出 NULL 的行）
+    );
+    -- 同 (kind, value, address) 只留一行：重复提交按**幂等**处理（不产生第二条记录，
+    -- 公开列表也不会把同一个身份列两遍）。见 routes/shop.js POST /claims 的三分支。
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_shop_claims_identity ON shop_claims(kind, value, address);
+    -- 公开列表只读"有效"行（revoked_at IS NULL），按 id 升序稳定输出
+    CREATE INDEX IF NOT EXISTS idx_shop_claims_active ON shop_claims(revoked_at, id);
 
     CREATE TABLE IF NOT EXISTS kv (
       key   TEXT PRIMARY KEY,

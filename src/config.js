@@ -86,6 +86,29 @@ const config = {
     ttlDays: intEnv('MK_REVIEW_TTL_DAYS', 30),
   },
 
+  /*
+    陈述时限（双方举证窗口；MK_DISPUTE_STATEMENT_DAYS，默认 7 天，0 = 关闭）。
+
+    语义：**自"进入争议"或"售后案件开案"那一刻起 N 天内**可提交陈述**与证据附件**（两者同一道门控），
+    过期提交被拒、拒因可读（判据本体只有一处：src/evidenceFiles.js 的 evidencePhaseError，
+    不在路由层各判一次——陈述端点与附件上传端点必须同时收口，否则一侧拒了、另一侧照收 20MB 个人数据）。
+
+    时间基准取**本地已镜像的链上时刻**，不另算一套：
+      · 争议  = orders.updated_at（watcher 回写 disputed 的时刻，与仲裁队列的 disputedAt 同一口径）；
+      · 案件  = orders.after_sale_opened_at（链上 AfterSaleOpened 的落库时刻）。
+    只作用于**争议（arbitration）与售后案件（after_sale）**两个阶段：退款理由/退款回复是"申请-答复"
+    的即时往来，链上另有它自己的时序，不套这条窗口。
+
+    0 = 关闭该特性（陈述不限时，与加这个配置之前的行为逐字一致；订单 DTO 的倒计时字段同时为 null）；
+    缺失/非法（空串、非数字、负数）回退默认 7。
+    getter 动态读取（与 autoDeliver 同款）：改 env 即改即生效，测试也能在同一进程里切换两种口径。
+  */
+  dispute: {
+    get statementDays() {
+      return intEnvAllowZero('MK_DISPUTE_STATEMENT_DAYS', 7);
+    },
+  },
+
   // 个人信息保留期（PIPL 式删除请求的自动化那一半，见 src/piiErase.js）：
   // 显式删除请求走 POST /api/shop/orders/:id/erase-pii 立即生效，本键只管"到期自动擦除"
   pii: {
@@ -180,8 +203,13 @@ const config = {
     ttlSeconds: intEnv('MK_SIWE_TTL', 600),
     // 登录令牌有效期（秒）
     tokenTtlSeconds: intEnv('MK_TOKEN_TTL', 86400),
-    // HMAC 签名密钥（生产必须设置强随机值）
-    secret: process.env.MK_TOKEN_SECRET || 'dev-insecure-secret-change-me',
+    /*
+      HMAC 签名密钥（生产必须设置强随机值）。
+      **刻意没有默认值**：留空即走 server.js 的 fail-fast（<32 字符 / 缺失一律 exit(1)）。
+      这里曾经填过 `dev-insecure-secret-change-me`——那是仓库里可查的字面量，
+      谁拿到都能离线伪造任意角色（含店主）的令牌；留着它只会让"默认能跑起来"变成一个陷阱。
+    */
+    secret: process.env.MK_TOKEN_SECRET || '',
   },
 
   db: {

@@ -121,6 +121,15 @@ test('履约画像：近窗事件计数与比率全对（5 争议 ≥ 样本阈�
   assert.equal(r.windows.all.confirmRate, 0.3333, '3/9 舍入 4 位小数');
   assert.equal(r.windows.all.refundRate, 0.4);
 
+  /*
+    重复交易对信号也随响应下发（端点走 reputationSummary，buyer/seller 两列必须真的被查出来——
+    少一列的话这里会静默变成"0 个交易对 / 全无重复"）。本 fixture 每单一个独立买家地址 ⇒ 无重复。
+  */
+  assert.equal(w.sybil.distinctPairs, 8, '近窗 8 单 = 8 个不同交易对（各买家各一单）');
+  assert.equal(w.sybil.repeatOrders, 0);
+  assert.equal(w.sybil.repeatPairShare, 0, '样本够且确实没有重复 ⇒ 0（不是 null）');
+  assert.equal(r.windows.all.sybil.distinctPairs, 9, 'all 含 500 天前老单（另一个买家）');
+
   // 发货耗时（本地账 ⚠）：3 单有交付记录（t2/t4/t9），中位数为非负毫秒数
   assert.equal(r.delivery.d30.count, 3);
   assert.equal(typeof r.delivery.d30.medianMs, 'number');
@@ -236,4 +245,73 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
   assert.equal(empty.delivery.all.medianMs, null);
   const drafts = computeReputation([{ status: 'draft', delivered_at: null, onchain_events: '[]' }], now);
   assert.equal(drafts.windows.all.orders, 0);
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   重复交易对（女巫）信号：同一 buyer↔seller 交易对的重复成交占总成交的比例。
+   它是**可疑信号、不是结论**（真实复购与刷量在数据上完全同形），所以本用例只钉
+   "口径可算、可复算、小样本不输出"，不钉任何"判定刷量"的行为。
+   ══════════════════════════════════════════════════════════════════════ */
+
+test('单元：重复交易对占比 =（总成交 − 不同交易对数）/ 总成交；小样本置 null 而非 0', () => {
+  const now = Date.now();
+  const e = (name, at) => ({ name, txHash: null, block: null, at });
+  const row = (buyer, seller, at) => ({
+    status: 'confirmed',
+    buyer,
+    seller,
+    delivered_at: null,
+    onchain_events: JSON.stringify([e('OrderCreated', at), e('ReceiptConfirmed', at + 10)]),
+  });
+  const A = '0x' + 'aa'.repeat(20);
+  const B = '0x' + 'bb'.repeat(20);
+  const row3 = '0x' + 'dd'.repeat(20);
+  const SHOP = '0x' + 'cc'.repeat(20);
+
+  // 6 单：A 买 4 次、B 买 1 次、C 买 1 次 → 不同交易对 3、重复成交 3（A 的第 2~4 笔）
+  const r = computeReputation(
+    [
+      row(A, SHOP, now - 6000),
+      row(A, SHOP, now - 5000),
+      row(A, SHOP, now - 4000),
+      row(A, SHOP, now - 3000),
+      row(B, SHOP, now - 2000),
+      row(row3, SHOP, now - 1000),
+    ],
+    now
+  );
+  const s = r.windows.all.sybil;
+  assert.equal(r.windows.all.orders, 6);
+  assert.equal(s.distinctPairs, 3, '同一买家 + 同一家店 = 同一个交易对');
+  assert.equal(s.repeatOrders, 3, '6 单 − 3 对 = 第 2 笔及以后的 3 笔');
+  assert.equal(s.repeatPairShare, 0.5, '3/6');
+  assert.equal(s.topPairShare, 0.6667, '最大的一对占 4/6（集中度，4 位小数）');
+  assert.equal(s.sampleTooSmall, false);
+  // 口径诚实标注：它是信号不是结论，且说明可由第三方扫链复算
+  assert.match(r.sybilNote, /可疑信号/);
+  assert.match(r.sybilNote, /OrderCreated/);
+
+  // 每个买家各买一次（无重复）→ 重复成交 0、比率 0（**不是 null**：样本够但确实没有重复）
+  const clean = computeReputation(
+    [row(A, SHOP, now - 6000), row(B, SHOP, now - 5000), row('0x' + 'dd'.repeat(20), SHOP, now - 4000)],
+    now
+  );
+  assert.equal(clean.windows.all.sybil.repeatOrders, 0);
+
+  // 小样本（<5 单）：比率置 null（"3 单里 2 单同一个人"读起来像 67% 的异常，其实什么都说明不了）
+  const tiny = computeReputation([row(A, SHOP, now - 2000), row(A, SHOP, now - 1000)], now);
+  assert.equal(tiny.windows.all.orders, 2);
+  assert.equal(tiny.windows.all.sybil.sampleTooSmall, true);
+  assert.equal(tiny.windows.all.sybil.repeatPairShare, null);
+  assert.equal(tiny.windows.all.sybil.topPairShare, null);
+  assert.equal(tiny.windows.all.sybil.distinctPairs, 1, '原始计数照常输出（读者可自行判断）');
+
+  // 分窗同源：交易对计数与成交计数归属同一个窗（老单不进 d30）
+  const old = computeReputation(
+    [row(A, SHOP, now - 400 * DAY_MS), row(A, SHOP, now - 400 * DAY_MS + 10), row(B, SHOP, now - 400 * DAY_MS + 20)],
+    now
+  );
+  assert.equal(old.windows.all.sybil.repeatOrders, 1);
+  assert.equal(old.windows.d30.orders, 0);
+  assert.equal(old.windows.d30.sybil.repeatOrders, 0, '分子分母同源：窗外单不会在窗内冒出重复笔数');
 });

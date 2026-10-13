@@ -23,9 +23,17 @@
  *                       而拆分裁决（任意比例、无需授权）仍只归仲裁人 `arbitrate(orderId, refundWei)`。
  *                       占位仅回补「从未交付」的行——交付后退款视为货在买家侧需线下回收，
  *                       不自动回补，与 shipped→expired 不释放同口径）
+ *   AfterSaleOpened     **状态不变**（confirmed/settled/expired 依旧），只置 after_sale_status=open
+ *                       + 开案时刻/区块（确认收货后的售后案件；契约 2026-10 第二批）
+ *   AfterSaleClosed     **状态不变**，置 closed + 结案时刻/说明（事件里的 note，截断见 afterSale.js）
  *
  * 两级售后为链上强制流程（合约状态机），本地 refund_status 仅为其镜像：
  * 迁移失败（changes=0）的事件不记录事件史，幂等重复扫描不重复记账。
+ *
+ * 售后案件（AfterSaleOpened/Closed）同样只是**叠加在终局之上的第二层**镜像：它不动托管资金
+ * （那笔钱早已结清）、不阻塞卖家撤资，补偿只能来自卖家保证金 Staking.penalize 或线下转账。
+ * 因此这两个分支刻意**不碰 orders.status**（见 src/afterSale.js 文件头的完整理由）；
+ * 人工 /sync 与后台对账按链上 afterSaleOpen/afterSaleOpenedAtBlock 回填同几列，判据同源。
  *
  * ⚠️ 上表的 from 集是**正常路径**；代码里每个分支的 from 集都更宽，用来收敛"节点停机/漏扫"
  * 留下的残镜像（`draft`/`cancelled` 也接受，否则这些单会永远停在非终态、卖家流水漏计）。
@@ -53,6 +61,8 @@ import { alertPoolEmptyForOrder } from './poolAlert.js';
 import { alertOnceDelivered } from './alertAck.js';
 // 费率/创建时收取方快照的取值口径（唯一实现，见 src/fees.js 的 feeSnapshotOf）
 import { feeSnapshotOf } from './fees.js';
+// 确认收货后的售后案件：本地镜像的**唯一写入口/判据**（事件路径、/sync、后台对账三者同源）
+import { applyAfterSaleOpened, applyAfterSaleClosed } from './afterSale.js';
 
 const LAST_BLOCK_KEY = 'mk:escrow_last_block';
 const LAST_HASH_KEY = 'mk:escrow_last_block_hash'; // 游标块哈希（重组检测基准）
@@ -168,6 +178,13 @@ export const EVENTS = [
   // **漏挂即静默**：卖家面板永远看不到买家授权额，只能拿 RefundAmountNotAccepted 的 revert 试错
   'PartialRefundAccepted',
   'RefundApproved',
+  // 确认收货后的**售后案件**（契约 2026-10 第二批，本地镜像见 src/afterSale.js）：
+  // 开案/结案只写售后案件那几列，**不改 orders.status**（订单仍是 confirmed/settled/expired 终局——
+  // 链上 Escrow.Order.status 全程停在 Settled，理由是那笔托管钱早已结清；改成本地 disputed
+  // 会把已结清的钱重新算进在途窗口，见 afterSale.js 文件头）。
+  // **漏挂即静默**：买家开了案、仲裁台队列里却没有这一单，而店主/仲裁人完全无从知道。
+  'AfterSaleOpened',
+  'AfterSaleClosed',
 ];
 
 /** 事件史上限（防单订单无限膨胀；20 条覆盖完整生命周期富余） */
@@ -250,6 +267,31 @@ export function chainParamsMatch(local, p) {
 }
 
 /**
+ * 「链上已退买家金额」的**唯一判据**：读得到 → `bigint`（≥ 0），读不到 → `null`。
+ *
+ * 为什么必须把"读不到"与"确证为 0"分开（2026-10 生产化清理）：
+ *   · `0n` 在这套语义里是一个**具体结论**——"从未退款 / 全额判卖家"（见 `mapChainTerminal`）；
+ *   · 而字段缺失、ABI 漂移、脏字符串是**不知道**。用一个 0 去代表"不知道"，等于替链上说了一句
+ *     它没说过的话：全额退款会被写成 `settled` + `refunded_amount_wei='0'`，**买家钱的下落记反**，
+ *     而且对账脚本会认为"本地与链上一致"（两边同错，自证清白）。
+ * 所以这里返回 `null`，调用方**必须**显式处理（不推进终态、不写金额、留下告警等下轮）。
+ */
+export function readRefundedWei(v) {
+  if (v === undefined || v === null) return null;
+  /*
+    ⚠️ 空串必须先挡掉：`BigInt('')` **等于 0n**（不是抛错），
+    所以"字段是空白"会被悄悄读成"确证为 0"——正是这个函数要防的那种伪造。
+  */
+  if (typeof v === 'string' && v.trim() === '') return null;
+  try {
+    const n = BigInt(typeof v === 'string' ? v.trim() : v);
+    return n >= 0n ? n : null; // 负数不是"没退过款"，是脏数据 ⇒ 不知道
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 链上终局（status + refundedAmount）→ 本地终态（**唯一实现**）。
  *
  * 链上状态本身无法区分"买家确认收货 / 超时释放 / 仲裁判付"（三者都是 Settled），
@@ -264,27 +306,25 @@ export function chainParamsMatch(local, p) {
  * 而事件路径/对账落 `settled`；`confirmed` 的界面文案断言"你已确认收货"，而链上状态无从证明
  * 这个**买家动作**，只有真实 ReceiptConfirmed 事件才能证明）。
  *
- * 解析失败（null/undefined/NaN/非数字字符串/负数溢出等）按 0 处理，**永不抛错**——调用方在
- * HTTP/轮询路径上，不能因为一个脏字段把整条修复链打断。
+ * **第三态（2026-10 生产化清理）**：返回 `null` = 判不了。此前"解析失败按 0 处理、永不抛错"，
+ * 于是"不知道"被写成了"全额判卖家"——账目不可逆。现在只有在下列情况下才允许继续判：
+ *   · 状态是 `Refunded`（状态自己就是结论）；
+ *   · 状态是 `Settled`（合约语义：不是全额退款才发 Settled）——此时缺的只是**金额**，
+ *     调用方必须按"读不到"处理（不许写 0）；
+ *   · 两个金额都读得到（正常路径）。
  *
  * @param {string} chainStatus 链上状态名（'Settled' / 'Refunded' / ...）
  * @param {string|number|bigint} refundedAmountWei 链上已退买家金额
  * @param {string|number|bigint} amountWei 本单托管额（本地锁定值，链上真值经 chainParamsMatch 校验过）
- * @returns {'refunded'|'settled'}
+ * @returns {'refunded'|'settled'|null}
  */
 export function mapChainTerminal(chainStatus, refundedAmountWei, amountWei) {
-  if (String(chainStatus ?? '') === 'Refunded') return 'refunded';
-  const wei = (v) => {
-    if (v === undefined || v === null || v === '') return 0n;
-    try {
-      const n = BigInt(typeof v === 'string' ? v.trim() : v);
-      return n > 0n ? n : 0n; // 负数/0 一律按 0（脏数据不外溢成"退款"）
-    } catch {
-      return 0n;
-    }
-  };
-  const amount = wei(amountWei);
-  return amount > 0n && wei(refundedAmountWei) >= amount ? 'refunded' : 'settled';
+  const st = String(chainStatus ?? '');
+  if (st === 'Refunded') return 'refunded';
+  const refunded = readRefundedWei(refundedAmountWei);
+  const amount = readRefundedWei(amountWei);
+  if (refunded === null || amount === null) return st === 'Settled' ? 'settled' : null;
+  return amount > 0n && refunded >= amount ? 'refunded' : 'settled';
 }
 
 /**
@@ -296,8 +336,9 @@ export function mapChainTerminal(chainStatus, refundedAmountWei, amountWei) {
  * 本地镜像必须与之一致：全额退 → 'refunded'；拆分/判卖家 → 'settled'。两者都记
  * `refunded_amount_wei`（账本净额 = amount − refunded − 已扣平台费；UI 据此展示拆分）。
  *
- * @param {string|number|bigint} refundWeiArg 事件里的退款额（缺失时回退本地金额，兼容旧事件字段）
+ * @param {string|number|bigint} refundWeiArg 事件里的退款额（**必填**：读不到即抛出，不再有"缺失按全额判卖家"的兼容路径）
  * @returns {number} 受影响行数（0 = 未命中可迁移的行）
+ * @throws 退款额或本地托管额读不到时抛出（**不落终态**，由调用方的失败/重试机制接管）
  *
  * 导出：链上状态对账（chainReconcile）的终局修复走**同一个函数**——对账若自己写一份
  * "链上 Refunded/Settled → 本地状态 + refunded_amount_wei + 占位回补"的映射，
@@ -308,17 +349,23 @@ export function settleByRefundSplit(db, orderId, refundWeiArg, meta = {}) {
     .prepare('SELECT id, amount_wei, status FROM orders WHERE escrow_order_id = ?')
     .get(orderId);
   if (!local) return 0;
-  let amount = 0n;
-  let refunded = 0n;
-  try {
-    amount = BigInt(local.amount_wei || '0');
-    refunded = refundWeiArg === undefined || refundWeiArg === null ? 0n : BigInt(refundWeiArg);
-  } catch {
-    refunded = 0n;
+  const amount = readRefundedWei(local.amount_wei);
+  const refunded = readRefundedWei(refundWeiArg);
+  if (amount === null || refunded === null) {
+    /*
+      **退款额读不到 ⇒ 一个字都不写**（2026-10 生产化清理）。
+      这个字段就是"全额退买家 还是 拆分/全额判卖家"的**唯一依据**——按 0 兜底会把全额退款写成
+      settled + refunded_amount_wei='0'，买家钱的下落就此记反（不可逆，且事后两边同错）。
+      这里**抛出**而不是返回 0：0 会被上游当成"没有需要迁移的行"，事件照旧算处理完成、游标继续前进，
+      那一单就永远停在非终态、也不会再有人来修。抛出则进 `applyEvent` 既有的失败处理
+      （记重试 → 连续失败转持久化隔离清单 + 每轮告警），下一轮带着健康的读数再来一次。
+      真实链上事件经 ABI 解码必然带 refundWei；**没有"字段缺失就按全额判卖家"这条兼容路径了**
+      （旧版 `refundToBuyer=false` 的语义已随合约删除）。
+    */
+    throw new Error(
+      `退款额读不到（refundWei=${String(refundWeiArg)}，本地 amount=${String(local.amount_wei)}）：不落终态`
+    );
   }
-  // 事件字段缺失（单测直调/兼容旧调用）时按「全额判卖家」处理，与旧版 refundToBuyer=false 等价；
-  // 真实链上事件经 ABI 解码必然带 refundWei，且已被 chainParams 校验过订单归属。
-  //
   // 与 `mapChainTerminal` 的关系：两者**同一判据**（amount > 0 && refunded >= amount → refunded），
   // 事件路径直接用事件里的 refundWei（信息更全：不必等 getOrder 快照），快照路径只有
   // status + refundedAmount 两个字段，故走 mapChainTerminal。改判据时必须同时改这两处，
@@ -608,6 +655,28 @@ function applyEventCore(name, args, meta = {}) {
       // 是事实，本地残镜像必须收敛（此前这些行永远停在非终态，买家看不到结果）。
       changed = settleByRefundSplit(db, orderId, args.refundWei, meta);
       break;
+    /*
+      确认收货后的售后案件（契约 2026-10 第二批）——**两个分支都不迁移 orders.status**。
+
+      为什么必须写在这里（而不是调用点各判一次）：`after_sale_status` 是"这一个终局单上有没有
+      在途案件"的**唯一**本地事实，它同时喂着售后陈述门控、退货单窗口、仲裁台队列、卖家徽标与
+      保留期保护。事件路径是它的第一来源；/sync 与后台对账（chainReconcile）按链上
+      afterSaleOpen/afterSaleOpenedAtBlock 走 afterSale.js 里**同一对**写入口回填，
+      所以"漏扫事件"不会让这个状态与链上永久分叉。
+
+      `changes=0`（本地无此单 / 已是该状态）时不写事件史、不发通知——与其它分支同口径；
+      链上真值核验（meta.chainParams 的买家/卖家/金额比对）在本函数头部统一执行，售后案件事件
+      同样受它保护（orderId 自草稿起公开，不核对就等于让别人的假案件驱动本地队列）。
+    */
+    case 'AfterSaleOpened':
+      // 只置 open + 开案时刻/区块（并清掉上一次结案的痕迹——窗口内买家可以再次开案）
+      changed = applyAfterSaleOpened(orderId, { block: meta.block ?? null });
+      break;
+    case 'AfterSaleClosed':
+      // note 是链上事件里的**用户文本**：在唯一写入口截断到 500 字符；只在 JSON 里下发，
+      // 由前端按纯文本渲染（节点不做 HTML 拼接/半吊子转义，见 afterSale.js 的 XSS 说明）
+      changed = applyAfterSaleClosed(orderId, { note: args?.note ?? null });
+      break;
     case 'Arbitrated':
       // 仲裁裁决（争议可能带着 requested/rejected 镜像进入）：refundWei 同口径拆分结算；
       // 占位回补（全额退款 = 未交付行口径 / 拆分与判卖家 = D1 退货已回收口径）由 settleByRefundSplit 内部处理
@@ -777,7 +846,10 @@ export async function pollOnce() {
   // OrderCreated 在前、后随以下任一事件 → 该 OrderCreated 跳过自动交付。
   // 复审补全：RefundRequested（冻结，同批内此前漏检——资金冻结后码已发出、随后 approveRefund
   // 即双损）与 DisputeRequested（争议冻结）一并纳入。
-  const TERMINAL_FOLLOW = new Set(['RefundApproved', 'Arbitrated', 'OrderExpiredReleased', 'RefundRequested', 'DisputeRequested']);
+  // 2026-10 补 AfterSaleOpened/AfterSaleClosed：售后案件只可能存在于**已终局**的单上
+  // （合约要求 status==Settled），所以同批内出现在 OrderCreated 之后，就说明这一单早就结清了——
+  // 此时自动发码等于把码发给一个已经终局（可能已退款失败/已超时）的单。
+  const TERMINAL_FOLLOW = new Set(['RefundApproved', 'Arbitrated', 'OrderExpiredReleased', 'RefundRequested', 'DisputeRequested', 'AfterSaleOpened', 'AfterSaleClosed']);
   const skipAutoDeliver = new Set(); // orderId → 本批内 OrderCreated 后有冻结/终局事件，跳过其自动交付
   {
     const orderSeq = new Map(); // orderId → { createdIdx: number|null, terminalAfter: boolean }
@@ -892,8 +964,15 @@ export async function pollOnce() {
                 .run(snap.feeBps, snap.feeCollectorAtCreate, row.id);
             }
           }
-        } catch {
-          /* RPC 失败静默：后续结算事件/sync 补录 */
+        } catch (e) {
+          /*
+            补录失败**不能静默**（原先这里连一行日志都没有）：费率/收取方快照缺失会让账本退回
+            全局口径——而那可能与这单的链上事实相反。RPC 失败本身仍不阻断本轮（后续结算事件/sync 会补），
+            但至少要在日志里留下线索，否则对账差异查无实据。
+          */
+          console.warn(
+            `[watcher] 订单 ${row.id} 的费率快照补录失败（该单账本将退回全局口径）：${(e && e.message) || e}`
+          );
         }
       }
     } catch (e) {

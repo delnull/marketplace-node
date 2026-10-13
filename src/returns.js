@@ -13,9 +13,18 @@
  *  - D1 例外：成交终局态（settled/confirmed/expired——资金判给卖家）但退货已确认收货/放弃追索
  *    （received_at 非空，货已实际回到卖家侧可再售）：终局迁移（watcher/sync）或 receive/waive
  *    动作当场由 releaseHoldsForReturnReceived 回补占位（released_at 幂等）。
+ *
+ * 建单窗口与售后案件的关系（2026-10）：窗口 = 退款协调相关状态（escrowed/shipped/disputed/refunded）
+ * **∪ 有在途售后案件**（after_sale_status='open'，即确认收货后买家在链上开的案件）。
+ * 后者是"货要寄回、需要留痕"的唯一凭据（已钱货两清的单没有它就没有追索依据），
+ * 详见 createReturn 的说明——但**占位回补语义不变**：仍只认 received_at。
  */
 import { getDb, txBegin, txCommit, txRollback } from './db.js';
 import { releaseHoldsForOrderIds, releaseHoldsForReturnReceived } from './stockHold.js';
+// 确认收货后的售后案件：在途判据的唯一实现（见 createReturn 的窗口说明）
+import { isAfterSaleOpen } from './afterSale.js';
+// 承运方名称的归一（与发货侧同一实现）：退回件与寄出件必须是同一种形状
+import { normalizeCarrier } from './shipping.js';
 
 /** 订单是否有交付事实（发货标记 shipped_at / 物流单号 / 交付行任一）。
  *  shipped_at 覆盖「自提/线下交付」空物流单号形态此前漏判致退款误释放占位，
@@ -44,6 +53,13 @@ export function returnToPublic(r) {
     address: r.address || '',
     note: r.note || '',
     trackingNo: r.tracking_no || null,
+    /*
+      退回件的承运方名称（买家填，可空）。与订单侧的 `carrier` **同一口径与同一归一实现**
+      （src/shipping.js）：只有运单号时查件只能靠单号前缀猜，纯数字号段的快递完全猜不出；
+      NULL = 未填（三态：不是空串）。退货这条路与发货那条路必须是同一种形状，否则
+      "同一个运单号，卖家寄出时能查、买家寄回时查不了"。
+    */
+    carrier: r.carrier || null,
     receivedAt: r.received_at || null,
     createdAt: r.created_at,
   };
@@ -52,7 +68,18 @@ export function returnToPublic(r) {
 /**
  * 店主创建退货单（同单唯一；已存在则幂等返回既有单）。
  * 门控：订单已交付；状态窗口 = escrowed（部分交付）/ shipped / disputed / refunded
- * （即退款协调相关阶段）；未交付单直接走退款即可，无需退货单。
+ * （即退款协调相关阶段）**或有在途售后案件**（确认收货后的售后案件，见下）；未交付单直接走退款即可。
+ *
+ * 为什么终局单只对"有在途售后案件"开放（**不要顺手放宽成"终局都可建"**）：
+ * 退货单在本仓是有资金后果的凭据——卖家 receive/waive 会经 `releaseHoldsForReturnReceived`
+ * 回补库存占位（D1 口径：货已实际回到卖家侧/卖家放弃追索，额度才能再售）。对一笔**已钱货两清**
+ * 的终局单，唯一能证明"货要寄回、需要留痕"的链上事实就是售后案件（买家在窗口内 openAfterSale）；
+ * 没有案件却允许建单，等于凭空给终局单补一条不存在的追索依据，而占位回补会跟着它走。
+ * 有案件时反而必须放行：案件主张的正是"货有问题"，货要寄回、流程要留痕（谁寄的、寄到哪、
+ * 卖家何时确认收到），否则双方只能在线下口头约定，占位与退货事实都无从对账。
+ *
+ * ⚠️ 与本文件既有纪律一致：这里只**放行建单**，绝不改占位回补语义——已交付单不因建单/结案
+ * 自动回补，仍以 `received_at` 为唯一凭据（见 releaseHoldsForReturnReceived）。
  */
 export function createReturn({ order, address, note }) {
   if (!order) return { error: '订单不存在', notFound: true };
@@ -61,8 +88,14 @@ export function createReturn({ order, address, note }) {
   if (!hasDelivered(order)) {
     return { error: '该订单尚无交付记录（未发货/未交付），无需退货单——可直接同意退款，库存将自动回补' };
   }
-  if (!['escrowed', 'shipped', 'disputed', 'refunded'].includes(order.status)) {
-    return { error: `当前状态(${order.status})不可创建退货单` };
+  const afterSaleOpen = isAfterSaleOpen(order);
+  if (!['escrowed', 'shipped', 'disputed', 'refunded'].includes(order.status) && !afterSaleOpen) {
+    return {
+      error:
+        `当前状态(${order.status})不可创建退货单：仅退款协商中（escrowed / shipped / disputed / refunded）` +
+        '或**有在途售后案件**（确认收货后由买家在链上 openAfterSale 开案）的订单可建单——' +
+        '已终局且无售后案件的订单钱货两清，无需退货单（如需追回请线下协商或先开售后案件）',
+    };
   }
   const addr = String(address ?? '').trim().slice(0, 300);
   const noteText = String(note ?? '').trim().slice(0, 1000);
@@ -81,8 +114,12 @@ export function createReturn({ order, address, note }) {
   return { ok: true, data: fetchReturnByOrder(order.id) };
 }
 
-/** 买家回填退回物流单号：open → shipped */
-export function setReturnTracking({ order, returnRow, buyer, trackingNo }) {
+/**
+ * 买家回填退回物流单号（可带承运方名称）：open → shipped。
+ * `carrier` 的归一与上限走 src/shipping.js（与发货侧**同一实现**）：空串/未填 → NULL，
+ * 不留空串、也不编"其他"——它是"买家有没有告诉我们寄的是哪家"这个事实本身。
+ */
+export function setReturnTracking({ order, returnRow, buyer, trackingNo, carrier }) {
   if (!returnRow) return { error: '退货单不存在（请先联系卖家创建退货单）' };
   if (String(order.buyer || '').toLowerCase() !== String(buyer || '').toLowerCase()) {
     return { error: '仅买家本人可填写退回物流单号', forbidden: true };
@@ -92,8 +129,8 @@ export function setReturnTracking({ order, returnRow, buyer, trackingNo }) {
   if (no.length > 100) return { error: '退回物流单号不能超过 100 字符' };
   if (returnRow.status !== 'open') return { error: `退货单当前状态(${returnRow.status})不可再填单号（已寄出/已确认）` };
   getDb()
-    .prepare("UPDATE order_returns SET status = 'shipped', tracking_no = ?, updated_at = ? WHERE id = ? AND status = 'open'")
-    .run(no, Date.now(), returnRow.id);
+    .prepare("UPDATE order_returns SET status = 'shipped', tracking_no = ?, carrier = ?, updated_at = ? WHERE id = ? AND status = 'open'")
+    .run(no, normalizeCarrier(carrier), Date.now(), returnRow.id);
   return { ok: true, data: fetchReturnByOrder(order.id) };
 }
 

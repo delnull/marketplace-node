@@ -179,21 +179,38 @@ test('前跳之后下单的草稿：created_at 落在"未来"，仍按单调年�
   assert.equal(availOf(o.productSlug), 1, '占位已回补');
 });
 
-test('跨运行遗留的草稿（boot 不同）退回墙钟判据：老的单被关掉、新的保留', async () => {
+test('跨运行遗留的草稿（boot 不同）：只认"可证明的年龄下界"，绝不退回墙钟（**推翻了旧断言**）', async () => {
   const oldOne = await createDraft({ title: '上次运行遗留·老', capacity: 1 });
   const newOne = await createDraft({ title: '上次运行遗留·新', capacity: 1 });
   assert.notEqual(PREV_BOOT, bootId, '前提：注入的 boot 必须与当前进程不同');
   db.prepare('UPDATE orders SET created_boot = ? WHERE id IN (?, ?)').run(PREV_BOOT, oldOne.id, newOne.id);
+  // 墙钟把它说成"两小时前"——跨运行的 created_at 不具备可比性（可能被跳变污染），这正是旧判据的危险处
   db.prepare('UPDATE orders SET created_at = created_at - ? WHERE id = ?').run(2 * 3600_000, oldOne.id);
 
-  const closed = sweepExpiredDrafts();
-  assert.equal(orderRow(oldOne.id).status, 'cancelled', '跨运行遗留的老草稿按墙钟收敛');
-  assert.equal(orderRow(newOne.id).status, 'draft', '跨运行遗留的新草稿不得被误杀');
+  const src = fakeTime();
+  const clock = createClock(src);
+  const bootStart = clock.now();
+
   /*
-    这条用例同时把**已知缺口**写进测试：跨运行的单调读数不可比，只能退回墙钟比较
-    （若在墙钟跳变之后重启，这些行仍可能被一次性误判）。要堵掉它得把单调基准持久化，
-    而那会引入"基准文件与数据库不同步"的新失败面——见 src/orderSweeper.js 与 monotonicClock.js。
-    `closed` 只断言"至少关了老的那一单"：同库其它用例也会留下跨运行行。
+    ① 本进程刚起来（单调运行 5 分钟 < TTL 30 分钟）⇒ 这一行没有**可证明**的年龄下界。
+    旧实现在这里用墙钟比，于是墙钟跳变之后重启可能误关**正在付款**的草稿并提前回补占位（⇒ 超卖）。
+    2026-10 生产化清理后：读不到年龄就不判过期，本轮跳过并告警。
   */
-  assert.ok(closed >= 1, `跨运行遗留的老草稿必须被清扫（实际关闭 ${closed}）`);
+  src.s.mono += 5 * MIN;
+  sweepExpiredDrafts({ now: () => clock.now(), boot: bootId, bootStart });
+  assert.equal(orderRow(oldOne.id).status, 'draft', '墙钟说它老不作数：没有可证明的下界就不扫');
+  assert.equal(orderRow(newOne.id).status, 'draft');
+
+  // ② 本进程已单调运行 31 分钟 ≥ TTL ⇒ 下界成立（"这行至少在进程启动前就存在，而进程已活了 > TTL"）⇒ 关闭
+  src.s.mono += 26 * MIN;
+  const closed = sweepExpiredDrafts({ now: () => clock.now(), boot: bootId, bootStart });
+  assert.ok(closed >= 1, `进程运行满 TTL 后遗留行必须被清扫（实际关闭 ${closed}）`);
+  assert.equal(orderRow(oldOne.id).status, 'cancelled');
+  assert.equal(availOf(oldOne.productSlug), 1, '占位已回补，额度可再售');
+  /*
+    代价如实钉住：下界是**本进程运行时长**（所有遗留行共享），所以同一批遗留行会在满 TTL 的
+    那一轮**一起**收敛——包括这一单"新的"。换来的是"任何一次关闭都建立在'这一行确实老过 TTL'
+    的证明上"，而不是"墙钟说它老"；最多晚一个 TTL，不会滞留。见 src/orderSweeper.js 文件头。
+  */
+  assert.equal(orderRow(newOne.id).status, 'cancelled', '同批遗留行共享下界 ⇒ 同轮收敛（刻意的代价）');
 });

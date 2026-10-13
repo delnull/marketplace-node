@@ -11,25 +11,36 @@ import { startPiiRetentionSweep } from './piiErase.js';
 import { cleanupExpiredSiwe } from './auth.js';
 import { createApp } from './app.js';
 import { shopName } from './routes/shop.js';
-// 下单风控闸（可选，默认关闭）：仅用于启动日志——开启时必须让运维一眼看到
-import { orderGateEnabled } from './orderGate.js';
+// 下单风控闸（可选，默认关闭）：启动日志 + 启动门禁（URL 非空但非法 ⇒ 拒绝启动）
+import { orderGateEnabled, orderGateStartupError } from './orderGate.js';
 import { applyEscrowAnchor } from './chainAnchor.js';
 
 initDb();
 
 /*
-  库结构自检（源码评审 2026-10，P1）：标价单位从 CNY（分）改成微 USDT 时**直接重写了建表语句**
-  ——本项目的约定就是"全新项目、无存量数据，不做兼容/迁移，删库重建"（见 db.js 文件头）。
-  但 `CREATE TABLE IF NOT EXISTS` 对**已存在**的表是空操作：拿旧库（Docker 命名卷里的
-  `/data/marketplace-node.db`、或宿主机上的 `marketplace-node.db`）跑新镜像时，表里没有
-  `*_usdt_micro` 列，而节点会"启动正常"：商品价格显示 0、起价下发 null、
-  所有商品快照校验失败（买家看到假的「商品内容已被修改」）、下单被一句与汇率无关的文案拒绝
-  ——故障现象与原因相隔十万八千里。这里按列名自检，缺列就拒绝启动并把"怎么办"写在日志里。
+  库结构自检（源码评审 2026-10，P1）：本项目的约定是"全新项目、无存量数据，不做兼容/迁移，
+  删库重建"（见 db.js 文件头）——**建表语句就是最终结构**，`CREATE TABLE IF NOT EXISTS` 对已存在的表
+  是空操作。拿旧库（Docker 命名卷里的 `/data/marketplace-node.db`、或宿主机上的 `marketplace-node.db`）
+  跑新镜像时，表里没有新列，而节点会"启动正常"却处处错位：商品价格显示 0、快照校验失败
+  （买家看到假的「商品内容已被修改」）、售后案件状态永远是 none（仲裁队列空着而链上有案件）、
+  缺列的那条 SQL 直接抛错——故障现象与原因相隔十万八千里。
+  历史上标价单位由 CNY（分）改微 USDT 时就是这么爆的（当时只补了那几列）。所以这里的判据是
+  **结构性的**：凡"当前代码必须存在"的列都在清单里，缺任何一列就拒绝启动，并把"怎么办"写进日志。
+  ⚠️ 加了新列就要加进本清单（否则旧库会带着缺列的 schema 静默跑起来）。
 */
 const REQUIRED_COLUMNS = {
   products: ['shipping_fee_usdt_micro'],
   product_skus: ['price_usdt_micro'],
-  orders: ['usdt_micro', 'shipping_fee_usdt_micro'],
+  // after_sale_* = 确认收货后的售后案件（契约 2026-10 第二批，见 src/afterSale.js）
+  /*
+    refunded_amount_wei / accepted_partial_refund_wei（2026-10 补进清单）：
+    这两列缺席时**不会**像其它列那样当场炸出 "no such column"——订单 DTO 走的是 `SELECT *`，
+    缺列只是让 `o.refunded_amount_wei === undefined`，而 DTO 里曾用 `|| '0'` 把它说成
+    "链上确证没退过款"：面板净额虚高、卖家授权额显示为"未授权"，一切看起来正常。
+    这正是本清单存在的意义（"凡当前代码必须存在的列都在清单里"）：缺列 ⇒ 拒绝启动，
+    而不是让某一层凭一次读不到的读出一个结论。
+  */
+  orders: ['usdt_micro', 'shipping_fee_usdt_micro', 'after_sale_status', 'after_sale_opened_at', 'refunded_amount_wei', 'accepted_partial_refund_wei'],
 };
 {
   const db = getDb();
@@ -44,7 +55,7 @@ const REQUIRED_COLUMNS = {
   }
   if (missing.length) {
     console.error(`[server] 本地库结构过旧，缺少列：${missing.join('、')}`);
-    console.error('[server] 标价单位已由 CNY（分）改为 USDT（微 USDT，1 USDT = 1e6），本项目不做存量迁移。');
+    console.error('[server] 本项目的建表语句即最终结构，不做存量迁移（见 src/db.js 文件头）。');
     console.error('[server] 请删库重建：停节点 → 删除数据库文件（默认 marketplace-node.db；Docker 部署在命名卷里）→ 重新启动。');
     console.error('[server] 删库不可逆，先备份；步骤见 docs/OPS_RUNBOOK.md。');
     process.exit(1);
@@ -103,11 +114,9 @@ if (!config.shop.owner) {
 // 仓库公开的占位/默认密钥一律拒绝启动（默认值 + .env.example 示例值，均可在仓库内查到——
 // 任何人都能用它们离线伪造店主令牌；弱密钥同样拒绝）
 const INSECURE_SECRETS = new Set([
+  // 代码里的默认值（config.js）与仓库 .env.example 的示例值——都在仓库里可查，必须一律拒绝
   'dev-insecure-secret-change-me',
   'change-me-to-a-long-random-secret',
-  // docker-compose.yml 演示节点示例密钥（仓库公开，任何人均可离线伪造对应演示节点店主令牌）
-  'demo-node-a-secret-change-me',
-  'demo-node-b-secret-change-me',
 ]);
 // 密钥强度（2026-09 修复）：占位串黑名单之外，长度 < 32 或纯重复字符/纯数字串一律拒绝——
 // HMAC 令牌 = base64url(JSON).HMAC(secret)，任何人拿到弱密钥即可离线伪造任意角色令牌
@@ -128,6 +137,19 @@ const weakSecret = !secret || INSECURE_SECRETS.has(secret) || secret.length < 32
 if (weakSecret) {
   console.error('[server] MK_TOKEN_SECRET 缺失/过短（需 ≥32 字符强随机值）/仍为仓库示例占位值/弱模式，已拒绝启动——请设置强随机密钥（如 openssl rand -base64 32）');
     process.exit(1);
+}
+
+/*
+  下单风控闸配置门禁（2026-10）：MK_ORDER_GATE_URL **非空但非法** ⇒ 拒绝启动。
+  旧行为是把它静默折成"未开启风控"（orderGateEnabled() === false）⇒ 店主以为开了风控，
+  实际每一单都直接放行，而日志里一个字都没有——"读不到一个可用的风控目标"被说成了
+  "店主没有开风控"。这里与密钥/库结构/合约锚点同一道启动门禁：要么配置可用，
+  要么拒绝启动并写明"改 URL 或清空该键（=关闭风控）"。判定在 src/orderGate.js（唯一实现）。
+*/
+const orderGateError = orderGateStartupError();
+if (orderGateError) {
+  console.error(`[server] 下单风控闸配置非法，已拒绝启动：${orderGateError}`);
+  process.exit(1);
 }
 
 

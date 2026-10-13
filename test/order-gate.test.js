@@ -23,7 +23,7 @@ delete process.env.MK_ORDER_GATE_TIMEOUT_MS;
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
-const { setOrderGateSender, resetOrderGate, checkOrderGate, orderGateEnabled } = await import('../src/orderGate.js');
+const { setOrderGateSender, resetOrderGate, checkOrderGate, orderGateEnabled, orderGateStartupError } = await import('../src/orderGate.js');
 const { setLookupAll } = await import('../src/netguard.js');
 
 /** 公网字面量地址（免 DNS；与 webhook.test.js 同款写法） */
@@ -96,11 +96,21 @@ test('默认关闭：未配置 URL 时建单与从前一致（草稿照建、库
   assert.ok(db.prepare('SELECT id FROM orders WHERE id = ?').get(res.body.data.id), '草稿确实落库');
   assert.equal(skuInv(db, p.slug).committed, 1, '库存照常占位（行为与从前一致）');
 
-  // 非法 URL（拼错/缺 scheme）不算"开启"——否则会变成每次下单都被 fail-closed 拒掉的静默故障
+  /*
+    非法 URL（拼错/缺 scheme）**不等于关掉风控**（2026-10 生产化清理，**推翻了本用例旧断言**）。
+    旧语义：`new URL()` 失败 ⇒ 当作"未开启" ⇒ **每一单静默放行**，而店主以为风控在拦单
+    ——安全功能静默失效，正是"读不到被降级成结论"的最坏形态。
+    新语义两个方向都有明确出口：启动期 `orderGateStartupError()` 非空 ⇒ 拒绝启动；
+    运行期（进程活着但 env 被改坏）走 `checkOrderGate` 的 fail-closed ⇒ 拒单。
+  */
   process.env.MK_ORDER_GATE_URL = 'gate.example.com/check';
-  assert.equal(orderGateEnabled(), false, '非法 URL 一律视为未开启');
-  assert.deepEqual(await checkOrderGate({ productSlug: p.slug }), { ok: true });
+  assert.equal(orderGateEnabled(), true, '非空即"配置了风控"（唯一判据不在这里解析 URL）');
+  assert.ok(orderGateStartupError(), '非法 URL 必须在启动期给出拒绝启动的理由');
+  const gatedBad = await checkOrderGate({ productSlug: p.slug });
+  assert.equal(gatedBad.ok, false, '运行期非法 URL 必须 fail-closed 拒单，绝不静默放行');
+  assert.equal(calls.length, 0, '目标校验就拦下了，没走到发送');
   delete process.env.MK_ORDER_GATE_URL;
+  assert.equal(orderGateStartupError(), null, '留空 = 关闭风控（默认部署路径不受影响）');
 });
 
 // ── (b) 放行 + payload 无 PII ──

@@ -1,7 +1,8 @@
 /**
  * 仲裁数据面（供链上仲裁人裁决参考；本节点 = 一家店，待仲裁单即本店 disputed 订单）。
  *
- *  GET /api/arbitration/pending   待仲裁争议单列表（公开只读，分页倒序）
+ *  GET /api/arbitration/pending       待仲裁争议单列表（公开只读，分页倒序）
+ *  GET /api/arbitration/after-sales   待处理**售后案件**列表（确认收货后开的案；公开只读，分页倒序）
  *
  * 裁决闭环：买家在订单页发起争议（链上 requestDispute）→ 节点 escrowWatcher 回写本单
  * 为 disputed（onchain_events 追加 DisputeRequested）→ 仲裁人在前端「仲裁台」从各可达
@@ -9,10 +10,22 @@
  * → 钱包直调链上 Escrow.arbitrate(orderId, refundWei) 裁决（可全额退买家 / 全额判卖家 / 按金额拆分；
  * 节点不经手资金，无写接口）→ 各节点 watcher 轮询 Arbitrated 事件回写 settled/refunded，本列表自动收敛。
  *
- * 隐私口径：待仲裁单已进入链上争议流程，订单号/金额/参与方在链上 DisputeRequested 与
- * OrderCreated 事件中公开可查——本端点摘要与链上公开信息对齐，不新增泄露面；
+ * **为什么售后案件是独立路由而不是并进 /pending 的一个 `kind`**（2026-10 决定，写在这里免得被"合并一下更省事"改回去）：
+ *  1. 两者是**不同的钱、不同的链上动作、不同的收口**：争议单资金还锁在托管里，裁决走
+ *     `Escrow.arbitrate`；售后案件的托管额早已结清（订单是终局），补偿只能走卖家保证金
+ *     `Staking.penalize`，收口走 `closeAfterSale`。合成一个列表后每个调用点都得按 kind 再分叉一次
+ *     ——那正是本仓反对的"在调用点补判据"。
+ *  2. 队列语义也不同：/pending 的候选是 `status='disputed'`（本地在途状态），
+ *     /after-sales 的候选是 `after_sale_status='open'`（**叠加在终局之上的第二层**，见 afterSale.js）。
+ *     两者的排序锚点、分页、限流与前端动作面都不一样。
+ *  3. 但**字段口径必须一致**：两个端点共用同一个行映射 `disputeToPublic`（含 kind 判别位），
+ *     所以仲裁台的两份数据面不会各长一套字段名。
+ * 「单节点 = 一家店」的口径不变：这两个列表都只含本店的单（不含联邦其它节点）。
+ *
+ * 隐私口径：待仲裁单已进入链上争议流程、售后案件也由链上 AfterSaleOpened 公开（含买卖双方），
+ * 订单号/金额/参与方在链上事件中公开可查——本端点摘要与链上公开信息对齐，不新增泄露面；
  * 交付内容（兑换码/tokenId 原文）属敏感资源，不出现在摘要——裁决证据经详情接口
- * 按身份返回（买家本人/店主/仲裁人，见 orders.js 详情路由的 as 判定）。
+ * 按身份返回（买家本人/店主/仲裁人，见 orders.js 详情路由的 as 判定；售后案件同样对仲裁人开放）。
  */
 import { Router } from 'express';
 import { getDb } from '../db.js';
@@ -24,6 +37,10 @@ import { goodsMicroOf, usdtOf } from '../money.js';
 import { hasDelivered } from '../returns.js';
 // 平台费**按单**判据的唯一实现（创建时收取方快照；见 src/fees.js）
 import { feeChargeableForOrder } from '../fees.js';
+// 确认收货后的售后案件：在途判据与 DTO 字段的唯一实现（见 src/afterSale.js）
+import { AFTER_SALE_OPEN_SQL, afterSaleFieldsOf } from '../afterSale.js';
+// 队列等待读数（计数 + 最久等待）的唯一实现：本文件的两个列表与 /api/shop/metrics 共用
+import { queueWait } from '../opsMetrics.js';
 
 const router = Router();
 
@@ -36,8 +53,12 @@ const router = Router();
 */
 const pendingLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '待仲裁列表查询过于频繁，请稍后再试' });
 
-/** DB 行 → 待仲裁摘要（不含交付内容原文；事件史为链上公开信息，可附） */
-function disputeToPublic(o) {
+/**
+ * 行 → 摘要（**两个列表共用**：争议单与售后案件，靠 `kind` 判别位分开）。
+ * 字段口径必须一致，否则仲裁台的两份数据面会各长一套名字（见文件头"为什么独立路由"）。
+ * @param {'dispute'|'after_sale'} kind 判别位
+ */
+function disputeToPublic(o, kind = 'dispute') {
   let snap = {};
   try {
     snap = JSON.parse(o.product_snapshot || '{}');
@@ -52,6 +73,8 @@ function disputeToPublic(o) {
     onchainEvents = [];
   }
   return {
+    // 判别位：同一份字段口径下的两类待办（'dispute'=争议中，'after_sale'=确认收货后的售后案件）
+    kind,
     id: o.id,
     escrowOrderId: o.escrow_order_id,
     productSlug: o.product_slug,
@@ -84,8 +107,11 @@ function disputeToPublic(o) {
       只给毛额时界面算出的上限**高于链上允许值**，仲裁人照填必然 revert `ExceedsCap()`。
       （争议单处于 disputed，通常在退款之前，所以它多为 0；但部分退款后再次进入争议的
       路径确实存在，不能靠"应该不会有"来省掉这个字段。）
+      `?? null` 而不是 `|| '0'`（2026-10 生产化清理）：两列在 db.js 里是 NOT NULL DEFAULT '0'
+      且已进 REQUIRED_COLUMNS，所以 null 实际上不可达；写成 `?? null` 是为了让**读不到**与
+      **确证为 0** 在代码里不混同（与 orders.js 的同款 DTO 一致，见 docs/DECISIONS.md「读不到不是 0」）。
     */
-    refundedAmountWei: o.refunded_amount_wei || '0',
+    refundedAmountWei: o.refunded_amount_wei ?? null,
     /*
       买家**已授权**的部分退款额（= 链上 `acceptedPartialRefund(orderId)` 的镜像；'0' = 未授权）。
       为什么给：契约 2026-09 起 `approveRefund` 只接受「全额」或「买家精确授权过的那个数」，
@@ -95,8 +121,8 @@ function disputeToPublic(o) {
       与同一对象里的 refundedAmountWei 同级（链上 OrderCreated / PartialRefundAccepted 事件
       本来就公开可查），不新增泄露面（见文件头隐私口径）。
     */
-    acceptedPartialRefundWei: o.accepted_partial_refund_wei || '0',
-    acceptedPartialRefundDecimal: weiToDecimal(o.accepted_partial_refund_wei || '0'),
+    acceptedPartialRefundWei: o.accepted_partial_refund_wei ?? null,
+    acceptedPartialRefundDecimal: weiToDecimal(o.accepted_partial_refund_wei),
     buyer: o.buyer,
     seller: o.seller,
     /*
@@ -138,11 +164,23 @@ function disputeToPublic(o) {
     evidenceCount: getDb().prepare('SELECT COUNT(*) AS c FROM dispute_evidence WHERE order_id = ?').get(o.id).c,
     // 进入争议时刻 = 最近一次状态迁移时间（watcher 回写 disputed 时更新）
     disputedAt: o.updated_at,
+    /*
+      确认收货后的售后案件（契约 2026-10 第二批；字段口径见 src/afterSale.js）。
+      争议单恒为 none（两套流程互斥：案件要求订单已终局，争议要求资金仍在托管里），
+      一并下发是为了让两份列表**形状一致**——仲裁台不必按 kind 决定读不读这几个字段。
+    */
+    ...afterSaleFieldsOf(o),
     onchainEvents,
   };
 }
 
-/** 待仲裁争议单列表（按进入争议时间倒序分页） */
+/**
+ * 队列等待读数（**待办计数 + 最久等待时长**）——实现已收口到 `src/opsMetrics.js` 的 `queueWait`
+ * （运营读数端点 `/api/shop/metrics` 读的是同一份：同一个"最久等待"不可能有两套算法）。
+ * 口径、锚点与该函数为什么长那样，见那一处的注释。
+ */
+
+/** 待仲裁争议单列表（按进入争议时间倒序分页；附"最久等待"读数） */
 router.get('/pending', pendingLimiter, wrap(async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
@@ -152,7 +190,33 @@ router.get('/pending', pendingLimiter, wrap(async (req, res) => {
   const rows = db
     .prepare("SELECT * FROM orders WHERE status = 'disputed' ORDER BY updated_at DESC LIMIT ? OFFSET ?")
     .all(pageSize, offset);
-  ok(res, { disputes: rows.map(disputeToPublic), total, page, pageSize });
+  // waiting：整队列（不分页）的待办计数与最久等待时长——分页里的 total 只给条数，看不出积压
+  ok(res, { disputes: rows.map((r) => disputeToPublic(r, 'dispute')), total, page, pageSize, waiting: queueWait({ where: "status = 'disputed'", timeCol: 'updated_at' }) });
+}));
+
+/**
+ * 待处理**售后案件**列表（确认收货后开的案；按开案时间倒序分页；附"最久等待"读数）。
+ *
+ * 候选 = `after_sale_status='open'` 的订单（本地镜像；三条回填路径见 afterSale.js）。
+ * 排序用 after_sale_opened_at（本队列的待办起点），**不是** updated_at：案件不迁移订单状态、
+ * 也不动 updated_at（那是入账窗口锚点），拿它排序会是"这笔钱什么时候结清的"，与待办无关。
+ */
+router.get('/after-sales', pendingLimiter, wrap(async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
+  const offset = (page - 1) * pageSize;
+  const db = getDb();
+  const total = db.prepare(`SELECT COUNT(*) AS c FROM orders WHERE ${AFTER_SALE_OPEN_SQL}`).get().c;
+  const rows = db
+    .prepare(`SELECT * FROM orders WHERE ${AFTER_SALE_OPEN_SQL} ORDER BY after_sale_opened_at DESC LIMIT ? OFFSET ?`)
+    .all(pageSize, offset);
+  ok(res, {
+    afterSales: rows.map((r) => disputeToPublic(r, 'after_sale')),
+    total,
+    page,
+    pageSize,
+    waiting: queueWait({ where: AFTER_SALE_OPEN_SQL, timeCol: 'after_sale_opened_at' }),
+  });
 }));
 
 export default router;

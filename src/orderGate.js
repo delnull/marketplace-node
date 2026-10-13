@@ -20,6 +20,17 @@
  * 代价是"风控服务一挂，全店下不了单"——这是店主自己选的可观测故障（启动日志会说明），
  * 逃生通道也很直白：**清空/删掉 MK_ORDER_GATE_URL** 即恢复"不过闸"的默认行为。
  *
+ * 配置非法 = **拒绝启动**（2026-10，取代旧的"非法 URL 视为未开启"）：
+ * 旧实现把 `new URL()` 解析失败静默折成 `orderGateEnabled() === false`，于是
+ * 「MK_ORDER_GATE_URL=gate.example.com/check」（少了 scheme）这类拼写错误**恰好等于关掉风控**——
+ * 店主的观感与真相相反：他以为风控在拦单，实际每一单都直接放行，而没有任何日志或界面说出来。
+ * 现在：URL 非空 ⇒ 本店**已开启**风控（唯一判据就是"非空"，见 orderGateEnabled），
+ * 非空但读不出 http(s) 目标 ⇒ 由 `orderGateStartupError()` 报出理由、`server.js` 在 listen 之前
+ * 拒绝启动（与密钥/库结构/合约锚点同一道启动门禁）。**"读不到一个可用的风控目标"与
+ * "店主没有开风控"是两件事**，本模块不允许前者冒充后者。
+ * 注意：`checkOrderGate` 的 fail-closed 与启动门禁是两条独立的保险——运行期 URL 被改坏
+ *（env getter 动态读取）时，闸会**拒单**（`assertPublicHttpTarget` 校验不通过），也绝不静默放行。
+ *
  * 安全实现与 webhook 同款（复用 netguard + pinnedRequest）：
  *  - 目标地址**每次**校验（URL 是运维参数、可随时改），禁内网/回环/链路本地/云元数据段；
  *  - **校验的地址就是连接的地址**（2026-09 续）：默认发送器走 `postPinned`，把校验通过的那批地址
@@ -70,19 +81,46 @@ export function resetOrderGate() {
 }
 
 /**
- * 风控闸是否开启：URL 非空且为 http(s)。
- * 只看"配了个地址"这一件事——非法 URL（拼错/少了 scheme）不算开启，否则会变成
- * "以为开了风控其实每次下单都被 fail-closed 拒掉"的静默故障。
+ * 风控闸是否开启：**URL 非空**即开启（唯一判据，只是"店主配了个地址"这一件事）。
+ *
+ * 为什么不再在这里解析 URL、并把非法 URL 判成"未开启"：那正是"配置拼错 ⇒ 风控静默失效"
+ * 的入口——非空但非法的 URL 会让 `checkOrderGate` 直接放行每一单。URL 是否**可用**由
+ * `orderGateStartupError()` 在启动期判定（非法即拒绝启动），运行期则由 `checkOrderGate`
+ * 的 fail-closed 兜住（校验不过 ⇒ 拒单）。
+ * 两个方向都只有"开启"与"明确拒单"，**不存在"配置了却没生效却当成没配"这条路径**。
  */
 export function orderGateEnabled() {
+  return !!config.orderGate.url;
+}
+
+/**
+ * 启动期配置门禁：MK_ORDER_GATE_URL 非空但读不出 http(s) 目标 ⇒ 返回拒绝启动的理由。
+ *
+ * 唯一实现（`server.js` 在 listen 之前调用一次，与密钥/库结构/合约锚点同一道门禁）：
+ * 配置拼错绝不能等于"本店没有风控"——那正是"读不到被降级成结论"的最坏形态（安全功能静默失效）。
+ * @returns {string|null} null = 通过（未配置 = 风控关闭，或配置了合法 http(s) 地址）
+ */
+export function orderGateStartupError() {
   const url = config.orderGate.url;
-  if (!url) return false;
+  if (!url) return null; // 未配置 = 关闭风控（默认部署，行为与没有这个功能完全一致）
+  let u;
   try {
-    const u = new URL(url);
-    return u.protocol === 'http:' || u.protocol === 'https:';
+    u = new URL(url);
   } catch {
-    return false;
+    return (
+      `MK_ORDER_GATE_URL 不是一个能解析的 URL：「${url}」。` +
+      `风控配置拼错**不等于**关掉风控（那会让每一单都静默放行，店主却以为风控在拦单）——` +
+      `请改成可解析的 http(s) 地址（如 https://risk.example.com/order-gate），` +
+      `或清空 MK_ORDER_GATE_URL（留空 = 关闭风控）后重启。`
+    );
   }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    return (
+      `MK_ORDER_GATE_URL 的协议是 ${u.protocol}，本节点只把单子发往 http:/https: 目标：「${url}」。` +
+      `请改用 http(s) 地址，或清空 MK_ORDER_GATE_URL（留空 = 关闭风控）后重启。`
+    );
+  }
+  return null;
 }
 
 /** 读取 JSON 应答（非 JSON/空体/读取失败一律 null → 调用方按"无法识别的应答"拒单） */
