@@ -26,7 +26,7 @@ function nftPayload(overrides = {}) {
   return {
     title: '测试 NFT 藏品',
     description: '单测 NFT 商品：链上藏品交付。',
-    images: ['https://example.com/nft.jpg'],
+    media: [{ type: 'image', url: 'https://example.com/nft.jpg' }],
     kind: 'nft',
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出；无规格商品就是 key='' 的唯一组合
@@ -97,7 +97,7 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
     slug: 'p-abc',
     title: '旧商品',
     description: 'd',
-    images: '[]',
+    media: '[]',
     kind: 'digital',
     description_blocks: '[]',
     specs: '[]',
@@ -117,7 +117,7 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
     全新项目不做存量迁移（改动量最大的那部分历史数据不存在）。
   */
   const canonical = JSON.stringify({
-    slug: 'p-abc', title: '旧商品', description: 'd', description_blocks: [], images: [], kind: 'digital',
+    slug: 'p-abc', title: '旧商品', description: 'd', description_blocks: [], media: [], kind: 'digital',
     shipping_fee_usdt_micro: 0, age_restricted: 0,
     specs: [], skus: [['', 100]],
   });

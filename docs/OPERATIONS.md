@@ -11,7 +11,7 @@
 |---|---|
 | `<安装目录>` | 代码 / 配置 / 状态文件所在目录，默认 `/opt/marketplace-node`（有 root/sudo 时）或 `$HOME/marketplace-node`（脚本的 `--dir`） |
 | `<容器名>` | = 服务名，默认 `marketplace-node`（脚本的 `--service`），也就是 `docker` 里的容器名 |
-| `<数据卷>` | 你的**全部数据**：默认 `marketplace-node-data`（脚本的 `--volume`），挂进容器是 `/data` |
+| `<数据卷>` | 你的**全部数据**：默认 `marketplace-node-data`（脚本的 `--volume`），挂进容器是 `/data`。里面有：SQLite 库文件（`marketplace-node.db`）、证据附件（`attachments/`）、**商品媒体（`uploads/`：图片 ≤2MB、视频 ≤50MB，每个视频单独一份原始文件）** |
 | `<端口>` | **宿主**上发布的端口，默认 `8090`（脚本的 `--port`）；容器内固定监听 `8090` |
 
 > 下面的命令一律按**默认名字**写。同机开了第二家店、或改过 `--service / --volume / --dir / --port` 的，
@@ -79,7 +79,7 @@
 **要备两样东西**：**数据卷**（SQLite 库 + 证据附件——商品、订单、客户收货信息全在这儿），以及 `<安装目录>/.env`（里面有令牌密钥，权限收紧、别外传）。
 
 ```bash
-# 1) 导出数据卷（整卷带走：库 + -wal/-shm + attachments/）
+# 1) 导出数据卷（整卷带走：库 + -wal/-shm + attachments/ 证据附件 + uploads/ 商品媒体（图片/视频））
 cd /opt/marketplace-node
 docker run --rm -v marketplace-node-data:/data -v "$PWD":/backup \
   --entrypoint tar marketplace-node:latest czf /backup/node-data-$(date +%F).tar.gz -C /data .

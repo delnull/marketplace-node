@@ -54,7 +54,11 @@ function migrate(d) {
       title         TEXT NOT NULL,
       description   TEXT NOT NULL DEFAULT '',      -- 纯文本摘要（由 description_blocks 派生，供 SQL LIKE 搜索；无块时即店主填的原文）
       description_blocks TEXT NOT NULL DEFAULT '[]', -- 详情块 JSON：[{type:'text',text} | {type:'image',url}] —— 商品详情的权威内容，入快照
-      images        TEXT NOT NULL DEFAULT '[]',      -- JSON 数组（图片 URL，可为 http(s) 外链或本站 /api/uploads/…）
+      media         TEXT NOT NULL DEFAULT '[]',      -- 主图区 JSON（**数组顺序即展示顺序**）：
+                                                      --   [{type:'image',url} | {type:'video',url,poster}]，合计 ≤10 项、其中视频 ≤3
+                                                      -- 图片 URL 可为 http(s) 外链或本站 /api/uploads/…；
+                                                      -- 视频**只收本站上传**（外链视频会绕过"类型由字节判定"这条判据）。
+                                                      -- 入快照：主图区是买家看到的商品本身，事后换图/换视频必须改哈希。
       kind          TEXT NOT NULL CHECK (kind IN ('digital','physical','nft')),
       shipping_fee_usdt_micro INTEGER NOT NULL DEFAULT 0, -- 运费（**微 USDT**，1 USDT = 1e6；**按单收取一次**；0=包邮）。仅实物商品可用，数字/NFT 恒 0；
                                                         -- 入快照：买家要能核验"锁定的运费没被事后改价"

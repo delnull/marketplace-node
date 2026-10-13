@@ -30,7 +30,7 @@ function nftPayload(overrides = {}) {
   return {
     title: '占位测试 NFT',
     description: 'capacity 占位单测 NFT 商品。',
-    images: ['https://example.com/n.jpg'],
+    media: [{ type: 'image', url: 'https://example.com/n.jpg' }],
     kind: 'nft',
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出；无规格商品就是 key='' 的唯一组合

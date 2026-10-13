@@ -142,7 +142,7 @@ test('商品列表与详情：分页、快照一致性（算法可复算）', as
   const rowLike = rowLikeOf(p);
   const obj = snapshotObject(rowLike);
   assert.equal(computeSnapshotHash(obj), p.snapshotHash, '快照哈希应可由公开字段复算');
-  assert.deepEqual(obj.images, p.images);
+  assert.deepEqual(obj.media, p.media);
 });
 
 test('改价后快照哈希变化；下架后不出现在公开列表', async () => {

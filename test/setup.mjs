@@ -89,7 +89,7 @@ export function productPayload(overrides = {}) {
   return {
     title: '测试数字商品',
     description: '单测上架的商品描述，用于校验快照与下单流程。',
-    images: ['https://example.com/a.jpg'],
+    media: [{ type: 'image', url: 'https://example.com/a.jpg' }],
     kind: 'digital',
     specs: specs ?? [],
     skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
@@ -131,7 +131,7 @@ export function ageDrafts(db, ids, ms) {
  * 由 API 返回的商品构造「DB 行形状」的对象，供测试复算快照哈希。
  * 快照契约（**键序即契约**，两端必须逐字一致，见 node/src/routes/products.js 的 snapshotObject
  * 与 frontend/src/utils/snapshot.ts）：slug / title / description / description_blocks /
- * images / kind / shipping_fee_usdt_micro / age_restricted / specs / skus（nft 商品在**末尾**
+ * media / kind / shipping_fee_usdt_micro / age_restricted / specs / skus（nft 商品在**末尾**
  * 追加 nft_contract、nft_standard）——价格不在商品级，每个组合的单价在 skus 里。
  */
 export function rowLikeOf(p) {
@@ -139,8 +139,14 @@ export function rowLikeOf(p) {
     slug: p.slug,
     title: p.title,
     description: p.description,
-    images: JSON.stringify(p.images),
+    // **每个快照键都要在这里**：这个助手是"公开字段 → 可复算的哈希"的判据输入，
+    // 漏一个键就会让"哈希对不对"这条断言悄悄失去意义（曾经漏过 description_blocks：
+    // 带详情块的商品复算必然不一致，而用例只报哈希不同、看不出是谁漏了）。
+    description_blocks: JSON.stringify(p.descriptionBlocks || []),
+    media: JSON.stringify(p.media || []),
     kind: p.kind,
+    shipping_fee_usdt_micro: p.shippingFeeUsdtMicro ?? 0,
+    age_restricted: p.ageRestricted ? 1 : 0,
     specs: JSON.stringify(p.specs || []),
     skus: (p.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
     nft_contract: p.nftContract || '',

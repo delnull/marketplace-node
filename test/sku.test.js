@@ -345,7 +345,7 @@ test('快照覆盖规格与逐组合单价，且可复算；改任一组合价�
     slug: p.slug,
     title: p.title,
     description: p.description,
-    images: JSON.stringify(p.images),
+    media: JSON.stringify(p.media),
     kind: p.kind,
     specs: JSON.stringify(p.specs),
     skus: p.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),

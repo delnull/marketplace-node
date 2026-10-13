@@ -41,6 +41,8 @@ import { feeChargeableForOrder } from '../fees.js';
 import { AFTER_SALE_OPEN_SQL, afterSaleFieldsOf } from '../afterSale.js';
 // 队列等待读数（计数 + 最久等待）的唯一实现：本文件的两个列表与 /api/shop/metrics 共用
 import { queueWait } from '../opsMetrics.js';
+// 主图区缩略图的读取口径（图片取 url、视频取 poster）——**唯一实现**，卡片/订单/仲裁台共用
+import { firstMediaThumb } from '../../../shared/media.js';
 
 const router = Router();
 
@@ -80,7 +82,10 @@ function disputeToPublic(o, kind = 'dispute') {
     productSlug: o.product_slug,
     productTitle: snap.title || o.product_slug,
     productKind: snap.kind || 'physical',
-    productImage: Array.isArray(snap.images) && snap.images[0] ? snap.images[0] : null,
+    // 商品缩略图：主图区第一项的**缩略图**（图片取 url，视频取封面 poster）。
+    // 这里只下发 URL 字符串（仲裁台的列表是密集列表，不该为了一个缩略图去解析媒体类型）；
+    // 相对路径由前端按该单所属节点的 origin 拼绝对地址（与商品页同一套解析）。
+    productImage: firstMediaThumb(snap.media),
     // 数量模型 v2：争议单可能为多份（同一快照同买家可重复下单，一份链上托管单 = 一个草稿单）
     quantity: o.quantity || 1,
     /*

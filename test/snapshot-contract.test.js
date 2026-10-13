@@ -24,27 +24,38 @@ const { snapshotObject, computeSnapshotHash } = await import('../src/routes/prod
 /** 与 frontend/test/snapshot.test.ts 的同名常量**必须逐字一致** */
 const CROSS_LANG_FIXTURE = {
   canonical:
-    '{"slug":"p-fix-1","title":"测试 \\"商品\\" & co","description":"desc\\nline2","description_blocks":[],' +
-    '"images":["https://a/b.png"],"kind":"physical","shipping_fee_usdt_micro":5000000,"age_restricted":1,' +
-    '"specs":[{"name":"颜色","options":["黑","白"]},{"name":"尺寸","options":["M"]}],' +
-    '"skus":[["尺寸=M|颜色=白",12000000],["尺寸=M|颜色=黑",10000000]]}',
-  hash: '0xb5cc9b5c79191520830752e5bc148f5f87e3fe7e564b48f20918d817496eba54',
+    '{"slug":"p-fix-1","title":"测试 \\"商品\\" & co","description":"desc\\nline2","description_blocks":[' +
+    '],"media":[{"type":"image","url":"https://a/b.png"},{"type":"video","url":"/api/uploads/00000000' +
+    '-0000-0000-0000-000000000000.mp4","poster":"/api/uploads/11111111-1111-1111-1111-111111111111.jp' +
+    'g"}],"kind":"physical","shipping_fee_usdt_micro":5000000,"age_restricted":1,"specs":[{"name":"颜色' +
+    '","options":["黑","白"]},{"name":"尺寸","options":["M"]}],"skus":[["尺寸=M|颜色=白",12000000],["尺寸=M|颜色=黑' +
+    '",10000000]]}',
+  hash: '0x19206bc018b76a2dcfc47377d50e450dbc9817e18426bb280585eaaed728a030',
   /** NFT 单：两个键**追加在 skus 之后**（顺序错了哈希就变，而没人会报错） */
   nftCanonical:
-    '{"slug":"p-fix-nft","title":"NFT 商品","description":"","description_blocks":[],"images":[],' +
-    '"kind":"nft","shipping_fee_usdt_micro":0,"age_restricted":0,"specs":[],"skus":[["",3000000]],' +
-    '"nft_contract":"0xabc0000000000000000000000000000000000001","nft_standard":"erc1155"}',
-  nftHash: '0x5a85ba0a3cb3e84ff97a5152bc6fd40e32ed20f6fabc576328dbd8c68a33891a',
+    '{"slug":"p-fix-nft","title":"NFT 商品","description":"","description_blocks":[],"media":[],"kind":' +
+    '"nft","shipping_fee_usdt_micro":0,"age_restricted":0,"specs":[],"skus":[["",3000000]],"nft_contr' +
+    'act":"0xabc0000000000000000000000000000000000001","nft_standard":"erc1155"}',
+  nftHash: '0x0a3b3e6affba38ea4f3034c1f13f02a5a1c7b86520b58494d7320df6c0cbd00f',
 };
 
 test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 keccak（两侧必须逐字节一致）', () => {
-  // node 输入形状：DB 行（snake_case；images/description_blocks/specs 是 JSON 字符串列）
+  // node 输入形状：DB 行（snake_case；media/description_blocks/specs 是 JSON 字符串列）
   const row = {
     slug: 'p-fix-1',
     title: '测试 "商品" & co', // 含引号与 &：转义差异会立刻改变 JSON
     description: 'desc\nline2', // 含换行：\n 的写法必须一致
     description_blocks: '[]',
-    images: JSON.stringify(['https://a/b.png']),
+    // 主图区：图片 + 视频各一。**元素里的键序也是契约**（type → url → poster）——
+    // 写入路径重建对象时就是这个顺序，两端不能各按自己的写法序列化。
+    media: JSON.stringify([
+      { type: 'image', url: 'https://a/b.png' },
+      {
+        type: 'video',
+        url: '/api/uploads/00000000-0000-0000-0000-000000000000.mp4',
+        poster: '/api/uploads/11111111-1111-1111-1111-111111111111.jpg',
+      },
+    ]),
     kind: 'physical',
     shipping_fee_usdt_micro: 5_000_000, // 运费必须进快照（否则店主可在下单前事后加价）
     age_restricted: 1, // 年龄限制必须进快照
@@ -70,7 +81,7 @@ test('snapshot 契约：NFT 单的两键追加在 skus 之后（与前端同一 
     title: 'NFT 商品',
     description: '',
     description_blocks: '[]',
-    images: '[]',
+    media: '[]',
     kind: 'nft',
     shipping_fee_usdt_micro: 0,
     age_restricted: 0,

@@ -192,7 +192,7 @@ test('编辑 PATCH：标签变更时两份镜像**同批**替换（旧标签行�
       ['新标签', '新标签'],
     ],
   });
-  // 清空：提交 [] = 显式清空（与 images 同款三态：未提交=不动）→ 两处都空
+  // 清空：提交 [] = 显式清空（与 media 同款三态：未提交=不动）→ 两处都空
   const cleared = await patchProduct(p.slug, { tags: [] });
   assertOk(cleared);
   assert.deepEqual(cleared.body.data.tags, []);

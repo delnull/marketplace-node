@@ -20,7 +20,7 @@ const PRODUCT_ID = 990001;
 /** 造一个商品 + 一笔订单（直接插行：本用例测的是体检判据，不是下单流程） */
 function seed(orderId, { status = 'shipped', productId = PRODUCT_ID } = {}) {
   db.prepare(
-    `INSERT INTO products (id, slug, title, description, description_blocks, images, kind, specs,
+    `INSERT INTO products (id, slug, title, description, description_blocks, media, kind, specs,
         snapshot_hash, created_at, updated_at)
      VALUES (?, ?, ?, '', '[]', '[]', 'digital', '[]', '0x' + '00', ?, ?)
      ON CONFLICT(id) DO NOTHING`

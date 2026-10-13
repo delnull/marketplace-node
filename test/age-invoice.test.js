@@ -125,7 +125,7 @@ test('年龄限制标记入快照：加/去限制必变哈希，同值保存哈�
     title: restricted.title,
     description: restricted.description,
     description_blocks: JSON.stringify(restricted.descriptionBlocks || []),
-    images: JSON.stringify(restricted.images),
+    media: JSON.stringify(restricted.media),
     kind: restricted.kind,
     shipping_fee_usdt_micro: restricted.shippingFeeUsdtMicro,
     age_restricted: restricted.ageRestricted ? 1 : 0,

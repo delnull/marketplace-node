@@ -168,7 +168,7 @@ test('NFT quantity=2：同单 tokenId 重复申报 / 一次超量申报 → 链�
   const p = await listProduct({
     title: '集合边界 NFT',
     description: 'd',
-    images: ['https://example.com/n.jpg'],
+    media: [{ type: 'image', url: 'https://example.com/n.jpg' }],
     kind: 'nft',
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出：无规格商品就是 key='' 的唯一组合

@@ -31,13 +31,15 @@
  * 字段顺序为约定契约，前端 utils/snapshot.ts 保持一致，勿随意调整）。
  *
  * **快照契约（唯一权威顺序）**：
- *   slug / title / description / description_blocks / images / kind /
+ *   slug / title / description / description_blocks / media / kind /
  *   shipping_fee_usdt_micro / age_restricted / specs / skus
  *   kind='nft' 时再追加 nft_contract、nft_standard（nft_contract 在前）。
  *   追加/改动键必须在**同一位置**同时改本文件与前端 utils/snapshot.ts，
  *   否则每个买家都会看到假的「商品内容已被修改」告警。
  *   运费与年龄限制必须在快照里：否则店主可以在买家下单前事后加价运费、
  *   或把限制商品悄悄摘掉限制，而买家手上的哈希不变。
+ *   主图区（media）同样必须在快照里：它就是买家看到的商品本身，
+ *   事后换一张图/换一段视频而哈希不变，等于主图可被无声替换。
  *   （历史契约曾把 nft 两键描述为"追加在 price_usdt_micro 之后"——价格早已下沉到
  *   skus，该措辞已失效，此处按当前实现重写。）
  */
@@ -61,6 +63,14 @@ import { usdtOf } from '../money.js';
 import { DRAFT_OR_ACTIVE_IN } from '../orderStatus.js';
 // 商品标签（类目）的键/展示形/归一化 —— **唯一实现**（两个写入入口、列表筛选与标签清单共用，见 src/tags.js 文件头）
 import { normalizeTags, parseTagsColumn, tagKeyOf } from '../tags.js';
+// 主图区（图片 + 视频）的字节判据、上限与 URL 规则 —— **唯一实现**（与前端共用同一份常量）
+import {
+  MAX_MEDIA_ITEMS,
+  MAX_VIDEO_ITEMS,
+  UPLOAD_URL_PREFIX,
+  mediaUrlAllowed,
+  normalizeMediaUrl,
+} from '../../../shared/media.js';
 
 /*
   价格与运费的闸门（**微 USDT**，1 USDT = 1e6）。
@@ -100,8 +110,24 @@ function snapshotNonNegInt(v) {
   return Number.isInteger(n) && n > 0 ? n : 0;
 }
 
+/**
+ * 解析库里的主图区 JSON（容错：脏数据/缺列当作"没有媒体"）。
+ *
+ * **刻意不做归一、不清洗、不补默认值**：快照哈希认的就是库里存的那一份字节，
+ * 任何"顺手规整"都会让 DTO 与快照算出的哈希不一致（买家看到假的「商品内容已被修改」）。
+ * 形状的保证在写入路径（`validateProduct` 的 media 分支），不在这里。
+ */
+function parseMediaColumn(json) {
+  try {
+    const v = JSON.parse(json || '[]');
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
 /** 快照规范化字段（顺序固定，勿改动）：
- *  slug / title / description / description_blocks / images / kind /
+ *  slug / title / description / description_blocks / media / kind /
  *  shipping_fee_usdt_micro / age_restricted / specs / skus；
  *  kind='nft' 时追加 nft_contract、nft_standard（nft_contract 在前）。
  *  新键插在 kind 之后、specs 之前，前端 utils/snapshot.ts 必须同位置同键。
@@ -109,14 +135,9 @@ function snapshotNonNegInt(v) {
  *  价格不在商品级 —— 每个组合的单价都在 skus 里（[[sku_key, price_usdt_micro], …] 按 key 升序），
  *  买家据此核验「所选规格的价格」没有被事后改动。
  *  运费（shipping_fee_usdt_micro）与年龄限制（age_restricted）**必须**在快照里：
- *  前者是钱（事后加价运费等于改价），后者是商品属性（上架后静默增删限制，买家无从察觉）。 */
+ *  前者是钱（事后加价运费等于改价），后者是商品属性（上架后静默增删限制，买家无从察觉）。
+ *  主图区（media）**必须**在快照里：它是买家看到的那件商品本身。 */
 export function snapshotObject(row) {
-  let images = [];
-  try {
-    images = JSON.parse(row.images || '[]');
-  } catch {
-    images = [];
-  }
   const skuRows = Array.isArray(row.skus) ? row.skus : [];
   const snap = {
     slug: row.slug,
@@ -125,7 +146,9 @@ export function snapshotObject(row) {
     // 详情块是商品详情的**权威内容**，必须入快照 —— 否则店主事后往说明里插一张图，
     // 买家手上的哈希不变，等于详情可被无声篡改。
     description_blocks: parseBlocks(row.description_blocks),
-    images,
+    // 主图区（图片 + 视频，顺序即展示顺序）。**逐字入快照**：元素里的 url/poster 就是
+    // 校验输入，展示层的绝对化改写绝不允许回写到这里（见前端 utils/media.ts 的解析函数）。
+    media: parseMediaColumn(row.media),
     kind: row.kind,
     // 运费（微 USDT，按单收取一次；0=包邮）——买家据此核验「锁定的运费」没被事后改价
     shipping_fee_usdt_micro: snapshotNonNegInt(row.shipping_fee_usdt_micro),
@@ -150,7 +173,9 @@ export function computeSnapshotHash(snap) {
     title: snap.title,
     description: snap.description,
     description_blocks: snap.description_blocks,
-    images: snap.images,
+    // 主图区**逐字透传**：元素里的 url/poster 不在这里归一/补默认值 ——
+    // 快照哈希算的是"服务端存的那一份"，任何就地改写都会让两端算出不同的哈希。
+    media: snap.media,
     kind: snap.kind,
     // 与 snapshotObject 同键同位（契约：见文件头快照契约）。手搓对象缺这两键时归一为默认值，
     // 保证「同一件商品」无论经哪条路径规范化都得到同一个哈希。
@@ -166,6 +191,33 @@ export function computeSnapshotHash(snap) {
   }
   const canonical = JSON.stringify(o);
   return ethers.keccak256(ethers.toUtf8Bytes(canonical));
+}
+
+/**
+ * 写操作的规范化结果（`validateProduct` 的 value）→ 快照用的**行形状**。
+ *
+ * 为什么要有这个唯一的转换：上架与编辑两条写入路径各自手写过一份对象字面量，
+ * 而"手挑字段"这种写法漏过一次（批量改价的快照重算漏了 description_blocks，
+ * 于是带详情块的商品一改价，买家就看到假的「商品内容已被修改」）。
+ * 现在快照输入的组装只有这一处：**新增快照键只改这里**，两条写入路径自动跟上。
+ * （批量改价那条路径手里本来就是整行 `SELECT *`，直接进 snapshotObject。）
+ */
+function snapshotRowOf(slug, value) {
+  return {
+    slug,
+    title: value.title,
+    description: value.description,
+    description_blocks: JSON.stringify(value.descriptionBlocks),
+    media: JSON.stringify(value.media),
+    kind: value.kind,
+    shipping_fee_usdt_micro: value.shippingFeeUsdtMicro,
+    age_restricted: value.ageRestricted,
+    specs: JSON.stringify(value.specs),
+    // 快照与 DB 行同形（sku_key / price_usdt_micro），便于同一套规范化逻辑复用
+    skus: value.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
+    nft_contract: value.nftContract,
+    nft_standard: value.nftStandard,
+  };
 }
 
 // ══ SKU（规格组合）═══════════════════════════════════════════════════
@@ -376,7 +428,8 @@ function rowToPublic(row) {
     description: r.description,
     /** 详情块（权威内容）：[{type:'text',text} | {type:'image',url}]；空数组时前端按 description 纯文本渲染 */
     descriptionBlocks: parseBlocks(r.description_blocks),
-    images: snap.images,
+    /** 主图区（顺序即展示顺序）：[{type:'image',url} | {type:'video',url,poster}] */
+    media: snap.media,
     kind: r.kind,
     /**
      * 运费（实物）：**按单收取一次**（不随件数翻倍），0 = 包邮。
@@ -427,14 +480,56 @@ function validateProduct(v) {
   const title = String(v.title ?? '').trim();
   if (!title || title.length > 120) errors.push('title 必填且不超过 120 字符');
   const description = String(v.description ?? '').slice(0, 5000);
-  if (!Array.isArray(v.images)) errors.push('images 需为图片 URL 字符串数组');
-  let images = [];
-  if (Array.isArray(v.images)) {
-    if (v.images.length > 9) errors.push('images 最多 9 张');
-    images = v.images.slice(0, 9).map((u) => String(u).slice(0, 500));
-    // 协议白名单（纵深防御）：仅 http/https 图片 URL——javascript:/data: 等一旦进入未来的
-    // 富文本/新渲染上下文可能被利用（当前 CSS url() 上下文执行面≈0，仍收口防漂移）
-    if (images.some((u) => !/^https?:\/\//i.test(u))) errors.push('图片 URL 仅支持 http/https');
+  /*
+    主图区（media）：**数组顺序即展示顺序**，元素是判别联合
+      { type:'image', url }  |  { type:'video', url, poster }
+
+    - 上限（合计 ≤10 项、视频 ≤3）来自 `shared/media.js` —— 与前端预检**同一份常量**，
+      不在两边各写一个数字；
+    - URL 规则走唯一判据 `mediaUrlAllowed`（http(s) 外链或本站 /api/uploads/…），
+      与详情块图片同一条；图片允许外链（店主自备图床是既有能力），
+      **视频只收本站上传**：外链视频会绕过"类型由字节判定"这条判据（服务端从没见过那些字节），
+      而主图区视频要进快照、要长期可播，不该建立在别人图床挂不挂上；
+    - poster（封面）必填：它同时是画廊缩略图与"这段视频在店主本机放得了"的证据
+      （前端抓首帧生成，抓不到就不给保存 —— 服务端不判编码，见 shared/media.js 的口径 2）。
+  */
+  let media = [];
+  if (!Array.isArray(v.media)) {
+    errors.push('media 需为主图区数组（[{type:"image",url} | {type:"video",url,poster}]）');
+  } else {
+    if (v.media.length > MAX_MEDIA_ITEMS) errors.push(`主图区最多 ${MAX_MEDIA_ITEMS} 项（图片 + 视频合计）`);
+    let videos = 0;
+    media = v.media.slice(0, MAX_MEDIA_ITEMS).flatMap((raw) => {
+      const type = String(raw?.type || '');
+      const url = normalizeMediaUrl(raw?.url);
+      if (type === 'image') {
+        if (!url) return [];
+        if (!mediaUrlAllowed(url)) {
+          errors.push('图片 URL 仅支持 http/https 外链或本站上传路径');
+          return [];
+        }
+        return [{ type: 'image', url }];
+      }
+      if (type === 'video') {
+        videos += 1;
+        if (videos > MAX_VIDEO_ITEMS) {
+          errors.push(`视频最多 ${MAX_VIDEO_ITEMS} 个`);
+          return [];
+        }
+        if (!url.startsWith(UPLOAD_URL_PREFIX)) {
+          errors.push('视频仅支持上传到本站（不收外链视频）');
+          return [];
+        }
+        const poster = normalizeMediaUrl(raw?.poster);
+        if (!poster || !mediaUrlAllowed(poster)) {
+          errors.push('每个视频都要有封面图（上传时由浏览器抓首帧生成）');
+          return [];
+        }
+        return [{ type: 'video', url, poster }];
+      }
+      errors.push('主图区条目的 type 只能是 image 或 video');
+      return [];
+    });
   }
   const kind = String(v.kind ?? '');
   if (!['digital', 'physical', 'nft'].includes(kind)) errors.push('kind 需为 digital / physical / nft');
@@ -527,7 +622,7 @@ function validateProduct(v) {
       // 有块时 description 降级为派生摘要；无块时就是店主填的纯文本（保持原有观感）
       description: blocks.length ? deriveDescription(blocks) : description,
       descriptionBlocks: blocks,
-      images,
+      media,
       kind,
       shippingFeeUsdtMicro,
       ageRestricted,
@@ -874,28 +969,12 @@ router.post('/', staffOnly, wrap(async (req, res) => {
   const now = Date.now();
   // 一次写入（snapshot_hash NOT NULL）：先由规范化字段算好哈希（kind='nft' 时快照含 nft_contract/nft_standard 键；
   // 运费与年龄限制同键同位进快照——契约见文件头）
-  const hash = computeSnapshotHash(
-    snapshotObject({
-      slug,
-      title: value.title,
-      description: value.description,
-      description_blocks: JSON.stringify(value.descriptionBlocks),
-      images: JSON.stringify(value.images),
-      kind: value.kind,
-      shipping_fee_usdt_micro: value.shippingFeeUsdtMicro,
-      age_restricted: value.ageRestricted,
-      specs: JSON.stringify(value.specs),
-      // 快照与 DB 行同形（sku_key / price_usdt_micro），便于同一套规范化逻辑复用
-      skus: value.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
-      nft_contract: value.nftContract,
-      nft_standard: value.nftStandard,
-    })
-  );
+  const hash = computeSnapshotHash(snapshotObject(snapshotRowOf(slug, value)));
   db.prepare(
-    'INSERT INTO products (slug, title, description, description_blocks, images, kind, shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, specs, tags, auto_deliver, stock_alert_at, snapshot_hash, active, created_at, updated_at) ' +
+    'INSERT INTO products (slug, title, description, description_blocks, media, kind, shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, specs, tags, auto_deliver, stock_alert_at, snapshot_hash, active, created_at, updated_at) ' +
       'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
   ).run(
-    slug, value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.images),
+    slug, value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.media),
     value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard,
     JSON.stringify(value.specs), JSON.stringify(value.tags), value.autoDeliver, value.stockAlertAt, hash, now, now
   );
@@ -956,24 +1035,19 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
       const up = db.prepare('UPDATE product_skus SET price_usdt_micro = ?, updated_at = ? WHERE product_id = ?');
       up.run(next.priceUsdtMicro, Date.now(), row.id);
     }
-    // 快照哈希重算（价格属快照字段；其余 batch 字段不入快照）。
-    // 运费/年龄限制取自**当前行**（batch 不改这两项）——漏传会被归一为 0，
-    // 于是"批量改个价"就把有运费商品的快照悄悄改成包邮版本，买家全部校验失败。
+    /*
+      快照哈希重算：直接把**整行**交给 snapshotObject（它认的就是 DB 行形状）。
+      这里曾经手挑字段（只列了 slug/title/description/images/kind/…），漏掉了 description_blocks：
+      带详情块的商品被批量改价后，重算出的哈希与商品真实内容不符，买家侧立刻报
+      「商品内容已被修改」——而店主只是改了个价。整行传入之后，"以后新增快照键就漏改这里"
+      这一类错误不可能再发生（新键自动跟着走）。
+    */
     const hash = computeSnapshotHash(
       snapshotObject({
-        slug: row.slug,
-        title: row.title,
-        description: row.description,
-        images: row.images,
-        kind: row.kind,
-        shipping_fee_usdt_micro: row.shipping_fee_usdt_micro,
-        age_restricted: row.age_restricted,
-        specs: row.specs,
+        ...row,
         skus: next.priceUsdtMicro !== null
           ? skuRows.map((s) => ({ sku_key: s.sku_key, price_usdt_micro: next.priceUsdtMicro }))
           : skuRows,
-        nft_contract: row.nft_contract,
-        nft_standard: row.nft_standard,
       })
     );
     db.prepare(
@@ -991,19 +1065,14 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
   const row = db.prepare('SELECT * FROM products WHERE slug = ?').get(String(req.params.slug || ''));
   if (!row) return fail(res, '商品不存在', 404, 404);
   const b = req.body || {};
-  let baseImages = [];
-  try {
-    baseImages = JSON.parse(row.images || '[]');
-  } catch {
-    baseImages = [];
-  }
+  let baseMedia = parseMediaColumn(row.media);
   const prevSkuMap = new Map(loadSkus(row.id).map((s) => [s.sku_key, s]));
   const merged = {
     title: b.title !== undefined ? b.title : row.title,
     description: b.description !== undefined ? b.description : row.description,
     // 详情块：未提交则沿用现有（DB 行 → API 形状）。有块时 description 由块派生。
     descriptionBlocks: b.descriptionBlocks !== undefined ? b.descriptionBlocks : parseBlocks(row.description_blocks),
-    images: b.images !== undefined ? b.images : baseImages,
+    media: b.media !== undefined ? b.media : baseMedia,
     kind: b.kind !== undefined ? b.kind : row.kind,
     // 运费（按单收取一次；0=包邮）与年龄限制：未提交则沿用现值——它们是快照字段，
     // 漏传等于把商品悄悄改回包邮/无限制（买家手里的哈希随即对不上）
@@ -1066,7 +1135,7 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
           })),
     autoDeliver: b.autoDeliver !== undefined ? b.autoDeliver : row.auto_deliver,
     stockAlertAt: b.stockAlertAt !== undefined ? b.stockAlertAt : row.stock_alert_at,
-    // 标签：未提交则沿用现有（DB 行 → 数组）；提交 `[]` = 显式清空（与 images 同款三态：
+    // 标签：未提交则沿用现有（DB 行 → 数组）；提交 `[]` = 显式清空（与 media 同款三态：
     // 未提交=不动、提交空数组=清空）。归一化在 validateProduct → src/tags.js（唯一实现）
     tags: b.tags !== undefined ? b.tags : parseTagsColumn(row.tags),
     active: b.active !== undefined ? b.active : !!row.active,
@@ -1215,26 +1284,11 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     }
   }
 
-  const hash = computeSnapshotHash(
-    snapshotObject({
-      slug: row.slug,
-      title: value.title,
-      description: value.description,
-      description_blocks: JSON.stringify(value.descriptionBlocks),
-      images: JSON.stringify(value.images),
-      kind: value.kind,
-      shipping_fee_usdt_micro: value.shippingFeeUsdtMicro,
-      age_restricted: value.ageRestricted,
-      specs: JSON.stringify(value.specs),
-      skus: value.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
-      nft_contract: value.nftContract,
-      nft_standard: value.nftStandard,
-    })
-  );
+  const hash = computeSnapshotHash(snapshotObject(snapshotRowOf(row.slug, value)));
   db.prepare(
-    'UPDATE products SET title = ?, description = ?, description_blocks = ?, images = ?, kind = ?, shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, specs = ?, tags = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, snapshot_hash = ?, updated_at = ? ' +
+    'UPDATE products SET title = ?, description = ?, description_blocks = ?, media = ?, kind = ?, shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, specs = ?, tags = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, snapshot_hash = ?, updated_at = ? ' +
       'WHERE id = ?'
-  ).run(value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.images), value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard, JSON.stringify(value.specs), JSON.stringify(value.tags), value.autoDeliver, value.stockAlertAt, value.active, hash, Date.now(), row.id);
+  ).run(value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.media), value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard, JSON.stringify(value.specs), JSON.stringify(value.tags), value.autoDeliver, value.stockAlertAt, value.active, hash, Date.now(), row.id);
   // 写 SKU（保留同 key 的 committed，编辑商品不该把已售数量清零）
   saveSkus(row.id, value.skus, Date.now());
   // 标签镜像同批写入（与上面的 products.tags 列更新同一次提交；见 saveTags 注释）

@@ -19,6 +19,8 @@ import crypto from 'node:crypto';
 import { getDb, txBegin, txCommit, txRollback } from './db.js';
 import config from './config.js';
 import { ACTIVE_STATUS } from './orderStatus.js';
+// 字节判据的唯一实现（商品媒体与证据附件共用；本文件的 ALLOWED 只决定"允许收哪几种"）
+import { sniffMediaMime } from '../../shared/media.js';
 // 确认收货后的售后案件：在途判据的唯一实现（本文件的阶段门控与退货窗口、仲裁队列共用）
 import { isAfterSaleOpen, hasAfterSaleHistory } from './afterSale.js';
 
@@ -27,28 +29,22 @@ export const MAX_FILES_PER_EVIDENCE = 6;
 export const MAX_BYTES_PER_ORDER = 20 * 1024 * 1024; // 20MB
 export const MAX_RAW_NAME = 120;
 
-/** 白名单：mime → { ext, magic 前缀（hex 字符串或 {offset,len}）} */
+/**
+ * 证据附件的**策略**：收哪些类型、各自落盘的扩展名。
+ *
+ * 字节层面的判据**不在这里**：`sniffMediaMime`（`shared/media.js`）是"这段字节到底是什么"
+ * 的唯一实现，商品媒体与证据附件共用。本表只回答"证据附件允许收哪几种"——
+ * 两张表曾各自维护一份魔数（改一处漏一处），现在只有策略是两套。
+ * 注意它与商品媒体的策略**故意不同**：附件不收 gif（动图对举证没有价值、却更难核验），
+ * 也不收任何视频（视频进主图区，不进举证附件）。
+ */
 const ALLOWED = {
-  'image/png': { ext: 'png', magic: '89504e47' },
-  'image/jpeg': { ext: 'jpg', magic: 'ffd8ff' },
-  'image/webp': { ext: 'webp', magic: { bytes: '52494646', at: 0, tag: '57454250', tagAt: 8 } }, // RIFF....WEBP
-  'application/pdf': { ext: 'pdf', magic: '25504446' }, // %PDF
+  'image/png': { ext: 'png' },
+  'image/jpeg': { ext: 'jpg' },
+  'image/webp': { ext: 'webp' },
+  'application/pdf': { ext: 'pdf' }, // %PDF
 };
 const MIME_ALIAS = { 'image/jpg': 'image/jpeg' };
-
-function hasMagic(buf, spec) {
-  if (typeof spec === 'string') {
-    const hex = Buffer.from(spec, 'hex');
-    return buf.length >= hex.length && buf.subarray(0, hex.length).equals(hex);
-  }
-  const head = Buffer.from(spec.bytes, 'hex');
-  const tag = Buffer.from(spec.tag, 'hex');
-  return (
-    buf.length >= spec.tagAt + tag.length &&
-    buf.subarray(0, head.length).equals(head) &&
-    buf.subarray(spec.tagAt, spec.tagAt + tag.length).equals(tag)
-  );
-}
 
 /** 校验并规范化单个文件声明；返回 {ok, error?} */
 export function validateFileMeta({ name, mime, size }) {
@@ -93,8 +89,7 @@ export function storeFiles({ orderId, evidenceId, files }) {
     const data = Buffer.from(f.dataB64, 'base64');
     const meta = validateFileMeta({ name: f.name, mime: f.mime, size: data.length });
     if (!meta.ok) throw userError(meta.error);
-    const spec = ALLOWED[meta.mime];
-    if (!hasMagic(data, spec.magic)) {
+    if (sniffMediaMime(data) !== meta.mime) {
       throw userError(`文件「${meta.rawName}」内容与声明类型不符（魔数校验失败）`);
     }
     return { data, meta };

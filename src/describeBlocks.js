@@ -12,7 +12,7 @@
  *    —— 商品搜索走 SQL LIKE，用户输入的是文字，不该去匹配 JSON 里的引号与 url
  *  - 块为空时，`description` 就是店主填的纯文本，前端直接按段落渲染（保持原有观感）
  */
-import { UPLOAD_URL_PREFIX } from './productImages.js';
+import { mediaUrlAllowed, normalizeMediaUrl } from '../../shared/media.js';
 
 export const MAX_BLOCKS = 40;
 export const MAX_TEXT_LEN = 2000;
@@ -53,10 +53,10 @@ export function normalizeBlocks(input) {
       if (last && last.type === 'text') last.text = `${last.text}\n${text}`;
       else blocks.push({ type: 'text', text });
     } else if (type === 'image') {
-      const url = String(raw?.url ?? '').trim().slice(0, 500);
+      const url = normalizeMediaUrl(raw?.url);
       if (!url) continue;
-      const okScheme = /^https?:\/\//i.test(url) || url.startsWith(UPLOAD_URL_PREFIX);
-      if (!okScheme) {
+      // URL 规则与商品主图**同一个判据**（shared/media.js）：同一条白名单只有一处实现
+      if (!mediaUrlAllowed(url)) {
         errors.push('详情图片仅支持 http/https 外链或本站上传的图片');
         continue;
       }

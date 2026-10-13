@@ -40,13 +40,13 @@ test('图片 URL 仅 http/https：javascript:/data: 拒绝入库，正常 https 
   const bad = await ctx.request(ctx.app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerToken}`)
-    .send(productPayload({ title: '坏图商品', images: ['javascript:alert(1)', 'data:image/png;base64,AAAA'] }))
+    .send(productPayload({ title: '坏图商品', media: [{ type: 'image', url: 'javascript:alert(1)' }, { type: 'image', url: 'data:image/png;base64,AAAA' }] }))
     .expect(200);
   assert.notEqual(bad.body.code, 0, '非 http(s) 图片应整体拒绝');
   assert.match(bad.body.message, /http\/https/);
 
-  const okP = await createProduct(productPayload({ title: '好图商品', images: ['https://example.com/ok.jpg'] }));
-  assert.equal(okP.images.length, 1);
+  const okP = await createProduct(productPayload({ title: '好图商品', media: [{ type: 'image', url: 'https://example.com/ok.jpg' }] }));
+  assert.equal(okP.media.length, 1);
 });
 
 test('下架商品详情：匿名/第三人 404，店主令牌可预览', async () => {

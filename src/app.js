@@ -11,6 +11,8 @@ import { escrowWatcherStatus } from './escrowWatcher.js';
 import { piiRetentionStatus } from './piiErase.js';
 import { chainReconcileStatus } from './chainReconcile.js';
 import { escrowAnchorStatus } from './chainAnchor.js';
+// 上传目录用量（视频把单个孤儿的成本从 2MB 抬到 50MB ⇒ 磁盘必须可见，见 productMedia.js）
+import { mediaUsage } from './productMedia.js';
 
 import authRouter from './routes/auth.js';
 import shopRouter from './routes/shop.js';
@@ -107,12 +109,16 @@ export function createApp() {
     }
     next();
   });
-  // 全局 JSON 1MB；证据附件与商品图片上传路径豁免（各自自带 body 解析，见对应路由）
+  // 全局 JSON 1MB；证据附件与商品媒体上传路径豁免（各自自带 body 解析，见对应路由）
   //
   // 路径先去掉**尾斜杠**再匹配（源码审计 2026-09 复审，P3）：`/api/uploads/` 与 `/api/uploads`
   // 在 Express 里路由到同一个 handler，而旧判据只认不带斜杠的字面量——于是带尾斜杠的写法
   // 会先吃到这里的 1MB 解析器：2MB 的图片上传变成 500（413 又被下面的错误兜底改写成
   // "服务内部错误"），而客户端看不出真正原因。
+  //
+  // 商品媒体上传（/api/uploads）现在**完全不吃 JSON 解析器**：请求体就是文件字节，
+  // 由路由自己流式写入磁盘（见 routes/uploads.js）。这里的豁免判据因此更要紧——
+  // 一旦漏掉，一个 50MB 的视频会被 JSON 解析器按 1MB 顶掉。
   const normPath = (p) => {
     const s = String(p || '');
     return s.length > 1 && s.endsWith('/') ? s.replace(/\/+$/, '') || '/' : s;
@@ -162,6 +168,12 @@ export function createApp() {
         就知道"这个节点现在锚在哪个合约上"。
       */
       escrowAnchor: escrowAnchorStatus(),
+      /*
+        商品媒体（upload dir）用量：孤儿媒体**刻意不删**（订单快照锁的是 URL 字符串），
+        而视频把单个孤儿的成本从 2MB 抬到 50MB —— 磁盘是这个功能新引入的失败面，
+        运维要能在健康检查上直接看见"这个节点囤了多少媒体"，而不是等写满那天。
+      */
+      uploads: mediaUsage(),
     });
   });
 

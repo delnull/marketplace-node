@@ -46,7 +46,7 @@ const NFT_CONTRACT = '0x' + '9'.repeat(40);
 const nftPayload = (overrides = {}) => ({
   title: '告警测试 NFT',
   description: 'NFT 池缺货告警单测商品。',
-  images: ['https://example.com/n.jpg'],
+  media: [{ type: 'image', url: 'https://example.com/n.jpg' }],
   kind: 'nft',
   nftContract: NFT_CONTRACT,
   specs: [],

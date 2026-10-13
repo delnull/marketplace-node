@@ -29,7 +29,8 @@ initDb();
   ⚠️ 加了新列就要加进本清单（否则旧库会带着缺列的 schema 静默跑起来）。
 */
 const REQUIRED_COLUMNS = {
-  products: ['shipping_fee_usdt_micro'],
+  // media = 主图区（图片 + 视频）；旧库里的列叫 images ⇒ 缺 media 即拒绝启动（重建库 + 重新上架）
+  products: ['shipping_fee_usdt_micro', 'media'],
   product_skus: ['price_usdt_micro'],
   // after_sale_* = 确认收货后的售后案件（契约 2026-10 第二批，见 src/afterSale.js）
   /*
