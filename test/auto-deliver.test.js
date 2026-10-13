@@ -32,6 +32,19 @@ const { setChainOrderFetcher } = await import('../src/chainOrder.js');
  */
 const chainSaysOpen = () => ({ status: 'Created', refundRequested: false, refundRejected: false, refundedAmount: '0' });
 
+/**
+ * 等一次**异步**自动交付落定（2026-10-13 起 watcher 路径要先读一次链上真值再决定发不发码，
+ * 所以 afterCommit 里那次交付不再是同步完成的）。轮询而不是固定 sleep：机器快慢不影响结论。
+ */
+async function waitStatus(id, want, ms = 800) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (rowOf(id).status === want) return true;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return rowOf(id).status === want;
+}
+
 /** 上架数字商品并返回 { ownerToken, slug } */
 async function listDigital(overrides = {}) {
   const ownerLogin = await login(ctx, owner);
@@ -97,12 +110,15 @@ test('watcher 路径：OrderCreated 回写 escrowed 后，数字商品自动从�
   assert.equal(draft.status, 'draft');
 
   // 模拟 watcher 轮询到链上 OrderCreated 事件（draft → escrowed 且自动交付；
-  // 事件带链上交易哈希，回写时同步落为支付凭证）
+  // 事件带链上交易哈希，回写时同步落为支付凭证）。
+  // 2026-10-13 起这条路径会**先读一次链上真值**（Created 且未申请退款）才发码，故注入链上桩。
+  setChainOrderFetcher(chainSaysOpen);
   const changed = applyEvent('OrderCreated', { orderId: draft.escrowOrderId }, { txHash: payHash(), block: 100 });
   assert.equal(changed, 1);
+  assert.ok(await waitStatus(draft.id, 'shipped'), '卡密订单托管成功应自动置 shipped');
+  setChainOrderFetcher(null);
 
   const row = rowOf(draft.id);
-  assert.equal(row.status, 'shipped', '卡密订单托管成功应自动置 shipped');
   const vals = itemsOf(draft.id);
   assert.equal(vals.length, 1, '数量 1 自动交付 1 行');
   assert.ok(['AUTO-KEY-1', 'AUTO-KEY-2'].includes(vals[0]), '应分配码池内未用码');
@@ -123,6 +139,46 @@ test('watcher 路径：OrderCreated 回写 escrowed 后，数字商品自动从�
     .expect(200);
   assert.equal(mine.body.data.status, 'shipped');
   assert.equal(mine.body.data.deliveries[0].value, vals[0]);
+});
+
+/**
+ * 源码评审 2026-10-13（P1）：watcher 的 OrderCreated 路径此前是**唯一**不做链上复核的自动交付入口，
+ * 只读本地镜像 `refund_status`。而镜像天然滞后：扫描上界是 `head − finalityBlocks`（默认 12 块），
+ * 买家付款后在 `N+1…N+12` 里补一笔 `requestRefund` 时，本地镜像仍是 `none`、`behind` 也为假
+ * ⇒ 码照发、钱却冻在托管里（`refundRequested` 让 `releaseExpired` 一直 revert），正是本仓
+ * 注释里写的"双损"。现在四个入口共用"链上 Created 且未申请退款"这一条判据。
+ */
+test('watcher 路径：链上已申请退款（本地镜像尚未落地）不得自动发码', async () => {
+  const { ownerToken, slug } = await listDigital({ title: 'watcher 冻结商品' });
+  await importCodes(ownerToken, slug, ['FROZEN-KEY-1']);
+
+  const draft = await createDraft(slug);
+  // 链上说"已冻结"，而本地镜像仍是 none —— 这正是那 12 块窗口里的真实状态
+  setChainOrderFetcher(() => ({ status: 'Created', refundRequested: true, refundRejected: false, refundedAmount: '0' }));
+  assert.equal(applyEvent('OrderCreated', { orderId: draft.escrowOrderId }, { txHash: payHash(), block: 100 }), 1);
+  await new Promise((r) => setTimeout(r, 40)); // 给异步交付留出落地时间（若实现漏判，这里会变成 shipped）
+  setChainOrderFetcher(null);
+
+  assert.equal(rowOf(draft.id).status, 'escrowed', '链上已申请退款 ⇒ 不得发码，保留 escrowed 等卖家处置');
+  assert.deepEqual(itemsOf(draft.id), [], '不得写入任何交付行');
+  const stillUnused = db.prepare("SELECT status FROM product_codes WHERE code = 'FROZEN-KEY-1'").get();
+  assert.equal(stillUnused.status, 'unused', '码必须留在池里');
+});
+
+test('watcher 路径：链上真值读不到时**不发码**（fail-safe，宁可留给卖家手动交付）', async () => {
+  const { ownerToken, slug } = await listDigital({ title: 'watcher 读不到链商品' });
+  await importCodes(ownerToken, slug, ['NORPC-KEY-1']);
+
+  const draft = await createDraft(slug);
+  setChainOrderFetcher(() => {
+    throw new Error('rpc down');
+  });
+  assert.equal(applyEvent('OrderCreated', { orderId: draft.escrowOrderId }, { txHash: payHash(), block: 100 }), 1);
+  await new Promise((r) => setTimeout(r, 40));
+  setChainOrderFetcher(null);
+
+  assert.equal(rowOf(draft.id).status, 'escrowed', '看不清链上状态时不发码');
+  assert.deepEqual(itemsOf(draft.id), []);
 });
 
 // ── paid 快路径（与 POST /:id/paid 钩子同逻辑）──

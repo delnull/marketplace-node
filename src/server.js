@@ -100,6 +100,33 @@ if (config.chain.escrowAddress) {
     console.error(`[server] ${e.message}`);
     process.exit(1);
   }
+  /*
+    启动期**合约代次自检**（2026-10-13，与"库缺一列拒绝启动"同一道纪律）。
+    见 chain.assertEscrowGeneration 的完整说明：链上 Escrow 必须是含 2026-10 加固的那一代，
+    否则本版本代码会把它缺的那几条能力静默降级（超时看板读不到、售后案件永远为空、
+    下单最小超时窗口与释放静置期缺席），而日志里一个字都不会说。
+    逃生口 MK_CONTRACT_GEN_ACK=1：显式声明"我知道它是旧实例，仍要以只读方式接"。
+  */
+  const { assertEscrowGeneration } = await import('./chain.js');
+  const gen = await assertEscrowGeneration();
+  if (!gen.ok) {
+    const why =
+      `链上托管合约（${config.chain.escrowAddress}）缺少本版本代码需要的入口：\n` +
+      `    - ${gen.missing.join('\n    - ')}\n` +
+      `  这说明它是一个**更早一代**的实例。旧实例缺 2026-10 的全部加固（确认收货后的售后案件、\n` +
+      `  拒绝退款后的释放静置期、下单最小超时窗口、三个资金出口参数的可调与按单快照），\n` +
+      `  节点照常跑起来只会把这些能力静默降级。\n` +
+      `  处置：把 MK_ESCROW_ADDRESS / MK_REGISTRY_ADDRESS / MK_ESCROW_START_BLOCK 三个值同批换成\n` +
+      `  当前这一批（见 deploy/README.md §1.3），然后**重建容器**（改 .env 后 docker restart 读不到）；\n` +
+      `  若确实要以只读方式接旧实例，设 MK_CONTRACT_GEN_ACK=1 显式声明。`;
+    if (String(process.env.MK_CONTRACT_GEN_ACK || '') !== '1') {
+      console.error(`[server] 托管合约代次自检未通过：\n  ${why}`);
+      process.exit(1);
+    }
+    console.warn(`[server] 托管合约代次自检未通过（MK_CONTRACT_GEN_ACK=1 已显式放行）：\n  ${why}`);
+  } else {
+    console.log('[marketplace-node] 托管合约代次自检通过（2026-10 加固的入口齐全）');
+  }
   startWatcher();
   // 链上状态对账（兜底）：watcher 只正向回放、从不回滚，事件漏扫一次就会让订单永久停在
   // 非终态（链上早已终局）——本扫描按 MK_CHAIN_RECONCILE_MS（默认 10 分钟）复查滞留住

@@ -54,7 +54,7 @@ import { getDb, kvGet, kvSet, txBegin, txCommit, txRollback } from './db.js';
 // 于是**所有**退款/争议/仲裁类事件每轮失败、回退重扫 3 次后被隔离，链上镜像静默停摆。
 import { getEscrow, getProvider, fetchOnchainOrder } from './chain.js';
 import { tryAutoDeliverByEscrowOrder, flushAutoDeliverPending } from './autoDeliver.js';
-import { releaseHoldsForOrderIds, releaseHoldsForReturnReceived, releaseRefundedEscrow, restockOrder } from './stockHold.js';
+import { releaseHoldsForOrderIds, releaseHoldsForReturnReceived, releaseRefundedEscrow, isDelivered, restockOrder } from './stockHold.js';
 import { notify, notifyRaw, typeForChainEvent } from './webhook.js';
 import { alertPoolEmptyForOrder } from './poolAlert.js';
 // 一次性告警的「投递成功才写幂等标记」（唯一实现；见 alertAck.js）
@@ -571,13 +571,35 @@ function applyEventCore(name, args, meta = {}) {
       if (changed > 0) {
         // 提交后再发（见 applyEvent 说明）：先 escrowed，再自动交付的 shipped
         meta.afterCommit?.push(() => notify('order.escrowed', orderId));
-        if (!meta.skipAutoDeliver) meta.afterCommit?.push(() => tryAutoDeliverByEscrowOrder(orderId));
         /*
-          池式商品「已收款却无货可交」告警（2026-09）：码池/NFT 池在下单与支付之间被淘空时
-          只有面板的 poolEmpty 标着，卖家不看就不知道（而买家钱已上链）。排在自动交付之后
-          （交付成功 = 池子里本来够，判定自然不成立），每单至多一次（poolAlert 内 kv 标记）。
+          自动交付（2026-10-13 改）：判据搬到**链上复核**里（见 autoDeliver.tryAutoDeliverByEscrowOrder 的说明）——
+          本地镜像 `refund_status` 有 12 块确认深度的滞后，够买家在 `OrderCreated` 之后补一笔
+          `requestRefund`，然后拿到码再让钱冻在托管里。
+          两件事随之改变，都必须在这里处理，否则会引入新的错：
+            · 它现在是 async ⇒ afterCommit 的调用方是**同步** for 循环，rejection 必须自己吞；
+            · `alertPoolEmptyForOrder`（池空告警）依赖"交付已经试过"这个前提 ⇒ 必须**排在交付之后**
+              （原先靠同步顺序保证；现在只能在 finally 里串起来，否则正常交付也会误报池空）。
+          注意 `skipAutoDeliver`（追赶回放）分支：交付交给收尾的 `flushAutoDeliverPending` 补，
+          但告警照旧要发（那条分支下"没发码"不是失败，只是延后）。
         */
-        meta.afterCommit?.push(() => alertPoolEmptyForOrder(orderId));
+        meta.afterCommit?.push(() => {
+          const alert = () => {
+            try {
+              alertPoolEmptyForOrder(orderId);
+            } catch (e) {
+              console.error(`[escrowWatcher] 池空告警失败（不影响一致性）: ${e?.message || e}`);
+            }
+          };
+          if (meta.skipAutoDeliver) {
+            alert();
+            return;
+          }
+          tryAutoDeliverByEscrowOrder(orderId)
+            .catch((e) =>
+              console.error(`[escrowWatcher] 自动交付链上复核失败（状态已落库，不影响一致性）: ${e?.message || e}`)
+            )
+            .finally(alert);
+        });
       }
       break;
     }
@@ -722,7 +744,7 @@ function applyEventCore(name, args, meta = {}) {
           声明要防的事：自提/线下交付也须据此判已交付）。
         */
         const released = before
-          .filter((r) => r.status !== 'shipped' && !r.shipped_at && !r.tracking_no && !r.items)
+          .filter((r) => !isDelivered(r)) // 「已交付事实」的唯一判据（stockHold.isDelivered）
           .map((r) => r.id);
         if (released.length) releaseHoldsForOrderIds(released);
         // D1：已交付行（shipped/有物流/有交付行）超时释放本不自动回补（货在买家侧钱货两清），

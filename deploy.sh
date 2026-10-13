@@ -51,10 +51,13 @@
 set -Eeuo pipefail
 
 FRONTEND='https://fedmall.bityuan.com'
-# 本联邦的共享合约（2026-09-23 部署到 BTY EVM 主网）；店主不需要填、也不该改
-ESCROW='0x820d7ae8fe55ba66d4a1eef2186c4548c85a5908'
-REGISTRY='0xce47d45fc94e774e479f34a406e84d086f999085'
-START_BLOCK=47487268
+# 本联邦的共享合约（**2026-10-13 这一批**部署到 BTY EVM 主网；店主不需要填、也不该改）。
+# 上一批（2026-09-23，Escrow 0x820d7ae8…）缺 2026-10 的全部加固，已停用：
+# 换批必须**同批**换掉 Escrow / Registry / START_BLOCK 三个值——Registry 把 Escrow 的运行时
+# 字节码哈希钉成 immutable（锚定），只换其中一个会让节点登记被链上拒绝。
+ESCROW='0x462f90446c32df9bbb52c56e0fc36b2422319e48'
+REGISTRY='0x438087f048c4adb867c4326f9daa659937fb155a'
+START_BLOCK=47828748
 RPC_URL='https://mainnet.bityuan.com/eth'
 CHAIN_ID=2999
 CONTAINER_PORT=8090

@@ -28,6 +28,12 @@ let seq = 0;
 const payHash = () => '0x' + String(++seq).padStart(64, '0');
 const { applyEvent } = await import('../src/escrowWatcher.js');
 const { setWebhookSender, notify } = await import('../src/webhook.js');
+/**
+ * 链上真值注入点（唯一实现见 src/chainOrder.js）：watcher 的 OrderCreated 路径从 2026-10-13 起
+ * 会**先读一次链上真值**（`status == Created` 且未申请退款）才自动发码——本用例要测的是
+ * 事件顺序，所以把链上桩设成"仍在托管、未冻结"。
+ */
+const { setChainOrderFetcher } = await import('../src/chainOrder.js');
 
 before(async () => {
   ownerToken = (await login(ctx, owner)).token;
@@ -221,13 +227,20 @@ test('自动交付路径事件顺序：order.escrowed 先于 order.shipped（wat
     .send({ codes: ['SEQ-1', 'SEQ-2'] })
     .expect(200);
   const order = await createDraft(p.slug);
-  // watcher 真实路径：draft 行 + OrderCreated 事件 → escrowed → 自动交付（码池有码）
+  // watcher 真实路径：draft 行 + OrderCreated 事件 → escrowed → 自动交付（码池有码）。
+  // 链上桩：仍在托管、未申请退款 ⇒ 允许自动交付；交付本身是异步的（先读链上真值），故轮询等落定。
+  setChainOrderFetcher(() => ({ status: 'Created', refundRequested: false, refundRejected: false, refundedAmount: '0' }));
   assert.equal(applyEvent('OrderCreated', { orderId: order.escrowOrderId }, { txHash: payHash(), block: 3 }), 1);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 800 && db.prepare('SELECT status FROM orders WHERE id = ?').get(order.id).status !== 'shipped') {
+    await new Promise((r) => setTimeout(r, 5));
+  }
   assert.equal(
     db.prepare('SELECT status FROM orders WHERE id = ?').get(order.id).status,
     'shipped',
     '码池有码应自动交付'
   );
+  setChainOrderFetcher(null);
   // notify 为 fire-and-forget，且投递前需经异步的 SSRF 目标校验（2026-09 修复）——等待投递落定
   await new Promise((r) => setTimeout(r, 40));
   const types = sent.map((s) => s.body.type);

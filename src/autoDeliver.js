@@ -112,15 +112,40 @@ export function tryAutoDeliverById(id) {
   return tryAutoDeliverOrder(order);
 }
 
-/** 按链上 escrow orderId 尝试自动交付（watcher 回写路径）。
- *  仅交付已落链上支付凭证（paid_tx_hash 非空）的 escrowed 行：凭证防呆——无凭证行（支付未回写/
- *  竞态残留）不自动发码，保留 escrowed 由卖家面板标注/发货防呆拦截（见 orders.js /ship）。 */
-export function tryAutoDeliverByEscrowOrder(orderIdHex) {
+/**
+ * 按链上 escrow orderId 尝试自动交付（**watcher 回写路径的唯一入口，带链上复核**）。
+ *
+ * **为什么必须复核链上**（2026-10-13，源码评审 P1）：此前这条路径直接调
+ * `tryAutoDeliverOrder`，而它只读**本地镜像** `refund_status === 'requested'`。
+ * 镜像的滞后是结构性的：watcher 的扫描上界是 `head − finalityBlocks`（默认 12 块 ≈ 1 分钟），
+ * 所以当它第一次看到 `OrderCreated(N)` 时，买家紧接着在 `N+1…N+12` 发出的 `requestRefund`
+ * **不在本批**、也不在"追赶抑制"的判定范围里（`behind=false`）⇒ 码照发。
+ * 结果是买家拿着全套兑换码、钱还冻在托管里（`refundRequested` 让 `releaseExpired` 一直 revert），
+ * 卖家只能拒绝 → 争议 → 仲裁——正是本文件 `tryAutoDeliverPendingForProduct` 注释里写的"双损"。
+ *
+ * 现在四个自动交付入口（本函数、`/paid` 快路径、补货补跑、追赶冲刷）**共用同一条判据**：
+ * **链上 `getOrder` 说 `status == Created(1)` 且 `refundRequested == false` 才发**；
+ * 读不到（RPC 不可达/无此单）**不发**——自动交付是"锦上添花"，宁可留给卖家面板手动交付，
+ * 也不要在看不清链上状态时把码发出去（与 `flushAutoDeliverPending` 的取舍逐字一致）。
+ *
+ * 返回 Promise：调用方（watcher 的 afterCommit）**必须** catch，否则失败会变成 unhandled rejection。
+ */
+export async function tryAutoDeliverByEscrowOrder(orderIdHex) {
+  const id = String(orderIdHex || '').toLowerCase();
+  if (!id) return false;
+  let cur = null;
+  try {
+    cur = await fetchOrderFor(id);
+  } catch {
+    console.warn(`[autoDeliver] ${id.slice(0, 18)}… 链上真值读取失败，本轮不自动交付（保留 escrowed 等手动交付/下轮再试）`);
+    return false;
+  }
+  if (String(cur?.status || '') !== 'Created' || cur?.refundRequested) return false;
   const order = getDb()
     .prepare(
       "SELECT * FROM orders WHERE escrow_order_id = ? AND status = 'escrowed' AND paid_tx_hash IS NOT NULL"
     )
-    .get(String(orderIdHex || '').toLowerCase());
+    .get(id);
   return tryAutoDeliverOrder(order);
 }
 

@@ -80,6 +80,13 @@ export const ESCROW_ABI = [
   */
   'function releaseNotBeforeBlock(bytes32 orderId) view returns (uint64)',
   /*
+    下单允许的最小超时窗口（块数；owner 可调，2026-10-13 起不再是 immutable）。
+    节点**不**用它做下单侧校验（`timeoutBlocks` 由本节点写进草稿，下限另有部署期约束），
+    它在这里的唯一用途是**启动期代次自检**（assertEscrowGeneration）：这条只读入口只在
+    2026-10 那一代合约上存在，读不到就说明接的是更早一代的实例。
+  */
+  'function minTimeoutBlocks() view returns (uint64)',
+  /*
     挂账余额（`_settle` 派发失败时改记到收款方名下，由其 withdrawPayout/withdrawFees 自领）。
     **按地址计**：payouts 读店主地址、fees 读当前全局 feeCollector；合约按**每单创建时快照**的
     收取方扣费，历史收取方的挂账不在这两个读数里（已知边界，见 opsMetrics.accruedReading）。
@@ -113,8 +120,40 @@ export async function assertChainId() {
   return got;
 }
 
-let _provider = null;
+/**
+ * 启动期**托管合约代次自检**（2026-10-13）。
+ *
+ * 为什么必须有它（真实事故的形状）：本节点代码会调用 2026-10 那一代 Escrow 的只读入口
+ * （`releaseNotBeforeBlock` / `afterSaleOpen` / `minTimeoutBlocks` …），而"链上部署的是哪一代"
+ * 与"仓库里是哪一代"是两件独立的事——换批要么漏改 `MK_ESCROW_ADDRESS`、要么根本没重部署。
+ * 两种情况下节点都**照常启动**，然后在运行时逐处降级：超时看板整列读不到、售后案件永远为空、
+ * 关键加固静默缺席——现象与原因相隔十万八千里（正是本仓"库缺一列必须拒绝启动"要防的那一类）。
+ *
+ * 判据：链上 Escrow 必须能读出这三个属于新代的只读值。链 ID 自检在本函数之前跑过，
+ * 所以"读不到"在这里只能意味着**合约不是这一代**（而不是 RPC 不可达）。
+ * 逃生口 `MK_CONTRACT_GEN_ACK=1`（与本仓 `MK_ESCROW_CHANGE_ACK` 同款）：确有需要时显式声明，
+ * **不设静默降级**。返回 `{ ok, missing }`，由 server.js 决定拒绝启动还是放行并告警。
+ */
+export async function assertEscrowGeneration() {
+  const escrow = getEscrow();
+  const zero = '0x' + '00'.repeat(32);
+  const probes = [
+    ['minTimeoutBlocks()', () => escrow.minTimeoutBlocks()],
+    ['releaseNotBeforeBlock(bytes32)', () => escrow.releaseNotBeforeBlock(zero)],
+    ['afterSaleOpen(bytes32)', () => escrow.afterSaleOpen(zero)],
+  ];
+  const missing = [];
+  for (const [name, call] of probes) {
+    try {
+      await call();
+    } catch (e) {
+      missing.push(`${name}（${String(e?.shortMessage || e?.message || e).slice(0, 60)}）`);
+    }
+  }
+  return { ok: missing.length === 0, missing };
+}
 
+let _provider = null;
 /** 获取 provider（惰性单例） */
 export function getProvider() {
   if (!_provider) {

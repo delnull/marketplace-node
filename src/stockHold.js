@@ -17,21 +17,21 @@
  * 释放态（cancelled/refunded/expired——终结且未成交）的状态迁移成功后，
  * **必须且仅需**调用本模块释放入口一次：批量路径 releaseHoldsForOrderIds，
  * 退款终局路径 releaseRefundedEscrow（仅未交付行）。
- * 已成交（confirmed/settled）默认不释放（货已承诺/已交付），不在常规释放集内；
+ * 已成交（confirmed/settled）默认不释放（货已承诺/已交付），但**"从未交付"是例外**
+ * （见 releaseHoldsForReturnReceived：那类单的占位滞留纯属账目错误，会把限量 SKU 永久钉住一件货）；
  * 已交付后退款（shipped/部分交付 → refunded）同样不自动回补（货在买家侧，需线下回收，
  * 与 shipped → expired 不释放同口径防超卖）——见 releaseRefundedEscrow。
  *
- * D1 例外（releaseHoldsForReturnReceived）：终局「成交向」状态（confirmed/settled/expired）
- * 但退货单已确认收货（order_returns.received_at 非空 = 货已实际回到卖家侧，或卖家放弃追索
- * waived）——实物可再售，占位不再有「防超卖」意义，应回补。覆盖 watcher 三条终局事件
- * （ReceiptConfirmed / Arbitrated 判卖家 / OrderExpiredReleased）与 sync Settled 兜底、
- * receive/waive 晚于终局迁移的动作路径（settleReturn）。
+ * D1 例外（releaseHoldsForReturnReceived）：终局「成交向」状态（confirmed/settled/expired）里，
+ * 货**不在买家手里**的两种情形（从未交付 / 退货已确认收到或卖家放弃追索）都回补占位。
+ * 覆盖 watcher 三条终局事件（ReceiptConfirmed / Arbitrated 判卖家 / OrderExpiredReleased）
+ * 与 sync Settled 兜底、receive/waive 晚于终局迁移的动作路径（settleReturn）。
  *
  * 原子性说明：SQLite 单写者连接 + 同步执行，条件 UPDATE 天然串行；
  * 占位失败发生在调用方事务内（ROLLBACK 后无残留副作用）。
  */
 import { getDb, txBegin, txCommit, txRollback } from './db.js';
-import { INCOME_IN } from './orderStatus.js';
+import { INCOME_IN, INCOME_STATUS } from './orderStatus.js';
 
 /** 占位：该组合销量 +quantity（默认 1），成功返回 true
  *  （committed + qty ≤ capacity 校验失败、或该组合不限量时返回 false——不限量不占位）
@@ -113,35 +113,69 @@ function releaseCore(orderIds, statuses) {
   }
 }
 
-/** 常规批量释放入口（终局且未成交：cancelled/refunded/expired） */
+/**
+ * 「**已交付事实**」的**唯一判据**（2026-10-13 收口；四处共用：本模块的三个释放入口 + watcher 的超时释放）。
+ *
+ * 已交付 = `shipped_at`（发货标记，含自提/线下交付这种空物流单号形态）∨ `tracking_no` ∨ 存在交付行
+ *          ∨ 本地状态已是 `shipped`。
+ *
+ * 为什么必须只有一处判据：这四个地方的结论方向相反却共用同一个事实——
+ *   · 释放占位时它回答"货还在不在买家手里"（判错=把已经交出去的货重新变成可售 ⇒ 超卖）；
+ *   · 退款终局时它回答"要不要等退货"（判错=货在买家侧就回补了额度 ⇒ 超卖）；
+ *   · 而"从未交付"这一侧此前**没有任何入口**（见 `releaseHoldsForReturnReceived`）⇒ 占位永久滞留。
+ * 口径只要有一处不同，同一单就会在不同路径上得到相反待遇。
+ */
+export function isDelivered(row) {
+  if (!row) return false;
+  return !!(
+    row.shipped_at ||
+    row.tracking_no ||
+    row.delivered_items ||
+    row.items ||
+    String(row.status || '') === 'shipped'
+  );
+}
+
+/**
+ * 常规批量释放入口（终局且未成交：cancelled/refunded/expired）
+ */
 
 export function releaseHoldsForOrderIds(orderIds) {
   return releaseCore(orderIds, ['cancelled', 'refunded', 'expired']);
 }
 
 /**
- * D1：终局「成交向/超时」订单但退货已确认收货的占位回补。
- * 场景：订单已交付（发货）→ 退货协调进行中卖家已确认收到退货（order_returns.received_at 非空，
- * 含放弃追索 waived——实物可再售/卖家不再追回）→ 链上终局却是非退款路径：
- * ReceiptConfirmed（→confirmed）、仲裁判卖家 `Arbitrated(refundWei == 0)`（→settled）、
- * 超时 OrderExpiredReleased（→expired，已交付行）、sync Settled 兜底（→confirmed）。
- * 这些路径下常规释放集（cancelled/refunded/expired）与 releaseRefundedEscrow（仅 refunded）
- * 都覆盖不到已交付行，占位将永久滞留（货已回库却不可再售，防超卖口径过度收紧）。
- * 判据：status ∈ 终局成交态 且 存在 received_at 非空的退货单 且 尚未释放。
- * released_at 幂等保证与 refunded 终局路径先后触发只回补一次。
+ * 终局「成交向」订单的占位回补：**仅当货已实际回到卖家侧**（原 D1 口径，2026-10-13 复核后保留）。
+ *
+ * 场景：订单已交付 → 退货协调中卖家已确认收到退货（`order_returns.received_at` 非空，含放弃追索
+ * waived）→ 链上终局却是非退款路径（ReceiptConfirmed→confirmed / Arbitrated 判卖家→settled /
+ * OrderExpiredReleased→expired）——实物可再售，占位不再有"防超卖"意义，应当回补。
+ *
+ * **为什么"从未交付的成交向单"刻意不在这里自动释放**（2026-10-13 评估结论，推翻当天早些时候的改动）：
+ * 本地唯一能回答"货在不在买家手里"的证据就是交付记录，而**没有交付记录 ≠ 没交付**——
+ * 线下交付/自提/卖家漏记都会产生"已成交且无任何交付痕迹"的行；而 `confirmed` 恰恰是**买家自己**
+ * 说"我收到了"。在这种行上自动回补，等于把一个**不可判定**的事实当成"货没出去"，
+ * 后果是把已经交到买家手里的货重新变成可售 ⇒ 超卖（比占位滞留贵得多：买家拿不到货 + 争议 + 赔付）。
+ * 代价是：一笔"真没发货、却被仲裁判了卖家"的单会把 `committed` 永久钉住一件——这是**账目**
+ * 问题，店主可经商品编辑扩容解决，且方向安全。**要真正消除它，正确做法是把这种行暴露给店主**
+ * （谁发货谁最清楚），而不是让节点替他在两个方向里猜一个——见 docs/DECISIONS.md 的记录。
+ *
+ * 判据：status ∈ 终局成交态 ∧ 存在 received_at 非空的退货单 ∧ 尚未释放。
+ * `released_at` 幂等保证与 refunded 终局路径先后触发只回补一次。
  */
 export function releaseHoldsForReturnReceived(escrowOrderId) {
   const db = getDb();
   const rows = db
     .prepare(
-      `SELECT o.id FROM orders o
+      `SELECT o.id
+       FROM orders o
        JOIN order_returns r ON r.order_id = o.id
        WHERE o.escrow_order_id = ? AND r.received_at IS NOT NULL
          AND o.status IN ${INCOME_IN}
          AND o.hold_qty > 0 AND o.released_at IS NULL`
     )
     .all(String(escrowOrderId || '').toLowerCase());
-  return rows.length ? releaseCore(rows.map((r) => r.id), ['settled', 'confirmed', 'expired']) : 0;
+  return rows.length ? releaseCore(rows.map((r) => r.id), [...INCOME_STATUS]) : 0;
 }
 
 /**
@@ -165,7 +199,7 @@ export function releaseRefundedEscrow(escrowOrderId) {
     )
     .all(String(escrowOrderId || '').toLowerCase());
   const releaseIds = rows
-    .filter((r) => (!r.shipped_at && !r.tracking_no && !r.delivered_items) || r.return_received_at != null)
+    .filter((r) => !isDelivered(r) || r.return_received_at != null)
     .map((r) => r.id);
   return releaseIds.length ? releaseHoldsForOrderIds(releaseIds) : 0;
 }
