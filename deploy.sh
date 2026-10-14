@@ -75,9 +75,9 @@ FRONTEND='https://fedmall.bityuan.com'
 # 与 immutable 双锚定），实际后果是店主**提不出质押**而节点 `/healthz` 一切正常。
 # 两批链上均无任何业务数据（弃用前实测余额为 0），无迁移成本。
 # 换批时把下面三个值一起换成 `node scripts/deploy-mainnet.cjs` 输出的那一组（少换一个会被链上拒绝）。
-ESCROW='0xee734f442be448595c387c84ca93b43c6acb1cbc'
-REGISTRY='0x593ae911fdaaeaa7f09c37d5ed61050957698882'
-START_BLOCK=47842741
+ESCROW='0x9c2cdf4079b499b8537da47ed9488966efa2531c'
+REGISTRY='0xd660917e82101609ee686699266b17faca6cdfc2'
+START_BLOCK=47845799
 RPC_URL='https://mainnet.bityuan.com/eth'
 CHAIN_ID=2999
 CONTAINER_PORT=8090
