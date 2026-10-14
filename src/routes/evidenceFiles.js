@@ -175,6 +175,9 @@ router.get('/:id/evidence/:evidenceId/files/:fileId', downloadLimiter, wrap(asyn
       就是"案件在链上处于开启状态"，所以他必须能读到双方 after_sale 陈述的附件。
       判据与订单详情的 `as='arbiter'`（routes/orders.js）**同一处**：afterSale.isAfterSaleOpen。
       案件结案后立即收回（与 disputed 终局后收回同口径）。
+      `getArbiterAddress()` 读不到时返回 **null**（"不知道现在是谁"）⇒ 恒不等于 auth.address
+      ⇒ 拒绝下载（2026-10-14：此前它会回退上次成功值——轮换过仲裁人之后，旧密钥在 RPC
+      故障期间仍能下载收货信息与售后附件，而注释写的安全方向恰恰相反）。
     */
     else if ((order.status === 'disputed' || isAfterSaleOpen(order)) && auth.address === (await getArbiterAddress())) allowed = true;
   }

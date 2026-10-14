@@ -110,11 +110,17 @@ export const ESCROW_ABI = [
   'function releaseNotBeforeBlock(bytes32 orderId) view returns (uint64)',
   /*
     下单允许的最小超时窗口（块数；owner 可调，2026-10-13 起不再是 immutable）。
-    节点**不**用它做下单侧校验（`timeoutBlocks` 由本节点写进草稿，下限另有部署期约束），
-    它在这里的唯一用途是**启动期代次自检**（assertEscrowGeneration）：这条只读入口只在
-    2026-10 那一代合约上存在，读不到就说明接的是更早一代的实例。
+    两个用途：**启动期代次自检**（assertEscrowGeneration——这条只读入口只在 2026-10 那一代
+    合约上存在，读不到就说明接的是更早一代），以及**启动期下单超时窗口自检**
+    （checkOrderTimeoutBounds：`MK_ESCROW_TIMEOUT_BLOCKS` 是本节点写进草稿的值，
+    低于它会让每一笔 createOrder 以 TimeoutTooShort 回滚）。
+    2026-10-14 更正：此处此前写"节点不用它做下单侧校验，下限另有部署期约束"——
+    部署期约束只管部署脚本，管不到运行期这个环境变量，于是配错时节点绿灯启动、全网下不了单。
   */
   'function minTimeoutBlocks() view returns (uint64)',
+  /// @dev 下单超时窗口的**上限**（`Escrow.MAX_TIMEOUT_BLOCKS` = 30 天）；与 `minTimeoutBlocks` 成对，
+  ///      同一条启动期自检用它拦住"配得比上限还大"这一侧的越界。
+  'function MAX_TIMEOUT_BLOCKS() view returns (uint64)',
   /*
     挂账余额（`_settle` 派发失败时改记到收款方名下，由其 withdrawPayout/withdrawFees 自领）。
     **按地址计**：payouts 读店主地址、fees 读当前全局 feeCollector；合约按**每单创建时快照**的
@@ -203,6 +209,83 @@ export async function assertChainId() {
     );
   }
   return got;
+}
+
+/**
+ * 启动期**下单超时窗口自检**（2026-10-14）。
+ *
+ * 为什么必须有它：`MK_ESCROW_TIMEOUT_BLOCKS`（默认 120960 ≈ 7 天）是**本节点自己**填进订单草稿的值，
+ * 买家只是照签（见 `routes/shop.js` 把它当店铺信息下发）。而合约对它有**常量下界**
+ * （`MIN_ORDER_TIMEOUT_BLOCKS` = 1 天 = 17280 块）与上限（`MAX_TIMEOUT_BLOCKS` = 30 天 = 518400 块）：
+ * 配置越界时 `Escrow.createOrder` 会以 `TimeoutTooShort` / `InvalidTimeout` 直接回滚。
+ * 后果的形状很坏——**节点启动绿灯、店面看起来在营业、商品能浏览，但全网每一笔下单都失败**，
+ * 而错误只在买家的钱包里以一次 revert 出现。运营方看到的是"没人下单"。
+ *
+ * 与仓库既有纪律的关系：本仓对"配置错误型 DoS"一律在**入口**拦掉
+ * （`MarketplaceRegistry.setStakingContract` 探 `poolOf`、`server.js` 的库结构/密钥/风控闸/合约代次自检）。
+ * 这一条此前是唯一漏网的：`node/src/chain.js` 的注释写着"节点不用 minTimeoutBlocks 做下单侧校验，
+ * 下限另有部署期约束"——而**部署期约束只管部署脚本**，管不到运行期这个环境变量。
+ *
+ * 判据只有一处：链上 `minTimeoutBlocks()` / `MAX_TIMEOUT_BLOCKS()`（合约自己的读数），
+ * 不在节点里再抄一份常量（抄一份就是第二个真相，合约改常量时它必然漂移）。
+ * 读不到 ⇒ `unknown`（本函数不把"读不到"说成"越界"；调用方按仓库纪律拒绝启动并给逃生口）。
+ *
+ * @returns {{ ok: boolean, reason: 'ok'|'too-low'|'too-high'|'unknown', configured: number,
+ *             min: number|null, max: number|null, message: string }}
+ */
+export async function checkOrderTimeoutBounds() {
+  const configured = Number(config.escrow.timeoutBlocks);
+  const base = { configured, min: null, max: null };
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return {
+      ...base,
+      ok: false,
+      reason: 'unknown',
+      message: `MK_ESCROW_TIMEOUT_BLOCKS 不是正整数（${String(config.escrow.timeoutBlocks)}）——这份草稿的超时窗口无法确定`,
+    };
+  }
+  let min;
+  let max;
+  try {
+    const escrow = getEscrow();
+    min = Number(await escrow.minTimeoutBlocks());
+    max = Number(await escrow.MAX_TIMEOUT_BLOCKS());
+  } catch (e) {
+    return {
+      ...base,
+      ok: false,
+      reason: 'unknown',
+      message: `读不到链上下单超时窗口的上下界（minTimeoutBlocks / MAX_TIMEOUT_BLOCKS）：${String(
+        e?.shortMessage || e?.message || e
+      ).slice(0, 80)}`,
+    };
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min <= 0 || max <= 0) {
+    return { ...base, ok: false, reason: 'unknown', message: `链上返回的窗口上下界不可用（min=${min} max=${max}）` };
+  }
+  base.min = min;
+  base.max = max;
+  if (configured < min) {
+    return {
+      ...base,
+      ok: false,
+      reason: 'too-low',
+      message:
+        `MK_ESCROW_TIMEOUT_BLOCKS=${configured} 低于链上下界 ${min}（Escrow.minTimeoutBlocks）：` +
+        `每一笔 createOrder 都会被 TimeoutTooShort 回滚——买家付不了款。请设为 ≥ ${min}（生产建议 120960 ≈ 7 天）后重启`,
+    };
+  }
+  if (configured > max) {
+    return {
+      ...base,
+      ok: false,
+      reason: 'too-high',
+      message:
+        `MK_ESCROW_TIMEOUT_BLOCKS=${configured} 超过链上上限 ${max}（Escrow.MAX_TIMEOUT_BLOCKS）：` +
+        `每一笔 createOrder 都会被 InvalidTimeout 回滚。请设为 ≤ ${max} 后重启`,
+    };
+  }
+  return { ...base, ok: true, reason: 'ok', message: `下单超时窗口 ${configured} 块在链上允许区间 [${min}, ${max}] 内` };
 }
 
 /**
@@ -337,14 +420,30 @@ export async function fetchOnchainOrder(orderIdHex) {
 }
 
 // ── 仲裁人地址（本地配置优先，其次链上读取 + 短缓存）──
+/**
+ * `null` = **本次没读到**（不是"某个地址"）。三态是刻意的，见 `getArbiterAddress`。
+ * `_arbiterLastOk` 只作诊断/日志用（"最后一次成功读到的是谁"），**绝不参与判定**。
+ */
 let _arbiterAddr = null;
 let _arbiterAt = 0;
+let _arbiterLastOk = null;
 
 /**
  * 解析链上仲裁人（Escrow.arbiter()）：供订单详情「仲裁人视角」鉴权（裁决证据开放）。
  * MK_ARBITER_ADDRESS 配置优先（免 RPC、可单测）；未配置则 RPC 读合约并缓存 60s；
- * RPC 失败也负缓存 60s（不立即重试）——防 RPC 故障时每个详情请求都触发一次超时重试拖慢接口；
- * 失败回退上次成功值；从未成功返回 null——安全方向：宁可拒绝开放不泄露交付码。
+ * RPC 失败也负缓存 60s（不立即重试）——防 RPC 故障时每个详情请求都触发一次超时重试拖慢接口。
+ *
+ * **读不到就返回 `null`，绝不用上一次成功值顶上**（2026-10-14 修）：
+ * 旧实现在 catch 里 `return _arbiterAddr`（上次成功的地址），而 `_arbiterAt` 在失败时也被刷新
+ * ⇒ **持续故障期间它会一直把那个旧地址当成"当前仲裁人"**。两个消费方都是鉴权
+ * （`routes/orders.js` 的 `as='arbiter'`、`routes/evidenceFiles.js` 的附件下载），
+ * 于是 `Escrow.setArbiter` 轮换掉一个仲裁人之后，只要 RPC 同时不可用，**被撤掉的那把密钥
+ * 仍能读到收货信息、交付码与双方售后陈述**——而注释里写的安全方向恰恰相反
+ * （"宁可拒绝开放不泄露交付码"）。这正是本仓反复强调的那条纪律：**"读不到"与"确证是某个值"
+ * 是两件事**，用一个旧值代表"现在是谁"等于替链上说了一句它没说过的话。
+ * 现在失败即 `null`（=不知道），两个鉴权点因此**默认拒绝**；恢复了自然又能读到。
+ * 代价如实写明：RPC 抖动期间合法的仲裁人也会被暂时挡在门外——方向是安全的那一侧，
+ * 且与 `arbitration-fallback.test.js` 早已钉住的"未配置 + 读不到 ⇒ null"逐字同款。
  */
 export async function getArbiterAddress() {
   const configured = (config.chain.arbiterAddress || '').toLowerCase();
@@ -355,8 +454,47 @@ export async function getArbiterAddress() {
   try {
     const a = await getEscrow().arbiter();
     _arbiterAddr = a.toLowerCase();
+    _arbiterLastOk = { at: now, addr: _arbiterAddr };
     return _arbiterAddr;
-  } catch {
-    return _arbiterAddr; // 失败：null（或上次成功值），负缓存期内不再打 RPC
+  } catch (e) {
+    /*
+      读不到 ⇒ 判定值归 null（本次窗口内不再打 RPC）。`_arbiterLastOk` 保留下来只为
+      让运维能回答"最后一次成功读到的是谁、什么时候"，它**不是**本次的答案。
+    */
+    _arbiterAddr = null;
+    console.warn(
+      `[chain] 读不到链上 arbiter()（${e?.message || e}）——本次按"不知道"处理（仲裁人视角不开放）；` +
+        `${_arbiterLastOk ? `最后一次成功读数是 ${_arbiterLastOk.addr}（${new Date(_arbiterLastOk.at).toISOString()}）` : '此前从未成功读到过'}`
+    );
+    return null;
   }
+}
+
+/**
+ * 仲裁人读数的诊断口径（不参与判定）：`known` = 本次窗口内是否**确证**读到了当前仲裁人。
+ * 与 `fees.feeStatus()` 同款三态，供 /healthz、运维台与排障使用——
+ * "读不到"必须能作为一个独立结论被看见，而不是表现为某个具体地址。
+ */
+export function arbiterStatus() {
+  return { arbiter: _arbiterAddr, known: _arbiterAddr !== null, lastOk: _arbiterLastOk };
+}
+
+/**
+ * 仅供测试：清空仲裁人读数缓存（含"最后一次成功读数"）。
+ * 为什么需要它：60s 的正/负缓存是生产语义，而用例要验证的恰恰是"缓存跨过一次成功、一次失败"
+ * 之后的行为——没有这个钩子就只能 sleep 60 秒。与 `fees.resetFeeCache()` 同款。
+ */
+export function __resetArbiterCacheForTest() {
+  _arbiterAddr = null;
+  _arbiterAt = 0;
+  _arbiterLastOk = null;
+}
+
+/**
+ * 仅供测试：只让 60s 窗口**过期**，保留 `lastOk`（"最后一次成功读到的是谁"）。
+ * 与 `__resetArbiterCacheForTest` 是两件事，用例要的现场不同：这一条模拟的是
+ * "缓存自然过期、而这次 RPC 读不到"——排障线索必须还在。
+ */
+export function __expireArbiterCacheForTest() {
+  _arbiterAt = 0;
 }

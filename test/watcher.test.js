@@ -476,7 +476,13 @@ test('副作用时序：迁移抛错回滚时不发通知，成功时通知在�
   const sent = [];
   const { setWebhookSender, resetWebhookStatus } = await import('../src/webhook.js');
   const { kvSet } = await import('../src/db.js');
-  kvSet('mk:webhook_url', 'https://example.com/hook');
+  /*
+    目标用 **IP 字面量**而不是 `example.com`（2026-10-14）：投递前那一步 SSRF 校验会**真的解析
+    主机名**，用域名就把一条"提交后才通知"的时序断言绑在了公网 DNS 上——解析抖动（本机实测
+    example.com 能解析、443 也通）会让下面那个 3s 上界偶发不够，报出来却是"没发出通知"。
+    本文件 :520 与其它文件早就用 IP 字面量，这里跟上；断言不变。
+  */
+  kvSet('mk:webhook_url', 'https://93.184.216.34/hook');
   resetWebhookStatus();
   setWebhookSender(async (url, opts) => {
     sent.push(JSON.parse(opts.body).type);
@@ -486,9 +492,9 @@ test('副作用时序：迁移抛错回滚时不发通知，成功时通知在�
   const a = insertOrder('draft');
   applyEvent('OrderCreated', createdArgs(a.orderIdHex), { txHash: '0x' + 'f'.repeat(64), block: 12 });
   /*
-    通知是 fire-and-forget（投递前还有一次 SSRF 校验，其中含**真实 DNS 解析**），固定 20ms 的
-    等待在整套测试并行跑（多个测试文件同时占 CPU + 解析 example.com）时会偶发不够——等待改成
-    有界轮询：断言不变（必须发出 order.escrowed），只是不再假设一个固定的墙钟时间。
+    通知是 fire-and-forget（投递前还有一次 SSRF 校验），固定 20ms 的等待在整套测试并行跑
+    （多个测试文件同时占 CPU）时会偶发不够——等待改成有界轮询：断言不变（必须发出
+    order.escrowed），只是不再假设一个固定的墙钟时间。
   */
   const until = async (pred, ms = 3000) => {
     const t0 = Date.now();

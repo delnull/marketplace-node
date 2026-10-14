@@ -11,6 +11,8 @@ import { escrowWatcherStatus } from './escrowWatcher.js';
 import { piiRetentionStatus } from './piiErase.js';
 import { chainReconcileStatus } from './chainReconcile.js';
 import { escrowAnchorStatus } from './chainAnchor.js';
+// 仲裁人读数（三态：确证到了 / 读不到）。**读不到必须能看见**——见 /healthz 里的说明
+import { arbiterStatus } from './chain.js';
 // 上传目录用量（视频把单个孤儿的成本从 2MB 抬到 50MB ⇒ 磁盘必须可见，见 productMedia.js）
 import { mediaUsage } from './productMedia.js';
 
@@ -168,6 +170,15 @@ export function createApp() {
         就知道"这个节点现在锚在哪个合约上"。
       */
       escrowAnchor: escrowAnchorStatus(),
+      /*
+        仲裁人读数（2026-10-14）。为什么要暴露它：`getArbiterAddress()` 在**读不到**时返回 `null`
+        ——那是刻意的安全方向（读不到就谁都不是仲裁人，见 chain.js 的说明），
+        但它的代价是「RPC 抖动期间合法的仲裁人也进不来」，而在此之前这个状态**只能靠翻日志**看：
+        `/healthz` 一切正常、仲裁人只看到自己被拒，运维无从知道是"你不是仲裁人"还是"节点读不到"。
+        `known:false` = 本次没确证（此时 `arbiter` 为 null），`lastOk` 只是排障线索、不参与判定。
+        与 `fees.feeStatus()` 同款三态——"读不到"必须能作为一个独立结论被看见。
+      */
+      arbiter: arbiterStatus(),
       /*
         商品媒体（upload dir）用量：孤儿媒体**刻意不删**（订单快照锁的是 URL 字符串），
         而视频把单个孤儿的成本从 2MB 抬到 50MB —— 磁盘是这个功能新引入的失败面，

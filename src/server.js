@@ -128,6 +128,29 @@ if (config.chain.escrowAddress) {
   } else {
     console.log('[marketplace-node] 托管合约代次自检通过（2026-10 加固的入口齐全）');
   }
+  /*
+    启动期**下单超时窗口自检**（2026-10-14，见 chain.checkOrderTimeoutBounds）：
+    `MK_ESCROW_TIMEOUT_BLOCKS` 是本节点自己填进草稿的值，合约对它另有常量上下界。
+    配越界时节点会**绿灯启动**，而全网每一笔下单都在买家钱包里 revert ——
+    运营方看到的现象是"没人下单"，与真实原因（一个环境变量）相隔十万八千里。
+    与"库缺一列/密钥是占位值/合约代次不对"同一道纪律：要么可用，要么拒绝启动并写明怎么改。
+    逃生口沿用 MK_CONTRACT_GEN_ACK（与代次自检同一个"我确实知道"的声明）。
+  */
+  const { checkOrderTimeoutBounds } = await import('./chain.js');
+  const bounds = await checkOrderTimeoutBounds();
+  if (!bounds.ok) {
+    const why =
+      `${bounds.message}\n` +
+      `  影响：下单草稿里写的就是这个值，买家的 createOrder 必然回滚——店面能浏览、但一单也成不了。\n` +
+      `  处置：改 .env 里的 MK_ESCROW_TIMEOUT_BLOCKS 后**重建容器**（docker restart 读不到新 .env）。`;
+    if (String(process.env.MK_CONTRACT_GEN_ACK || '') !== '1') {
+      console.error(`[server] 下单超时窗口自检未通过：\n  ${why}`);
+      process.exit(1);
+    }
+    console.warn(`[server] 下单超时窗口自检未通过（MK_CONTRACT_GEN_ACK=1 已显式放行）：\n  ${why}`);
+  } else {
+    console.log(`[marketplace-node] 下单超时窗口自检通过（${bounds.message}）`);
+  }
   startWatcher();
   // 链上状态对账（兜底）：watcher 只正向回放、从不回滚，事件漏扫一次就会让订单永久停在
   // 非终态（链上早已终局）——本扫描按 MK_CHAIN_RECONCILE_MS（默认 10 分钟）复查滞留住

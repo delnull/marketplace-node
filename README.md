@@ -47,7 +47,7 @@ bash deploy.sh
 
 | 需要 | 说明 |
 | --- | --- |
-| **一台 Linux 服务器** | Ubuntu / Debian / CentOS 等，1 核 1G 起步即可。节点只依赖 Node 内置 SQLite，**不需要 MySQL/Redis**；**需要 Docker**——没有的话脚本会自己装 |
+| **一台机器** | 三类宿主，各自一条命令：<br>· **Linux**（Ubuntu / Debian / Fedora / CentOS Stream / Rocky / AlmaLinux / Oracle Linux / Amazon Linux / openSUSE / Alpine 等）：`bash deploy.sh`，没有 Docker 时脚本按**包管理器**自行安装（apt / dnf / yum / zypper / apk / pacman）<br>· **macOS**：同一份 `bash deploy.sh`，但 Docker 需要你自己装（它是带虚拟机的应用：Docker Desktop / colima / OrbStack——脚本不会替你装）<br>· **Windows Server / Windows**：`.\deploy.ps1`，**原生**跑（不需要 Docker、不需要 WSL）<br>1 核 1G 起步即可；节点只依赖 Node 内置 SQLite，**不需要 MySQL/Redis** |
 | **一个域名**（证书可选） | 买家浏览器会**直接访问你的节点**，所以**买家看到的节点地址必须是 `https://`**（前端是 https，浏览器会拦掉到 http 节点的请求）。但**证书不一定要在这台机器上**——HTTPS 在哪终止，证书就在哪申请：① 本机申请（`--tls-mode caddy` 一键全包，或干净机器上用 `--tls-mode nginx`）；② 别处申请（负载均衡 / CDN / 另一台 nginx —— **默认**，本机只出 `http://<本机>:$PORT`）。 |
 | **一个钱包地址**（店主钱包） | 作为你的店铺身份：上架商品、发货、改店铺设置都用它签名登录。**它也是收款方** |
 | **一点点 BTY 当 gas** | 只在"链上登记/更新登记"时用，一次约 0.001 BTY 量级，留 0.01 BTY 绰绰有余。**开店不需要质押**（本联邦当前 `minStakeToRegister = 0`） |
@@ -55,9 +55,14 @@ bash deploy.sh
 
 **要在本机申请证书**（`--tls-mode caddy`，或干净机器上的 `--tls-mode nginx`）时才需要放行 **80 端口**
 （Let's Encrypt 校验用）与 **443 端口**（买家访问）——这两件事发生在**证书所在的那台机器**上，
-所以"证书在别处"的部署只要在本机放行节点端口，另需让那个外部入口连得到本机。节点容器自身监听 8090：
+所以"证书在别处"的部署只要在本机放行节点端口，另需让那个外部入口连得到本机。节点自身监听 8090：
 不配本机 TLS 时绑 `0.0.0.0`（给外部入口连），配了本机 TLS 时默认只绑 `127.0.0.1`（由本机反代连），
 需要收紧就显式 `--bind 127.0.0.1`。
+
+> **Windows 上的 `--tls-mode nginx` 不存在**：那条路是 Linux 发行版的实现（`/etc/nginx/conf.d` +
+> `systemctl reload` + `certbot --nginx`）。Windows 那条路径只有两种：本机 Caddy 申请（`-TlsMode caddy`）
+> 或外部入口终止（`-TlsMode none`，默认）。**两条路径的本机监听端口都是 8090**，容器路径里
+> 它是容器内固定端口（`--port` 只改发布到宿主的端口）。
 
 ---
 
@@ -126,11 +131,33 @@ bash deploy.sh --owner 0x你的店主钱包 --domain shop.example.com --tls-mode
 
 先用 `bash deploy.sh --dry-run` 可以只打印计划、什么都不改。
 
+### 第 2 步（Windows）：运行 `deploy.ps1`（**原生**，不需要 Docker）
+
+```powershell
+# 在**管理员** PowerShell 里（注册开机自启需要它；非管理员会在动手前就拒绝，并说明原因）
+git clone https://github.com/delnull/marketplace-node.git
+cd marketplace-node
+.\deploy.ps1 -Owner 0x你的店主钱包 -Domain shop.example.com -Yes
+
+# 想让本机申请证书： -TlsMode caddy -Email you@example.com
+# 已有入口在终止 TLS（默认）： -TlsMode none，节点只出 http://<本机>:8090
+.\deploy.ps1 -DryRun          # 只打印计划，什么都不改
+.\deploy.ps1 -Status | -Health | -Update | -Uninstall | -Purge
+```
+
+它做的事与 `deploy.sh` 逐一对应，只是载体换成 Windows 本机：**找/装 Node**（装就装进安装目录，
+不动系统 PATH）→ 写 `<安装目录>\.env`（**同一套键**，ACL 收紧）→ `npm ci --omit=dev` →
+注册**开机自启的计划任务**（以 SYSTEM 运行，含崩溃重拉）→ 探活 →（可选）本机 Caddy 申请证书。
+安装目录默认 `C:\ProgramData\marketplace-node`；数据在它的 `data\` 子目录里（升级只换代码，不碰它）。
+
+> 两条路径的**合约地址与运行参数来自同一份** `deploy-constants.json`（换批只改那一处），
+> 且 `MK_*` 键集合由测试钉住一致——否则同一家店在两种宿主上会悄悄有不同行为。
+
 **脚本会依次做这 9 件事**（每步都会打印它在干什么）：
 
 | 步 | 做什么 | 你可以从中确认什么 |
 | --- | --- | --- |
-| ① 环境检测 | 系统 / 权限 / `curl` `tar` `openssl`；**检查 Docker，没有就按发行版装上并启动**（apt/dnf/yum/apk/pacman/zypper，兜底用官方脚本） | 装完会把你的用户加进 `docker` 组，并提醒**重新登录一次**才不用 sudo |
+| ① 环境检测 | 系统 / 权限 / `curl` `tar` `openssl`；**检查 Docker，没有就按宿主平台装上并启动** | 判据是**包管理器**而不是发行版名（apt/dnf/yum/zypper/apk/pacman；RHEL 系衍生版名字一直在变，白名单必然漏）。装完会把你的用户加进 `docker` 组，并提醒**重新登录一次**才不用 sudo。**macOS** 上不自动装（Docker 是带虚拟机的应用），只给出该装哪个的指引；**容器内/不可变宿主**（CoreOS 一类）同样只给指引 |
 | ② 取代码 | 就地用当前目录；或把当前代码复制到安装目录；或 `git clone`；**宿主机连 git 都没有时，用容器把源码包下载下来** | 安装目录默认 `/opt/marketplace-node`（有 root/sudo 时）或 `$HOME/marketplace-node` |
 | ③ 写配置 | 生成 `<安装目录>/.env`（权限 600）：**合约地址已内置**、令牌密钥当场随机生成、数据路径指向卷内 | 重跑会**沿用已有的 `MK_TOKEN_SECRET`**（否则店主登录态全失效），你自己加的配置项也原样保留 |
 | ④ 构建镜像 | `docker build`（基础镜像 `node:24-slim`）—— Node 与依赖都进镜像，**宿主不装任何运行时** | 镜像落盘约 370 MB（其中基础镜像约占 330 MB）；构建过程中不额外下载任何系统包（这是刻意的，见 Dockerfile 注释） |

@@ -41,6 +41,19 @@ async function waitUntil(pred, ms = 3000) {
   while (!pred() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 10));
   return pred();
 }
+/**
+ * 该单的「已成功告警」幂等标记（`alertAck.js` 在**投递结算成功**之后才写它）。
+ *
+ * 为什么断言前等它、而不是 `flushDeliveries()`（2026-10-14 修一条 flaky 用例）：
+ * 那条 `order.pool_empty` 的投递链上挂着一次链上真值读取（`tryAutoDeliverByEscrowOrder`，
+ * 单测里 `MK_RPC_URL=127.0.0.1:1` ⇒ 每次都要走一遍真实的连接失败）与 SSRF 校验，
+ * 40ms 的固定 sleep 在 node --test 并行跑整套时**偶发不够**：断言读到 0 条告警就红，
+ * 而实现完全正确（实测 5 次全套 1 次红、单跑该文件 5 次全绿）。
+ * 等标记 = 等"这件事真的结算完了"——它是投递成功的**果**，不是又一次拍脑袋的时长。
+ */
+const poolAckKey = (orderId) => `mk:order_pool_empty:${orderId}`;
+const alertDelivered = (orderId) =>
+  (db.prepare('SELECT value FROM kv WHERE key = ?').get(poolAckKey(orderId)) || {}).value === '1';
 
 const NFT_CONTRACT = '0x' + '9'.repeat(40);
 const nftPayload = (overrides = {}) => ({
@@ -159,7 +172,7 @@ test('alertPoolEmptyForOrder：池空每单只告警一次；payload 无 PII；�
 
   sent.length = 0;
   assert.equal(alertPoolEmptyForOrder(d.id), true, '本地 id 命中并发告警');
-  await flushDeliveries();
+  assert.ok(await waitUntil(() => alertDelivered(d.id)), '投递结算完成（标记已写）才断言');
   assert.equal(sent.length, 1);
   assert.equal(sent[0].body.type, 'order.pool_empty');
   assert.equal(sent[0].body.orderId, d.id);
@@ -178,7 +191,7 @@ test('alertPoolEmptyForOrder：池空每单只告警一次；payload 无 PII；�
   // watcher 路径按链上单号定位：重置标记后可再发一次（证明两种入参都能命中）
   resetPoolAlertFlag(d.id);
   assert.equal(alertPoolEmptyForOrder(d.escrowOrderId), true);
-  await flushDeliveries();
+  assert.ok(await waitUntil(() => alertDelivered(d.id)), '第二投也结算完成');
   assert.equal(sent.length, 2);
 
   // 池子够：不告警
@@ -192,7 +205,9 @@ test('alertPoolEmptyForOrder：池空每单只告警一次；payload 无 PII；�
   resetPoolAlertFlag(df.id);
   assert.equal(alertPoolEmptyForOrder(df.id), false);
   await flushDeliveries();
-  assert.equal(sent.length, 2, '以上两种情形都不发');
+  // 只断言"这两单没被推"（此时同进程里没有别的告警在途，`sent` 长度即全量）
+  assert.equal(sent.filter((s) => s.body.orderId === df.id).length, 0, '池够 + 已交付：都不发');
+  assert.equal(sent.filter((s) => s.body.type === 'order.pool_empty').length, 2, '全程只发过前两条');
 });
 
 test('watcher 路径：OrderCreated 回写为 escrowed 时池内不足 → 自动告警一次（重复事件不再发）', async () => {
@@ -202,15 +217,21 @@ test('watcher 路径：OrderCreated 回写为 escrowed 时池内不足 → 自�
   // 本地 draft + 链上 OrderCreated：状态推进与告警同一条事件路径（applyEvent 的 afterCommit）
   assert.equal(applyEvent('OrderCreated', { orderId: order.escrowOrderId }, { txHash: payHash(), block: 3 }), 1);
   assert.equal(statusOf(order.id), 'escrowed');
-  await flushDeliveries();
+  /*
+    这条投递链比别的用例更长：`afterCommit` → `tryAutoDeliverByEscrowOrder`（**一次链上真值读取**，
+    单测里必然连接失败）→ `.finally(alert)` → 告警。原先用固定 40ms sleep 等它，在整套并行跑时
+    偶发不够（实测 5 次全套 1 次红），断言读到 0 条就误报。现在等"投递成功"这个**结果**。
+  */
+  assert.ok(await waitUntil(() => alertDelivered(order.id)), '投递应结算完成');
   const alerts = sent.filter((s) => s.body.type === 'order.pool_empty');
   assert.equal(alerts.length, 1, '托管落定即告警（无需卖家去看面板）');
   assert.equal(alerts[0].body.orderId, order.id);
 
-  // 幂等重放（事件重扫 changed=0）：不得再次推送
+  // 幂等重放（事件重扫 changed=0）：不得再次推送。
+  // 这里**不需要**任何等待：`changed === 0` ⇒ `applyEventCore` 根本不会压入 afterCommit，
+  // 而本用例此刻没有别的告警在途 —— 少一个"等多久"的拍脑袋数字，就少一处 flaky。
   sent.length = 0;
   assert.equal(applyEvent('OrderCreated', { orderId: order.escrowOrderId }, { txHash: payHash(), block: 3 }), 0);
-  await flushDeliveries();
   assert.equal(sent.filter((s) => s.body.type === 'order.pool_empty').length, 0);
 });
 

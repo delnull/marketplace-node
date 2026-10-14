@@ -2,8 +2,11 @@
  * 卡密自动交付：数字商品订单进入 escrowed（买家托管成功，链上 OrderCreated）
  * 后自动从码池分配一个未用码并置 shipped——卡密/兑换码类无需卖家手动发货。
  *
- * 触发路径：escrowWatcher 轮询回写（权威）与 POST /:id/paid 即时确认（快路径）
- * 均调用本模块；幂等（仅 escrowed 状态可交付，码分配走条件 UPDATE 防并发）。
+ * 触发路径（**三条，全部经 `tryAutoDeliverByEscrowOrder`**——交付的输入一律是链上单号）：
+ *  - `escrowWatcher` 轮询到 `OrderCreated` 回写之后（权威路径）；
+ *  - `POST /:id/paid` 即时确认之后（快路径）；
+ *  - 码池补货后的补跑 / 追赶回放收尾的冲刷（`tryAutoDeliverPendingForProduct`、`flushAutoDeliverPending`）。
+ * 幂等（仅 escrowed 状态可交付，码分配走条件 UPDATE 防并发）。
  * 自动交付不覆盖的场景保持 escrowed 等卖家手动交付：
  *  - 实物商品（无码池语义，需物流单号）；
  *  - 数字商品但码池为空 / 未建池（MK_AUTO_DELIVER='0' 时全局关闭）。
@@ -106,29 +109,32 @@ export function tryAutoDeliverOrder(order) {
   return false;
 }
 
-/** 按本地订单 id 尝试自动交付（paid 即时确认路径） */
-export function tryAutoDeliverById(id) {
-  const order = getDb().prepare('SELECT * FROM orders WHERE id = ?').get(String(id || ''));
-  return tryAutoDeliverOrder(order);
-}
-
 /**
- * 按链上 escrow orderId 尝试自动交付（**watcher 回写路径的唯一入口，带链上复核**）。
+ * 按链上 escrow orderId 尝试自动交付（**本模块唯一的对外交付入口**）。
  *
- * **为什么必须复核链上**（2026-10-13，源码评审 P1）：此前这条路径直接调
- * `tryAutoDeliverOrder`，而它只读**本地镜像** `refund_status === 'requested'`。
- * 镜像的滞后是结构性的：watcher 的扫描上界是 `head − finalityBlocks`（默认 12 块 ≈ 1 分钟），
- * 所以当它第一次看到 `OrderCreated(N)` 时，买家紧接着在 `N+1…N+12` 发出的 `requestRefund`
- * **不在本批**、也不在"追赶抑制"的判定范围里（`behind=false`）⇒ 码照发。
- * 结果是买家拿着全套兑换码、钱还冻在托管里（`refundRequested` 让 `releaseExpired` 一直 revert），
- * 卖家只能拒绝 → 争议 → 仲裁——正是本文件 `tryAutoDeliverPendingForProduct` 注释里写的"双损"。
+ * **为什么必须复核链上**（2026-10-13，源码评审 P1）：判据一旦落在本地镜像
+ * （`refund_status === 'requested'`）上，镜像的滞后就是结构性的：watcher 的扫描上界是
+ * `head − finalityBlocks`（默认 12 块 ≈ 1 分钟），所以当它第一次看到 `OrderCreated(N)` 时，
+ * 买家紧接着在 `N+1…N+12` 发出的 `requestRefund` **不在本批**、也不在"追赶抑制"的判定范围里
+ * （`behind=false`）⇒ 码照发。结果是买家拿着全套兑换码、钱还冻在托管里（`refundRequested`
+ * 让 `releaseExpired` 一直 revert），卖家只能拒绝 → 争议 → 仲裁——正是本文件
+ * `tryAutoDeliverPendingForProduct` 注释里写的"双损"。
  *
- * 现在四个自动交付入口（本函数、`/paid` 快路径、补货补跑、追赶冲刷）**共用同一条判据**：
- * **链上 `getOrder` 说 `status == Created(1)` 且 `refundRequested == false` 才发**；
+ * 判据只有一条：**链上 `getOrder` 说 `status == Created(1)` 且 `refundRequested == false` 才发**；
  * 读不到（RPC 不可达/无此单）**不发**——自动交付是"锦上添花"，宁可留给卖家面板手动交付，
  * 也不要在看不清链上状态时把码发出去（与 `flushAutoDeliverPending` 的取舍逐字一致）。
  *
- * 返回 Promise：调用方（watcher 的 afterCommit）**必须** catch，否则失败会变成 unhandled rejection。
+ * **2026-10-14：这里原本还有一个 `tryAutoDeliverById(id)`**（只读本地镜像、供 `/paid` 快路径用）。
+ * 它不是一个"少一层校验"的变体，而是**第二条判据**：同一个"该不该发码"的问题有两个答案层，
+ * 于是 `/paid`（买家付款后立刻打的那条、恰好在镜像滞后窗口正中间）按镜像判、watcher 按链上判，
+ * 而两者的结论在这 12 块里**必然相反**。实测（临时用例，跑完即删）：链上已 `requestRefund` 时
+ * `tryAutoDeliverByEscrowOrder` ⇒ false，`tryAutoDeliverById` ⇒ true，订单被置 shipped、码被占用。
+ * 修法不是"给 `/paid` 也补一次链上读"（那会留下两条都要各自维护的路径），而是**把按本地 id
+ * 发码这件事整体删掉**：交付的输入是**链上单号**，本地行只是"要不要发"的下游查询条件。
+ * 调用方一律 await 本函数（它读链），并在**链上单号已落库之后**调用。
+ *
+ * 返回 Promise：调用方（`/paid` 快路径、watcher 的 afterCommit）**必须** await 或 catch，
+ * 否则失败会变成 unhandled rejection。
  */
 export async function tryAutoDeliverByEscrowOrder(orderIdHex) {
   const id = String(orderIdHex || '').toLowerCase();

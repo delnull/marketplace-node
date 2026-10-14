@@ -40,6 +40,14 @@ export function usdtOf(micro) {
  * 商品金额（微 USDT）= 应付总额 − 运费（夹到 ≥ 0）。
  * 运费按单收取一次、只对实物商品计；数字/NFT 单的 `shipping_fee_usdt_micro` 恒 0，
  * 此时它就等于总额（旧语义），所以这个兜底对老数据同样成立。
+ *
+ * **这里保持"永远返回 number"**（不引入 `null`）：两个入参在节点侧都是**自己库里的
+ * SQLite INTEGER 列**，畸形值到不了这里——为一条不可达的路径把返回值改成 `number | null`，
+ * 会让这个 DTO 字段的形状在**链路上**多出一态，而下游（前端 `types.ts` 与各渲染点）
+ * 得跟着改一遍。trust boundary 在**消费端**：畸形载荷由 `utils/orderVault` 的
+ * `toFiniteNumber` 判成"读不到"（不写这个键），不在这里造一个假数字。
+ * 因此这里只做有限的形状防御（数组/对象等非数值 → 夹成 0，与从前逐字节一致），
+ * 不承担"读不到"的语义。
  */
 export function goodsMicroOf(usdtMicro, shippingFeeUsdtMicro = 0) {
   const total = Number.isFinite(Number(usdtMicro)) ? Math.trunc(Number(usdtMicro)) : 0;

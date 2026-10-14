@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "部署期常量：**唯一真相**。deploy.sh（Linux/macOS，容器路径）与 deploy.ps1（Windows，原生路径）都从这里读。",
+    "为什么要有这个文件：两条部署路径必须装出**同一个**节点——接错托管合约的表现是静默的（节点照常启动、",
+    "商品照常展示，只有买家付款路径指向别处），而两边各写一份常量迟早会在换批时分叉。",
+    "改这里的规矩与 deploy.sh 文件头写的一致：Escrow / Registry / startBlock 三个值必须**同批**换。",
+    "appDefaults 是两条路径都必须写进 .env 的运行参数：写偏了不会报错，只会让某个后台任务悄悄不跑、",
+    "或者让同一家店在两种宿主上行为不同——所以它也算常量，不算'各自的本机状态'。"
+  ],
+  "network": {
+    "rpcUrl": "https://mainnet.bityuan.com/eth",
+    "chainId": 2999,
+    "frontendOrigin": "https://fedmall.bityuan.com"
+  },
+  "contracts": {
+    "escrow": "0x9c2cdf4079b499b8537da47ed9488966efa2531c",
+    "registry": "0xd660917e82101609ee686699266b17faca6cdfc2",
+    "startBlock": 47845799
+  },
+  "runtime": {
+    "containerPort": 8090,
+    "serviceName": "marketplace-node",
+    "image": "marketplace-node:latest"
+  },
+  "appDefaults": {
+    "MK_ESCROW_TIMEOUT_BLOCKS": 120960,
+    "MK_ESCROW_FINALITY_BLOCKS": 12,
+    "MK_ESCROW_POLL_MS": 15000,
+    "MK_CHAIN_RECONCILE_MS": 600000,
+    "MK_CORS_ALLOW_ALL": 0,
+    "MK_AUTO_DELIVER": 1,
+    "MK_PII_RETENTION_DAYS": 180,
+    "MK_BTY_TTL_MS": 60000,
+    "MK_DRAFT_TTL_MINUTES": 30,
+    "MK_REVIEW_TTL_DAYS": 30,
+    "MK_TOKEN_TTL": 86400,
+    "MK_SIWE_TTL": 600
+  }
+}

@@ -967,13 +967,42 @@ export async function pollOnce() {
       if (quarantined[fp]) delete quarantined[fp];
       // 订单级 feeBps 快照补录（链上 getOrder 权威；收款净额口径）：
       // 本地行缺快照（fee_bps 为默认 0）时尝试补录（paid 快路径先行迁移时同样覆盖——
-      // paid 路由尽力补录可能失败，此处兜底），RPC 失败静默，sync 路径还会再补
+      // paid 路由尽力补录可能失败，此处兜底）；读不到只记一行日志、**不算事件失败**，
+      // sync 路径还会再补。
       if (n > 0 && FEE_FILL_EVENTS.has(ev.name)) {
+        /*
+          两个 try 的**范围是刻意的**（2026-10-14 修）：本地 SELECT 与链上读取分开。
+          旧实现把两者裹在同一个 try 里、catch 里用 `row.id` 报错，而 `row` 是那个 try 的
+          块级 const ⇒ catch 触发的是 ReferenceError。它是从下面那个 `catch (e)`（外层、按
+          "事件应用失败"处理）里被看见的，于是**一次纯粹的 RPC 失败**会变成：该事件被计为失败、
+          隔离重试 +1、游标回退到 `failedFrom - 1`（最多 2000 块重扫）——而这条事件的迁移其实
+          早已提交成功。也就是说"补录失败"这件事被记到了错误的维度上：代价（重扫 + 隔离计数）
+          挂在了"事件坏了"那一维，而真实原因只是"这次 RPC 没读到"。
+          `fee_bps` 为 0 时**刻意不回退链上快照**：那会让链上返回 0 的合法情形退化成死循环，
+          而"费率为 0"本身就是缺快照的判据。
+        */
+        let needsFeeFill = false;
+        let localRowId = '';
         try {
           const row = db
             .prepare('SELECT id, fee_bps, fee_collector_at_create FROM orders WHERE escrow_order_id = ?')
             .get(String(ev.args.orderId).toLowerCase());
-          if (row && !row.fee_bps) {
+          if (row) {
+            needsFeeFill = !row.fee_bps;
+            localRowId = row.id;
+          }
+        } catch (e) {
+          console.warn(
+            `[watcher] 费率快照补录前的本地行读取失败（orderId=${String(ev.args?.orderId || '').slice(0, 18)}…，本单账本继续退回全局口径）：${(e && e.message) || e}`
+          );
+        }
+        /*
+          RPC 失败只记一行日志（**不抛出**）：补录是"锦上添花"，失败时后续结算事件与 /sync
+          还会再补；把它升级成"事件失败"会在游标回退 + 隔离重试上白付代价，而那一维度描述的是
+          "这条事件本身坏了"——两件事不该共用同一个计数。
+        */
+        if (needsFeeFill) {
+          try {
             const o = await escrow.getOrder(String(ev.args.orderId).toLowerCase());
             // 费率与「创建时收取方」快照一并补录（**唯一实现**的取值函数，见 src/fees.js）：
             // 合约按 feeCollectorAtCreate 决定这单扣不扣费，两列必须同时落库——
@@ -982,18 +1011,13 @@ export async function pollOnce() {
             const snap = feeSnapshotOf(o);
             if (snap.feeBps > 0 || snap.feeCollectorAtCreate) {
               db.prepare('UPDATE orders SET fee_bps = ?, fee_collector_at_create = ? WHERE id = ?')
-                .run(snap.feeBps, snap.feeCollectorAtCreate, row.id);
+                .run(snap.feeBps, snap.feeCollectorAtCreate, localRowId);
             }
+          } catch (e) {
+            console.warn(
+              `[watcher] 订单 ${localRowId} 的费率快照补录失败（该单账本将退回全局口径）：${(e && e.message) || e}`
+            );
           }
-        } catch (e) {
-          /*
-            补录失败**不能静默**（原先这里连一行日志都没有）：费率/收取方快照缺失会让账本退回
-            全局口径——而那可能与这单的链上事实相反。RPC 失败本身仍不阻断本轮（后续结算事件/sync 会补），
-            但至少要在日志里留下线索，否则对账差异查无实据。
-          */
-          console.warn(
-            `[watcher] 订单 ${row.id} 的费率快照补录失败（该单账本将退回全局口径）：${(e && e.message) || e}`
-          );
         }
       }
     } catch (e) {

@@ -60,28 +60,24 @@
 # =============================================================================
 set -Eeuo pipefail
 
-FRONTEND='https://fedmall.bityuan.com'
 # 本联邦的共享合约（店主不需要填、也不该改）。
+# ⚠️ 这三个值现在住在 `deploy-constants.json`（与 Windows 原生路径 `deploy.ps1` **共用同一份**）。
+# 为什么必须共用：两条部署路径要装出同一个节点，而"接错托管合约"的表现是**静默的**
+# ——节点照常启动、商品照常展示，只有买家付款路径指向别处。各写一份常量，换批时必然分叉。
+# 为什么是 JSON 而不是这里的 shell 常量：PowerShell 读 JSON 是一等公民（ConvertFrom-Json），
+# 读 shell 变量则要自己解析；反过来 bash 用一行 sed 就能从固定结构里取值。
 #
-# ⚠️ 下面三个值是**构建期常量**：换一批合约必须**同批**换掉 Escrow / Registry / START_BLOCK，
-# 并且重新构建镜像（本脚本用 `docker build` 把它们编进容器的默认配置）。
+# ⚠️ 换批时：改 `deploy-constants.json` 的 contracts 三项（Escrow / Registry / startBlock），
+# 两边脚本**同时**生效，不需要改脚本本体。
 #   · Registry 把 Escrow 的**地址与运行时字节码哈希**钉成 immutable（canonical 双锚定），
 #     只换其中一个 ⇒ 节点登记会被链上以 EscrowNotCanonical 拒绝；
 #   · Staking 自 2026-10-14 起也把事实源钉成 immutable 双锚定（**换源能力已整条删除**），
 #     所以换 Escrow 必须连带重部署 Staking——这条在合约层是硬约束，不是运维建议；
-#   · START_BLOCK 错成旧高度只会空扫一轮（不报错），但错成**更高**的高度会**漏扫历史事件**。
+#   · startBlock 错成旧高度只会空扫一轮（不报错），但错成**更高**的高度会**漏扫历史事件**。
 # 更早两代（2026-09-23 的 Escrow 0x820d7ae8…、2026-10-13 的 Escrow 0x462f9044…319e48）都已停用：
 # 它们的字节码与仓库当前代码不一致（缺 sellerOpenExposure / totalOpenExposure / sellerNetAtSettle
 # 与 immutable 双锚定），实际后果是店主**提不出质押**而节点 `/healthz` 一切正常。
 # 两批链上均无任何业务数据（弃用前实测余额为 0），无迁移成本。
-# 换批时把下面三个值一起换成 `node scripts/deploy-mainnet.cjs` 输出的那一组（少换一个会被链上拒绝）。
-ESCROW='0x9c2cdf4079b499b8537da47ed9488966efa2531c'
-REGISTRY='0xd660917e82101609ee686699266b17faca6cdfc2'
-START_BLOCK=47845799
-RPC_URL='https://mainnet.bityuan.com/eth'
-CHAIN_ID=2999
-CONTAINER_PORT=8090
-CADDY_IMAGE='caddy:2-alpine'
 # 取源码用（只在"宿主机没有源码也没有 git"时启用；见 ② 取代码）
 SRC_REPO='https://github.com/delnull/marketplace-node.git'
 SRC_TARBALL='https://codeload.github.com/delnull/marketplace-node/tar.gz/refs/heads/main'
@@ -91,29 +87,60 @@ KEEP_SECRET=''
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IN_REPO=0; [ -f "$HERE/package.json" ] && [ -f "$HERE/src/server.js" ] && IN_REPO=1
+CONSTANTS_FILE="$HERE/deploy-constants.json"
 
-# ── 构建期硬门禁：共享合约地址没填就**不许开店**（fail-closed，不静默） ─────────────
+# ── 部署常量：**唯一真相**在 deploy-constants.json（与 Windows 原生路径 deploy.ps1 共用同一份）
+# 从这里取，不在脚本里各留一份。取不到就当场失败 —— 绝不退回某个内建默认值
+# （退回默认值正是"静默接了错合约"的形状）。
+[ -r "$CONSTANTS_FILE" ] || die "缺少 $CONSTANTS_FILE —— 部署常量（合约地址/RPC/端口）的唯一真相在那里；文件不在就无法保证接的是本批合约，拒绝继续"
+
+# 从固定结构的 JSON 里取标量（`"key": value`，value 是字符串/数字/布尔）。
+# 为什么自己做而不依赖 jq：宿主上不能假定有 jq（本脚本的定位是"只有 Docker 就行"）。
+const() {
+  local key="$1" val
+  val="$(sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$CONSTANTS_FILE" | head -1 | sed 's/[[:space:]]*$//')"
+  [ -n "$val" ] || die "deploy-constants.json 里取不到 $key —— 文件结构变了？脚本拒绝用一个猜出来的值继续"
+  printf '%s' "$val"
+}
+# 取**数值**型常量：多一道 expr 校验，因为下面要把它裸着写进 .env 的 here-doc
+# （here-doc 里裸写的值会被当算术表达式展开，塞进非数字就是一个"看起来成功、写进去却是 0/空"的坑）。
+# expr 不认就当场退出，问题止在取值这一步。
+constN() {
+  local key="$1" val
+  val="$(const "$key")"
+  expr "$val" + 0 >/dev/null 2>&1 || die "deploy-constants.json 的 $key 不是数字：'$val'（脚本不猜）"
+  printf '%s' "$val"
+}
+FRONTEND="$(const frontendOrigin)"
+RPC_URL="$(const rpcUrl)"
+CHAIN_ID="$(const chainId)"
+ESCROW="$(const escrow)"
+REGISTRY="$(const registry)"
+START_BLOCK="$(const startBlock)"
+CONTAINER_PORT="$(const containerPort)"
+CADDY_IMAGE='caddy:2-alpine'
+
+# ── 构建期硬门禁：共享合约地址必须是**本批**的（fail-closed，不静默） ───────────────
 # 为什么是一条门禁而不是靠注释提醒（2026-10-14）：这三个值决定"买家把钱锁到哪个合约"，
 # 而错了之后的表现是**静默的**——节点照常启动、商品照常展示，只有买家付款路径指向别处。
 # 历史已经踩过一次：那批链上字节码与仓库代码不一致（缺 sellerOpenExposure 等读法），
-# 后果是店主提不出质押而 `/healthz` 一切正常。"忘记换这三个值"必须当场停下。
-# 判据取"是不是占位符"而不是"是不是合法地址"：合法地址也可能是**上一批已弃用**的那一个，
-# 那种情况脚本无法判断，只能由部署者按上面的注释同批替换（发布检查表里有对应勾选项）。
-if [ "$ESCROW" = '__FILL_AFTER_DEPLOY__' ] || [ "$REGISTRY" = '__FILL_AFTER_DEPLOY__' ] || [ "${START_BLOCK:-0}" = '0' ]; then
-  cat >&2 <<'EOF'
-[deploy.sh] 拒绝执行：共享合约地址还是占位符。
+# 后果是店主提不出质押而 `/healthz` 一切正常。"常量填错"必须当场停下。
+# 判据只做**结构性**校验（地址形状 + 起始块非 0）：「是不是上一批已弃用的那个合法地址」
+# 脚本无法判断，只能由部署者按发布检查表逐项核对。
+if ! printf '%s' "$ESCROW" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+   || ! printf '%s' "$REGISTRY" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+   || ! printf '%s' "$START_BLOCK" | grep -Eq '^[0-9]+$' \
+   || [ "$START_BLOCK" = '0' ]; then
+  cat >&2 <<EOF
+[deploy.sh] 拒绝执行：deploy-constants.json 里的合约常量不合法。
 
-  本脚本把 Escrow / Registry / START_BLOCK 三个值编进镜像（店主不需要、也不该自己填）。
-  它们必须由部署方在**发布本脚本之前**按当批部署结果替换：
+  取到的值：escrow=$ESCROW  registry=$REGISTRY  startBlock=$START_BLOCK
 
+  本脚本把这三个值编进镜像（店主不需要、也不该自己填），它们必须由部署方按当批部署结果填：
     1) 部署当批合约：node scripts/deploy-mainnet.cjs
-    2) 把输出的 Escrow / Registry / 起始扫描块填进本文件的 ESCROW / REGISTRY / START_BLOCK
-    3) 重新构建并发布（镜像里编的是这三个值）
-
-  为什么必须同批换：Registry 把 Escrow 的**地址与运行时字节码哈希**钉成 immutable，
-  而 Staking 自 2026-10-14 起同样把事实源钉成 immutable（换源能力已删除）——
-  只换其中一个，节点登记会被链上以 EscrowNotCanonical 拒绝；
-  START_BLOCK 填成比真实部署块**更高**的高度会漏扫历史事件（且不报错）。
+    2) 把输出的 Escrow / Registry / 起始扫描块填进 deploy-constants.json 的 contracts
+       （**不要改脚本**：Windows 原生路径 deploy.ps1 读的是同一份文件）
+    3) 起始块不能是 0（0 = 从最新块开始 ⇒ 漏扫历史事件且不报错）
 EOF
   exit 1
 fi
@@ -188,6 +215,18 @@ dk() { "${SUDO[@]}" docker "$@"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 as_root() { "${SUDO[@]}" "$@"; }
 
+# ── 宿主平台探测：**平台判据的唯一一层**（见 platform.sh 文件头）──────────────
+# 为什么在这里探测一次：这台机器是 Linux 还是 macOS、用哪个包管理器装 Docker、要不要 root、
+# 安装目录默认放哪、--tls-mode nginx 能不能用 —— 这些结论在第 ①④⑤⑧ 步都要用。
+# 散着判就会变成"每个调用点各判一次"，而新增一种宿主时永远判不全（这正是本仓忌讳的形状）。
+if [ -r "$HERE/platform.sh" ]; then
+  # shellcheck source=platform.sh
+  . "$HERE/platform.sh"
+else
+  die "缺少 $HERE/platform.sh（宿主平台适配层）—— 安装包不完整，请重新获取完整代码后再跑"
+fi
+host_probe
+
 # --help 只打印文件头那段注释（不能写死行号：上一版按 '2,57p' 取行，头部一改就把下面的
 # 代码行也当帮助打出来了 —— 用"遇到第一行非注释就停"的规则，头部怎么改都不会漏出代码）
 if [ "$MODE" = help ]; then
@@ -200,8 +239,14 @@ case "$MODE" in status|health|update|register|uninstall|purge) ;; *) MODE=instal
 # ── 目录/名字/端口的默认值 ──
 if [ "${DIR_GIVEN}" = 0 ]; then
   if [ "$IN_REPO" = 1 ]; then DIR="$HERE"
-  elif [ "$(id -u)" -eq 0 ] || { [ ${#SUDO[@]} -gt 0 ] && sudo -n true 2>/dev/null; }; then DIR='/opt/marketplace-node'
-  else DIR="$HOME/marketplace-node"; fi
+  else
+    # 默认安装目录由平台决定：Linux 上"有 root/sudo"才用 /opt（有 FHS 约定），
+    # macOS 上永远用 $HOME（那里没有 /opt 约定，往系统目录装东西属于越权改系统）。
+    CAN_ROOT=0
+    [ "$(id -u)" -eq 0 ] && CAN_ROOT=1
+    [ "$CAN_ROOT" = 0 ] && [ ${#SUDO[@]} -gt 0 ] && sudo -n true 2>/dev/null && CAN_ROOT=1
+    DIR="$(host_default_dir "$CAN_ROOT")"
+  fi
 fi
 STATE_FILE="$DIR/.deploy-state"
 # 已有安装优先沿用状态文件里的名字/端口（--update/--status/--uninstall 不必重复给）
@@ -251,11 +296,27 @@ fi
 # （多几行就会把"看一行就知道死没死"这件事毁掉）。--status 保留横幅，它本来就是给人看的。
 if [ "$MODE" != health ]; then
   step "① 环境检测"
-  [ "$(uname -s)" = Linux ] || die "本脚本面向 Linux 服务器（当前：$(uname -s)）"
-  info "系统：$( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -sr ) / $(uname -m)"
-  info "目录：$DIR    容器：$SERVICE    端口：$PORT    数据卷：$VOLUME"
+  case "$MK_HOST_OS" in
+    linux|macos)
+      info "系统：$MK_HOST_VER（包管理器：$MK_HOST_PM  服务管理：$MK_HOST_INIT）"
+      info "目录：$DIR    容器：$SERVICE    端口：$PORT    数据卷：$VOLUME"
+      ;;
+    windows)
+      # 这条路径不是"以后再做"，而是**在 Windows 上本来就是错的**：bash 下的 $DIR 是
+      # MSYS 路径（/c/Users/…），交给 docker.exe 会被当 Linux 路径解释，构建上下文与
+      # bind mount 全错。所以这里不是拒绝支持 Windows，而是把 Windows 交给对的入口。
+      die "Windows 上请用 deploy.ps1（PowerShell）：节点直接跑在 Windows 上，不需要容器。
+    在 PowerShell 里执行：  .\\deploy.ps1
+    （在 Git Bash / WSL 里跑本脚本得到的路径与 docker 的路径语义不一致，会把构建上下文和挂载指错）"
+      ;;
+    *) die "无法识别的宿主系统（$MK_HOST_VER）—— 本脚本支持 Linux 与 macOS；Windows 请用 deploy.ps1" ;;
+  esac
 else
-  [ "$(uname -s)" = Linux ] || die "本脚本面向 Linux 服务器（当前：$(uname -s)）"
+  case "$MK_HOST_OS" in
+    linux|macos) ;;
+    windows) die "Windows 上请用 PowerShell 版：.\\deploy.ps1" ;;
+    *) die "无法识别的宿主系统（$MK_HOST_VER）" ;;
+  esac
 fi
 
 ensure_docker() {
@@ -266,55 +327,29 @@ ensure_docker() {
   step "安装 / 启动 Docker"
   if [ "$DRY_RUN" = 1 ]; then
     if have docker; then info "[dry-run] 将启动 Docker 守护进程"
-    else info "[dry-run] 将按发行版安装 Docker（apt/dnf/apk/pacman/zypper，兜底用官方 get.docker.com 脚本）"; fi
+    else info "[dry-run] 将安装 Docker（宿主：$MK_HOST_VER，包管理器：$MK_HOST_PM）"; fi
     return 0
   fi
+  # 装：由适配层按包管理器分派（macOS 不自动装、容器内不装、不可变宿主不装，都只给指引）
   if ! have docker; then
-    if have apt-get; then
-      info "apt-get 安装 docker.io …"
-      as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
-      as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io
-    elif have dnf; then
-      info "dnf 安装 docker …"; as_root dnf install -y -q docker || as_root dnf install -y -q docker-ce
-    elif have yum; then
-      info "yum 安装 docker …"; as_root yum install -y -q docker || as_root yum install -y -q docker-ce
-    elif have apk; then
-      info "apk 安装 docker …"; as_root apk add --no-cache docker
-    elif have pacman; then
-      info "pacman 安装 docker …"; as_root pacman -Sy --noconfirm docker
-    elif have zypper; then
-      info "zypper 安装 docker …"; as_root zypper --non-interactive install docker
-    else
-      # 兜底：官方便捷脚本（覆盖上面没列到的发行版；它会自己加软件源并装 docker-ce）
-      have curl || die "既没有已知的包管理器，也没有 curl，无法自动安装 Docker —— 请手动安装后重跑"
-      warn "未识别的发行版：改用 Docker 官方脚本安装（curl -fsSL https://get.docker.com | sh）"
-      curl -fsSL https://get.docker.com -o /tmp/get-docker.sh || die "下载 Docker 安装脚本失败（出网受限？）"
-      as_root sh /tmp/get-docker.sh || die "Docker 官方脚本安装失败（看上面的输出）"
-      rm -f /tmp/get-docker.sh
-    fi
-    have docker || die "安装后仍找不到 docker —— 请手动安装后重跑（https://docs.docker.com/engine/install/）"
+    info "安装 Docker（$MK_HOST_PM）…"
+    host_install_docker "${SUDO[*]}" || {
+      have docker || { host_docker_install_hint; die "本机没有可用的 Docker，且无法自动安装（见上面的指引）"; }
+    }
+    have docker || { host_docker_install_hint; die "安装后仍找不到 docker"; }
   fi
-  # 启动守护进程（systemd / service / openrc 三种都试一遍，装完不一定自动起）
-  as_root systemctl enable --now docker >/dev/null 2>&1 \
-    || as_root service docker start >/dev/null 2>&1 \
-    || as_root rc-service docker start >/dev/null 2>&1 \
-    || true
-  local i
-  for i in $(seq 1 20); do dk info >/dev/null 2>&1 && break; sleep 1; done
-  dk info >/dev/null 2>&1 || die "Docker 守护进程没起来（看 journalctl -u docker / tail /var/log/docker.log）"
+  host_start_docker dk "${SUDO[*]}" || die "Docker 守护进程没起来（看 journalctl -u docker / tail /var/log/docker.log）"
   ok "Docker 已就绪：$(dk --version 2>/dev/null | awk '{print $3}')"
-  if [ "$(id -u)" -ne 0 ]; then
-    local target="${SUDO_USER:-$(id -un)}"
-    if ! id -nG "$target" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
-      as_root usermod -aG docker "$target" >/dev/null 2>&1 || true
-      warn "已把 $target 加入 docker 组 —— **重新登录一次**之后才不用 sudo（本次部署继续用 sudo）"
-    fi
-  fi
+  # 免 sudo 用 docker（仅 Linux 有意义；macOS 上 docker 走用户自己的 socket，没有 docker 组）
+  local granted
+  granted="$(host_grant_docker "${SUDO[*]}")"
+  [ -n "$granted" ] && warn "已把 $granted 加入 docker 组 —— **重新登录一次**之后才不用 sudo（本次部署继续用 sudo）"
+  return 0
 }
 
 # ── 旧版（宿主安装）的残留：只提示，不自动删（那是回滚点，也可能是别人的东西）──
 check_legacy_host_install() {
-  if [ -f "$UNIT_LEGACY" ]; then
+  if host_supports_systemd_legacy && [ -f "$UNIT_LEGACY" ]; then
     warn "检测到宿主机上还有旧版的 systemd 单元 $UNIT_LEGACY（上一版是宿主安装）——"
     warn "  本脚本不再使用它。容器版跑通后可自行清理："
     warn "    sudo systemctl disable --now $SERVICE && sudo rm -f $UNIT_LEGACY && sudo systemctl daemon-reload"
@@ -395,7 +430,7 @@ if [ "$MODE" = uninstall ] || [ "$MODE" = purge ]; then
   else
     warn "这台机器上没有 docker —— 没什么可卸的"
   fi
-  if [ -f "$UNIT_LEGACY" ]; then
+  if host_supports_systemd_legacy && [ -f "$UNIT_LEGACY" ]; then
     warn "宿主上还留着旧版的 systemd 单元：sudo systemctl disable --now $SERVICE && sudo rm -f $UNIT_LEGACY && sudo systemctl daemon-reload"
   fi
   info "配置与状态文件保留在 $DIR（含 .env，里面有令牌密钥；不需要了就自行删除）"
@@ -558,7 +593,11 @@ if [ "$MODE" != register ]; then
       log "  这不等于证书必须在本机 —— TLS 在哪终止，证书就在哪申请）"
       log "    1) 别处 —— 负载均衡 / CDN / 另一台 nginx 拿域名与证书，转发到本机 http://<本机>:$PORT（默认）"
       log "    2) 本机 Caddy 容器 —— 自动申请与续期 Let's Encrypt，宿主不装任何东西（一键全包）"
-      log "    3) 本机宿主 nginx+certbot —— 会在宿主上装 nginx 与 certbot（只适合干净机器）"
+      # 「本机宿主 nginx + certbot」这一条是 Linux 发行版的实现（/etc/nginx/conf.d + systemctl +
+      # certbot --nginx），在 macOS 上根本不存在这套约定 ⇒ 不列出来，免得店主选了一个必然失败的路。
+      if host_supports_nginx_certbot; then
+        log "    3) 本机宿主 nginx+certbot —— 会在宿主上装 nginx 与 certbot（只适合干净机器）"
+      fi
       ANS="$(ask '  请选择（默认 1）> ' '1' 'HTTPS 终止方式（用 --tls-mode caddy|nginx|none 指定）')"
       case "$ANS" in 2) TLS_MODE=caddy ;; 3) TLS_MODE=nginx ;; *) TLS_MODE=none ;; esac
     else
@@ -570,6 +609,15 @@ if [ "$MODE" != register ]; then
   fi
   [ -z "$DOMAIN" ] && TLS_MODE=none
   case "$TLS_MODE" in caddy|nginx|none) ;; *) die "--tls-mode 只能是 caddy / nginx / none（收到：$TLS_MODE）";; esac
+  # `--tls-mode nginx` 的实现全是 Linux 发行版的假设：写 /etc/nginx/conf.d、`systemctl reload nginx`、
+  # `certbot --nginx`。macOS 上这三样都不成立（nginx 走 brew、没有 conf.d 约定、没有 systemctl）
+  # —— 所以这里不是"暂不支持"，而是**这条路在这台机器上本来就是错的**：拒绝，并给出对的写法。
+  if [ "$TLS_MODE" = nginx ] && ! host_supports_nginx_certbot; then
+    die "--tls-mode nginx 只适用于 Linux（宿主 nginx + certbot 是本脚本的 Linux 实现）。
+    这台机器（$MK_HOST_VER）请二选一：
+      · 想让本机自动申请证书： --tls-mode caddy --email 你的邮箱
+      · 已有 nginx/其它入口在终止 TLS： --tls-mode none --bind 127.0.0.1，再由那个入口反代到本机 $PORT"
+  fi
   if [ "$TLS_MODE" != none ] && [ -z "$EMAIL" ] && [ "$ASSUME_YES" != 1 ]; then
     # 邮箱可以合法地留空（certbot 有 --register-unsafely-without-email 这条路），
     # 所以非交互场景不报错、直接留空，只提示一句。
@@ -655,8 +703,18 @@ if [ -f "$ENV_FILE" ]; then
   ' "$ENV_FILE" 2>/dev/null | tr -d '\r' || true)"
 fi
 if [ -z "$KEEP_SECRET" ] || [ "${#KEEP_SECRET}" -lt 32 ]; then
-  have openssl || die "缺少 openssl（装一下：apt install openssl），它用来生成令牌密钥"
-  KEEP_SECRET="$(openssl rand -base64 48 | tr -d '\n')"
+  # 令牌密钥的生成：**两条路都必须是密码学随机**（它被用作 HMAC 密钥，弱密钥 = 任何人可离线
+  # 伪造店主令牌）。openssl 在 macOS 上自带（LibreSSL），但"自带"不等于"一定有"，所以补一条
+  # 不依赖外部命令的路 —— 脚本本来就要求宿主有 Node 吗？没有，所以这里也不能假定有 Node。
+  # 取舍：优先 openssl；没有就用 /dev/urandom（POSIX，Linux/macOS 都有）；两者都没有才拒绝。
+  if have openssl; then
+    KEEP_SECRET="$(openssl rand -base64 48 | tr -d '\n')"
+  elif [ -r /dev/urandom ]; then
+    KEEP_SECRET="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64)"
+  else
+    die "既没有 openssl 也没有 /dev/urandom，无法生成强随机令牌密钥（MK_TOKEN_SECRET）"
+  fi
+  [ "${#KEEP_SECRET}" -ge 32 ] || die "生成的令牌密钥长度不足（${#KEEP_SECRET}）—— 拒绝写入弱密钥"
   ok "已生成强随机令牌密钥 MK_TOKEN_SECRET（只写在本机 $ENV_FILE，权限 600）"
 else
   ok "沿用已有 MK_TOKEN_SECRET（店主登录态不失效）"
@@ -677,24 +735,24 @@ MK_CHAIN_ID=$CHAIN_ID
 MK_ESCROW_ADDRESS=$ESCROW
 MK_REGISTRY_ADDRESS=$REGISTRY
 MK_ESCROW_START_BLOCK=$START_BLOCK
-MK_ESCROW_TIMEOUT_BLOCKS=120960
-MK_ESCROW_FINALITY_BLOCKS=12
-MK_ESCROW_POLL_MS=15000
-MK_CHAIN_RECONCILE_MS=600000
+MK_ESCROW_TIMEOUT_BLOCKS=$(constN MK_ESCROW_TIMEOUT_BLOCKS)
+MK_ESCROW_FINALITY_BLOCKS=$(constN MK_ESCROW_FINALITY_BLOCKS)
+MK_ESCROW_POLL_MS=$(constN MK_ESCROW_POLL_MS)
+MK_CHAIN_RECONCILE_MS=$(constN MK_CHAIN_RECONCILE_MS)
 # 谁可以跨域读你的节点：联邦前端（买家聚合） + 你自己的域名
 MK_CORS_ORIGIN=$CORS
-MK_CORS_ALLOW_ALL=0
+MK_CORS_ALLOW_ALL=$(constN MK_CORS_ALLOW_ALL)
 # 数据在**卷**里：容器删了重建数据也在，这是升级与搬家都不丢数据的前提
 MK_DB_FILE=$DATA_MOUNT/marketplace-node.db
 MK_ATTACH_DIR=$DATA_MOUNT/attachments
-MK_AUTO_DELIVER=1
-MK_PII_RETENTION_DAYS=180
+MK_AUTO_DELIVER=$(constN MK_AUTO_DELIVER)
+MK_PII_RETENTION_DAYS=$(constN MK_PII_RETENTION_DAYS)
 # 行情缓存（毫秒）：官方 BTY-USDT 行情直接决定"买家要付多少 BTY"，所以跟得紧（标价单位就是 USDT）
 MK_BTY_TTL_MS=$KEEP_BTY_TTL
-MK_DRAFT_TTL_MINUTES=30
-MK_REVIEW_TTL_DAYS=30
-MK_TOKEN_TTL=86400
-MK_SIWE_TTL=600
+MK_DRAFT_TTL_MINUTES=$(constN MK_DRAFT_TTL_MINUTES)
+MK_REVIEW_TTL_DAYS=$(constN MK_REVIEW_TTL_DAYS)
+MK_TOKEN_TTL=$(constN MK_TOKEN_TTL)
+MK_SIWE_TTL=$(constN MK_SIWE_TTL)
 MK_TOKEN_SECRET=$KEEP_SECRET
 MK_SIWE_DOMAIN=$DOMAIN
 EOF
@@ -957,7 +1015,9 @@ EOF
     NGINX_FOREIGN=''
     for d in /etc/nginx/conf.d /etc/nginx/sites-enabled /etc/nginx/vhosts.d; do
       as_root test -d "$d" || continue
-      NGINX_FOREIGN="$NGINX_FOREIGN$(as_root find "$d" -maxdepth 1 -type f -name '*.conf' ! -name "$SERVICE.conf" -printf ' %p' 2>/dev/null || true)"
+      # 不用 GNU find 的 `-printf`（那是 GNU 扩展）：这里要的只是"有哪些别人的站点"，
+      # 换成一个空行分隔的 print + tr 即可 —— 少依赖一个非 POSIX 开关。
+      NGINX_FOREIGN="$NGINX_FOREIGN$(as_root find "$d" -maxdepth 1 -type f -name '*.conf' ! -name "$SERVICE.conf" -print 2>/dev/null | tr '\n' ' ' || true)"
     done
     CERT_FOREIGN=''
     if as_root test -e "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"; then CERT_FOREIGN="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"; fi

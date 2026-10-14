@@ -109,7 +109,7 @@ import {
 import { verifyToken, roleOf, isStaff } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { getEscrow, getProvider, fetchOnchainOrder, isAddress, weiToDecimal, getArbiterAddress } from '../chain.js';
-import { deliverDigitalFromPool, tryAutoDeliverById } from '../autoDeliver.js';
+import { deliverDigitalFromPool, tryAutoDeliverByEscrowOrder } from '../autoDeliver.js';
 import { holdStock, releaseHoldsForOrderIds, releaseHoldsForReturnReceived, releaseRefundedEscrow, restockOrder } from '../stockHold.js';
 import { verifyNftTransfersTx } from '../nftDelivery.js';
 import { newOrderId } from '../ids.js';
@@ -1227,7 +1227,9 @@ router.get('/:id', wrap(async (req, res) => {
     if (auth.address === order.buyer) as = 'buyer';
     else if (isStaff(auth.address)) as = 'owner';
     // 争议裁决证据开放：仅 disputed 单对仲裁人开码（正常在途单的交付码不属于裁决证据，
-    // 仲裁人无查看必要——收紧隐私面；配置/RPC 失败则 null，不开放）
+    // 仲裁人无查看必要——收紧隐私面）。
+    // `getArbiterAddress()` 读不到时返回 **null**（"不知道现在是谁"）⇒ 恒不等于 auth.address
+    // ⇒ 不开放（2026-10-14：此前它会回退上次成功值，轮换过仲裁人之后旧密钥在 RPC 故障期间仍能开码）
     // + 确认收货后的**售后案件**同样对仲裁人开放：案件由仲裁人结案、罚没（Staking.penalize）
     //   的资格门槛就是"案件在链上处于开启状态"，他必须能看到双方的 after_sale 陈述与附件才谈得上裁决；
     //   这类单的 status 是终局（settled/confirmed/expired），所以判据只能看案件在途标记
@@ -1333,10 +1335,12 @@ router.post('/:id/paid', requireAuth, paidLimiter, wrap(async (req, res) => {
   // 当前仍 Created。若链上已终局（Refunded/Settled——仲裁判退/卖家已退款/超时释放判卖）或已
   // 争议（Disputed），本地仍 draft 属事件漏扫竞态，把草稿推进为 escrowed 会复活一笔资金早已
   // 定局的单并可能自动发码（已退款买家免费得码）。RPC 不可达时不阻断（收据校验已通过、
-  // watcher/sync 稍后纠正），仅尽力复核。退款申请待决（status=Created 且 refundRequested=true，
-  // 请求不迁状态，此前漏检）同样不得自动发码——迁移照常（镜像），发码让位于
-  // 冻结守卫（curRefundPending 传给尾部）。
-  let curRefundPending = false;
+  // watcher/sync 稍后纠正），仅尽力复核。
+  //
+  // 注：**退款申请待决不在本复核里管**（2026-10-14 收口）。它的判据只在交付那一刻成立
+  // （链上 `refundRequested`），而"迁移前读到的值"与"迁移后要不要发码"之间隔着一次写库 +
+  // 一次 RPC 往返——用那个陈旧值当交付判据正是本节要修掉的错。发不发码现在只由
+  // 交付路径自己按链上真值判（见下方 notify 之后的 `tryAutoDeliverByEscrowOrder`）。
   try {
     const cur = await fetchOnchainOrder(order.escrow_order_id);
     const st = String(cur?.status || 'Created');
@@ -1348,7 +1352,6 @@ router.post('/:id/paid', requireAuth, paidLimiter, wrap(async (req, res) => {
           '请对该订单执行「同步链上状态」，让本地与链上终局一致（草稿占位将按终局释放）'
       );
     }
-    curRefundPending = !!(cur && cur.refundRequested);
   } catch {
     /* RPC 不可达：跳过复核（收据校验已通过；watcher 会按事件纠正） */
   }
@@ -1420,10 +1423,23 @@ router.post('/:id/paid', requireAuth, paidLimiter, wrap(async (req, res) => {
   }
   // 卡密自动交付：数字商品且码池有未用码 → 自动发码置 shipped（买家立即可见兑换码）。
   // 通知顺序：escrowed（托管成功）先于 shipped（自动交付）——与 watcher 路径一致。
-  // 链上退款申请待决（curRefundPending=true）时不自动发码（本地镜像滞后窗口；watcher
-  // RefundRequested 事件随后会落 requested——此前该窗口会把码发给即将退款的买家）
+  //
+  // 交付判据**必须在链上**（2026-10-14 收口）：这里此前调 `tryAutoDeliverById(order.id)`
+  //（只读本地镜像 `refund_status`），而买家完全可以在 `createOrder` 之后、本请求返回之前
+  // 补一笔 `requestRefund` —— 那时本地镜像按定义还没跟上（watcher 的扫描上界是
+  // `head − finalityBlocks`，默认 12 块 ≈ 1 分钟），于是码照发、钱冻在托管里，
+  // 卖家只能拒绝 → 争议 → 仲裁（本仓注释里写的"双损"）。`/paid` 恰恰是**唯一**落在
+  // 那个滞后窗口正中间的交付入口，所以这条不是"少一层校验"，而是判据挂错了层。
+  // 现在按链上单号走 `tryAutoDeliverByEscrowOrder`（全模块唯一交付入口，链上 Created 且未申请退款才发；
+  // 读不到链上真值就不发，留给卖家面板手动交付）——本行**不再**有第二个答案。
   notify('order.escrowed', order.id);
-  const autoDelivered = curRefundPending ? false : tryAutoDeliverById(order.id);
+  let autoDelivered = false;
+  try {
+    autoDelivered = await tryAutoDeliverByEscrowOrder(order.escrow_order_id);
+  } catch (e) {
+    // 交付失败不影响"托管已确认"这个事实（状态已落库）；watcher / 补货补跑会再试
+    console.error(`[paid] 自动交付失败（不影响托管确认）order=${order.id}: ${e?.message || e}`);
+  }
   /*
     池式商品主动告警（2026-09）：草稿创建到支付之间池子可能被别的订单掏空，此时买家钱已上链、
     却没有可交付资源——此前只有卖家面板的 poolEmpty 标着（卖家不看就不知道）。放在自动交付
