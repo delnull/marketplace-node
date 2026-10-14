@@ -38,8 +38,7 @@
  * ⚠️ 上表的 from 集是**正常路径**；代码里每个分支的 from 集都更宽，用来收敛"节点停机/漏扫"
  * 留下的残镜像（`draft`/`cancelled` 也接受，否则这些单会永远停在非终态、卖家流水漏计）。
  * 以 `applyEventCore`（`case 'ReceiptConfirmed'` / `case 'OrderExpiredReleased'` 里的 FROM_SET）
- * 与 `settleByRefundSplit` / `markEscrowDisputed` 里的实际集合为准
- *（`docs/ARCHITECTURE.md` §3.2 的表是按代码逐行核对的）。
+ * 与 `settleByRefundSplit` / `markEscrowDisputed` 里的实际集合为准。
  *
  * 说明：
  *  - BTY EVM 主网无可靠的公共 WebSocket，事件轮询（eth_getLogs 按块区间）是稳妥路径；

@@ -107,14 +107,16 @@ function disputeToPublic(o, kind = 'dispute') {
     amountDecimal: weiToDecimal(o.amount_wei),
     /*
       已退买家（链上真值镜像；0 = 未退款）。
-      为什么必须给（源码审计 2026-09）：`Staking.penalize` 的罚没上限基准是
-      `amount − refundedAmount`，前端要显示"本单可罚没上限"就得有这一项；
-      只给毛额时界面算出的上限**高于链上允许值**，仲裁人照填必然 revert `ExceedsCap()`。
+      为什么必须给（源码审计 2026-09；2026-10-13 复审扩展了基准）：`Staking.penalize` 的罚没上限
+      基准是 `min(amount − refundedAmount, escrow.sellerNetAtSettle(orderId))`——**毛额那一腿**由这里给，
+      **净额那一腿**（判给卖家时的实收净额，已扣平台费）由前端直接读链（`utils/staking.penaltyCapOf`
+      先读 `Staking.escrow()` 再读 `sellerNetAtSettle`）。只给毛额、或按毛额算上限，界面算出的数就
+      **高于链上允许值**，仲裁人照填必然 revert `ExceedsCap()`。
       （争议单处于 disputed，通常在退款之前，所以它多为 0；但部分退款后再次进入争议的
       路径确实存在，不能靠"应该不会有"来省掉这个字段。）
       `?? null` 而不是 `|| '0'`（2026-10 生产化清理）：两列在 db.js 里是 NOT NULL DEFAULT '0'
       且已进 REQUIRED_COLUMNS，所以 null 实际上不可达；写成 `?? null` 是为了让**读不到**与
-      **确证为 0** 在代码里不混同（与 orders.js 的同款 DTO 一致，见 docs/DECISIONS.md「读不到不是 0」）。
+      **确证为 0** 在代码里不混同（与 orders.js 的同款 DTO 一致）。
     */
     refundedAmountWei: o.refunded_amount_wei ?? null,
     /*

@@ -35,12 +35,57 @@ export function initDb(file = config.db.file) {
   db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
+  /*
+    **释放页清零**（2026-10-14 审计新增）：个人信息擦除走的是 `UPDATE ... = ''`，
+    而 SQLite 默认只是把该页标记为空闲——**原文仍留在库文件里**，任何人拿到
+    `.db` 文件（备份/卷快照/失窃磁盘/镜像层）都能直接搜到手机号与地址。
+    本仓自己在 `piiErase.js` 里写着"删行不删文件等于'数据还在磁盘上'，是最常见的假删除"，
+    同一条论证对 SQLite 的空闲页同样成立，只是这条腿此前没有接上。
+    `secure_delete=ON` 让删除/更新时把腾出的字节清零，代价是每次写稍慢一点
+    （纯文本商城场景可忽略；而隐私承诺是不能打折的那一侧）。
+  */
+  db.exec('PRAGMA secure_delete = ON');
   // 忙等待上限（5s）：单进程单连接下无并发写者，此设置仅为防御性——若误把同一库文件
   // 挂给第二个写进程/备份工具，SQLite 会等待而非立即 SQLITE_BUSY（数据完整性不受影响）。
   // ⚠️ 部署纪律：一库一进程（事务深度计数为进程内状态），见 OPS_RUNBOOK。
   db.exec('PRAGMA busy_timeout = 5000');
   migrate(db);
   return db;
+}
+
+/**
+ * 把 WAL 里已经落库的内容并回主库并**截断 WAL 文件**（个人信息擦除后必须调用一次）。
+ *
+ * 为什么需要它（2026-10-14 审计新增，"假删除"的第二条腿）：WAL 模式下每一次写都先进
+ * `<db>-wal`，而 `secure_delete` 管不到 **WAL 里的历史帧**——擦除之后 `<db>-wal` 仍可能保留
+ * 手机号/地址/备注的原文（实测：库内字段确为 `''`，而 `.db-wal` 里能直接搜到明文）。
+ * SQLite 的 PASSIVE 自动 checkpoint **不截断** WAL 文件，低写入量的节点上这些帧会长期留存，
+ * 直到被后续写入覆盖（可能永远不）。
+ *
+ * `TRUNCATE` 模式在并回之后把 WAL 文件截到 0 —— 这是"擦除后磁盘上不再有原文"这条承诺
+ * 唯一能落到文件系统上的动作。
+ *
+ * 失败**不抛**：这是一次尽力而为的加固（例如另一个连接正持着读锁时 checkpoint 会被跳过），
+ * 调用方不该因为"清 WAL 没成功"而回滚已经落库的擦除。失败时返回 false 并留日志，
+ * 由调用方按需再试（手动擦除端点每次都会再调一次）。
+ *
+ * @returns {boolean} 是否确实完成（`busy=0` 表示没有被其它连接挡住）
+ */
+export function checkpointTruncate() {
+  if (!db) return false;
+  try {
+    const rows = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').all();
+    // PRAGMA 返回 {busy, log, checkpointed}：busy != 0 表示有读者挡着，本次未截断
+    const busy = Number(rows?.[0]?.busy ?? 0);
+    if (busy !== 0) {
+      console.warn('[db] WAL 截断被其它连接挡住（busy≠0）：擦除后的原文可能仍在 -wal 里，下次擦除会再试');
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn(`[db] WAL 截断失败：${e?.message || e}（擦除后的原文可能仍在 -wal 里，下次擦除会再试）`);
+    return false;
+  }
 }
 
 /**
@@ -148,15 +193,15 @@ function migrate(d) {
 
         为什么是**叠加在终局之上的第二层**，而不是又一个 orders.status：
         链上那笔托管在该单终局时就已经结清（钱判给卖家或已退买家），售后案件**不动任何托管资金**，
-        补偿只能来自卖家保证金（Staking.penalize）或卖家线下转账，也因此**不阻塞卖家撤资**
-        （撤资闸只看 Escrow.sellerOpenCases，售后案件不计入）。链上事实源是
+        补偿只能来自卖家保证金（Staking.penalize）或卖家线下转账，也因此**不阻塞卖家出金**
+        （出金下限只看 Escrow.sellerOpenExposure = 退款待决/争议中的 Σ amount，售后案件不计入）。链上事实源是
         afterSaleOpenedAtBlock(orderId) —— Escrow.Order.status 全程停在 Settled。
         所以这里用独立列表达"这一个终局单上有没有在途案件"，orders.status 仍旧是 confirmed/settled/
         expired（谁把它改写成 disputed 就等于把一笔已结清的钱重新拉回在途：流水窗口、库存占位、
         发货闸、争议队列全都会跟着错）。语义与写入口的唯一实现在 src/afterSale.js。
 
         代价（如实写）：多一层状态就多一处必须同步的镜像——事件（watcher）、人工 /sync、
-        后台对账三条路径都写这几列，判据同源（src/afterSale.js），见 docs/ARCHITECTURE.md 的事件表。
+        后台对账三条路径都写这几列，判据同源（src/afterSale.js）。
       */
       after_sale_status TEXT NOT NULL DEFAULT 'none'
                     CHECK (after_sale_status IN ('none','open','closed')), -- none=从未开案 / open=在途案件 / closed=已结案（可再开新案）
@@ -265,7 +310,7 @@ function migrate(d) {
     -- "谁在什么时候改了店铺设置/导出了什么"因此失去证据力。现在每行带 prev_hash（上一行的
     -- entry_hash，链首为空串）与 entry_hash = sha256(规范序列化(本行))——算法、三态纪律
     -- 与"能查出什么/查不出什么"全写在 src/auditChain.js 的文件头（写入与校验共用那一份实现）。
-    -- 为什么不给存量库做 ALTER：见 docs/DECISIONS.md「不留兼容垫片」——新列直接写进建表语句，
+    -- 为什么不给存量库做 ALTER（greenfield，不留兼容垫片）——新列直接写进建表语句，
     -- 存量库按 OPS_RUNBOOK §1.2 删库重建（本仓是 greenfield，无迁移框架）。
     -- 代价（已实测，如实写在这里）：从旧备份恢复来的库若带**旧形状**的 audit_logs，这两列不存在 ⇒
     -- logAudit 的哈希落库那一步报 "no such column: entry_hash"、整行随事务回滚，调用方只看到一行

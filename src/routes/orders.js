@@ -67,8 +67,8 @@
  *   它与**退款/争议**的关系（三者互不替代，别混着用）：
  *     · **不动托管资金**——该单托管早已按终局结清，售后案件不冻结、不退还任何托管额；
  *       补偿只能来自卖家保证金（罚没）或卖家线下转账；
- *     · **不阻塞卖家撤资**——撤资闸只看链上 `Escrow.sellerOpenCases`（退款申请/争议），
- *       售后案件不计入；能追罚的口子由窗口长度限制（没有窗口就等于作废"买家点过头的单不再被追罚"）；
+ *     · **不阻塞卖家出金**——出金下限只读链上 `Escrow.sellerOpenExposure`（退款申请/争议中的
+ *       Σ amount），售后案件不计入；能追罚的口子由窗口长度限制（没有窗口就等于作废"买家点过头的单不再被追罚"）；
  *     · 它**不是** disputed：争议单资金仍在托管里、仲裁走 `Escrow.arbitrate`；案件走的是保证金。
  *   三条回填路径同源：事件（watcher 的 AfterSaleOpened/Closed）、本文件的 `/sync`
  *   （读 afterSaleOpen/afterSaleOpenedAtBlock）、后台对账（chainReconcile 的售后案件复查）——
@@ -285,7 +285,7 @@ function orderToPublic(o, opts = {}) {
         reply: reviewRow.reply_content || null,
         createdAt: reviewRow.created_at,
         replyAt: reviewRow.reply_at || null,
-        // 内容哈希存证（ARCHITECTURE.md §2.3）：kind='review'，买家原文哈希，可上链防删改
+        // 内容哈希存证：kind='review'，买家原文哈希，可上链防删改
         contentHash: reviewContentHash(o.id, reviewRow.content || ''),
       }
     : { rated: false, rating: null, reviewable: reviewableAt(o) };
@@ -482,7 +482,7 @@ function transition(orderId, from, to) {
  * 校验买家支付收据：交易已上链、接收方为托管合约且含本订单 OrderCreated 日志。
  * 返回 { ok: true, canonicalHash } 或 { ok: false, message }。
  * canonicalHash 取收据的链上规范哈希：BTY EVM 交易在链上同时存在
- * Chain33TxId（主链哈希）与 EvmTxId（EVM 哈希）两个 ID（见 docs/ARCHITECTURE.md 3.7），
+ * Chain33TxId（主链哈希）与 EvmTxId（EVM 哈希）两个 ID，
  * 钱包广播返回的可能只是其中一个别名。一律以 eth_getTransactionReceipt 返回的
  * 规范哈希落库，同一笔支付无论用哪个别名确认都归一为同一值——
  * 配合 paid_tx_hash 唯一索引实现「支付 txHash 必须唯一」。
@@ -737,7 +737,7 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
   }
   // 池式商品（码池 / NFT tokenId 池）的可用量核算在**事务内**做（见下方 txBegin 段）：
   // 只 COUNT 未用资源不扣减在途需求时，N 个并发草稿对 1 个码可以全部通过（各自都看到"还剩 1"），
-  // 付款后只有先交付的那单拿得到资源，其余买家钱被托管却拿不到货——与 ARCHITECTURE.md §3.2
+  // 付款后只有先交付的那单拿得到资源，其余买家钱被托管却拿不到货——与
   // 「售罄拦截：防付款后无码可发」的承诺不符（源码审计 2026-09）。
 
   const rates = await getRates();
@@ -1252,7 +1252,7 @@ router.get('/:id', wrap(async (req, res) => {
       phase: e.phase,
       content: e.content,
       createdAt: e.created_at,
-      // 争议陈述内容哈希（ARCHITECTURE.md §2.3）：可上链存证防节点删改
+      // 争议陈述内容哈希：可上链存证防节点删改
       contentHash: evidenceContentHash(order.id, e.role, e.content),
       files: filesByEvidence.get(e.id) || [], // 附件元数据（下载走鉴权接口，见 routes/evidenceFiles.js）
     }));
@@ -2251,7 +2251,7 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
       }
       if (movedToTarget) {
         notify('order.settled', order.id); // 卖家通知：sync 兜底（链上 Settled 无法区分确认/超时/判付，
-        // 以"资金已结算给卖家"的终局语义推送 order.settled，与 ARCHITECTURE.md §3.1.1 口径一致；
+        // 以"资金已结算给卖家"的终局语义推送 order.settled；
         // 拆分结算的买家侧说明看订单详情的「已退买家」一行）
       }
       break;

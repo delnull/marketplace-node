@@ -2,7 +2,7 @@
 /**
  * 部署期链上登记：用店主私钥当场注册/更新本店到 Registry（防他人抢注你的域名）。
  *
- * 背景（docs/ARCHITECTURE.md §2.2）：registerNode 允许"代注册"（首次注册可他人代付），
+ * 背景：registerNode 允许"代注册"（首次注册可他人代付），
  * 因此**任何钱包都可以抢先占用一个未登记的 endpoint**（链上无法验证域名归属）——
  * 唯一可靠的先手权是 operator（店主）私钥签名。本脚本把登记前移到部署期：
  * 店主密钥当场签名 keccak256(abi.encode(endpoint, escrowAddress, chainId, registryAddress))

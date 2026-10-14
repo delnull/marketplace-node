@@ -31,7 +31,7 @@
  * 占位失败发生在调用方事务内（ROLLBACK 后无残留副作用）。
  */
 import { getDb, txBegin, txCommit, txRollback } from './db.js';
-import { INCOME_IN, INCOME_STATUS } from './orderStatus.js';
+import { INCOME_IN, INCOME_STATUS, DRAFT_OR_ACTIVE_IN } from './orderStatus.js';
 
 /** 占位：该组合销量 +quantity（默认 1），成功返回 true
  *  （committed + qty ≤ capacity 校验失败、或该组合不限量时返回 false——不限量不占位）
@@ -137,6 +137,52 @@ export function isDelivered(row) {
 }
 
 /**
+ * 「**这一单的库存承诺还没结清**」的 SQL 谓词（**唯一实现**；2026-10-14 审计新增）。
+ *
+ * 判据是两个出口的**并集**，两个方向都故意取安全侧：
+ *   · `o.status IN (在途集合)` —— 订单生命还没走完（草稿/托管中/已发货/争议中）；
+ *   · 或者 `(o.hold_qty > 0 AND o.released_at IS NULL AND 退货未确认收到)` ——
+ *     生命走完了但**占位还押着**，且货没回到店主手里。
+ *
+ * 第二个出口就是本次修的那个洞：**已交付后退款**（`status = 'refunded'`）的单
+ * `releaseRefundedEscrow` **刻意不释放**（货在买家手里，需线下回收）。旧的状态白名单
+ * `status IN DRAFT_OR_ACTIVE_IN` 看不见它们——于是店主把规格选项名从「红」改成「深红」时，
+ * `saveSkus` 按**同 key** 继承 `committed` 继承不到，那一行的已占位数静默归零，
+ * 同一件实物可被再卖一次（**超卖**，受害方是下一个买家，且无任何错误码或审计痕迹）。
+ *
+ * 为什么要并上"在途集合"（而不是只留第二个出口）：在途但**曾释放过占位**的行
+ * （`released_at` 非空，例如取消后又恢复的单）同样是未结清的承诺，必须继续挡住改名。
+ * 方向是安全的：多算 ⇒ 更容易拒绝这次规格变更，而不是把 `committed` 记成偏小（那才会超卖）。
+ *
+ * 用法：`WHERE ${stockPromiseSql('o')}`（表别名可换，默认 `o`）。
+ */
+export function stockPromiseSql(alias = 'o') {
+  return `(${alias}.status IN ${DRAFT_OR_ACTIVE_IN} OR (${alias}.hold_qty > 0 AND ${alias}.released_at IS NULL AND NOT EXISTS (SELECT 1 FROM order_returns r WHERE r.order_id = ${alias}.id AND r.received_at IS NOT NULL)))`;
+}
+
+/**
+ * 「**还押着占位**」的 SQL 谓词：`hold_qty > 0` ∧ `released_at IS NULL`。
+ *
+ * 与 `stockPromiseSql` 的分工：这个回答"占位还在不在册"（释放/回补类判据用它），
+ * 那个回答"承诺结清了没有"（规格改名这类**拒绝性**判据用它，取并集更安全）。
+ * 两个条件缺一不可，而且**状态列不是判据**：一条订单可以走到任何状态而占位仍在。
+ */
+export function occupyingSql(alias = 'o') {
+  return `${alias}.hold_qty > 0 AND ${alias}.released_at IS NULL`;
+}
+
+/**
+ * 「**还没记进 `committed` 的承诺量**」的 SQL 谓词：`hold_qty = 0`。
+ * 用于"不限量 → 限量"切换时的**补记**核算（不限量期间下的单从未占位，承诺量没记进 `committed`）。
+ *
+ * 为什么它必须是 `hold_qty = 0`：`committed` 只统计**占位在册**的行；把 `hold_qty > 0` 的行
+ * 也当成"未记入的承诺"，补记时会**重复计入**（`committed` 记两遍 ⇒ 虚高 ⇒ 该商品卖不出去）。
+ */
+export function uncommittedPromiseSql(alias = 'o') {
+  return `${alias}.hold_qty = 0`;
+}
+
+/**
  * 常规批量释放入口（终局且未成交：cancelled/refunded/expired）
  */
 
@@ -158,7 +204,7 @@ export function releaseHoldsForOrderIds(orderIds) {
  * 后果是把已经交到买家手里的货重新变成可售 ⇒ 超卖（比占位滞留贵得多：买家拿不到货 + 争议 + 赔付）。
  * 代价是：一笔"真没发货、却被仲裁判了卖家"的单会把 `committed` 永久钉住一件——这是**账目**
  * 问题，店主可经商品编辑扩容解决，且方向安全。**要真正消除它，正确做法是把这种行暴露给店主**
- * （谁发货谁最清楚），而不是让节点替他在两个方向里猜一个——见 docs/DECISIONS.md 的记录。
+ * （谁发货谁最清楚），而不是让节点替他在两个方向里猜一个。
  *
  * 判据：status ∈ 终局成交态 ∧ 存在 received_at 非空的退货单 ∧ 尚未释放。
  * `released_at` 幂等保证与 refunded 终局路径先后触发只回补一次。

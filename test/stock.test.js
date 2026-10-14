@@ -62,12 +62,16 @@ async function listProduct(payload) {
   return res.body.data;
 }
 
-/** 店主代买家下单草稿（返回 superagent 响应） */
-async function createDraft(slug, who = buyer.address) {
+/**
+ * 店主代买家下单草稿（返回 superagent 响应）。
+ * `extra` 透传给请求体（例如 `{ skuKey: '红' }`）——多规格商品必须指定组合，
+ * 而占位是按组合记的：不传 skuKey 时服务端只有单组合商品才认，多规格会拒绝。
+ */
+async function createDraft(slug, who = buyer.address, extra = {}) {
   return request(app)
     .post('/api/orders')
     .set('Authorization', `Bearer ${ownerToken}`)
-    .send({ productSlug: slug, buyer: who })
+    .send({ productSlug: slug, buyer: who, ...extra })
     .expect(200);
 }
 
@@ -519,4 +523,105 @@ test('confirmed 残镜像 + 自提交付（shipped_at 非空、无单号、无�
     'shipped_at 必须计入「已交付事实」——否则已交到买家手里的货被回补成可售库存（超卖）'
   );
   assert.equal(availOf(p.slug), 4, '余量不得虚高');
+});
+
+/*
+  ── 2026-10-14 审计新增：规格改名不得把「已交付后退款、货未回收」的占位丢掉 ──────────
+  这条路此前是一个**静默超卖**：
+    1) 限量 1 件，买家下单（committed=1）；
+    2) 发货 → 全额退款：`releaseRefundedEscrow` **刻意不释放**（货在买家手里，需线下回收），
+       于是该行长期保持 hold_qty=1 ∧ released_at IS NULL ∧ status='refunded'；
+    3) 店主把规格选项名从「红」改成「深红」（正常编辑动作，capacity 不变）：
+       `saveSkus` 按**同 key** 继承 committed ⇒ 新 key 从 0 起算，占位静默归零；
+    4) 那件货还在买家手里，却重新变成可售 ⇒ 下一个买家付了钱拿不到货。
+  守卫此前只数 `status IN DRAFT_OR_ACTIVE_IN` 的行，第 3 步正好从旁边绕过去（200 + 无审计痕迹）。
+  现在守卫用 `stockHold.stockPromiseSql`（在途状态 ∨ 占位在册且退货未收到），本用例钉住它。
+*/
+test('规格改名守卫：已交付后退款（货未回收）的占位不得被静默丢掉', async () => {
+  const p = await listProduct(
+    productPayload({
+      kind: 'physical',
+      title: '改名守卫商品',
+      specs: [{ name: '颜色', options: ['红', '蓝'] }],
+      skus: [
+        { key: '红', priceUsdtMicro: 10_000_000, capacity: 1 },
+        { key: '蓝', priceUsdtMicro: 10_000_000, capacity: 1 },
+      ],
+    })
+  );
+  /*
+    多规格商品的 committed 在**逐组合的行**上，而且**没有** `sku_key=''` 的默认组合行
+    （`invRow` 只查默认行 ⇒ 对多规格商品会返回 undefined，不能拿它取 product_id）。
+    所以这里直接查商品行再聚合所有组合——被测的是"这件货还占着没有"，与它在哪个组合无关。
+  */
+  const productId = db.prepare('SELECT id FROM products WHERE slug = ?').get(p.slug).id;
+  const totalCommitted = () =>
+    db.prepare('SELECT COALESCE(SUM(committed), 0) AS c FROM product_skus WHERE product_id = ?').get(productId).c;
+
+  const draftRes = await createDraft(p.slug, buyer.address, { skuKey: '红' });
+  assertOk(draftRes);
+  const d = draftRes.body.data;
+  assert.equal(totalCommitted(), 1, '下单占位 1 件');
+
+  escrowed(d);
+  const ship = await request(app)
+    .post(`/api/orders/${d.id}/ship`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({ carrier: '顺丰', trackingNo: 'SF123' })
+    .expect(200);
+  assertOk(ship);
+
+  // 全额退款（已交付）：占位**刻意保留**（货在买家手里）
+  // 金额取本单真实的托管额——"全额"由 amount == refundWei 判定（写死一个常量会在改价时假红）
+  const fullWei = db.prepare('SELECT amount_wei FROM orders WHERE id = ?').get(d.id).amount_wei;
+  assert.equal(applyEvent('Arbitrated', { orderId: d.escrowOrderId, refundWei: fullWei }, { txHash: payHash(), block: 140 }), 1);
+  const row = db.prepare('SELECT status, hold_qty, released_at FROM orders WHERE id = ?').get(d.id);
+  assert.equal(row.status, 'refunded');
+  assert.equal(row.hold_qty, 1, '占位仍在（这是「货未回收」的表达）');
+  assert.equal(row.released_at, null, '占位未释放');
+  assert.equal(totalCommitted(), 1, 'committed 仍记着这 1 件');
+
+  // 改名（capacity 不变）：必须被拒，否则 committed 归零、同一件货可再卖一次
+  const rename = await request(app)
+    .patch(`/api/products/${p.slug}`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({
+      specs: [{ name: '颜色', options: ['深红', '蓝'] }],
+      skus: [
+        { key: '深红', priceUsdtMicro: 10_000_000, capacity: 1 },
+        { key: '蓝', priceUsdtMicro: 10_000_000, capacity: 1 },
+      ],
+    })
+    .expect(200);
+  assert.notEqual(rename.body.code, 0, '改名必须被拒（否则占位静默归零 ⇒ 超卖）');
+  assert.match(rename.body.message || '', /占位|超卖|在途/);
+  assert.equal(totalCommitted(), 1, '被拒后 committed 不变');
+
+  // 退货确认收到（货回到店主手里）⇒ 占位释放，此后改名照常放行
+  const ret = await request(app)
+    .post(`/api/orders/${d.id}/return`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({ reason: '退款后回收' })
+    .expect(200);
+  assertOk(ret);
+  const recv = await request(app)
+    .post(`/api/orders/${d.id}/return/receive`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({})
+    .expect(200);
+  assertOk(recv);
+  assert.equal(totalCommitted(), 0, '货已回收 ⇒ 占位释放');
+
+  const rename2 = await request(app)
+    .patch(`/api/products/${p.slug}`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({
+      specs: [{ name: '颜色', options: ['深红', '蓝'] }],
+      skus: [
+        { key: '深红', priceUsdtMicro: 10_000_000, capacity: 1 },
+        { key: '蓝', priceUsdtMicro: 10_000_000, capacity: 1 },
+      ],
+    })
+    .expect(200);
+  assertOk(rename2, '占位已释放后改名为正常操作');
 });

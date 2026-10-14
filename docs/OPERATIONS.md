@@ -65,14 +65,14 @@
 
 | 想做的事 | 命令 / 做法 |
 |---|---|
-| 换域名 | 域名解析好后重跑 `bash deploy.sh --update --domain 新域名`（会重建容器与反代/证书配置，SIWE 域名与 CORS 白名单一并更新），然后到前端开店向导里**重新登记**一次 |
+| 换域名 | 两件事分开办：① 节点侧 `bash deploy.sh --update --domain 新域名`（只更新 `MK_SIWE_DOMAIN` 与 CORS 白名单，**不会**因为换域名就去申请证书）；② 证书与入口那侧同步（本机申请证书的安装按新域名重签，外部入口改转发规则）；然后到前端开店向导里**重新登记**一次 |
 | 同机再开一家店 | `bash deploy.sh --service shop-b --volume shop-b-data --port 8091 --dir /opt/shop-b`（容器名、卷名、端口三者都要换）。第二家店**别再选 Caddy 模式**：`80/443` 已经被第一家店的 Caddy 容器占着，第二个 Caddy 起不来——用 `--tls-mode none`（交给已有反代）更省事 |
 | 链上更新登记 / 注销登记 | 到 https://fedmall.bityuan.com 的开店向导里操作（**只有登记时的那个钱包**能更新或注销） |
 | 暂停营业 | 前端「卖家面板 → 店铺设置」把商品下架；要让目录里也看不到，就在向导里注销登记。**数据与订单都还在你的卷里**，重新登记即可复业 |
 | 关掉节点（数据不动） | `docker stop marketplace-node`；以后恢复：`docker start marketplace-node` |
 | 不想再用这套安装（但留数据） | `bash deploy.sh --uninstall`：移除节点容器与 Caddy 容器、删掉它们之间的网络，**数据卷保留**；`.env` 与状态文件也留在安装目录 |
 | 彻底清除（不可逆） | `bash deploy.sh --purge`：**连数据卷一起删**，要先手输卷名确认（非交互场景加 `--yes` 跳过确认） |
-| 只看计划、不动手 | `bash deploy.sh --dry-run`（把要装 Docker / 建镜像 / 建卷 / 起容器 / 配 HTTPS 的计划打印出来就退出） |
+| 只看计划、不动手 | `bash deploy.sh --dry-run`（把要装 Docker / 建镜像 / 建卷 / 起容器 / **HTTPS 在哪终止**的计划打印出来就退出） |
 
 ## 2. 备份
 
@@ -174,7 +174,7 @@ docker run -d --name marketplace-node --restart unless-stopped \
 ## 5. 换服务器（迁移）
 
 1. **备份**：在旧机上按 §2 做两件事——导出数据卷，**并把 `<安装目录>/.env` 一起带走**（里面有 `MK_TOKEN_SECRET`，不带走的话新机上所有人的登录态都失效）；
-2. **新机上先把架子搭好**：装好 Docker（`bash deploy.sh` 会自己装），按新机的路径放好代码，先跑一次 `bash deploy.sh --owner <店主地址> --domain <域名> --email <邮箱>`，把镜像、空数据卷、反代/证书都建好；
+2. **新机上先把架子搭好**：装好 Docker（`bash deploy.sh` 会自己装），按新机的路径放好代码，先跑一次 `bash deploy.sh --owner <店主地址> --domain <域名>`（**证书在哪终止按新机的实际情况选**：本机申请就加 `--tls-mode caddy`，由外部入口终止就加 `--tls-mode none`，本机已有 nginx 则 `--tls-mode none --bind 127.0.0.1`），把镜像、空数据卷、入口都建好；
 3. **搬数据**：`docker stop <容器名>` → 按 §3 第 3 步把备份导进新机的数据卷 → 用旧机那份 `.env` 覆盖新机的 `<安装目录>/.env` → `bash deploy.sh --update`（它会重建并启动容器，这样新那份 `.env` 才会被读进去）；
 4. **改配置**：`.env` 里的共享合约地址、`MK_ESCROW_START_BLOCK` **保持原值**（事件游标存在库里，会自动从停摆处接着扫）；链上登记的 endpoint 不在 `.env` 里，它在开店向导网页填写；
 5. **对外入口**：确认 `curl -s https://你的域名/healthz` 正常后，**再把域名解析指到新机**（反代与证书在第 2 步已经配好；域名变了就 `bash deploy.sh --update --domain 新域名`）；
@@ -195,7 +195,7 @@ docker run -d --name marketplace-node --restart unless-stopped \
 ### 6.2 换店主钱包（链上转让）
 
 - 店主身份 = 店主钱包地址（`.env` 的 `MK_SHOP_OWNER`）；**链上登记的 operator 就是登记时用的那个钱包**，链上更新登记 / 注销只能由它发起。
-- 换店主**不能只改 `.env`**：要走链上 Registry 的原子转让 `transferNode`——登记从旧 operator 直接换到新 operator，**没有抢注窗口**，也不用"先注销再注册"。转让要**双方各签一次**（旧店主 `fromSig` + 新店主 `toSig`，各自的 EIP-191 personal 签名；摘要 = `keccak256(abi.encode(from, to, endpoint, escrowAddress, chainId, registry))`，chainId = 2999）。**前端转让向导尚未实现**，目前只能用脚本 / 钱包直调合约——这一步建议找懂链上工具的人配合。
+- 换店主**不能只改 `.env`**：要走链上 Registry 的原子转让 `transferNode`——登记从旧 operator 直接换到新 operator，**没有抢注窗口**，也不用"先注销再注册"。转让要**双方各签一次**（旧店主 `fromSig` + 新店主 `toSig`，各自的 EIP-191 personal 签名；摘要 = `keccak256(abi.encode(from, to, endpoint, escrowAddress, deadline, chainId, registry))`，chainId = 2999）。**票据带 `deadline`（2026-10-13 起，`transferNode` 的第 5 个参数）**：它进签名消息体、由双方签字那一刻定死，`block.timestamp > deadline` 即 `TransferExpired`——**授权不再永久有效**。没有时效时，一份泄露的票据（截图/转发/误发/设备被读）可以在**任意未来时刻**被广播，把店铺连同编号与店龄一起拿走，而店主没有任何链上撤销手段；过期只需**重新签一份**（链上刻意没有"撤销"这种状态），所以给一个够用的窗口（例如几天）就行，别签成永久。**前端转让向导尚未实现**，目前只能用脚本 / 钱包直调合约——这一步建议找懂链上工具的人配合。
 - **转让的是店铺经营权，不是历史订单的资金归属**：链上托管单的 `seller` 在下单时已锁定且不可更改，在途订单仍按 §6.3 处理。
 - 操作顺序：新服务器按 §5 恢复数据 → `.env` 设 `MK_SHOP_OWNER=新地址` → `bash deploy.sh --update`（重建容器）→ `docker exec -u node marketplace-node npm run reconcile` 对账 → 到店铺页确认「链上登记 operator」已变成新地址。
 - 旧店主**无法操作**（失能、身故）时：转让必须 `fromSig`，**拿不到旧私钥就转不了**——这是双签设计的必然代价；此时新店主只能用新地址另起一家店，搬走能搬的数据（商品 / 码池），并在原店公告与社区渠道公示。
@@ -241,8 +241,12 @@ docker run -d --name marketplace-node --restart unless-stopped \
 | 容器起不来，日志说 `chainId` 不符 | `MK_RPC_URL` 指到了别的链 | 改回 `https://mainnet.bityuan.com/eth` 后 `bash deploy.sh --update` |
 | 端口被占用 / 想换端口 | 同机已有服务占了 8090（另外 8080 也很常被别的东西占着，别改用它） | 换一个：`bash deploy.sh --update --port 8091`（会重建容器并更新反代配置）。**占用者若是旧版的宿主安装**（这台机器以前用"装 Node + systemd"的方式部署过）：`systemctl status marketplace-node` 看它还在不在跑，清理掉：`sudo systemctl disable --now marketplace-node && sudo rm -f /etc/systemd/system/marketplace-node.service && sudo systemctl daemon-reload`（`deploy.sh` 检测到这种残留也会提示你） |
 | 改完 `.env` 没生效 | `.env` 是在 `docker run` 那一刻读进容器配置的，`docker restart` 不会重读 | `bash deploy.sh --update`（重建容器）。Caddyfile 不一样，它是挂载进去的文件，改完 `docker restart marketplace-node-caddy` 就生效 |
+| 手改过 Caddyfile（换证书邮箱 / 加 header / 日志），怕被下次部署覆盖 | 每次部署（含 `--update`）都会**整份重新生成** Caddyfile | 脚本会先把上一份备份成 `Caddyfile.bak.<时间戳>`，并且只在**内容确实变了**时打印"被重新生成过"（只差时间戳那行时不打扰你、也不留垃圾备份）。把改动合并回去 → `docker restart marketplace-node-caddy`；整份回退：`cp -a <安装目录>/Caddyfile.bak.<ts> <安装目录>/Caddyfile && docker restart marketplace-node-caddy` |
+| 退出码怎么判（喂监控/cron） | 脚本只用三个码：**0** 成功；**1** 脚本自己的失败（原因都在输出里，且一律给出下一步命令）；**2** 用法错或 `--health` 判为不健康 | docker 的原生码（例如端口被占的 125）**不会漏出**：脚本会连同 docker 原始报错一起回显，然后以 1 结束，并清掉这次没起来的空壳容器（否则下次重跑撞"容器已存在"，把真原因盖掉） |
 | 磁盘满了 | 卷里的附件 / 审计 / 日志（`docker logs` 也占磁盘） | `docker system df -v` 看是谁占的；清理无用的旧镜像：`docker image prune -f`。⚠️ **千万别 `docker volume prune`**——它删的正是"当前没有容器在用"的卷，你的店就在里面 |
-| 脚本第 ⑧ 步证书申请失败 | 域名没解析到本机 / 80 端口没放行 / 用了 CDN 代理 | **Caddy 的报错在 `docker logs marketplace-node-caddy` 里**（证书数据在 `${服务名}-caddy-data` 卷里，重建 Caddy 容器不会重新申请）；修好后重跑 `bash deploy.sh --update --domain 你的域名`。用宿主 nginx 模式的话，也可手动 `sudo certbot --nginx -d 你的域名` |
+| 脚本第 ⑧ 步证书申请失败 | **只在你选了本机申请证书（`--tls-mode caddy`/`nginx`）时才会遇到**：域名没解析到本机 / 80 端口没放行 / 用了 CDN 代理 | **Caddy 的报错在 `docker logs marketplace-node-caddy` 里**（证书数据在 `${服务名}-caddy-data` 卷里，重建 Caddy 容器不会重新申请）；修好后重跑 `bash deploy.sh --update --domain 你的域名`。用宿主 nginx 模式的话，也可手动 `sudo certbot --nginx -d 你的域名`；不想在本机申请证书就改走 `--tls-mode none`，证书交给你的入口 |
+| 脚本**拒绝** `--tls-mode nginx`（说本机已有 nginx 站点） | 这是刻意的：再写一个 `listen 80` 的 server 块会与同机站点争 `server_name`，而 `systemctl reload nginx` 会把它们一起卷进来（certbot `--redirect` 还会去改已有的 443 server 块） | 改走「本机已有入口」那条：`bash deploy.sh --update --tls-mode none --bind 127.0.0.1 --yes`，再在**你那份 nginx** 的 server 块里加 `location / { proxy_pass http://127.0.0.1:8090; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; }` |
+| 我只给了 `--domain`，脚本却说"本机不申请证书" | 这是**默认口径**（2026-10 改）：域名的含义是"节点的对外身份"，证书在哪申请由 **TLS 在哪终止**决定 | 想让本机全包：`bash deploy.sh --update --tls-mode caddy`（干净机器也可 `--tls-mode nginx`）；想用既有入口：`--tls-mode none`（本机已有 nginx 时加 `--bind 127.0.0.1`） |
 | 买家说"已支付但订单还是待支付" | 轮询器刻意等确认深度（默认 12 块 ≈ 1 分钟），状态回写天生滞后 | 先等 1 分钟；仍不动让买家点订单页「同步链上状态」（不受确认深度限制，直读链上真值）；再核 `.env` 合约地址与买家实际支付地址是否一致、RPC 是否可达 |
 | 界面一直不更新 / 收款流水缺单 | 轮询器停摆或事件被隔离——**容器照样 `healthy`，看不出来** | 看 §1 的 `watcher` 块：`lastOkAt` 不推进 = 停摆；`quarantined > 0` = 有事件被跳过；`lagBlocks` 持续增长 = 跟不上 |
 | `/healthz` 的 `quarantined > 0` | 同一事件连续失败 3 次后被移入隔离清单（跳过它并继续推进游标，避免一个坏事件把扫描窗口永久钉死） | ① 读隔离清单定位事件；② 按订单号用 `POST /api/orders/:id/sync` 从链上**单独补回**（隔离期间的正规补救路径）；③ 确认该事件确实无害后，从隔离清单删掉该条，下轮会重试；④ 同一单反复被隔离 = 本地行与链上真值不符，按下一行查 |

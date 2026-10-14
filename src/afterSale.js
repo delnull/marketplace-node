@@ -2,13 +2,16 @@
  * 确认收货后的**售后案件**（契约 2026-10 第二批）——本地镜像的**唯一判据层**。
  *
  * 链上语义（事实源 `contracts/src/Escrow.sol`，只读参考）：
- *  - 买家在**订单终局（链上 Settled = 钱已判给卖家）之后**、窗口内（`afterSaleWindowBlocks`，
+ *  - 买家在**订单终局（链上 Settled = 钱全额判给卖家）之后**、窗口内（开案窗口取该单**结算时的快照**，
  *    自 `settledAtBlock` 起算，生产默认 180 天、上限 360 天）调 `openAfterSale(orderId)` 开案；
+ *    入口形状（2026-10-13 收紧）：`status == Settled && buyerConfirmed && refundedAmount == 0`
+ *    —— 执行过部分退款/仲裁拆分的单不再能开案（那是"谈拢的和解"，不是"收货后新发现的问题"）；
  *  - 只有买家能开案，且每个单同时只能有一个在途案件（`afterSaleOpenedAtBlock != 0` ⇒ 再开 revert
  *    `AfterSaleAlreadyOpen`）；结案会**清空**该槽位 ⇒ 窗口内买家可以再次开案（open→closed→open）；
  *  - `closeAfterSale(orderId, note)` 由买家撤诉或仲裁人结案，`note` 是**用户填的文本**；
  *  - 它**不动托管资金**（那笔钱早已结清），补偿只能来自卖家保证金 `Staking.penalize` 或卖家线下转账；
- *    也因此**不阻塞卖家撤资**（撤资闸只数 `Escrow.sellerOpenCases`，售后案件不计入）。
+ *    也因此**不阻塞卖家出金**（出金下限只读 `Escrow.sellerOpenExposure` = 退款待决 + 争议中的
+ *    Σ amount，售后案件不计入）。
  *
  * ⚠️ 为什么**不改 `orders.status`**（本仓纪律，改这一行之前先读这段）：
  * 链上 `Escrow.Order.status` 在售后案件全程都停在 `Settled` —— 案件是**叠加在终局之上的第二层**。

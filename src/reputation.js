@@ -1,5 +1,5 @@
 /**
- * 店铺履约画像统计（公开只读，链下信誉索引——docs/ARCHITECTURE.md §3.9）。
+ * 店铺履约画像统计（公开只读，链下信誉索引）。
  *
  * 口径（每项标注数据源与可审计性）：
  *  - 事件计数（托管单量/买家确认/超时释放/争议/仲裁判向）取自订单 onchain_events——
@@ -9,7 +9,7 @@
  *    refunded = 判买家 / settled = 判卖家（只统计**含 Arbitrated 事件**的行）。
  *    注意 refunded/settled 两态**也可由 `RefundApproved` 产生**（卖家同意退款 / 争议中和解，
  *    含部分退款——那类单没有 Arbitrated 事件，因此不计入判向统计）；拆分裁决按 settled
- *    计入判卖家侧（要区分"拆分"需另读 refundedAmountWei，见 docs/ARCHITECTURE.md §3.9）；
+ *    计入判卖家侧（要区分"拆分"需另读 refundedAmountWei）；
  *  - 发货耗时中位数/P90 = delivered_at − OrderCreated.at，本地账 ⚠ 节点自述（可交叉抽样）；
  *    减法的唯一实现在 shipLatencySpan（卖家 SLA 读数复用同一批样本与同一基准，见 opsMetrics.js）；
  *  - 样本阈值：窗口内争议 < 5 笔时争议率/判买家率置 null（sampleTooSmall 标记），防小样本误导；

@@ -1,7 +1,7 @@
 /**
  * 卖家经营看板统计（P1-①，ownerOnly 私域）。
  *
- * 口径（见 docs/ARCHITECTURE.md §3.1）：
+ * 口径：
  *  - 入账（GMV）= confirmed/settled/expired 的净额（金额 − 订单级 feeBps 折算，与收款流水一致）；
  *  - 退款额 = refunded 单托管毛额合计（单独口径，不与 GMV 净混合）；
  *  - 买家/复购按 address 去重计数（成交 ≥1 / ≥2 单）；

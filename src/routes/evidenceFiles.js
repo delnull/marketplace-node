@@ -37,8 +37,33 @@ const downloadLimiter = simpleRateLimit({ windowMs: 60_000, max: 600, message: '
 const findOrder = (id) => getDb().prepare('SELECT * FROM orders WHERE id = ?').get(String(id || ''));
 const findEvidence = (id) => getDb().prepare('SELECT * FROM dispute_evidence WHERE id = ?').get(Number(id) || 0);
 
-// 鉴权在 body 解析之前（requireAuth 401 时不触发 18MB JSON 解析——防未认证大体积 DoS）
-router.post('/:id/evidence/:evidenceId/files', requireAuth, uploadLimiter, express.json({ limit: '18mb' }), wrap(async (req, res) => {
+/**
+ * 单请求体上限（base64 JSON 形态的天然上界：4/3 × 单附件上限 + 一点 JSON 外壳余量）。
+ *
+ * 为什么要有**容量**这一层闸（2026-10-14 审计修订）：限流只按**次数**（30 次/分钟/IP），
+ * 同一瞬间发 30 个请求会全部放行，而每个请求的 body 都要先被完整缓冲再 `JSON.parse`
+ * （base64 在 V8 里是 UTF-16，常驻堆约为明文的 2 倍）⇒ 单 IP 一分钟内可造出 GB 级瞬时占用，
+ * 小规格 VPS 直接被 OOM 杀掉（进程退出 = 全店不可用 + watcher 停摆漏扫）。
+ * 次数限流挡不住"同一瞬间的 N 个大请求"；容量闸才挡得住。
+ * 判据取自同一份配额常量（`MAX_BYTES_PER_ORDER` 是单订单累计上限），
+ * 所以"能塞进一个请求的最大字节"与"一个订单最多能存多少"同源，改配额时不会两处漂移。
+ */
+export const FILES_BODY_LIMIT = `${MAX_BYTES_PER_ORDER}b`;
+
+/**
+ * 上传前置门控（**中间件**，刻意排在 body 解析之前）。
+ *
+ * 判据全部只依赖 URL 参数与 `req.auth`，与请求体无关——所以没有任何理由先收 18MB 再判。
+ * 旧实现把这一整段放在 `express.json({limit:'18mb'})` **之后**（审计 H-4）：
+ * 任何人自助登录（nonce+login，签名免费、无地址白名单）后，用 30 个并发的 18MB 请求
+ * （甚至 order id 根本不存在）就能让节点在解析阶段 OOM。现在不存在的订单/无权上传
+ * 在**第一个字节被读进内存之前**就被拒。
+ *
+ * 把结果挂在 `req.evidenceCtx` 上而不是再查一遍库：判据只有一处实现，
+ * 下面的 handler 直接消费它——两处各查一次必然漂移（而漂移的后果是"门控放行、
+ * handler 按别的条件处理"）。
+ */
+function gateEvidenceUpload(req, res, next) {
   const order = findOrder(req.params.id);
   if (!order) return fail(res, '订单不存在', 404, 404);
   const evidence = findEvidence(req.params.evidenceId);
@@ -49,6 +74,27 @@ router.post('/:id/evidence/:evidenceId/files', requireAuth, uploadLimiter, expre
   if (role !== evidence.role) return fail(res, '只能向本人提交的证据条目追加附件', 403, 403);
   const gate = evidencePhaseError(order, evidence.phase, role);
   if (gate) return fail(res, gate.message + '（附件同证据阶段门控）', gate.code, gate.http);
+  req.evidenceCtx = { order, evidence, role };
+  next();
+}
+
+/**
+ * 中间件顺序即安全判据（改动前先读这一段）：
+ *   ① `requireAuth` —— 401 时不触发任何 body 解析；
+ *   ② `uploadLimiter` —— 按 IP 的**次数**闸；
+ *   ③ `gateEvidenceUpload` —— 订单/证据/角色/阶段四道判据，**只用 URL 参数**；
+ *   ④ `express.json({limit: FILES_BODY_LIMIT})` —— 到这里才收字节，且容量有界。
+ * 顺序反了（旧实现 ③ 在 ④ 之后）就等于"先让陌生人把内存塞满，再决定他有没有资格"。
+ */
+router.post(
+  '/:id/evidence/:evidenceId/files',
+  requireAuth,
+  uploadLimiter,
+  gateEvidenceUpload,
+  express.json({ limit: FILES_BODY_LIMIT }),
+  wrap(async (req, res) => {
+  // 门控已在上面的中间件里判完（唯一实现）；这里只消费它的结论
+  const { order, evidence } = req.evidenceCtx;
 
   const raw = Array.isArray(req.body?.files) ? req.body.files : [];
   if (!raw.length) return fail(res, 'files 需为非空数组 [{name, mime, dataB64}]');

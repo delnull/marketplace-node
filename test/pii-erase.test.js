@@ -24,7 +24,7 @@ const operator = Wallet.createRandom();
 
 const { applyEvent } = await import('../src/escrowWatcher.js');
 const { eraseOrderPii, runPiiRetention, startPiiRetentionSweep, PII_TOMBSTONE, PII_ERASABLE_STATUS, PII_PROTECTED_STATUS } = await import('../src/piiErase.js');
-const { PII_RETENTION_DAYS } = await import('../src/config.js');
+const { PII_RETENTION_DAYS, default: appConfig } = await import('../src/config.js');
 
 let ownerToken;
 let buyerToken;
@@ -509,4 +509,48 @@ test('保留期让路：有在途售后案件的终局单不自动擦除（证�
   const sweep2 = runPiiRetention({ days: 180 });
   assert.ok(sweep2.orderIds.includes(o2.id), '结案后不再让路：到期即擦（保留期的最终效果不变）');
   assert.equal(rowOf(o2.id).shipping_name, '');
+});
+
+/*
+  ── 2026-10-14 审计新增：擦除必须在**文件层面**也成立（"假删除"的两条腿）────────────
+  与上面所有用例的形状不同：那些测的是"SQL 查询还能不能读到"，而数据主体的删除请求问的是
+  "**文件里还有没有**"。两者在 SQLite + WAL 下并不等价：
+    · 释放页：`UPDATE ... = ''` 之后原文默认仍留在库文件的空闲页里
+      ⇒ 修法是 `PRAGMA secure_delete = ON`；
+    · WAL：每次写先进 `<db>-wal`，而 PASSIVE 自动 checkpoint **不截断**文件
+      ⇒ 修法是擦除后 `PRAGMA wal_checkpoint(TRUNCATE)`（`checkpointTruncate()`）。
+  本用例守的是这两个修法**真的生效**，而不是"某个字节在不在文件里"：后者受 SQLite 的
+  页分配与写入时机影响，做成断言会时真时假——一个随机变红的用例比没有用例更糟。
+  审计时的原始字节取证与结论记在这里：问题**确实存在**（擦除后 `<db>-wal` 里能直接搜到
+  手机号/地址/备注原文），但它作为自动化断言不稳定，所以不进测试。
+*/
+test('擦除的两条腿都在位：secure_delete 已开启、擦除后 WAL 被截断', async () => {
+  const { getDb, checkpointTruncate } = await import('../src/db.js');
+  // 修法一：释放页清零（否则原文留在库文件空闲页里）
+  const sd = getDb().prepare('PRAGMA secure_delete').get();
+  assert.equal(Number(sd?.secure_delete ?? 0), 1, 'PRAGMA secure_delete 必须为 ON（db.js initDb 里设置）');
+
+  const p = await listProduct(productPayload({ kind: 'physical', title: '磁盘残留检测商品' }));
+  const o = await createDraft(p.slug, {
+    shipping: { name: '残留检测', phone: '13900000099', address: '残留地址-A' },
+    note: '残留备注-A',
+  });
+  escrowed(o);
+  // 必须先终局：擦除只对资金流已终结的单开放（在途单要按地址发货，见 PII_ERASABLE_STATUS）
+  assert.equal(applyEvent('ReceiptConfirmed', { orderId: o.escrowOrderId }, { txHash: payHash(), block: 91 }), 1);
+
+  const dbFile = appConfig.db.file;
+  assert.ok(dbFile, '本用例需要真实的库文件路径');
+
+  const r = await eraseViaApi(o.id);
+  assertOk(r);
+  assert.equal(rowOf(o.id).shipping_phone, '', '查询侧确实读不到了');
+  /*
+    修法二：擦除路径**自己**截断 WAL（响应里的 walTruncated 就是它的读数）。
+    断它而不是断"文件当前大小"：TRUNCATE 成功后 wal 会回到 0，但当前大小还受本轮之后
+    有没有别的写影响（其它用例/后台任务），拿它当断言同样会漂。响应字段是这一单擦除动作的
+    直接读数，与修法一一对应。再单测直调一次（保留期路径走的是同一个原语）。
+  */
+  assert.equal(r.body?.data?.walTruncated, true, '擦除必须顺带把 WAL 截断（否则原文留在 -wal 里）');
+  assert.equal(checkpointTruncate(), true, 'checkpointTruncate 在无写者时应返回 true');
 });

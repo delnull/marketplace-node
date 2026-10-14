@@ -14,11 +14,21 @@
 #      · 数据在**命名卷**里 —— 容器可以随时删掉重建（升级就是换镜像），搬家就是导出/导入卷。
 #  宿主上只多三样东西：Docker（若原本没有）、一个数据卷、（可选）一个反向代理容器。
 #
-#  ── HTTPS 怎么给（运行时会让你选）──────────────────────────────────────────
-#  联邦前端是 https，浏览器会拦掉到 http 节点的请求，所以节点对外必须是 https：
-#    1) Caddy 容器（推荐）：全容器、自动申请与续期 Let's Encrypt，宿主不装任何东西
-#    2) 宿主 nginx + certbot：和上一版一样（宿主会被装 nginx 与 certbot）
-#    3) 不配 TLS：节点只监听端口，TLS 由外部（负载均衡 / 已有反向代理）终止
+#  ── 证书放哪、HTTPS 在哪终止（**这是两个拓扑，不是一个开关**）─────────────
+#  联邦前端是 https，浏览器会拦掉到 http 节点的请求，所以**买家看到的 endpoint 必须是 https**
+#  （链上登记与前端向导都强制 https）。但**证书不一定要在本机**：TLS 在哪终止，证书就在哪申请。
+#
+#    拓扑 A「TLS 在外部终止」：本机只出 http://<本机>:$PORT，域名与证书在别处
+#                             （负载均衡 / CDN / 另一台 nginx）——**默认就是这条**：
+#                             不给 --tls-mode 只给 --domain 即走它，本机不申请任何证书、不碰宿主 nginx。
+#    拓扑 B「TLS 在本机终止」：域名直接解析到本机，证书由本机申请：
+#                             · Caddy 容器（`--tls-mode caddy`）：全自动申请与续期，宿主不装任何东西
+#                               —— **干净机器上想要一键全包就显式选它**；
+#                             · 宿主 nginx + certbot（`--tls-mode nginx`）：**只适合干净机器**；
+#                               机器上已有 nginx 站点时脚本会**拒绝**（理由与替代写法见第 ⑧b 步）。
+#
+#  「本机已有 nginx、证书也已就绪」（拓扑 B 的第二形态）：用 `--tls-mode none --bind 127.0.0.1`，
+#  节点只监听回环，由你那份 nginx 加一段反代指过来 —— 脚本不碰你的证书，也不写 conf.d。
 #
 #  ── 用法 ───────────────────────────────────────────────────────────────────
 #      bash deploy.sh                      # 交互式：问域名/邮箱/店主地址
@@ -51,13 +61,23 @@
 set -Eeuo pipefail
 
 FRONTEND='https://fedmall.bityuan.com'
-# 本联邦的共享合约（**2026-10-13 这一批**部署到 BTY EVM 主网；店主不需要填、也不该改）。
-# 上一批（2026-09-23，Escrow 0x820d7ae8…）缺 2026-10 的全部加固，已停用：
-# 换批必须**同批**换掉 Escrow / Registry / START_BLOCK 三个值——Registry 把 Escrow 的运行时
-# 字节码哈希钉成 immutable（锚定），只换其中一个会让节点登记被链上拒绝。
-ESCROW='0x462f90446c32df9bbb52c56e0fc36b2422319e48'
-REGISTRY='0x438087f048c4adb867c4326f9daa659937fb155a'
-START_BLOCK=47828748
+# 本联邦的共享合约（店主不需要填、也不该改）。
+#
+# ⚠️ 下面三个值是**构建期常量**：换一批合约必须**同批**换掉 Escrow / Registry / START_BLOCK，
+# 并且重新构建镜像（本脚本用 `docker build` 把它们编进容器的默认配置）。
+#   · Registry 把 Escrow 的**地址与运行时字节码哈希**钉成 immutable（canonical 双锚定），
+#     只换其中一个 ⇒ 节点登记会被链上以 EscrowNotCanonical 拒绝；
+#   · Staking 自 2026-10-14 起也把事实源钉成 immutable 双锚定（**换源能力已整条删除**），
+#     所以换 Escrow 必须连带重部署 Staking——这条在合约层是硬约束，不是运维建议；
+#   · START_BLOCK 错成旧高度只会空扫一轮（不报错），但错成**更高**的高度会**漏扫历史事件**。
+# 更早两代（2026-09-23 的 Escrow 0x820d7ae8…、2026-10-13 的 Escrow 0x462f9044…319e48）都已停用：
+# 它们的字节码与仓库当前代码不一致（缺 sellerOpenExposure / totalOpenExposure / sellerNetAtSettle
+# 与 immutable 双锚定），实际后果是店主**提不出质押**而节点 `/healthz` 一切正常。
+# 两批链上均无任何业务数据（弃用前实测余额为 0），无迁移成本。
+# 换批时把下面三个值一起换成 `node scripts/deploy-mainnet.cjs` 输出的那一组（少换一个会被链上拒绝）。
+ESCROW='0xee734f442be448595c387c84ca93b43c6acb1cbc'
+REGISTRY='0x593ae911fdaaeaa7f09c37d5ed61050957698882'
+START_BLOCK=47842741
 RPC_URL='https://mainnet.bityuan.com/eth'
 CHAIN_ID=2999
 CONTAINER_PORT=8090
@@ -72,10 +92,36 @@ KEEP_SECRET=''
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IN_REPO=0; [ -f "$HERE/package.json" ] && [ -f "$HERE/src/server.js" ] && IN_REPO=1
 
+# ── 构建期硬门禁：共享合约地址没填就**不许开店**（fail-closed，不静默） ─────────────
+# 为什么是一条门禁而不是靠注释提醒（2026-10-14）：这三个值决定"买家把钱锁到哪个合约"，
+# 而错了之后的表现是**静默的**——节点照常启动、商品照常展示，只有买家付款路径指向别处。
+# 历史已经踩过一次：那批链上字节码与仓库代码不一致（缺 sellerOpenExposure 等读法），
+# 后果是店主提不出质押而 `/healthz` 一切正常。"忘记换这三个值"必须当场停下。
+# 判据取"是不是占位符"而不是"是不是合法地址"：合法地址也可能是**上一批已弃用**的那一个，
+# 那种情况脚本无法判断，只能由部署者按上面的注释同批替换（发布检查表里有对应勾选项）。
+if [ "$ESCROW" = '__FILL_AFTER_DEPLOY__' ] || [ "$REGISTRY" = '__FILL_AFTER_DEPLOY__' ] || [ "${START_BLOCK:-0}" = '0' ]; then
+  cat >&2 <<'EOF'
+[deploy.sh] 拒绝执行：共享合约地址还是占位符。
+
+  本脚本把 Escrow / Registry / START_BLOCK 三个值编进镜像（店主不需要、也不该自己填）。
+  它们必须由部署方在**发布本脚本之前**按当批部署结果替换：
+
+    1) 部署当批合约：node scripts/deploy-mainnet.cjs
+    2) 把输出的 Escrow / Registry / 起始扫描块填进本文件的 ESCROW / REGISTRY / START_BLOCK
+    3) 重新构建并发布（镜像里编的是这三个值）
+
+  为什么必须同批换：Registry 把 Escrow 的**地址与运行时字节码哈希**钉成 immutable，
+  而 Staking 自 2026-10-14 起同样把事实源钉成 immutable（换源能力已删除）——
+  只换其中一个，节点登记会被链上以 EscrowNotCanonical 拒绝；
+  START_BLOCK 填成比真实部署块**更高**的高度会漏扫历史事件（且不报错）。
+EOF
+  exit 1
+fi
+
 MODE=install
 DRY_RUN=0; ASSUME_YES=0; FORCE=0; NO_REGISTER=0; NO_DOMAIN=0; PULL=0
 OWNER=''; DOMAIN=''; EMAIL=''; KEY_FILE=''; PORT=''; DIR=''; SERVICE=''; VOLUME=''; IMAGE=''
-TLS_MODE=''; DIR_GIVEN=0; KEY_INPUT=''; BIND=''
+TLS_MODE=''; TLS_MODE_GIVEN=0; BIND=''; BIND_GIVEN=0; DIR_GIVEN=0; KEY_INPUT=''
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -88,12 +134,12 @@ while [ $# -gt 0 ]; do
     --service) SERVICE="${2:-}"; shift 2 ;;
     --volume) VOLUME="${2:-}"; shift 2 ;;
     --image) IMAGE="${2:-}"; shift 2 ;;
-    --tls-mode) TLS_MODE="${2:-}"; shift 2 ;;
-    --no-tls) TLS_MODE=none; shift ;;
+    --tls-mode) TLS_MODE="${2:-}"; TLS_MODE_GIVEN=1; shift 2 ;;
+    --no-tls) TLS_MODE=none; TLS_MODE_GIVEN=1; shift ;;
     # 发布到哪个宿主地址：默认跟着 TLS 方式走（配了 TLS 就只绑本机，让本机反代访问；
     # 不配 TLS 就绑 0.0.0.0，因为外部负载均衡要从**私网 IP** 连进来，绑 127.0.0.1 它就连不上）。
     # 需要收紧时显式指定，例如同机已有 nginx 反代：--bind 127.0.0.1
-    --bind) BIND="${2:-}"; shift 2 ;;
+    --bind) BIND="${2:-}"; BIND_GIVEN=1; shift 2 ;;
     --no-register) NO_REGISTER=1; shift ;;
     --no-domain) NO_DOMAIN=1; shift ;;
     --pull) PULL=1; shift ;;
@@ -184,6 +230,21 @@ CADDY_CONFIG="${SERVICE}-caddy-config"
 IMAGE="${IMAGE:-marketplace-node:latest}"
 ENV_FILE="$DIR/.env"
 UNIT_LEGACY="/etc/systemd/system/$SERVICE.service"
+
+# ── 端口判据（挂在这个唯一入口上，不是散在各调用点）─────────────────────────
+# 为什么在**这里**判：这两个毛病（端口非法 / 撞 8080）都是"输入就不该被接受"，
+# 而它们的症状（docker run 失败、与同机别的服务抢端口）要等到第 ⑥ 步才暴露——
+# 那时镜像已经建好了、卷已经建好了，店主看到的是"节点起不来"而不是"你填的端口不行"。
+case "$PORT" in
+  ''|*[!0-9]*) die "端口非法：'$PORT'（要 1-65535 的十进制整数）" ;;
+esac
+if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then die "端口越界：$PORT（1-65535）"; fi
+if [ "$PORT" -eq 8080 ]; then
+  # 8080 是本机开发的默认端口，同机也很可能被别的东西占着（正式站上 `cs-agent-api` 就绑在
+  # 127.0.0.1:8080）——这是**静态判据**，不依赖本机现状：现在空着不代表下次也空着，
+  # 而"两个服务抢同一个端口"的代价（谁的容器先起来谁赢）落在别人身上。
+  die "别用 8080：本机开发的默认端口，同机常被别的服务占着（正式站的 cs-agent-api 就在 127.0.0.1:8080）。换一个，例如 --port 8090"
+fi
 
 # =============================================================================
 # ① 环境检测的横幅对 --health **不打**：那个模式是给监控/cron 用的，输出必须只有一行结论
@@ -463,25 +524,48 @@ if [ "$MODE" != register ]; then
       info "沿用现有配置：这套安装没有配域名（要加域名请显式给：--domain 你的域名）"
     else
       log ""
-      log "  节点要挂在哪个域名下？（买家会直接访问它，域名请先解析到本机）"
+      log "  节点要挂在哪个域名下？这个域名是你在链上登记的对外身份（endpoint 必须 https）"
       log "  例：shop.example.com     —— 留空 = 先只跑节点、稍后再配（那就还不能被买家发现）"
+      log "  注：域名解析到哪台机器由你决定（本机 / 负载均衡 / CDN / 另一台反代都行）"
       DOMAIN="$(ask '  > ' '' '节点域名（用 --domain shop.example.com 指定，或 --no-domain 先不配）')"
     fi
   fi
   DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN#https://}"; DOMAIN="${DOMAIN%%/*}"
   DOMAIN="$(printf '%s' "$DOMAIN" | tr 'A-Z' 'a-z')"
   ENDPOINT=''; [ -n "$DOMAIN" ] && ENDPOINT="https://$DOMAIN"
+else
+  DOMAIN="$(env_val MK_SIWE_DOMAIN)"
+  # 与安装路径同一把尺子（去掉协议与路径、转小写）：补登记时这个值会重新签进签名原文，
+  # 两种形态会得到两个不同的 endpoint —— 规范化只能有一处口径。
+  DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN#https://}"; DOMAIN="${DOMAIN%%/*}"
+  DOMAIN="$(printf '%s' "$DOMAIN" | tr 'A-Z' 'a-z')"
+  ENDPOINT=''; [ -n "$DOMAIN" ] && ENDPOINT="https://$DOMAIN"
+  OWNER="$(env_val MK_SHOP_OWNER)"
+  [ -n "$ENDPOINT" ] || die "补登记需要域名：现有配置里 MK_SIWE_DOMAIN 为空（先跑 bash deploy.sh --domain 你的域名）"
+fi
 
-  if [ -n "$DOMAIN" ] && [ -z "$TLS_MODE" ]; then
-    if [ "$ASSUME_YES" = 1 ]; then TLS_MODE=caddy
-    else
+# ── TLS 方式：**只由 --tls-mode / --no-tls 决定，没有隐式默认** ──────────────
+#  域名的含义只有一个：这个节点的对外身份（SIWE 签名原文 + CORS 白名单 + 登记 endpoint）。
+#  **证书与它无关** —— TLS 在哪终止，证书就在哪申请（两种拓扑见文件头）。
+#  这里刻意不写"有域名就默认在本机申请证书"：那样"我只填个域名、证书自己在别处弄"会被**悄悄
+#  解释成**"在本机起 Caddy 去占 80/443 申请证书"，在已有入口的机器上只会留下一条 warn，
+#  而店主以为自己配好了。要一键全包就显式 `--tls-mode caddy`。
+if [ "$MODE" != register ]; then
+  if [ "$TLS_MODE_GIVEN" = 0 ] && [ -n "$DOMAIN" ]; then
+    if [ "$TTY" = 1 ] && [ "$ASSUME_YES" != 1 ]; then
       log ""
-      log "  HTTPS 用哪种方式？（前端是 https，浏览器会拦掉到 http 节点的请求）"
-      log "    1) Caddy 容器        —— 全容器、自动申请与续期证书，宿主不装任何东西（推荐）"
-      log "    2) 宿主 nginx+certbot —— 和上一版一样，会在宿主上装 nginx 与 certbot"
-      log "    3) 不配 TLS          —— 节点只监听端口，由外部（负载均衡/已有反代）终止 TLS"
-      ANS="$(ask '  请选择（默认 1）> ' '1' 'HTTPS 方式（用 --tls-mode caddy|nginx|none 指定）')"
-      case "$ANS" in 2) TLS_MODE=nginx ;; 3) TLS_MODE=none ;; *) TLS_MODE=caddy ;; esac
+      log "  HTTPS 在哪终止？（前端是 https，所以**买家看到的 endpoint 必须是 https**；"
+      log "  这不等于证书必须在本机 —— TLS 在哪终止，证书就在哪申请）"
+      log "    1) 别处 —— 负载均衡 / CDN / 另一台 nginx 拿域名与证书，转发到本机 http://<本机>:$PORT（默认）"
+      log "    2) 本机 Caddy 容器 —— 自动申请与续期 Let's Encrypt，宿主不装任何东西（一键全包）"
+      log "    3) 本机宿主 nginx+certbot —— 会在宿主上装 nginx 与 certbot（只适合干净机器）"
+      ANS="$(ask '  请选择（默认 1）> ' '1' 'HTTPS 终止方式（用 --tls-mode caddy|nginx|none 指定）')"
+      case "$ANS" in 2) TLS_MODE=caddy ;; 3) TLS_MODE=nginx ;; *) TLS_MODE=none ;; esac
+    else
+      TLS_MODE=none
+      if [ "$TLS_MODE_GIVEN" = 0 ]; then
+        info "本机不申请证书（TLS 方式由外部入口决定）—— 这是**默认**；要让本机自动申请证书请显式给 --tls-mode caddy"
+      fi
     fi
   fi
   [ -z "$DOMAIN" ] && TLS_MODE=none
@@ -495,11 +579,6 @@ if [ "$MODE" != register ]; then
       warn "非交互环境：证书邮箱留空（之后可在 $DIR/Caddyfile 改 email 后重启 $CADDY_CONTAINER）"
     fi
   fi
-else
-  DOMAIN="$(env_val MK_SIWE_DOMAIN)"
-  ENDPOINT=''; [ -n "$DOMAIN" ] && ENDPOINT="https://$DOMAIN"
-  OWNER="$(env_val MK_SHOP_OWNER)"
-  [ -n "$ENDPOINT" ] || die "补登记需要域名：现有配置里 MK_SIWE_DOMAIN 为空（先跑 bash deploy.sh --domain 你的域名）"
 fi
 
 # ── 登记私钥（可选）──
@@ -530,6 +609,10 @@ info "对外域名：${ENDPOINT:-（未指定，节点不会被买家发现）}"
 info "HTTPS   ：$TLS_MODE"
 info "链上登记：$([ "$DO_REGISTER" = 1 ] && echo '本次脚本完成' || echo '稍后（前端开店向导）')"
 info "合约：Escrow=$ESCROW  Registry=$REGISTRY（已内置）"
+# 域名给了但本机不申请证书时，在这里把"这不等于不能上 https"说清楚（拓扑 A 的定位说明）
+if [ -n "$ENDPOINT" ] && [ "$TLS_MODE" = none ]; then
+  info "证书    ：本机不申请（TLS 在哪终止、证书就在哪申请 —— 见上面第 ⑧ 步）"
+fi
 
 if [ "$DRY_RUN" = 1 ]; then
   step "dry-run：以上是全部计划，未做任何改动"
@@ -538,8 +621,16 @@ if [ "$DRY_RUN" = 1 ]; then
   BIND_PLAN="$BIND"
   [ -n "$BIND_PLAN" ] || { BIND_PLAN='127.0.0.1'; [ "$TLS_MODE" = none ] && BIND_PLAN='0.0.0.0'; }
   info "将起容器 $CONTAINER：--restart unless-stopped -p $BIND_PLAN:$PORT:$CONTAINER_PORT --env-file $ENV_FILE -v $VOLUME:/data"
-  [ "$TLS_MODE" = caddy ] && info "将起 Caddy 容器 $CADDY_CONTAINER（自动 HTTPS：$DOMAIN）"
-  [ "$TLS_MODE" = nginx ] && info "将在宿主安装 nginx + certbot 并写 /etc/nginx/conf.d/$SERVICE.conf"
+  if [ "$TLS_MODE" = caddy ]; then
+    info "将在本机申请证书：Caddy 容器 $CADDY_CONTAINER 自动申请并续期 Let's Encrypt（$DOMAIN，需 80/443 空闲且可达）"
+  elif [ "$TLS_MODE" = nginx ]; then
+    info "将在本机申请证书：宿主安装 nginx + certbot 并写 /etc/nginx/conf.d/$SERVICE.conf（只适合干净机器）"
+  elif [ -n "$DOMAIN" ]; then
+    info "本机**不申请任何证书**：节点只监听 $BIND_PLAN:$PORT，TLS 与证书由你的外部入口终止"
+    info "  要让买家看见，还差三步：① 域名 $DOMAIN 解析到那个入口；② 在那个入口上配证书并转发到本机 $PORT；③ 到 $FRONTEND 登记 $ENDPOINT"
+  else
+    info "未指定域名：本机不申请证书，节点只在 http://127.0.0.1:$PORT 上可访问"
+  fi
   [ "$DO_REGISTER" = 1 ] && info "将在容器里执行链上登记"
   info "去掉 --dry-run 即真正执行"
   exit 0
@@ -653,6 +744,10 @@ if [ "$MODE" != register ]; then
     local img="$1"
     dk rm -f "$CONTAINER" >/dev/null 2>&1 || true
     dk network inspect "$NETWORK" >/dev/null 2>&1 || dk network create "$NETWORK" >/dev/null
+    # 这里**故意不写 `dk run … || return 1`**：真正的原因是"端口被占"时 docker 会先建容器再连网络，
+    # 于是留下一个 Created 状态的同名容器；而 `set -e` 会在 run 失败的那一行直接退脚本，
+    # 后面任何补救都执行不到（实测：店主看到的只有一行裸的 docker 报错）。
+    # 所以失败信息与善后一律在**调用方**处理（见下面的 ⑥ 段）。
     dk run -d --name "$CONTAINER" \
       --restart unless-stopped \
       --network "$NETWORK" --network-alias "$SERVICE" \
@@ -689,7 +784,33 @@ if [ "$MODE" != register ]; then
     0.0.0.0|127.0.0.1|'[::]'|'::') ;;
     *) die "--bind 只能是 0.0.0.0 或 127.0.0.1（收到：$BIND）" ;;
   esac
-  run_container "$IMAGE"
+  # 失败**必须自己兜住**（`|| true` 不是"吞错"）：`set -e` 会在 run 失败的那一行直接退脚本，
+  # 于是下面的诊断与善后一行都执行不到（实测店主只看到一行裸的 docker 报错，且留下 Created 空壳）。
+  # 同时**不让 docker 的退出码漏出去**：本脚本的失败口径只有 die=1 / 用法错=2（`--health` 不健康=2），
+  # 漏出 125/127 这类原生码，喂监控的人就得去猜"125 是这个脚本的哪种失败"——退出码也是契约。
+  RUN_RC=0
+  # 注意别写成 `if ! run_container …; then RUN_RC=$?`：`!` 会把状态取反成 0，拿不到真实码
+  run_container "$IMAGE" || RUN_RC=$?
+  # 端口被占不会等在最后：`docker run` 直接失败（"failed to bind host port … address already in use"），
+  # 而那时**容器名已被占用**（docker 先建容器再连网络），于是这一轮留下一个 Created 状态的同名容器，
+  # 下次重跑会撞上"容器已存在"——把"端口被占"这个真原因盖成一句"用 --update 或 --force"。
+  # 所以这里显式识别这一类失败：把真原因回显出来，并把这次没起来的空壳清掉（数据在卷里，不受影响）。
+  if [ "$RUN_RC" -ne 0 ] && ! dk ps -a --filter "name=^${CONTAINER}$" --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+    die "容器没建起来（docker 退出码 $RUN_RC；看上面的 docker 输出）：最常见是**宿主端口 $BIND:$PORT 已被占用**（改 --port，或用 --bind 换绑定地址）"
+  fi
+  if [ "$(dk inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo missing)" = created ]; then
+    # 这一条是**端口被占**最常见的形态：docker 先建容器、再连网络，连不上就留下 Created 空壳。
+    # 两条诊断都要给全：docker 的**退出码**（$RUN_RC，例如 125）与容器自己的 State.Error ——
+    # 前者是"哪一类失败"，后者是"具体哪一步失败"，缺一个都要让店主去翻上游输出。
+    warn "容器创建了但没起来（docker 退出码 $RUN_RC；多半是**端口 $PORT 被占**）—— docker 的原始报错："
+    dk inspect -f '{{.State.Error}}' "$CONTAINER" 2>/dev/null | head -c 300 | sed 's/^/    /' || true
+    log ""
+    log "  换端口：bash deploy.sh --update --port <别的端口>；换绑定地址：--bind 0.0.0.0|127.0.0.1"
+    log "  看占用者：ss -lntp | grep ':$PORT\\b'"
+    warn "已把这次没起来的空壳清掉，避免下次重跑撞上「容器已存在」（数据卷不受影响）"
+    dk rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    die "启动失败：宿主端口 $PORT 可能已被占用（上面的 docker 原始报错为准）"
+  fi
   ok "容器已启动：$CONTAINER（$BIND:$PORT → 容器 $CONTAINER_PORT，数据卷 $VOLUME）"
 
   step "⑦ 探活"
@@ -710,17 +831,47 @@ if [ "$MODE" != register ]; then
   BODY="$(curl -s -m 8 "http://127.0.0.1:$PORT/healthz" || true)"
   ok "探活通过：$BODY"
 
-  step "⑧ HTTPS（$TLS_MODE）"
-  if [ "$TLS_MODE" = none ]; then
-    if [ -n "$DOMAIN" ]; then
-      warn "未配置 TLS：请把外部入口（负载均衡/反向代理）指到 http://<本机>:$PORT，并在那里终止 TLS"
-      warn "联邦前端是 https，浏览器会拦掉到 http 节点的请求 —— 这一步不做，买家就看不到你"
+  step "⑧ HTTPS 终止于外部（$TLS_MODE）"
+  new_section=0
+  if [ -n "$DOMAIN" ] && [ "$BIND" = '127.0.0.1' ]; then
+    warn "本机**没有申请任何证书**：证书与 HTTPS 由**本机你自己那个反代**负责（这是「本机 nginx 已是入口」那条路）"
+    warn "还差两步：① 在你那份 nginx 的 server 块里加一段反代（见下）；② 到 $FRONTEND 登记 endpoint $ENDPOINT"
+    info "  在你那份 nginx 的 server 块里加：location / { proxy_pass http://127.0.0.1:$PORT; proxy_set_header Host \$host; proxy_set_header X-Forwarded-Proto \$scheme; }"
+    new_section=1
+  elif [ -n "$DOMAIN" ]; then
+    warn "本机**没有申请任何证书** —— 这不等于不能上 https：TLS 在哪终止，证书就在哪申请。"
+    warn "还差三步，买家才看得见你（顺序不能颠倒）："
+    warn "  ① 域名（$DOMAIN）：解析到**那台终止 TLS 的机器**（负载均衡 / CDN / 另一台 nginx）"
+    warn "  ② 证书与转发：在那台机器上给 $DOMAIN 配好证书，反代到本机 http://<本机>:$PORT"
+    warn "  ③ 链上登记：到 $FRONTEND 的「开店/登记我的节点」登记 endpoint $ENDPOINT"
+  else
+    info "未指定域名：本机不申请证书，节点只在 http://127.0.0.1:$PORT 上可访问（仅本机）"
+    info "  之后有域名了：bash deploy.sh --update --domain 你的域名（证书在哪终止随后自己定）"
+    new_section=1
+  fi
+  if [ "$BIND" = '0.0.0.0' ]; then
+    warn "端口已监听在所有网卡上 —— 记得放行防火墙/安全组，否则外部入口也连不进来"
+    new_section=1
+  fi
+  if [ "$BIND_GIVEN" = 0 ]; then
+    if [ "$BIND" = '0.0.0.0' ]; then
+      info "想只对本机暴露：加 --bind 127.0.0.1（这个选择会记进 $STATE_FILE，重跑不会退回 0.0.0.0）"
     else
-      info "未指定域名：节点只在 http://127.0.0.1:$PORT 上可访问（仅本机）"
+      info "要让外部入口从别的网卡连进来：加 --bind 0.0.0.0"
     fi
-    [ "$BIND" = '0.0.0.0' ] && warn "端口已监听在所有网卡上 —— 记得放行防火墙/安全组，否则公网仍然访问不到"
-  elif [ "$TLS_MODE" = caddy ]; then
+    new_section=1
+  fi
+  [ "$new_section" = 1 ] && log ""
+  if [ "$TLS_MODE" = caddy ]; then
     step "⑧a Caddy 容器（自动 HTTPS）"
+    # Caddyfile 是**脚本生成但店主也会手改**的文件（例如换证书邮箱、加 header/日志），
+    # 而这里每次部署都整份重写 ⇒ 手改会被静默覆盖。所以先备份一份，并在"确实被改过时"明说：
+    # 与 chmod 644 + 挂载进容器（改完 `docker restart …-caddy` 即生效）配套，店主有得回退。
+    CADDY_BAK=''
+    if [ -f "$DIR/Caddyfile" ]; then
+      CADDY_BAK="$DIR/Caddyfile.bak.$(date +%Y%m%d-%H%M%S)"
+      cp -a "$DIR/Caddyfile" "$CADDY_BAK" 2>/dev/null || CADDY_BAK=''
+    fi
     cat > "$DIR/Caddyfile" <<EOF
 # 由 deploy.sh 生成于 $(date -u +%Y-%m-%dT%H:%M:%SZ)；改完执行：docker restart $CADDY_CONTAINER
 {
@@ -736,6 +887,44 @@ $DOMAIN {
 }
 EOF
     chmod 644 "$DIR/Caddyfile"
+    if [ -n "$CADDY_BAK" ]; then
+      # 与"上一次那份"逐字比对（`cmp -s` 只看有没有差别，不产生输出），再单独判断"差别是否只在时间戳那行"。
+      # 不用 `<(...)`：进程替换依赖 /dev/fd，在容器/受限 shell 里不一定有；
+      # 也不用 `|| true` 吞掉报错（那会把"比对失败"说成"没改过"）。
+      if cmp -s "$CADDY_BAK" "$DIR/Caddyfile"; then
+        info "Caddyfile 已重新生成（与上次逐字一致）"
+        rm -f "$CADDY_BAK"          # 等价：撤掉备份，不留垃圾
+      else
+        CADDY_DIFF=''; CADDY_DIFF_RC=0
+        # 只看"去掉时间戳那行之后还剩什么差别"：diff 的 `1c1` 行号头与 `---` 分隔行也要一起滤掉，
+        # 否则"只差时间戳"会被误判成"内容有变化"（会把店主吓得以为手改被覆盖）。
+        # ⚠️ 判据必须看 **diff 自己的退出码**：本脚本开了 pipefail，diff 报错（rc=2）时
+        # `$(… | grep …)` 整体非 0，而"过滤后为空"既可能是"只差时间戳"也可能是"diff 报错"——
+        # 两者混为一谈就会把"比对失败"说成"没改过"。
+        CADDY_DIFF="$(diff "$CADDY_BAK" "$DIR/Caddyfile" 2>&1)" || CADDY_DIFF_RC=$?
+        if [ ! -r "$CADDY_BAK" ] || [ ! -r "$DIR/Caddyfile" ]; then
+          warn "Caddyfile 比对失败（备份或新文件读不到）—— 无法判断这次有没有覆盖你的手改；上一次那份已备份为：$(basename "$CADDY_BAK")"
+        elif [ "$CADDY_DIFF_RC" -eq 0 ]; then
+          info "Caddyfile 已重新生成（与上次逐字一致）"
+          rm -f "$CADDY_BAK"
+        elif [ "$CADDY_DIFF_RC" -eq 1 ]; then
+          CADDY_DIFF="$(printf '%s\n' "$CADDY_DIFF" | grep -vE '^([<>-] # 由 deploy\.sh 生成于|[0-9,]+[acd][0-9,]+$|---$)' || true)"
+          if [ -n "${CADDY_DIFF//[[:space:]]/}" ]; then
+            warn "Caddyfile 被重新生成过（内容有变化）—— 上一次那份已备份为：$(basename "$CADDY_BAK")"
+            info "  你手改过的内容（certificate email / header / 日志等）请按需合并回去"
+          else
+            info "Caddyfile 已重新生成（内容与上次一致，只差那行时间戳）"
+            rm -f "$CADDY_BAK"
+          fi
+        else
+          warn "Caddyfile 比对失败（diff 退出码 $CADDY_DIFF_RC）—— 无法判断这次有没有覆盖你的手改；上一次那份已备份为：$(basename "$CADDY_BAK")"
+        fi
+      fi
+      if [ -f "$CADDY_BAK" ]; then
+        info "  改完只需重启即生效（它是挂载进容器的文件，不用重建容器）：docker restart $CADDY_CONTAINER"
+        info "  想回到备份：cp -a $CADDY_BAK $DIR/Caddyfile && docker restart $CADDY_CONTAINER"
+      fi
+    fi
     dk rm -f "$CADDY_CONTAINER" >/dev/null 2>&1 || true
     info "拉起 Caddy（首次会去申请证书：需要 $DOMAIN 已解析到本机、80/443 可达）…"
     if dk run -d --name "$CADDY_CONTAINER" \
@@ -748,11 +937,52 @@ EOF
       ok "Caddy 已启动：$CADDY_CONTAINER（证书数据在卷 $CADDY_DATA）"
       info "看证书申请进度：docker logs -f $CADDY_CONTAINER"
     else
-      warn "Caddy 启动失败（拉不到 $CADDY_IMAGE？看上面的输出）"
-      warn "节点本身已经在跑；你可以改用 --tls-mode nginx 或 --tls-mode none 重跑"
+      warn "Caddy 启动失败（拉不到 $CADDY_IMAGE？看上面的输出；本机 80/443 已被别的服务占用也会这样）"
+      warn "节点本身已经在跑；想改走「TLS 由既有入口终止」：再跑一次 bash deploy.sh --update --tls-mode none"
+      warn "  然后让那个入口把 $DOMAIN 反代到本机 http://<本机>:$PORT（证书在它那边申请）"
     fi
-  else
-    step "⑧b 宿主 nginx + certbot"
+  elif [ "$TLS_MODE" = nginx ]; then
+    step "⑧b 宿主 nginx + certbot（**只适合干净机器**）"
+    # ── 前置判据：这台机器上已经有别人的 nginx 站点吗？──────────────────────────
+    # 为什么必须有这道门（旧形态会**静默**做三件危险的事）：
+    #   ① 往 /etc/nginx/conf.d/ 里**再写一个 listen 80 的 server 块** —— 机器上就有第二个
+    #      server_name 相同的 80 站点，谁被匹配取决于加载顺序；而下面那次 `systemctl reload nginx`
+    #      会把**同机别人**的站点一起 reload（一个写坏的 conf 能让所有站点一起挂）；
+    #   ② 用 `certbot --nginx -d $DOMAIN --redirect` 给**同一个域名再申请一张证书**，并在 80 上
+    #      加一条重定向规则 —— 这与店主自己那套证书体系是两份真相；
+    #   ③ 店主已有的 443 server 块，certbot 的 `--redirect` 会去改它（certbot 改的是**所有**
+    #      匹配该域名的 server 块，不是只有我们写的那一个）。
+    # 这一条不是"多写一个分支"，而是**判据落在"TLS 由谁终止"上**：
+    # 机器上已有 nginx ⇒ TLS 与证书已经在别人手里，本脚本就不该再插一手。
+    NGINX_FOREIGN=''
+    for d in /etc/nginx/conf.d /etc/nginx/sites-enabled /etc/nginx/vhosts.d; do
+      as_root test -d "$d" || continue
+      NGINX_FOREIGN="$NGINX_FOREIGN$(as_root find "$d" -maxdepth 1 -type f -name '*.conf' ! -name "$SERVICE.conf" -printf ' %p' 2>/dev/null || true)"
+    done
+    CERT_FOREIGN=''
+    if as_root test -e "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"; then CERT_FOREIGN="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"; fi
+    if [ -n "$(printf '%s' "$NGINX_FOREIGN" | tr -d ' ')" ]; then
+      warn "这台机器上已经有别的 nginx 站点配置："
+      warn "  $NGINX_FOREIGN"
+      if [ -n "$CERT_FOREIGN" ]; then
+        warn "而且 $DOMAIN 的证书已经在（$CERT_FOREIGN）—— 说明你的 https 入口本来就在跑。"
+      fi
+      log ""
+      log "  这里不给你往 conf.d 里再塞一个 server 块（会与上面这些争同一个 server_name，"
+      log "  而 certbot 的 --redirect 还会去改它们）。你的拓扑该走这一条："
+      log ""
+      log "    bash deploy.sh --update --tls-mode none --bind 127.0.0.1 --yes"
+      log "      ⇒ 节点只监听 127.0.0.1:$PORT，证书与 https 由你那份 nginx 负责；"
+      log "        在它的 server 块里加一段反代即可（不动其它站点）："
+      log "          location / {"
+      log "            proxy_pass http://127.0.0.1:$PORT;"
+      log "            proxy_set_header Host \$host;"
+      log "            proxy_set_header X-Forwarded-Proto \$scheme;"
+      log "          }"
+      log ""
+      log "  想让本脚本全权接管证书与 80/443：换一台干净机器，或用 --tls-mode caddy（Caddy 自己占 80/443）。"
+      die "本机已有 nginx 站点，--tls-mode nginx 会把它们一起卷进来（见上）"
+    fi
     if ! have nginx; then
       info "安装 nginx …"
       if have apt-get; then
@@ -856,6 +1086,10 @@ fi
 step "完成"
 ok "节点：http://127.0.0.1:$PORT/healthz（容器 $CONTAINER，数据卷 $VOLUME）"
 [ -n "$ENDPOINT" ] && ok "对外：$ENDPOINT"
+if [ -n "$ENDPOINT" ] && [ "$TLS_MODE" = none ]; then
+  log "  （对外地址由**你的入口**提供：本机没申请证书 —— 域名指向哪台机器、证书在哪申请都由你定；"
+  log "    入口那边的自检：curl -s $ENDPOINT/healthz 应返回 \"code\":0）"
+fi
 log ""
 if [ "$MODE" = register ] || [ "$DO_REGISTER" = 1 ]; then
   log "  你的店已上链登记，打开 $FRONTEND 首页即可看到（首次显示可能需要几十秒）。"

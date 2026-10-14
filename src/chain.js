@@ -38,7 +38,7 @@ export const ESCROW_ABI = [
   // 确认收货后的**售后案件**（契约 2026-10 第二批；本地镜像的唯一判据见 src/afterSale.js）：
   // 开案（仅买家、仅终局且窗口内）/ 结案（买家撤诉或仲裁人，note 为用户文本）。
   // 它不动托管资金（钱早已结清），补偿只能来自卖家保证金 Staking.penalize 或线下转账，
-  // 因此也**不阻塞卖家撤资**（撤资闸只看 sellerOpenCases，案件不计入）。
+  // 因此也**不阻塞卖家出金**（出金下限只算 sellerOpenExposure = 退款待决/争议中的敞口，案件不计入）。
   'event AfterSaleOpened(bytes32 indexed orderId, address indexed buyer, address indexed seller)',
   'event AfterSaleClosed(bytes32 indexed orderId, address indexed by, string note)',
   // 只读（字段顺序必须与 Escrow.Order **逐字段对应**：refundedAmount 在 status 之前；末尾两项是
@@ -69,6 +69,35 @@ export const ESCROW_ABI = [
   */
   'function afterSaleOpen(bytes32 orderId) view returns (bool)',
   'function afterSaleOpenedAtBlock(bytes32 orderId) view returns (uint64)',
+  /*
+    售后窗口的两个**按单**读数（2026-10-14 与 Staking 的罚没窗口判据同批加）：
+      · `settledAtBlock(orderId)`            —— 窗口的**起算点**（0 = 这笔钱从未判给卖家）；
+      · `afterSaleWindowBlocksOf(orderId)`   —— 窗口长度，`_settle` 时写入的**快照**
+        （等价于 `afterSaleWindowAtSettle` 这个 public mapping；这里用视图函数名，
+         因为合约里两者都在、而读法是"这一单的窗口是多少"这一个人话口径）。
+    为什么节点也要能读它们：`Staking.penalize` 现在判"案件开着 ∧ 仍在窗口内"，
+    前端仲裁台与运维对账都要用**同一对读数**复算，不能各写一遍块高算术
+    （`Escrow.settledAtBlock` / `afterSaleWindowAtSettle` 是同一份事实的两种读法）。
+  */
+  'function settledAtBlock(bytes32 orderId) view returns (uint64)',
+  'function afterSaleWindowBlocksOf(bytes32 orderId) view returns (uint64)',
+  /*
+    该卖家当前的**在途售后敞口**（wei）= Σ 在途单（退款申请待决 + 争议中）的 amount。
+    它是 `Staking.payoutFloors` 的唯一读数来源 ⇒ 缺这个读法时四条出金路径整体 revert
+    （店主提不出质押，而日志无声）。节点自己不做出金决策，但**代次探针必须探它**
+    （见 ESCROW_GENERATION_PROBES 的说明），运维也拿它解释"为什么这家店提不出钱"。
+  */
+  'function sellerOpenExposure(address seller) view returns (uint256)',
+  /*
+    2026-10-13 复审新增（跨端镜像同批）：
+      · `totalOpenExposure()`：全局在途售后敞口（= Σ `sellerOpenExposure`）。原消费方（Staking 的
+        换源闸）已随"事实源不可更换"（2026-10-14）消失，今天读它的是 Staking 构造期探针的形状判据；
+      · `sellerNetAtSettle(orderId)`：判给卖家时的**实收净额**（已扣平台费）——`Staking.penalize`
+        单笔上限的基准（按毛额会多罚一笔卖家从未收到的费，并让自建订单洗池有利可图）。
+    节点自身不做罚没、也不改事实源，这两项是给对账/脚本与人工核查用的读数。
+  */
+  'function totalOpenExposure() view returns (uint256)',
+  'function sellerNetAtSettle(bytes32 orderId) view returns (uint256)',
   /*
     托管超时的**链上阈值**（前端 utils/escrowCountdown 同判据）：
     释放允许**当且仅当** `latestBlock > releaseNotBeforeBlock(orderId)`。刻意不自己用
@@ -105,6 +134,62 @@ export const ESCROW_ABI = [
 export const ESCROW_STATUS = ['None', 'Created', 'Disputed', 'Settled', 'Refunded'];
 
 /**
+ * **代次探针清单：本节点在运行时真正调用的、且只存在于新一代 Escrow 上的读法。**
+ *
+ * 为什么要有这份清单（2026-10-14 审计修订，这是一个真实发生过的失效）：
+ * 旧实现把三个探针**内联写死在** `assertEscrowGeneration` 里
+ * （`minTimeoutBlocks()` / `releaseNotBeforeBlock()` / `afterSaleOpen()`）。于是出现了一个
+ * 恰好穿过那道闸的状态：链上的 Escrow 有这三个读法、却**没有** `totalOpenExposure()` /
+ * `sellerOpenExposure()` / `sellerNetAtSettle()`——节点自检**绿灯通过**，然后在运行时逐处死掉
+ * （`Staking.payoutFloors` 读 `sellerOpenExposure` ⇒ 四条出金路径整体 revert，而 `/healthz` 一切正常）。
+ * 判据与 `Staking._probeEscrow`（探六个读法 + `getOrder` 确切字数）、
+ * `MarketplaceRegistry.setStakingContract`（探自己唯一会调用的 `poolOf`）是同一条纪律：
+ * **探的必须是会调用的**；分散写三处必然漏，所以清单只能有一份。
+ *
+ * 入清单的三个条件（缺一不可）：
+ *   ① 本节点或它的合约伙伴**真的会调**（不是"存在但没人用"）；
+ *   ② 该读法**只在新一代**上存在（旧一代没有 ⇒ 缺它就能判定代次）；
+ *   ③ 传零参/零值也**必定成功返回**（探针是只读判定，不能因为"这个 orderId 不存在"就 revert）。
+ * 条件③ 排除了 `releaseNotBeforeBlock(bytes32)` 这类对不存在订单会返回 0 的读法吗？不排除——
+ * 它传零值返回 0，是安全的。真正要排除的是会 revert 的写法。
+ *
+ * `shape` 与调用形状逐字对应，探针按 `zeroArg` 构造入参，因此"清单写着 A、代码调 B"不可表达。
+ */
+export const ESCROW_GENERATION_PROBES = [
+  // 下单最小超时窗口：节点读它做展示/运维读数（`opsMetrics`），旧一代没有
+  { shape: 'minTimeoutBlocks()', zeroArg: 'none' },
+  // 超时释放的阈值块高（前端倒计时 + 节点看板共用判据），2026-10 新增
+  { shape: 'releaseNotBeforeBlock(bytes32)', zeroArg: 'bytes32' },
+  // 确认收货后的售后案件（本节点 watcher / 对账 / 详情页都读），2026-10 第二批新增
+  { shape: 'afterSaleOpen(bytes32)', zeroArg: 'bytes32' },
+  // 案件开案区块：/sync 与后台对账按它回填本地镜像
+  { shape: 'afterSaleOpenedAtBlock(bytes32)', zeroArg: 'bytes32' },
+  // 售后窗口的**按单快照**（罚没资格与买家开案两处都要），2026-10-13 新增
+  { shape: 'afterSaleWindowBlocksOf(bytes32)', zeroArg: 'bytes32' },
+  // 结算区块：售后窗口的起算点，2026-10-13 新增
+  { shape: 'settledAtBlock(bytes32)', zeroArg: 'bytes32' },
+  /*
+    后三项是**合约伙伴**会调的（本节点不直接调，但节点接错代次就等于把它们一起弄死）：
+    `Staking.payoutFloors` 读 `sellerOpenExposure` ⇒ 缺它则四条出金路径整体 revert；
+    `Staking._penaltyBase` 读 `sellerNetAtSettle` ⇒ 缺它则罚没 fail-closed（上限 0）；
+    `Staking` 的构造期探针与 Escrow 侧不变量对拍都用 `totalOpenExposure`。
+    把"别人的判据"也算进本节点的代次门禁，理由很直接：这三项缺一个，店主就提不出钱，
+    而节点日志里一个字都不会说——正是这道自检存在的理由。
+  */
+  { shape: 'sellerOpenExposure(address)', zeroArg: 'address' },
+  { shape: 'sellerNetAtSettle(bytes32)', zeroArg: 'bytes32' },
+  { shape: 'totalOpenExposure()', zeroArg: 'none' },
+];
+
+/** 按 `zeroArg` 造零值入参（探针入参的唯一构造处，与清单同源） */
+function zeroArgsFor(kind) {
+  if (kind === 'none') return [];
+  if (kind === 'address') return ['0x0000000000000000000000000000000000000000'];
+  if (kind === 'bytes32') return ['0x' + '00'.repeat(32)];
+  throw new Error(`ESCROW_GENERATION_PROBES 里有未知的 zeroArg 种类：${kind}`);
+}
+
+/**
  * 启动期链 ID 自检（源码审计 2026-09）：staticNetwork: true 会让 ethers 跳过与节点协商网络，
  * 于是把 MK_RPC_URL 配到别的链（测试网/分叉）不会被发现——而 receipt/日志校验的**信任根**就是这条 RPC：
  * 一旦指错链，别处的同名合约事件会驱动本地托管状态与账本。故启动时显式比对一次 eth_chainId，
@@ -121,7 +206,7 @@ export async function assertChainId() {
 }
 
 /**
- * 启动期**托管合约代次自检**（2026-10-13）。
+ * 启动期**托管合约代次自检**（2026-10-13；2026-10-14 改为清单驱动）。
  *
  * 为什么必须有它（真实事故的形状）：本节点代码会调用 2026-10 那一代 Escrow 的只读入口
  * （`releaseNotBeforeBlock` / `afterSaleOpen` / `minTimeoutBlocks` …），而"链上部署的是哪一代"
@@ -129,28 +214,38 @@ export async function assertChainId() {
  * 两种情况下节点都**照常启动**，然后在运行时逐处降级：超时看板整列读不到、售后案件永远为空、
  * 关键加固静默缺席——现象与原因相隔十万八千里（正是本仓"库缺一列必须拒绝启动"要防的那一类）。
  *
- * 判据：链上 Escrow 必须能读出这三个属于新代的只读值。链 ID 自检在本函数之前跑过，
- * 所以"读不到"在这里只能意味着**合约不是这一代**（而不是 RPC 不可达）。
+ * 判据：`ESCROW_GENERATION_PROBES` 里**每一个**形状都必须读得出来（清单是唯一真相，见它的说明）。
+ * 链 ID 自检在本函数之前跑过，所以"读不到"在这里只能意味着**合约不是这一代**（而不是 RPC 不可达）。
  * 逃生口 `MK_CONTRACT_GEN_ACK=1`（与本仓 `MK_ESCROW_CHANGE_ACK` 同款）：确有需要时显式声明，
- * **不设静默降级**。返回 `{ ok, missing }`，由 server.js 决定拒绝启动还是放行并告警。
+ * **不设静默降级**。返回 `{ ok, missing, probed }`，由 server.js 决定拒绝启动还是放行并告警。
+ *
+ * ⚠️ **这条自检曾经漏过**（2026-10-14 审计 H2）：旧实现把三个探针内联写死在这里，
+ * 于是"链上有这三个读法、却没有 `sellerOpenExposure`"的 Escrow 能让节点**绿灯启动**，
+ * 然后在运行时把四条出金路径整体弄死（`payoutFloors` 读不到敞口 ⇒ 店主提不出质押），
+ * 而 `/healthz` 一切正常。现在探针清单只有一份，并由
+ * `test/escrow-generation-probes.test.js` 守着它与 ABI、与合约源码、与"必须覆盖的读法"三者一致。
  */
 export async function assertEscrowGeneration() {
   const escrow = getEscrow();
-  const zero = '0x' + '00'.repeat(32);
-  const probes = [
-    ['minTimeoutBlocks()', () => escrow.minTimeoutBlocks()],
-    ['releaseNotBeforeBlock(bytes32)', () => escrow.releaseNotBeforeBlock(zero)],
-    ['afterSaleOpen(bytes32)', () => escrow.afterSaleOpen(zero)],
-  ];
   const missing = [];
-  for (const [name, call] of probes) {
+  /*
+    探针逐个来自 ESCROW_GENERATION_PROBES（**唯一清单**，见它的说明）：清单是"会调用的读法"，
+    新增一处依赖就在这里加一行，而不是在别处再写一次 if。
+    判据：读得到 = 这一代；读不到（链 ID 已在上一步自检过，所以不是 RPC 不可达）= 不是这一代。
+  */
+  for (const { shape, zeroArg } of ESCROW_GENERATION_PROBES) {
+    if (!escrow[shape.split('(')[0]]) {
+      // ABI 里没有这个片段 ⇒ 是清单与 ABI 漂移（配置期错误，不该等到运行时报"合约不对"）
+      missing.push(`${shape}（本节点的 Escrow ABI 里没有这个片段——清单与 ABI 漂移了）`);
+      continue;
+    }
     try {
-      await call();
+      await escrow[shape.split('(')[0]](...zeroArgsFor(zeroArg));
     } catch (e) {
-      missing.push(`${name}（${String(e?.shortMessage || e?.message || e).slice(0, 60)}）`);
+      missing.push(`${shape}（${String(e?.shortMessage || e?.message || e).slice(0, 60)}）`);
     }
   }
-  return { ok: missing.length === 0, missing };
+  return { ok: missing.length === 0, missing, probed: ESCROW_GENERATION_PROBES.length };
 }
 
 let _provider = null;

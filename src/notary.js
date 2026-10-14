@@ -1,5 +1,5 @@
 /**
- * 内容哈希规范（docs/ARCHITECTURE.md §2.3）：
+ * 内容哈希规范：
  *   contentHash = keccak256(abi.encode(orderId, kind, role, sha256(bytes(content))))
  * 由当事人/节点/第三方按同一公式计算，供 ReviewNotary 合约存证（存在性 + 时间戳证明，
  * 防节点事后删改评价/证据）。kind：'review'（买家评价，role='buyer'）/ 'evidence'（争议陈述）。

@@ -1,7 +1,7 @@
 /**
  * 买家评价数据层（P0-1）：成交订单一单一评 + 店主单次回复 + 商品/店铺聚合。
  *
- * 口径（见 docs/ARCHITECTURE.md §3.1）：
+ * 口径：
  *  - 资格：status ∈ (confirmed/settled/expired) 且（now - updated_at）≤ MK_REVIEW_TTL_DAYS；
  *    refunded/cancelled 不可评（与收款流水成交口径一致）；
  *  - 一次一单：reviews.order_id UNIQUE 硬约束（DB 兜底 + 应用层预检给友好错误）；

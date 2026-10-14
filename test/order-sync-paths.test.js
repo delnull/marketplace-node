@@ -490,7 +490,7 @@ test('/sync 恢复失败（限量售罄）时**不**把支付凭证写进 cancel
 test('/sync 把 cancelled 恢复为 escrowed 时**在同一事务内**补写支付凭证（否则卖家必须同步两次才能发货）', async () => {
   /*
     这条钉的是源码审计 2026-09 复审的一处 P1：`/sync` 的 `movedToEscrowed` 分支此前只 append 镜像事件，
-    **没有**补写 `paid_tx_hash`——而同一段代码的注释与 `docs/ARCHITECTURE.md` 都承诺
+    **没有**补写 `paid_tx_hash`——而同一段代码的注释承诺
     "cancelled 行的凭证改由迁移成功那一刻补写"，`orders.js` 第 55 行还声明了
     「escrowed 及以上状态必有 paid_tx_hash」这条不变量。实际后果是一条可复现的坏路径：
       ① 限量商品下单 → draft；② 未付款被清扫成 cancelled；③ 买家**随后**才在链上完成支付；

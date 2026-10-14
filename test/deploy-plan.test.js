@@ -111,16 +111,32 @@ guard('Staking gas：--new-escrow 时即便 env 里有旧地址也不拿它估�
 guard('Staking gas：回退值可覆盖，非 bigint 输入也能归一', () => {
   assert.equal(planStakingGas({ escrowAction: 'deploy', fallbackGas: 9_000_000n }).gasLimit, 9_000_000n);
   assert.equal(planStakingGas({ escrowAction: 'deploy', fallbackGas: '9000000' }).gasLimit, 9_000_000n);
-  // 默认回退值必须够大：Staking 部署产物 8 KiB 级，实测 ~2M gas 量级
-  assert.ok(STAKING_FALLBACK_GAS >= 5_000_000n, `回退 gasLimit 太小：${STAKING_FALLBACK_GAS}`);
+  /*
+    默认回退值的判据是「**够**且**准**」，不是「够大」：
+      · 够：主网真机实测 Staking 部署 gasUsed = 3_184_180；
+      · 准：它同时被预检的余额门禁用来算预估费用（见 deployPlan 里 STAKING_FALLBACK_GAS 的长注释），
+        虚高会在钱够的时候拒绝部署 —— 旧值 6_000_000 就把 0.1075 BTY 的余额判成了不够。
+    所以下界钉「实测 × 110%」，上界钉「实测 × 2」，两头都是防回归。
+  */
+  const MEASURED_MAINNET_GAS = 3_184_180n;
+  assert.ok(
+    STAKING_FALLBACK_GAS >= (MEASURED_MAINNET_GAS * 110n) / 100n,
+    `回退 gasLimit 覆盖不了实测用量：${STAKING_FALLBACK_GAS} < ${MEASURED_MAINNET_GAS} × 110%`
+  );
+  assert.ok(
+    STAKING_FALLBACK_GAS <= MEASURED_MAINNET_GAS * 2n,
+    `回退 gasLimit 虚高（预检余额门禁会误报）：${STAKING_FALLBACK_GAS} > 实测 ${MEASURED_MAINNET_GAS} × 2`
+  );
 });
 
 /**
  * `resolveRejectGraceBlocks` —— 2026-10 加固 A 的构造参数预检。
  *
- * `Escrow` 构造函数对 0 与超上限直接 `revert InvalidRejectGrace()`，而部署是**真实交易**：
- * 本地预检拦掉，省一笔 gas；更重要的是 0 会让"拒绝后静置期"静默失效——部署者以为有窗口、
- * 实际没有，那正是这条加固要消灭的零窗口抢跑。
+ * `Escrow` 构造函数对**低于下界**与**超上限**的值直接 `revert InvalidRejectGrace()`，而部署是
+ * **真实交易**：本地预检拦掉，省一笔 gas。判据本身只有合约一处，这里与它**同批判同一个值域**——
+ * 2026-10-14 起下界是 1 天（`Escrow.MIN_REJECT_GRACE_BLOCKS` = 17 280 块），不再是"非 0"：
+ * 1 与 0 的客观效果相同（静置期的唯一目的是给买家一段插入争议的时间，而这段窗口里买家没有机会），
+ * 旧口径（只拒 0）会让一条"看起来只是把窗口调到最小"的治理交易把加固 A 静默关掉。
  */
 guard('静置期：未设置 ⇒ 默认 1 天（17 280 块），且不是错误', () => {
   for (const v of ['', '   ', undefined, null]) {
@@ -132,12 +148,15 @@ guard('静置期：未设置 ⇒ 默认 1 天（17 280 块），且不是错误'
   }
 });
 
-guard('静置期：0 ⇒ 拒绝（加固 A 不允许关闭，合约会 revert）', () => {
-  for (const v of ['0', ' 0 ', 0]) {
+guard('静置期：低于下界一律拒绝（含 0 与 1——两者客观效果相同），下界本身放行', () => {
+  const MIN = 17_280n;
+  assert.equal(resolveRejectGraceBlocks(String(MIN)).ok, true, '下界本身必须是合法值');
+  assert.match(resolveRejectGraceBlocks(String(MIN)).reason, /17280 块/);
+  for (const v of ['0', ' 0 ', 0, '1', 1, '12', String(MIN - 1n)]) {
     const r = resolveRejectGraceBlocks(v);
     assert.equal(r.ok, false, `env=${String(v)}`);
     assert.equal(r.blocks, null);
-    assert.match(r.reason, /静默失效/);
+    assert.match(r.reason, /低于合约下界/);
     assert.match(r.reason, /InvalidRejectGrace/);
   }
 });
@@ -160,24 +179,26 @@ guard('静置期：非十进制整数 ⇒ 拒绝（含小数/负数/十六进制
   }
 });
 
-guard('静置期：合法值原样透传（含前导空白）', () => {
-  const r = resolveRejectGraceBlocks(' 4320 ');
+guard('静置期：下界之上的合法值原样透传（含前导空白）', () => {
+  const r = resolveRejectGraceBlocks(' 43200 ');
   assert.equal(r.ok, true);
   assert.equal(r.level, 'set');
-  assert.equal(r.blocks, 4_320n);
-  assert.match(r.reason, /4320 块/);
+  assert.equal(r.blocks, 43_200n);
+  assert.match(r.reason, /43200 块/);
 });
 
 /**
- * `resolveMinTimeoutBlocks` / `resolveAfterSaleWindowBlocks` —— 2026-10 新增的两个 immutable
- * 构造参数预检（`minTimeoutBlocks` / `afterSaleWindowBlocks`）。
+ * `resolveMinTimeoutBlocks` / `resolveAfterSaleWindowBlocks` —— 2026-10 新增的两个构造参数预检
+ * （`minTimeoutBlocks` / `afterSaleWindowBlocks`）。
  *
- * 与静置期同一类风险：两个值都决定资金出口条件、部署后**无 setter**（改只能重部署一个实例）。
- * 关键差别是 `MIN_TIMEOUT_BLOCKS` 的 **0 合法**（显式"不设下限"，本地演示链需要分钟级超时——
- * 否则演示"超时释放"要先挖 17 280 块），而 `AFTER_SALE_WINDOW_BLOCKS` 的 0 非法
- * （会让"确认收货后仍可开售后案件"这条路径静默关闭）。
+ * 与静置期同一类风险：两个值都决定资金出口条件。**2026-10-14 起两者的值域完全一致**——
+ * 下界都是 1 天（`Escrow.MIN_ORDER_TIMEOUT_BLOCKS` / `MIN_AFTER_SALE_WINDOW_BLOCKS` = 17 280 块），
+ * 上限各自是 30 天（518 400）与 360 天（6 220 800）。旧口径里 `MIN_TIMEOUT_BLOCKS` 的 **0 合法**
+ * （"显式不设下限"，本地演示链用）已被推翻：`minTimeoutBlocks = 0` 的实际含义是"卖方节点可以把
+ * `timeoutBlocks` 写成 1"，买家付款后约一个块就能被 `releaseExpired` 判给卖家；1 与 0 的客观效果
+ * 相同，所以下界统一成"一段真人来得及动作的时间"。
  */
-guard('最小超时窗口：未设置 ⇒ 默认 1 天（17 280 块）；0 ⇒ 合法（显式不设下限）', () => {
+guard('最小超时窗口：未设置 ⇒ 默认 1 天（17 280 块）；低于下界一律拒绝（含 0 与 1）', () => {
   for (const v of ['', '   ', undefined, null]) {
     const r = resolveMinTimeoutBlocks(v);
     assert.equal(r.ok, true, `env=${String(v)}`);
@@ -185,13 +206,15 @@ guard('最小超时窗口：未设置 ⇒ 默认 1 天（17 280 块）；0 ⇒ �
     assert.equal(r.blocks, 17_280n);
     assert.match(r.reason, /≈1 天/);
   }
-  // 0 允许：这是本地演示链唯一能跑通"超时释放"的配置，绝不能当成错误拦掉
-  for (const v of ['0', ' 0 ', 0]) {
+  const MIN = 17_280n;
+  assert.equal(resolveMinTimeoutBlocks(String(MIN)).ok, true, '下界本身必须是合法值');
+  // 0 不再是合法值：它等于"节点可以写 timeoutBlocks = 1"，而 1 与 0 客观效果相同
+  for (const v of ['0', ' 0 ', 0, '1', 1, '12', String(MIN - 1n)]) {
     const r = resolveMinTimeoutBlocks(v);
-    assert.equal(r.ok, true, `env=${String(v)}`);
-    assert.equal(r.level, 'set');
-    assert.equal(r.blocks, 0n);
-    assert.match(r.reason, /不设最小超时窗口/);
+    assert.equal(r.ok, false, `env=${String(v)}`);
+    assert.equal(r.blocks, null);
+    assert.match(r.reason, /低于合约下界/);
+    assert.match(r.reason, /InvalidMinTimeout/);
   }
 });
 
@@ -213,7 +236,7 @@ guard('最小超时窗口：上限（30 天 = MAX_TIMEOUT_BLOCKS）本身通过�
   }
 });
 
-guard('售后窗口：未设置 ⇒ 默认 180 天（3 110 400 块）；0 ⇒ 拒绝（入口不得被静默关闭）', () => {
+guard('售后窗口：未设置 ⇒ 默认 180 天；低于下界（含 0 与 1）一律拒绝——0 与 1 的效果相同', () => {
   for (const v of ['', '   ', undefined, null]) {
     const r = resolveAfterSaleWindowBlocks(v);
     assert.equal(r.ok, true, `env=${String(v)}`);
@@ -221,7 +244,15 @@ guard('售后窗口：未设置 ⇒ 默认 180 天（3 110 400 块）；0 ⇒ �
     assert.equal(r.blocks, 3_110_400n);
     assert.match(r.reason, /180 天/);
   }
-  for (const v of ['0', ' 0 ', 0]) {
+  /*
+    2026-10-14：下界是 **1 天**，不是"非 0"。旧判据只拒 0，而 `1`（乃至几块）在客观效果上与 0 相同——
+    都要求买家在结算当块就开案 ⇒ 等于把唯一救济入口静默关闭，而"不接受 0"那条理由对它同样成立。
+    所以这里逐个钉住下界之下的取值（含 1 与下界-1），以及下界本身必须放行。
+  */
+  const MIN = 17_280n;
+  assert.equal(resolveAfterSaleWindowBlocks(String(MIN)).ok, true, '下界本身必须是合法值');
+  assert.match(resolveAfterSaleWindowBlocks(String(MIN)).reason, /17280 块/);
+  for (const v of ['0', ' 0 ', 0, '1', 1, '1440', String(MIN - 1n)]) {
     const r = resolveAfterSaleWindowBlocks(v);
     assert.equal(r.ok, false, `env=${String(v)}`);
     assert.equal(r.blocks, null);

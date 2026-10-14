@@ -1,10 +1,9 @@
 /**
- * 内容哈希规范与存证（ARCHITECTURE.md §2.3 §3.1）：
+ * 内容哈希规范与存证：
  *  - contentHash 确定性、区分 order/kind/role/content。
  *
  * 注：/api/shop/notary-info 端点已随 MK_NOTARY_ADDRESS 配置移除——存证入口由前端
- * VITE_NOTARY_ADDRESS 决定、哈希以本地复算为准（节点返回值仅作对照），见
- * docs/DECISIONS.md。
+ * VITE_NOTARY_ADDRESS 决定、哈希以本地复算为准（节点返回值仅作对照）。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

@@ -36,6 +36,7 @@ const read = (rel) =>
 const ESCROW_SOL = read('contracts/src/Escrow.sol');
 const REGISTRY_SOL = read('contracts/src/MarketplaceRegistry.sol');
 const STAKING_SOL = read('contracts/src/Staking.sol');
+const NOTARY_SOL = read('contracts/src/ReviewNotary.sol');
 const NODE_CHAIN = read('node/src/chain.js');
 const FE_CHAIN = read('frontend/src/chain.ts');
 const REGISTER_SCRIPT = read('node/scripts/register-node.mjs');
@@ -166,6 +167,179 @@ guard('NodeInfo 的字段全部出现在登记脚本的 tuple 声明里', () => 
  * `filters[name]` 直接是 undefined，抛在轮询里，该事件**永远扫不到**且不会有人发现。
  * 判据取 watcher 自己的 `EVENTS` 清单（清单本身漏挂会先被它自己的用例拦下）。
  */
+/**
+ * **契约的每一个"状态改变入口"要么在网页上能操作，要么在一张带理由的例外表里显式声明**。
+ *
+ * 产品口径（2026-10-14 明确）：写入口存在的意义是**让用户/运营更方便地达成某个目的**；
+ * 没有这种意义的写入口**不要求**有界面。所以这条守卫不是"一律必须有按钮"，而是要求
+ * **这件事被显式决定过**——"漏给界面出口"与"决定不给界面"在代码上必须长得不一样：
+ *   · 已登记 = 出现在 `frontend/src/pages/authority/actions.ts`（它既是行为动作表、又是
+ *     「全操作索引」的真值，`where` 字段写明在哪一页/在哪一步）；
+ *   · 例外 = 写进下面的 `EXEMPT`，**每条必须带理由**，且理由不许被写成空话（断言里同时检查
+ *     例外名仍然真实存在，防止表烂掉）。
+ * 判据来源：`contracts/src/*.sol` 里 external/public 且非 view/pure 的函数名
+ * （加上 Ownable2Step 继承来的 `transferOwnership` / `acceptOwnership`）。
+ * **只读接口不受此约束**：其中相当一部分是合约之间互相调用的
+ * （`IEscrowMinimal.arbiter/getOrder/sellerOpenExposure/sellerNetAtSettle/totalOpenExposure/
+ * afterSaleOpen`、`IStakingPool.poolOf`），本来就不需要界面出口。
+ */
+const EXEMPT = [
+  // { name: 'someWriteEntry', reason: '为什么它没有界面也不影响任何人达成目的（一句话说清）' },
+];
+const writeEntriesOf = (sol) =>
+  [
+    ...new Set(
+      [...sol.matchAll(/\bfunction\s+(\w+)\s*\([^)]*\)([^;{]*)[;{]/g)]
+        .filter((m) => /\b(external|public)\b/.test(m[2]) && !/\b(view|pure)\b/.test(m[2]))
+        .map((m) => m[1])
+    ),
+  ].sort();
+
+guard('每个状态改变入口都有出口或在例外表里带理由声明（漏给界面 ⇒ 红）', () => {
+  const ACTIONS = read('frontend/src/pages/authority/actions.ts');
+  assert.ok(ACTIONS.length > 1000, 'frontend/src/pages/authority/actions.ts 读不到或结构变了');
+  const registered = new Set([...ACTIONS.matchAll(/fn:\s*'(\w+)'/g)].map((m) => m[1]));
+  /*
+    三个 Ownable2Step 合约各有**两个从库继承来的**写入口（源码里没有重新声明，所以上面那段
+    正则抽不到）：`transferOwnership`（两步转让第一步）与 `acceptOwnership`（接收）。
+    写成常量而不是"去读 lib/openzeppelin-contracts"：库的路径随包管理器/子模块布局变，
+    而这两个名字是**本仓契约的一部分**（文档与链上权限台都按它写）。ReviewNotary 没有 Ownable，
+    故不补。`renounceOwnership` 三个合约都在源码里 override 了（禁用），上面已经抽到。
+  */
+  const INHERITED_WRITES = ['transferOwnership', 'acceptOwnership'];
+  const entries = [
+    ...writeEntriesOf(ESCROW_SOL).flatMap((n) => [`Escrow.${n}`]),
+    ...writeEntriesOf(STAKING_SOL).flatMap((n) => [`Staking.${n}`]),
+    ...writeEntriesOf(REGISTRY_SOL).flatMap((n) => [`MarketplaceRegistry.${n}`]),
+    ...writeEntriesOf(NOTARY_SOL).map((n) => `ReviewNotary.${n}`),
+    ...['Escrow', 'Staking', 'MarketplaceRegistry'].flatMap((c) => INHERITED_WRITES.map((n) => `${c}.${n}`)),
+  ];
+  /*
+    下限（不是精确值）：它守的是"正则或文件结构变了，于是抽不出入口"这一类静默失效——
+    精确值会让每一次合法的入口增删都要改这里，反而训练人去调数字。
+    2026-10-14 由 55 下调到 54：Staking 的 `proposeEscrow` / `cancelEscrowChange` / `applyEscrow`
+    三个写入口**被整条删除**（事实源改为 immutable 双锚定，理由见 contracts/src/Staking.sol），
+    54 = 55 − 3 + 2（新增 `unfreeze` 的守卫不产生新入口；这 2 是本次同批新增的
+    `NotFrozen`/`EscrowCodeHashMismatch` **错误**，不计入写入口——故此值按实测写死）。
+    下调数字本身不构成"把断言改软"：下面两条**集合级**判据（例外表不许有不存在项、
+    每个入口必须已登记或有理由）一字未动，它们才是这条守卫的实质。
+  */
+  assert.ok(
+    entries.length >= 54,
+    `只从 4 个合约里抽出 ${entries.length} 个状态改变入口（样例：${entries.slice(0, 4).join(', ')}）——正则或文件结构变了，先修守卫`
+  );
+  // 例外表的两条纪律：① 每条必须有**能读懂的理由**（不是占位符）；② 名字必须在上面真实存在，
+  // 否则例外就成了"永远为真"的空条款（与"旧路径同批删净"同一条纪律）。
+  const badReason = EXEMPT.filter((e) => typeof e.reason !== 'string' || e.reason.trim().length < 8);
+  assert.deepEqual(badReason.map((e) => e.name), [], `例外必须写清理由（${EXEMPT.length} 条例外里有的理由是空的）`);
+  const allNames = new Set(entries.map((e) => e.split('.')[1]));
+  const stale = EXEMPT.filter((e) => !allNames.has(e.name)).map((e) => e.name);
+  assert.deepEqual(stale, [], `例外表里有已经不存在的入口（旧例外要同批删掉）：${stale.join(', ')}`);
+
+  const exempt = new Set(EXEMPT.map((e) => e.name));
+  const missing = entries.filter((e) => {
+    const n = e.split('.')[1];
+    return !registered.has(n) && !exempt.has(n);
+  });
+  assert.deepEqual(
+    missing,
+    [],
+    `这些状态改变入口既没有网页出口、也没在守卫的例外表里声明（要么给它一个有意义的入口，` +
+      `要么在 node/test/abi-consistency.test.js 的 EXEMPT 里写清"为什么不需要"）：${missing.join(', ')}`
+  );
+});
+
+/**
+ * **反向：手写 ABI 里声明的每一个函数都还必须真的存在**（2026-10-14 补）。
+ *
+ * 为什么需要它：上一条守卫只管"合约有、网页没有"这一个方向，而**反方向**的残留是静默的——
+ * 合约删掉一个入口（本仓刚删过 `proposeEscrow` / `cancelEscrowChange` / `applyEscrow` 与两个
+ * `pendingEscrow*` 读法），前端 ABI 里那几行字符串却还留着：合约能跑、测试全绿、
+ * 类型检查也过（ABI 是 `string[]`，写错名字没人管），只有真去调它才会 `unknown function`。
+ * 与既有的"反向：前端 ABI 里的自定义错误都还在合约里"（错误那一半）成对：
+ * **错误靠它守，函数靠这一条守**。
+ *
+ * 判据：声明处里出现的 `'function <name>('` 必须落在"四个合约的函数名并集 ∪ Ownable2Step 继承名"
+ * 之内。声明处是白名单（下面 `ABI_SITES`）而不是全仓扫描——`shopCode.js`/`stakingRisk.js`
+ * 这类文件里也有 `'function ...'` 片段，但它们不是合约 ABI 的声明处，混进来会把守卫变成噪声源。
+ */
+const ABI_SITES = [
+  'frontend/src/chain.ts',
+  'frontend/src/utils/contractAuthority.ts',
+  'frontend/src/utils/notary.ts',
+  'node/src/chain.js',
+];
+/** Ownable2Step/Ownable 提供的名字：本仓合约的 ABI 里有，但源码里查不到声明（继承来的） */
+const INHERITED_ABI_NAMES = [
+  'owner',
+  'pendingOwner',
+  'transferOwnership',
+  'acceptOwnership',
+  'renounceOwnership',
+  // 收到原生转账的钩子（本仓四个合约都没有；留着是为了让"新增 receive"只报一次、报在正确的地方）
+  'receive',
+  'fallback',
+];
+
+guard('反向：前端/节点 ABI 里声明的函数都还在合约里（删了入口忘删声明 ⇒ 红）', () => {
+  /** 某个 .sol 里所有 external/public 的函数名（含 view/pure；写法与 writeEntriesOf 同源） */
+  const allEntriesOf = (sol) =>
+    [
+      ...new Set(
+        [...sol.matchAll(/\bfunction\s+(\w+)\s*\([^)]*\)([^;{]*)[;{]/g)]
+          .filter((m) => /\b(external|public)\b/.test(m[2]))
+          .map((m) => m[1])
+      ),
+    ];
+  /**
+   * **public 状态变量的自动 getter**——它们同样是 ABI 里的函数，但源码里没有 `function` 关键字
+   * （`arbiter` / `feeBps` / `nodes` / `notarizedCount` / `MIN_UNLOCK_DELAY` …）。
+   * 漏掉这一半会把"合法声明"误判成残留（实测第一版就漏了 30 个），所以必须一起抽：
+   * 形状是 `<类型> public [immutable|constant] <名字> [= 初值] ;`，类型里可能含 `mapping(...)`。
+   */
+  const publicGettersOf = (sol) =>
+    [
+      ...new Set(
+        [...sol.matchAll(/[\w\[\]().,=>\s]+?\bpublic\s+(?:immutable\s+|constant\s+)?(\w+)\s*(?:=|;)/g)].map(
+          (m) => m[1]
+        )
+      ),
+    ];
+  const known = new Set([
+    ...allEntriesOf(ESCROW_SOL),
+    ...allEntriesOf(STAKING_SOL),
+    ...allEntriesOf(REGISTRY_SOL),
+    ...allEntriesOf(NOTARY_SOL),
+    ...publicGettersOf(ESCROW_SOL),
+    ...publicGettersOf(STAKING_SOL),
+    ...publicGettersOf(REGISTRY_SOL),
+    ...publicGettersOf(NOTARY_SOL),
+    ...INHERITED_ABI_NAMES,
+  ]);
+  // 与 `contracts/out/*.json` 实测对齐（2026-10-14）：四个合约的 ABI 函数名**并集 = 125**
+  // （Escrow 55 / Staking 54 / Registry 28 / Notary 5，互相重叠的部分去重后 125）；
+  // 本条抽取含 Ownable 继承名与两个钩子名 ⇒ 127（实测 ⊇ 125，差集为空）。
+  // 阈值取 120 留一点余量：它只用来抓"正则或文件结构被改坏"，不是精确断言。
+  assert.ok(
+    known.size >= 120,
+    `四个合约只抽出 ${known.size} 个函数名（函数 + public getter + 继承；实测应为 127）——正则或文件结构变了，先修守卫`
+  );
+
+  const stale = [];
+  for (const rel of ABI_SITES) {
+    const text = read(rel);
+    assert.ok(text.length > 0, `ABI 声明处读不到：${rel}`);
+    for (const m of text.matchAll(/'function\s+(\w+)\s*\(/g)) {
+      if (!known.has(m[1])) stale.push(`${rel} → ${m[1]}`);
+    }
+  }
+  assert.deepEqual(
+    stale,
+    [],
+    `这些 ABI 声明在合约里已经不存在（删入口时必须同批删声明）：${stale.join(', ')}`
+  );
+});
+
 guard('escrowWatcher 的 EVENTS 清单都能在节点 ABI 里解析出过滤器', async () => {
   const { EVENTS } = await import('../src/escrowWatcher.js');
   assert.ok(EVENTS.length >= 9, `EVENTS 只有 ${EVENTS.length} 项，清单疑似被改坏`);

@@ -70,7 +70,18 @@ router.post('/orders/:id/erase-pii', ownerOnly, erasePiiLimiter, wrap(async (req
     action: 'order.erase_pii',
     targetType: 'order',
     targetId: r.orderId,
-    detail: { trigger: 'request', ...r.counts, alreadyErased: !r.changed, attachmentsRemoved: r.attachmentFilesRemoved },
+    /*
+      审计只记**计数与结果读数**，绝不把擦掉的内容再抄进审计表（那就等于没擦）。
+      `attachmentsRemaining` 用残留数而不是一个布尔：审计要能回答"那次到底删干净了没有"，
+      而布尔在读的时候永远不知道它是从哪个判据派生的（旧实现就派生于一个恒真的字段名）。
+    */
+    detail: {
+      trigger: 'request',
+      ...r.counts,
+      alreadyErased: !r.changed,
+      attachmentsRemaining: r.attachmentFilesRemaining,
+      walTruncated: r.walTruncated,
+    },
   });
   ok(
     res,
@@ -79,11 +90,27 @@ router.post('/orders/:id/erase-pii', ownerOnly, erasePiiLimiter, wrap(async (req
       status: r.status,
       alreadyErased: !r.changed,
       erased: r.counts,
-      attachmentFilesRemoved: r.attachmentFilesRemoved,
+      /*
+        **擦得干不干净**必须由这两个读数回答，不能由 `changed` 回答（2026-10-14 修订）。
+        `changed` 是"本次有没有改动"，而删除请求问的是"数据还在不在"：
+        · `attachmentFilesRemaining`：磁盘上还剩几个附件文件（0 = 干净；<0 = 目录读不出来）；
+        · `walTruncated`：WAL 是否已截断（false = 原文可能仍留在 `<db>-wal` 里）。
+        旧实现只回 `attachmentFilesRemoved`，且它是从**恒真**的判据派生的（已修），
+        于是"盘上还有文件"这件事在响应里看不出来。
+      */
+      attachmentFilesRemaining: r.attachmentFilesRemaining,
+      walTruncated: r.walTruncated,
     },
-    r.changed
-      ? '个人信息已擦除（金额/订单状态/链上托管单号/支付凭证/事件史/交付行/评价保留不变）'
-      : '该订单的个人信息此前已擦除（本次无内容变更；重复调用幂等）'
+    /*
+      文案必须与"盘上到底还有没有东西"一致：擦除失败时锚点会被回退以便自动重试，
+      于是下一次调用 `changed` 可能是 0——旧文案会把它说成"此前已擦除（幂等）"，
+      而真相是"上一轮没删干净"。谎报比不报更糟，所以这里按失败态单独给一句。
+    */
+    !r.ok
+      ? '库内的收货信息/备注/陈述正文/附件索引已清空，但**磁盘上的附件文件没能删掉**——请检查附件目录权限/占用后重试（系统会在下一轮保留期扫描中自动重试）'
+      : r.changed
+        ? '个人信息已擦除（金额/订单状态/链上托管单号/支付凭证/事件史/交付行/评价保留不变）'
+        : '该订单的个人信息此前已擦除（本次无内容变更；重复调用幂等）'
   );
 }));
 

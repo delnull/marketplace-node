@@ -37,9 +37,9 @@ bash deploy.sh
 脚本只要求宿主有 **Docker**（没有就自己装）；**Node 与依赖全在容器镜像里**，宿主机不需要装任何运行时。
 所有数据在**命名卷**里，容器可以随时删掉重建——升级就是换个镜像，数据不会动。
 
-脚本会问你几件事（其余全部自动）：**店主钱包地址**、**对外域名**、**HTTPS 用哪种方式**
-（Caddy 容器 / 宿主 nginx+certbot / 不配 TLS）、**证书邮箱**，以及**是否现在就链上登记**
-（选"稍后"就在上面那个网页里登记，更安全）。
+脚本会问你几件事（其余全部自动）：**店主钱包地址**、**对外域名**、**HTTPS 在哪终止**
+（别处负载均衡/CDN/另一台 nginx —— 默认 / 本机 Caddy 容器 / 本机宿主 nginx+certbot）、
+**是否现在就链上登记**（选"稍后"就在上面那个网页里登记，更安全）；只有选了"本机申请证书"才会问**证书邮箱**。
 
 ---
 
@@ -48,22 +48,30 @@ bash deploy.sh
 | 需要 | 说明 |
 | --- | --- |
 | **一台 Linux 服务器** | Ubuntu / Debian / CentOS 等，1 核 1G 起步即可。节点只依赖 Node 内置 SQLite，**不需要 MySQL/Redis**；**需要 Docker**——没有的话脚本会自己装 |
-| **一个域名 + HTTPS** | 买家浏览器会**直接访问你的节点**（前端是 https，所以你也必须 https）。默认用**一个 Caddy 容器**全自动申请并续期 Let's Encrypt 证书（也可以选宿主 nginx + certbot，或干脆不配 TLS、交给你的负载均衡）；域名要先解析到这台机器 |
+| **一个域名**（证书可选） | 买家浏览器会**直接访问你的节点**，所以**买家看到的节点地址必须是 `https://`**（前端是 https，浏览器会拦掉到 http 节点的请求）。但**证书不一定要在这台机器上**——HTTPS 在哪终止，证书就在哪申请：① 本机申请（`--tls-mode caddy` 一键全包，或干净机器上用 `--tls-mode nginx`）；② 别处申请（负载均衡 / CDN / 另一台 nginx —— **默认**，本机只出 `http://<本机>:$PORT`）。 |
 | **一个钱包地址**（店主钱包） | 作为你的店铺身份：上架商品、发货、改店铺设置都用它签名登录。**它也是收款方** |
 | **一点点 BTY 当 gas** | 只在"链上登记/更新登记"时用，一次约 0.001 BTY 量级，留 0.01 BTY 绰绰有余。**开店不需要质押**（本联邦当前 `minStakeToRegister = 0`） |
 | **一个能跑链上交易的钱包**（MetaMask 等） | 登记那一步需要它；手机端请用带内置钱包的浏览器 |
 
-服务器需要放行 **80 端口**（申请证书）与 **443 端口**（买家访问）；节点容器自身只在内部监听 8090，
-默认只绑到本机（`127.0.0.1:8090`），对外由 Caddy/nginx 反代，不需要对公网直接开。
+**要在本机申请证书**（`--tls-mode caddy`，或干净机器上的 `--tls-mode nginx`）时才需要放行 **80 端口**
+（Let's Encrypt 校验用）与 **443 端口**（买家访问）——这两件事发生在**证书所在的那台机器**上，
+所以"证书在别处"的部署只要在本机放行节点端口，另需让那个外部入口连得到本机。节点容器自身监听 8090：
+不配本机 TLS 时绑 `0.0.0.0`（给外部入口连），配了本机 TLS 时默认只绑 `127.0.0.1`（由本机反代连），
+需要收紧就显式 `--bind 127.0.0.1`。
 
 ---
 
 ## 二、详细部署流程
 
-### 第 1 步：把域名解析到你的服务器
+### 第 1 步：把域名指向**终止 HTTPS 的那台机器**
 
-在域名服务商处加一条 **A 记录**：`shop.example.com` → 你的服务器公网 IP。
+"那台机器"可以是本机，也可以是负载均衡 / CDN / 另一台 nginx —— 这决定证书在哪申请（见下面 A/B）：
+
+在域名服务商处加一条 **A 记录**：`shop.example.com` → **那台机器的公网 IP**。
 （用 Cloudflare 之类的话，先关掉"小黄云"代理，证书申请会更顺。）
+
+> **域名与证书是两件事**：发给买家的地址必须是 `https://shop.example.com`（前端强制 https），
+> 但**证书不一定在这台跑节点的机器上**。先想清楚 TLS 在哪终止，再决定用下面哪种拓扑。
 
 验证（在服务器上执行，能返回你的公网 IP 就对了）：
 
@@ -72,24 +80,49 @@ dig +short shop.example.com        # 或 nslookup shop.example.com
 curl -s https://api.ipify.org      # 本机公网出口 IP
 ```
 
-> 域名没解析好会怎样：脚本第 ⑦ 步的 Let's Encrypt 申请会失败（这是唯一一处强依赖域名解析的地方）。
-> 节点本身仍然会跑起来，只是买家还看不到你。
+> 域名没解析好会怎样：只有**选了本机申请证书**（`--tls-mode caddy`/`nginx`）时才强依赖它——
+> 那时 Let's Encrypt 校验会失败（节点本身照样跑起来，只是买家还看不到你）。证书在别处时，
+> 解析是你和那台机器之间的事，脚本不参与也不会因此报错。
+
+**两种拓扑，先选一种**（决定后面给哪些参数）：
+
+| | A. TLS 在**别处**终止（**默认**） | B. TLS 在**本机**终止 |
+| --- | --- | --- |
+| 谁拿域名与证书 | 负载均衡 / CDN / 另一台 nginx | 本机：Caddy 容器（`--tls-mode caddy`）或宿主 nginx+certbot（`--tls-mode nginx`） |
+| 本机出什么 | `http://<本机>:8090`（容器绑 `0.0.0.0`，给那个入口连） | Caddy/nginx 出 443；节点绑 `127.0.0.1:8090` |
+| 本机要证书吗 | **不要**（脚本一个证书都不申请、不碰宿主 nginx） | 要（脚本负责申请与续期） |
+| 谁转发到 8090 | 那台外部机器 | 本机的 Caddy / nginx |
+| 适用 | 已经有机器/入口在管证书；本机只跑节点 | 一台干净机器，想一条命令全包 |
+
+> 已经装了 nginx（域名与证书都在它上面）的机器属于 **B 的第二种形态**，但**不要**选
+> `--tls-mode nginx`（那会在 conf.d 里再写一个 server 块、再申请一张证书，还可能把你现有站点一起
+> reload）。正确写法是：`--tls-mode none --bind 127.0.0.1`，然后在**你那份 nginx** 的 server 块里加
+> `location / { proxy_pass http://127.0.0.1:8090; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; }`。
 
 ### 第 2 步：运行 `deploy.sh`
 
-三种跑法，任选其一：
+几种跑法，任选其一：
 
 ```bash
-# A. 交互式（推荐第一次）：只问必填项
+# A. 交互式（推荐第一次）：问店主地址 / 域名 / HTTPS 在哪终止
 git clone https://github.com/delnull/marketplace-node.git && cd marketplace-node
 bash deploy.sh
 
 # B. 不落盘、直接跑（脚本会自己把代码取到 /opt/marketplace-node 或 $HOME/marketplace-node）
 bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/deploy.sh)
 
-# C. 全自动（零交互，适合已经有域名/邮箱/私钥的人）
-bash deploy.sh --owner 0x你的店主钱包 --domain shop.example.com --email you@example.com
+# C. 零交互·证书在别处（拓扑 A，**默认**：本机只出 http://<本机>:8090，不申请任何证书）
+bash deploy.sh --owner 0x你的店主钱包 --domain shop.example.com --yes
+
+# D. 零交互·本机一键全包（拓扑 B：Caddy 自动申请并续期证书，需 80/443 空闲且域名已解析到本机）
+bash deploy.sh --owner 0x你的店主钱包 --domain shop.example.com --email you@example.com --tls-mode caddy --yes
+
+# E. 本机已有 nginx 与证书（拓扑 B 第二形态：节点只监听回环，由你那份 nginx 反代）
+bash deploy.sh --owner 0x你的店主钱包 --domain shop.example.com --tls-mode none --bind 127.0.0.1 --yes
 ```
+
+> `--domain` 只写"这个节点的对外身份"（SIWE 签名原文 + CORS 白名单 + 登记 endpoint），
+> **它不会触发本机申请证书**；想让本机全包就显式加 `--tls-mode caddy`。
 
 先用 `bash deploy.sh --dry-run` 可以只打印计划、什么都不改。
 
@@ -104,7 +137,7 @@ bash deploy.sh --owner 0x你的店主钱包 --domain shop.example.com --email yo
 | ⑤ 数据卷 | `docker volume create <服务名>-data`（已存在就沿用） | 商品/订单/附件都在卷里，**容器删了重建数据也在** |
 | ⑥ 启动容器 | `docker run -d --restart unless-stopped`：发布端口、挂数据卷、注入 `.env` | 开机自启靠 Docker 的 restart policy，**不需要 systemd 单元** |
 | ⑦ 探活 | 循环请求 `http://127.0.0.1:8090/healthz` 直到通过 | 必须返回 `"code":0`，且链 ID 自检通过（`chainId 2999`） |
-| ⑧ HTTPS | 按你选的方式：**Caddy 容器**（自动申请+续期证书，证书存在卷里）/ 宿主 nginx + certbot / 不配 TLS（只监听端口，交给外部入口） | nginx 与 Caddy 的配置都会先校验，校验不过就**还原成部署前的样子**，不会把坏配置留在机器上 |
+| ⑧ HTTPS 在哪终止 | **默认在你指定的外部入口**（本机一个证书都不申请，只监听 `http://<本机>:8090`，并打印还差哪三步）；选了 `--tls-mode caddy` 才在本机起 Caddy 自动申请+续期证书（证书存在卷里）；`--tls-mode nginx` 则在宿主装 nginx + certbot（**机器上已有 nginx 站点时会被拒绝**，并给你该用的写法） | Caddy/nginx 的配置都会先校验，校验不过就**还原成部署前的样子**，不会把坏配置留在机器上；本机已有 nginx 时脚本**不碰你的 conf.d** |
 | ⑨ 链上登记 | 只有你给了私钥（`--key-file` 或交互选"现在登记"）才执行：在**容器里**签名并广播 `registerNode`，然后核验 `getActiveNodes()` | 私钥只经**标准输入**进容器、随容器销毁，宿主磁盘上不落任何文件；没给就跳过，第 3 步在网站上登记即可 |
 
 脚本结束时你会看到容器名、数据卷、探活结果、对外地址，以及**下一步该做什么**。
@@ -196,17 +229,31 @@ curl -s https://shop.example.com/api/shop   # 从公网看你的节点（应返�
 | 看日志 | `docker logs -f marketplace-node`（`--tail 100` 看最近 100 行） |
 | **升级到最新版** | `bash deploy.sh --update`（刷新代码 → 重新构建镜像 → 用**同一个数据卷**重建容器；**配置、密钥、数据全部保留**）。`git clone` 装的自带 `git pull`；**没有 git 的安装（ZIP/curl）加 `--pull`** 从公开仓拉最新代码；新镜像起不来会**自动回滚**到上一个镜像 |
 | **改了 `.env`** | 用 `bash deploy.sh --update` 重建容器。⚠️ `docker restart` **不会**重新读 `.env`——配置是在**创建容器那一刻**由 `--env-file` 注入的，重启沿用旧配置（Caddyfile 例外：它是挂进容器的文件，改完 `docker restart <服务名>-caddy` 即生效） |
+| **手改过 Caddyfile**（换证书邮箱/加 header/日志） | ⚠️ 每次部署（含 `--update`）都会**整份重新生成**它。脚本会先把上一份备份成 `Caddyfile.bak.<时间戳>` 并告诉你"内容有变化"；把改动合并回去后 `docker restart <服务名>-caddy` 即生效；想整份回退：`cp -a <安装目录>/Caddyfile.bak.<ts> <安装目录>/Caddyfile && docker restart <服务名>-caddy` |
 | 重启节点 | `docker restart marketplace-node` |
-| 同机再开一家店 | `bash deploy.sh --service shop-b --volume shop-b-data --port 8091 --dir /opt/shop-b`（容器名、卷名、端口三者都要换）。⚠️ 第二家店**不要选 `--tls-mode caddy`**：Caddy 要独占宿主 80/443，第二个 Caddy 容器会因端口冲突起不来，用 `--tls-mode none` 交给已有反代 |
-| 收紧端口暴露面 | 默认按 TLS 方式发布（配了 TLS → 只绑 `127.0.0.1`；不配 → 绑 `0.0.0.0`）。同机已有 nginx 反代、但又用了 `--tls-mode none` 时，用 `--bind 127.0.0.1` 只对宿主机暴露（这个选择会记进 `.deploy-state`，`--update` 不会偷偷改回 `0.0.0.0`） |
+| 同机再开一家店 | `bash deploy.sh --service shop-b --volume shop-b-data --port 8091 --dir /opt/shop-b`（容器名、卷名、端口三者都要换）。⚠️ 第二家店**不要再选 `--tls-mode caddy`**：Caddy 要独占宿主 80/443，第二个 Caddy 容器会因端口冲突起不来，用 `--tls-mode none` 交给已有反代 |
+| 收紧端口暴露面 | 默认按 TLS 方式发布（本机申请证书 → 只绑 `127.0.0.1`；证书在别处 → 绑 `0.0.0.0` 好让那个入口连进来）。同机已有 nginx 反代、走 `--tls-mode none` 时，用 `--bind 127.0.0.1` 只对宿主机暴露（这个选择会记进 `.deploy-state`，`--update` 不会偷偷改回 `0.0.0.0`） |
 | 备份 | 导出数据卷：`docker run --rm -v marketplace-node-data:/data -v "$PWD":/backup --entrypoint tar marketplace-node:latest czf /backup/node-data-$(date +%F).tar.gz -C /data .` |
 | 恢复 | 先 `docker stop marketplace-node`，再 `docker run --rm -v marketplace-node-data:/data -v "$PWD":/backup --entrypoint tar marketplace-node:latest xzf /backup/node-data-YYYY-MM-DD.tar.gz -C /data`，然后 `docker start marketplace-node` |
-| 换域名 | 域名解析好后重跑 `bash deploy.sh --update --domain 新域名`（会更新反代/证书/SIWE 域名与 CORS），然后重新登记一次 |
+| 换域名 | 两件事分开办：① 节点侧重跑 `bash deploy.sh --update --domain 新域名`（只更新 `MK_SIWE_DOMAIN` 与 CORS 白名单；**不会**因为换了域名就去申请证书）；② 证书与入口在你那边同步：本机证书（Caddy/nginx）按新域名重新签发，外部入口改转发规则。然后到开店向导按新 endpoint **重新登记一次** |
 | 链上更新登记 / 注销登记 | 到 https://fedmall.bityuan.com 的开店向导里操作（**只有登记时的那个钱包**能更新或注销） |
 | 暂停营业 | 前端「卖家面板 → 店铺设置」下架商品；要让目录里也看不到，可在向导里注销登记（数据与订单都还在你的卷里） |
 | 关掉节点 | `docker stop marketplace-node`（数据不动）；以后重启：`docker start marketplace-node` |
 | 不再需要 / 搬走 | `bash deploy.sh --uninstall`（删容器，**数据卷保留**）；`docker run --rm -v marketplace-node-data:/data -v "$PWD":/backup --entrypoint tar marketplace-node:latest czf /backup/backup.tar.gz -C /data .` 导出后即可换机器 |
 | 彻底清除 | `bash deploy.sh --purge`（**连数据卷一起删**，不可逆，需要手输卷名确认） |
+
+**退出码只有这几种**（喂监控/cron 时按这个判，不用去猜 docker 的原生码）：
+
+| 码 | 含义 |
+| --- | --- |
+| 0 | 成功 |
+| 1 | 脚本自己的失败（配置不合规、镜像构建失败、容器起不来、端口被占……**原因都在上面的输出里**，脚本一律给出下一步命令） |
+| 2 | 用法错（未知参数 / 非法取值），或 `--health` 判为不健康 —— 适合直接当告警信号 |
+
+> 端口被占这类 docker 原生失败（`docker run` 返回 125）**不会漏出脚本**：脚本会把 docker 的原始
+> 报错与退出码一起回显，然后以 **1** 结束，并清掉这次没起来的空壳容器（否则下次重跑会撞上
+> "容器已存在"，把真原因盖掉）。
+
 
 **容器名、卷名、端口是"这套安装的身份"**：安装目录里会留一份 `.deploy-state`（记下它们），
 `--update` / `--status` / `--health` / `--uninstall` 会自动沿用，不用每次重复指定。
@@ -247,7 +294,9 @@ curl -s https://shop.example.com/api/shop   # 从公网看你的节点（应返�
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| 脚本第 ⑧ 步证书申请失败 | 域名没解析到本机 / 80 端口没放行 / 用了 CDN 代理。**Caddy 的报错在 `docker logs marketplace-node-caddy` 里**；修好后重跑 `bash deploy.sh --update --domain 你的域名`。用宿主 nginx 模式的话，也可手动 `sudo certbot --nginx -d 你的域名` |
+| 我只要一个域名、证书自己在别处弄，脚本却在本机折腾证书 | 旧口径下"给了 `--domain` 就当你要在本机申请证书"；现在**默认不申请**。若你看到它去起 Caddy/装 nginx，说明你（或旧命令里）显式给了 `--tls-mode caddy/nginx`——去掉它重跑 `bash deploy.sh --update --yes` 即可，本机只监听端口 |
+| 脚本拒绝 `--tls-mode nginx`：本机已有 nginx 站点 | 这是刻意的：再写一个 `listen 80` 的 server 块会与同机站点争 `server_name`，而 `systemctl reload nginx` 会把它们一起卷进来。改走：`bash deploy.sh --update --tls-mode none --bind 127.0.0.1 --yes`，再在**你那份 nginx** 里加 `location / { proxy_pass http://127.0.0.1:8090; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; }` |
+| 脚本第 ⑧ 步证书申请失败 | **只在你选了本机申请证书时才会遇到**：域名没解析到本机 / 80 端口没放行 / 用了 CDN 代理。**Caddy 的报错在 `docker logs marketplace-node-caddy` 里**；修好后重跑 `bash deploy.sh --update --domain 你的域名`。用宿主 nginx 模式的话，也可手动 `sudo certbot --nginx -d 你的域名`。不想在本机申请：`--tls-mode none`，证书交给你的入口 |
 | 节点起不来，日志说 `MK_TOKEN_SECRET` 不合格 | 密钥被改短或被替换成示例值。删掉 `.env` 里那一行后重跑 `bash deploy.sh --update`（会重新生成），代价是店主登录态失效 |
 | 日志说 `chainId` 不符 | `MK_RPC_URL` 指到了别的链。改回 `https://mainnet.bityuan.com/eth` 后 `bash deploy.sh --update` |
 | 端口被占用 | 同机已有服务占了 8090。换一个：`bash deploy.sh --update --port 8091`（会重建容器并更新反代配置） |

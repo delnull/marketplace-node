@@ -29,11 +29,11 @@
  *
  * ⚠ 擦除只写 `pii_erased_at`（擦除锚点），**绝不写 `updated_at`**（2026-09 复审修复，P1）：
  * `updated_at` 是入账/争议起始时刻的口径，被擦除动作改写会让旧成交额重新落进近期报表窗口
- * （详见 eraseOrderPii 内的说明与 docs/ARCHITECTURE.md §3.11）。
+ * （详见 eraseOrderPii 内的说明）。
  */
 import fs from 'node:fs';
 import config, { PII_RETENTION_DAYS } from './config.js';
-import { getDb, txBegin, txCommit, txRollback } from './db.js';
+import { getDb, txBegin, txCommit, txRollback, checkpointTruncate } from './db.js';
 import { logAudit } from './audit.js';
 import { orderAttachDir, removeOrderAttachments } from './evidenceFiles.js';
 // 状态集合的唯一出处（见下方再导出说明）：本文件内部要用，所以先 import 再 export
@@ -73,25 +73,37 @@ const nonEmpty = (v) => String(v ?? '') !== '';
 
 /**
  * 磁盘附件清理（事务外，见 eraseOrderPii 说明）。
- * @returns {{files:number, ok:boolean}} files = 删除前目录内的文件数
+ *
+ * @returns {{removed:number, remaining:number}} `removed` = 删除**前**目录内的文件数（= 本次擦掉了
+ *   几个，用于响应/审计的计数）；`remaining` = 删除**之后**目录里还剩几个文件，
+ *   **0 表示确实干净**，非 0 表示没删净（权限/占用/只读挂载）。
+ *
+ * 为什么返回"残留数"而不是 `ok:false` 加一个原因字段（2026-10-14）：调用方要判的是
+ * "盘上还有没有个人数据"，那就该由**实测的残留数**回答。返回一个布尔时，消费方只要把字段名
+ * 猜错（历史上就写成了 `attachmentFiles.failed`）就会把失败读成成功，而且**没有任何测试会红**——
+ * `undefined > 0` 不抛错。残留数是**事实**，不是对事实的描述，猜不歪。
+ *
+ * ⚠️ `remaining` 用 `-1` 作"列不出来"的哨兵（目录不可读时 `existsSync`/`readdirSync` 会抛）：
+ * 那种情况**绝不能**算 0（"读不到"不等于"没有"——与全仓三态纪律一致），调用方按"没删净"处理。
  */
 function removeAttachmentsFromDisk(orderId) {
   const dir = orderAttachDir(orderId);
-  let files = 0;
-  try {
-    if (fs.existsSync(dir)) files = fs.readdirSync(dir).length;
-  } catch {
-    files = 0;
-  }
+  const countFiles = () => {
+    try {
+      return fs.existsSync(dir) ? fs.readdirSync(dir).length : 0;
+    } catch {
+      return -1; // 列不出来 ⇒ 不知道 ⇒ 按没删净处理（不得当成 0）
+    }
+  };
+  const before = countFiles();
   try {
     removeOrderAttachments(orderId);
-    return { files, ok: true };
   } catch (e) {
     // 删文件失败必须留痕：DB 行已删，磁盘上却仍有个人数据（权限/占用/只读挂载）——
-    // 这是"以为删干净了其实没删"的典型场景，需运维人工清理；下次调用会再试一次。
-    console.error(`[pii] 订单 ${String(orderId).slice(0, 8)}… 的证据附件删除失败（磁盘上仍有数据，需人工清理）:`, e?.message || e);
-    return { files, ok: false };
+    // 这是"以为删干净了其实没删"的典型场景，需运维人工清理；下一轮保留期扫描会再试。
+    console.error(`[pii] 订单 ${String(orderId).slice(0, 8)}… 的证据附件删除失败（磁盘上仍有数据，将重试）:`, e?.message || e);
   }
+  return { removed: Math.max(0, before), remaining: countFiles() };
 }
 
 /**
@@ -156,25 +168,46 @@ export function eraseOrderPii(orderId) {
   // "先落库、后删文件"——若此处失败，DB 已无引用、磁盘残留由下次调用/运维清理兜底；
   // 反过来（先删文件后落库）一旦回滚，DB 里会留下指向不存在文件的悬空行。
   attachmentFiles = removeAttachmentsFromDisk(id);
-  counts.attachmentFiles = attachmentFiles.files;
+  counts.attachmentFiles = attachmentFiles.removed;
   /*
-    附件**删盘失败**不算擦干净（源码审计 2026-09 复审，P2）：`pii_erased_at` 一旦前移，
-    保留期扫描的锚点就把它推出候选集，自动路径**永不重试**——而磁盘上的证据文件还留着。
-    此前这段失败只体现在返回值的 `attachmentFilesRemoved`，而保留期扫描只看 `r.error`，
-    于是把它记成"已擦除"、写"已擦除"审计、`retentionStatus.lastError` 仍为 null（/healthz 常绿）。
-    现在把它当成一次**失败**：返回 error；保留期扫描据此跳过该单、计入 `diskFailed` 并写进
-    `/healthz` 的 `piiRetention.lastError`；手动端点则如实告诉店主"库里的引用已清、磁盘文件没删掉，
-    请检查目录权限后重试"。
-    **边界如实写明**：锚点已经前移，所以这一单不会自动重来——残留的是一个**已无 DB 引用**的
-    孤儿文件（配额按行计、下载按行定位，功能上无害），清理由运维按上面的告警处理
-    （见 `OPS_RUNBOOK.md` 的附件目录一节）。典型触发：Windows 上下载中的
-    `createReadStream` 仍占着句柄 → `rmSync` EPERM。
+    ── 附件删盘失败**不算擦干净**（2026-10-14 审计修订：旧判据是死代码）──────────────
+    旧实现把判据写成 `!attachmentFiles.ok && attachmentFiles.failed > 0`，而
+    `removeAttachmentsFromDisk` 从来**没有**返回过 `failed` 字段（它返回 `{files, ok}`）——
+    `undefined > 0` 恒为 false ⇒ `diskFailed` 恒 false ⇒ 失败分支整段不可达：
+    `ok:true` / `error:undefined` 恒成立，手动端点回"个人信息已擦除"，
+    保留期扫描把它记成已擦除、写审计、`/healthz` 的 `piiRetention.lastError` 仍为 null。
+    而磁盘上的证据附件（真正的个人数据）一个都没删掉。
+    这正是"判据挂错层"的形状：**成功与否必须由事实产出方给出**，不能由消费方去猜字段名。
+    所以现在 `removeAttachmentsFromDisk` 返回"**删完之后还剩几个文件**"（含"连目录都列不出来"
+    时的哨兵值），这里的 `ok` 只由它派生——名字写错不可能再变成成功。
   */
-  const diskFailed = !attachmentFiles.ok && attachmentFiles.failed > 0;
+  const diskFailed = attachmentFiles.remaining !== 0;
+  /*
+    锚点（`pii_erased_at`）只在**真的擦干净**时前移（2026-10-14）。
+    旧实现的注释写着"锚点已经前移，所以这一单不会自动重来"，把"永不重试"当成一个已接受的边界——
+    而它其实与"保留期自动擦除"这条产品承诺直接冲突：数据主体要求的删除，系统答复"已删除"、
+    盘上却还在，而且没有任何自动重试。现在删盘失败 ⇒ 把锚点回退（连同本轮写入的行内字段一起
+    已经没有个人信息了，回退锚点不会让信息复活），保留期扫描下一轮会**再试一次**；
+    重试全部成功之后锚点才落定。代价如实写：失败期间这一单会反复出现在候选集里，
+    直到目录权限/占用问题被解决（这正是我们要的——它是**可见的**未完成，而不是静默的成功）。
+  */
+  if (diskFailed) {
+    db.prepare('UPDATE orders SET pii_erased_at = NULL WHERE id = ?').run(id);
+  }
+  /*
+    WAL 截断（2026-10-14 审计新增，"假删除"的第二条腿）：库内字段已置空、释放页由
+    `secure_delete=ON` 清零，但**WAL 里的历史帧**不在那两条的作用范围内——实测擦除之后
+    `<db>-wal` 里仍能直接搜到手机号/地址/备注原文，而 PASSIVE 自动 checkpoint 不截断文件。
+    所以每次擦除（手动与保留期都走这里）之后强制截断一次。失败不抛出：清 WAL 是加固，
+    不该让一次"没清成"回滚已经落库的擦除（返回 null 时由下次擦除再试）。
+  */
+  const walTruncated = checkpointTruncate();
   return {
     ok: !diskFailed,
     error: diskFailed
-      ? `附件索引已清空，但磁盘上有 ${attachmentFiles.failed} 个文件删除失败（目录权限/文件被占用）——请处理后重试`
+      ? attachmentFiles.remaining < 0
+        ? '附件目录无法读取（权限/挂载异常），无法确认磁盘上的附件是否已删除——请检查目录权限后重试（系统会在下一轮保留期扫描中自动重试）'
+        : `附件索引已清空，但磁盘上还剩 ${attachmentFiles.remaining} 个文件未删除（目录权限/文件被占用）——请处理后重试（系统会在下一轮保留期扫描中自动重试）`
       : undefined,
     orderId: id,
     status: order.status,
@@ -182,7 +215,11 @@ export function eraseOrderPii(orderId) {
     // 有意义的删除（否则响应会报"无变更"，让人以为没删干净/白跑一趟）
     changed:
       counts.shippingFields + counts.invoiceFields + counts.evidenceContents + counts.attachmentRows + counts.attachmentFiles > 0,
-    attachmentFilesRemoved: attachmentFiles.ok,
+    // 三态（与响应里的其它读数同款）：true 确认删净 / false 确认没删净 / null 读不到 ⇒ 不敢说
+    attachmentFilesRemoved: attachmentFiles.remaining < 0 ? null : attachmentFiles.remaining === 0,
+    attachmentFilesRemaining: attachmentFiles.remaining,
+    /** WAL 是否已截断（false = 原文可能仍在 `<db>-wal` 里；见 checkpointTruncate 的说明） */
+    walTruncated,
     counts,
   };
 }

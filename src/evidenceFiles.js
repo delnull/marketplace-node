@@ -1,7 +1,7 @@
 /**
  * 证据附件（P0-2）：图片/PDF 上传、鉴权下载、文件落盘与安全校验。
  *
- * 规则（见 docs/ARCHITECTURE.md §3.1）：
+ * 规则：
  *  - 白名单 image/png|jpeg|webp、application/pdf；**magic bytes 嗅探**（防改扩展名伪装）；
  *  - 单文件 ≤2MB；单条 evidence ≤6 个；单订单累计 ≤20MB；
  *  - 磁盘文件名 = uuid.安全扩展名（与原始文件名隔离，防路径穿越/编码诡计）；

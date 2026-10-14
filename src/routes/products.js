@@ -59,8 +59,9 @@ import { normalizeBlocks, deriveDescription, parseBlocks } from '../describeBloc
 import { tryAutoDeliverPendingForProduct } from '../autoDeliver.js';
 // 金额展示口径的唯一实现（usdtOf / goodsMicroOf）——不要再手写 (micro/1e6).toFixed(2)
 import { usdtOf } from '../money.js';
-// 订单状态集合的唯一出处（"在途需求"核算用的是"草稿+在途"那一套）
-import { DRAFT_OR_ACTIVE_IN } from '../orderStatus.js';
+// 「这一单还占着库存」的唯一谓词（2026-10-14）：改名守卫与 willRestrict 的补记核算共用它，
+// 不再各自拼状态白名单——状态集每加一个终态就会漏一次，而漏的后果是超卖。
+import { stockPromiseSql, uncommittedPromiseSql } from '../stockHold.js';
 // 商品标签（类目）的键/展示形/归一化 —— **唯一实现**（两个写入入口、列表筛选与标签清单共用，见 src/tags.js 文件头）
 import { normalizeTags, parseTagsColumn, tagKeyOf } from '../tags.js';
 // 主图区（图片 + 视频）的字节判据、上限与 URL 规则 —— **唯一实现**（与前端共用同一份常量）
@@ -1190,11 +1191,22 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
   */
   {
     const newKeys = new Set(value.skus.map((s) => s.key));
+    /*
+      判据 = 「**这一单的库存承诺还没结清**」（`stockHold.stockPromiseSql` 的唯一实现），
+      **不是**一串状态白名单。
+      为什么（真实缺陷）：旧实现是 `hold_qty > 0 AND released_at IS NULL AND status IN DRAFT_OR_ACTIVE_IN`，
+      漏掉了「**已交付后退款、货未回收**」的单（`releaseRefundedEscrow` 刻意不释放它——
+      货在买家手里，需线下回收）。于是店主把规格选项名从「红」改成「深红」时，
+      `saveSkus` 按**同 key** 继承 `committed` 继承不到，那一行的已占位数**静默归零**，
+      同一件实物可被再卖一次（超卖）；触发者是店主的正常编辑动作，受害方是下一个买家，
+      且没有任何错误码或审计痕迹。
+      现状判据是并集（在途状态 ∨ 占位在册且退货未收到），方向安全：多算 ⇒ 更容易拒绝这次改名，
+      而不是让 `committed` 变小（那才会超卖）。状态集今后增删也不会再漏。
+    */
     const held = db
       .prepare(
-        `SELECT sku_key, COUNT(*) AS c, SUM(quantity) AS q FROM orders
-          WHERE product_id = ? AND hold_qty > 0 AND released_at IS NULL
-            AND status IN ${DRAFT_OR_ACTIVE_IN}
+        `SELECT sku_key, COUNT(*) AS c, SUM(quantity) AS q FROM orders o
+          WHERE o.product_id = ? AND ${stockPromiseSql('o')}
           GROUP BY sku_key`
       )
       .all(row.id)
@@ -1233,14 +1245,14 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     return prev && prev.capacity === null && s.capacity !== null;
   });
   if (willRestrict.length) {
-    const IN_FLIGHT = `(
-      o.status IN ${DRAFT_OR_ACTIVE_IN}
-      OR (
-        o.status = 'refunded'
-        AND NOT EXISTS (SELECT 1 FROM order_returns r WHERE r.order_id = o.id AND r.received_at IS NOT NULL)
-        AND (o.shipped_at IS NOT NULL OR COALESCE(o.tracking_no, '') <> '' OR EXISTS (SELECT 1 FROM order_delivery_items d WHERE d.order_id = o.id))
-      )
-    )`;
+    /*
+      在途/未回收的承诺量 = 「**还押着占位**」**且** `hold_qty = 0` 的行。
+      为什么必须带 `hold_qty = 0`：不限量期间下单的行从未占位，它们的承诺量没记进 `committed`，
+      切回限量时要现补（这是本段存在的理由）。而"已交付+退款+退货未收到"那类行的占位
+      **已经记在 `committed` 里**（只是没释放），把它算进来会重复计入 ⇒ `committed` 虚高 ⇒ 商品卖不出去。
+      两个谓词都来自 `stockHold` 的唯一实现，不在路由里手写状态白名单。
+    */
+    const IN_FLIGHT = `${uncommittedPromiseSql('o')} AND ${stockPromiseSql('o')}`;
     // 先整体算一遍在途量，任一组合放不下就整体拒绝（不留部分生效）
     const plans = [];
     for (const s of willRestrict) {
