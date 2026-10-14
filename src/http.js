@@ -20,9 +20,16 @@ export function ok(res, data = null, message = 'success') {
   res.json({ code: 0, message, data });
 }
 
-/** 统一业务失败响应（HTTP 200 + code != 0，与前端既有处理约定一致） */
-export function fail(res, message = '操作失败', code = 1, httpStatus = 200) {
-  res.status(httpStatus).json({ code, message, data: null });
+/**
+ * 统一业务失败响应（HTTP 200 + code != 0，与前端既有处理约定一致）。
+ *
+ * `data`（2026-10-14 新增，**可选**，默认 `null`）：失败时也需要带**读数**的场景。
+ * 先例是个人信息擦除——"库内已清空、但磁盘上的附件没删掉"是一种**半成品失败**，
+ * 调用方必须读到残留数才知道该显示什么（只给一句 message，界面只能猜，而这里猜错的
+ * 代价是"以为删干净了、其实盘上还有个人数据"）。默认值保持了既有调用方的响应形状不变。
+ */
+export function fail(res, message = '操作失败', code = 1, httpStatus = 200, data = null) {
+  res.status(httpStatus).json({ code, message, data });
 }
 
 /** 异步路由包装：捕获异常统一映射 */

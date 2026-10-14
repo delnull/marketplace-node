@@ -33,7 +33,7 @@
 #  ── 用法 ───────────────────────────────────────────────────────────────────
 #      bash deploy.sh                      # 交互式：问域名/邮箱/店主地址
 #      bash deploy.sh --owner 0x… --domain shop.example.com --email me@x.com
-#      bash deploy.sh --tls-mode caddy|nginx|none       # 跳过 TLS 选择
+#      bash deploy.sh --tls-mode caddy|nginx|none       # 跳过 TLS 选择（--no-tls 等价于 --tls-mode none）
 #      bash deploy.sh --dry-run            # 只打印计划，什么都不改（含"要不要装 Docker"）
 #      bash deploy.sh --status | --health | --update | --register | --uninstall
 #      bash deploy.sh --update --pull      # 升级（并强制从公开仓拉最新代码）
@@ -889,7 +889,7 @@ if [ "$MODE" != register ]; then
   BODY="$(curl -s -m 8 "http://127.0.0.1:$PORT/healthz" || true)"
   ok "探活通过：$BODY"
 
-  step "⑧ HTTPS 终止于外部（$TLS_MODE）"
+  step "⑧ HTTPS 的落点（$TLS_MODE）"
   new_section=0
   if [ -n "$DOMAIN" ] && [ "$BIND" = '127.0.0.1' ]; then
     warn "本机**没有申请任何证书**：证书与 HTTPS 由**本机你自己那个反代**负责（这是「本机 nginx 已是入口」那条路）"
@@ -1160,7 +1160,7 @@ fi
 log ""
 log "  常用命令："
 log "    docker logs -f $CONTAINER            # 看日志（容器版没有 systemd 单元）"
-log "    bash deploy.sh --health              # 探活（含最近日志）"
+log "    bash deploy.sh --health              # 探活（健康时一行结论；不健康才带最近日志）"
 log "    bash deploy.sh --update              # 重新构建镜像并用同一个数据卷重建容器（数据不丢）"
 log "    bash deploy.sh --register            # 补登记（或换域名后重新登记）"
 log "    docker restart $CONTAINER            # 重启节点"
@@ -1169,6 +1169,7 @@ log ""
 log "  数据（数据库与附件）都在卷 $VOLUME 里 —— 备份就是导出这个卷（命令见上面 ⑤ 的提示）"
 log "  店铺资料（店名/公告/店员/通知）登录 $FRONTEND 的卖家面板网页维护，即改即生效"
 log ""
-log "  建议接着读两份（都在本仓库 docs/ 目录里）："
-log "    docs/COMPLIANCE.md  合规与责任须知（开店前必读：经营者的法律义务、个人信息、被投诉怎么办）"
+log "  建议接着读三份（都在本目录的 docs/ 里）："
+log "    docs/COMPLIANCE.md  合规与责任手册（开店前必读：经营者的法律义务、个人信息、被投诉怎么办）"
 log "    docs/OPERATIONS.md  运维手册（备份/恢复/升级/轮换密钥/故障速查）"
+log "    docs/MECHANICS.md   钱、订单与边界（钱怎么被保护、售后怎么走、明确不做什么）"

@@ -18,8 +18,12 @@
  *    "谁在什么时候提交过陈述"必须留着，只有正文属于个人信息）；
  *  - 证据附件 → DB 行 + 磁盘文件一并删除（文件才是真正的个人数据，行只是索引；
  *    删行不删文件等于"数据还在磁盘上"，是最常见的假删除）。
- * 金额、状态、链上托管单号、支付交易哈希、链上事件史、不带 PII 的评价与交付行**一律不动**：
- * 它们是账目与链上凭证，删掉就等于篡改账本（也删不掉链上那份公开历史）。
+ * 金额、状态、链上托管单号、支付交易哈希、链上事件史、平台费/净额、物流单号、退货单地址与备注、
+ * 已交付的兑换码与 NFT tokenId、不带 PII 的评价正文**一律不动**：
+ * 它们是账目、履约与链上凭证，删掉就等于篡改账本（也删不掉链上那份公开历史）。
+ * ⚠️ 这份"刻意保留"清单是**对用户的承诺**，`node/test/pii-scope-consistency.test.js` 会核对它
+ * 与 `node/docs/COMPLIANCE.md` §4、`docs/DEPLOY_NODE.md`、`docs/OPS_RUNBOOK.md` 三份文档逐项一致——
+ * 往这里加/删一类数据时，那三处要同批改（少一项不会报错，但当事人会按错误的预期行事）。
  *
  * 终局才可擦（PII_ERASABLE_STATUS）：draft/escrowed/shipped/disputed 的在途单必须保留收货
  * 信息，否则卖家无法发货、退款也无法联系买家。该约束写在核心里，两条通道同样受它约束。
@@ -118,9 +122,20 @@ export function eraseOrderPii(orderId) {
   const db = getDb();
   const id = String(orderId || '');
   const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
-  if (!order) return { error: 'not_found', message: '订单不存在' };
+  /*
+    ── 两个必填字段的**分工**（2026-10-14）────────────────────────────────────
+    `code` 明说这是哪一类结果，调用方按它分支；`error` 是一句给人看的原因。
+    为什么必须有 `code`：此前调用方用"有没有 `error` 字段"来判"这是拒绝"，
+    而**删盘失败**的结果也带 `error`（它确实是"有东西没做成"），于是被同一个守卫拦下——
+    那条分支返回的响应**不带读数**，界面恰好在这一刻读不到"盘上还剩几个文件"。
+    也就是说：靠"字段在不在"猜语义，等于让两个不同的结论共用一个形状。
+    现在三种结果的 `code` 各自不同：'not_found' / 'not_terminal' = **什么也没擦**（拒绝）；
+    成功时 `ok:true` 且 `code` 为 undefined（半成品失败由 `ok:false` + 读数表达）。
+  */
+  if (!order) return { code: 'not_found', error: 'not_found', message: '订单不存在' };
   if (!PII_ERASABLE_STATUS.includes(String(order.status))) {
     return {
+      code: 'not_terminal',
       error: 'not_terminal',
       message:
         `当前状态(${order.status})不可擦除个人信息：资金流未终结——在途单必须保留收货信息，` +

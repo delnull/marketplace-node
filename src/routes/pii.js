@@ -60,8 +60,41 @@ router.post('/orders/:id/erase-pii', ownerOnly, erasePiiLimiter, wrap(async (req
   const order = getDb().prepare('SELECT id FROM orders WHERE id = ?').get(String(req.params.id || ''));
   if (!order) return fail(res, '订单不存在', 404, 404);
   const r = eraseOrderPii(order.id);
-  // 在途单拒绝擦除（draft/escrowed/shipped/disputed 的收货信息是履约必需）——错误信息里说明出口
-  if (r.error) return fail(res, r.message || '个人信息擦除失败', 1, r.error === 'not_found' ? 404 : 200);
+  // 在途单拒绝擦除（draft/escrowed/shipped/disputed 的收货信息是履约必需）——错误信息里说明出口。
+  // ⚠️ 判据是结果方给的 `code`（'not_found' / 'not_terminal' = **什么也没擦**），
+  // 不是"有没有 error 字段"：删盘失败（**擦了一半**）也带 error，用字段存在性判会把两种结论
+  // 混成一支，那一支不下发读数——界面恰好在这一刻读不到"盘上还剩几个文件"（2026-10-14 修）。
+  if (r.code) return fail(res, r.message || '个人信息擦除失败', 1, r.code === 'not_found' ? 404 : 200);
+  /*
+    ── 成功与"擦了一半"必须**同一个形状**（2026-10-14 修）────────────────────────
+    此前删盘失败走的是业务错误分支（`fail(res, …, 1)`），那个分支**不下发读数**——
+    而界面（`utils/piiEraseAction.piiEraseOutcomeText`）正是按 `attachmentFilesRemaining` /
+    `walTruncated` / `alreadyErased` 三个读数决定说什么。于是最需要读数的时刻（盘上还有个人数据）
+    恰恰读不到，界面只能退化成一句通用文案，还可能被读成"已擦除"。
+    修法：payload 只构造一次，成功与失败走同一份字段集，差别只在 `attachmentFailed`。
+  */
+  const payload = {
+    orderId: r.orderId,
+    status: r.status,
+    alreadyErased: !r.changed,
+    erased: r.counts,
+    /*
+      **擦得干不干净**必须由这两个读数回答，不能由 `changed` 回答（2026-10-14 修订）。
+      `changed` 是"本次有没有改动"，而删除请求问的是"数据还在不在"：
+      · `attachmentFilesRemaining`：磁盘上还剩几个附件文件（0 = 干净；<0 = 目录读不出来）；
+      · `walTruncated`：WAL 是否已截断（false = 原文可能仍留在 `<db>-wal` 里）。
+      旧实现只回 `attachmentFilesRemoved`，且它是从**恒真**的判据派生的（已修），
+      于是"盘上还有文件"这件事在响应里看不出来。
+    */
+    attachmentFilesRemaining: r.attachmentFilesRemaining,
+    /* 三态布尔（与读数同款）：true 确认删净 / false 确认没删净 / null 目录读不出来 ⇒ 不敢说。
+       它与 `attachmentFilesRemaining` 一起给出，界面不必自己把残留数翻译成结论。 */
+    attachmentFilesRemoved: r.attachmentFilesRemoved,
+    walTruncated: r.walTruncated,
+    /* 盘上没删净：界面要原样展示 `error` 那句（它比通用文案具体到原因） */
+    attachmentFailed: !r.ok,
+    ...(r.ok ? {} : { error: r.error }),
+  };
   // 管理审计：detail 只记**计数**与来源，绝不把擦掉的内容再抄进审计表（那就等于没擦）
   logAudit({
     req,
@@ -83,34 +116,27 @@ router.post('/orders/:id/erase-pii', ownerOnly, erasePiiLimiter, wrap(async (req
       walTruncated: r.walTruncated,
     },
   });
-  ok(
-    res,
-    {
-      orderId: r.orderId,
-      status: r.status,
-      alreadyErased: !r.changed,
-      erased: r.counts,
-      /*
-        **擦得干不干净**必须由这两个读数回答，不能由 `changed` 回答（2026-10-14 修订）。
-        `changed` 是"本次有没有改动"，而删除请求问的是"数据还在不在"：
-        · `attachmentFilesRemaining`：磁盘上还剩几个附件文件（0 = 干净；<0 = 目录读不出来）；
-        · `walTruncated`：WAL 是否已截断（false = 原文可能仍留在 `<db>-wal` 里）。
-        旧实现只回 `attachmentFilesRemoved`，且它是从**恒真**的判据派生的（已修），
-        于是"盘上还有文件"这件事在响应里看不出来。
-      */
-      attachmentFilesRemaining: r.attachmentFilesRemaining,
-      walTruncated: r.walTruncated,
-    },
+  if (!r.ok) {
     /*
+      删盘失败：**业务码非 0**（调用方据此知道"这次没做成"），但读数照给。
       文案必须与"盘上到底还有没有东西"一致：擦除失败时锚点会被回退以便自动重试，
       于是下一次调用 `changed` 可能是 0——旧文案会把它说成"此前已擦除（幂等）"，
       而真相是"上一轮没删干净"。谎报比不报更糟，所以这里按失败态单独给一句。
     */
-    !r.ok
-      ? '库内的收货信息/备注/陈述正文/附件索引已清空，但**磁盘上的附件文件没能删掉**——请检查附件目录权限/占用后重试（系统会在下一轮保留期扫描中自动重试）'
-      : r.changed
-        ? '个人信息已擦除（金额/订单状态/链上托管单号/支付凭证/事件史/交付行/评价保留不变）'
-        : '该订单的个人信息此前已擦除（本次无内容变更；重复调用幂等）'
+    return fail(
+      res,
+      '库内的收货信息/备注/陈述正文/附件索引已清空，但**磁盘上的附件文件没能删掉**——请检查附件目录权限/占用后重试（系统会在下一轮保留期扫描中自动重试）',
+      1,
+      200,
+      payload
+    );
+  }
+  return ok(
+    res,
+    payload,
+    r.changed
+      ? '个人信息已擦除（金额/订单状态/链上托管单号/支付凭证/事件史/交付行/评价保留不变）'
+      : '该订单的个人信息此前已擦除（本次无内容变更；重复调用幂等）'
   );
 }));
 

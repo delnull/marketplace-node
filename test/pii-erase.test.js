@@ -24,6 +24,8 @@ const operator = Wallet.createRandom();
 
 const { applyEvent } = await import('../src/escrowWatcher.js');
 const { eraseOrderPii, runPiiRetention, startPiiRetentionSweep, PII_TOMBSTONE, PII_ERASABLE_STATUS, PII_PROTECTED_STATUS } = await import('../src/piiErase.js');
+// ORDER_STATUS：可擦 ∪ 受保护必须等于全部状态（本文件末尾的用例拿它对拍）
+const { ORDER_STATUS } = await import('../src/orderStatus.js');
 const { PII_RETENTION_DAYS, default: appConfig } = await import('../src/config.js');
 
 let ownerToken;
@@ -553,4 +555,117 @@ test('擦除的两条腿都在位：secure_delete 已开启、擦除后 WAL 被�
   */
   assert.equal(r.body?.data?.walTruncated, true, '擦除必须顺带把 WAL 截断（否则原文留在 -wal 里）');
   assert.equal(checkpointTruncate(), true, 'checkpointTruncate 在无写者时应返回 true');
+});
+
+/*
+  ── 2026-10-14：**删盘失败那条分支**必须真的可达、而且不许被报成"已擦除"──────────────
+  为什么这条单独成文：这个分支此前是**死代码**（判据写的是 `attachmentFiles.failed > 0`，而该字段
+  从来不存在 ⇒ `undefined > 0` 恒 false），于是磁盘上的证据附件（真正的个人数据）一个都没删掉时，
+  手动端点照样回"个人信息已擦除"、保留期扫描照样写审计、`/healthz` 也不报错。
+  修法是让 `ok` 由**事实产出方**给出的残留数派生（`remaining !== 0`，含"目录列不出来"的 -1 哨兵）。
+  但"修好了"这件事必须由测试守：这里用一次故意的删盘失败（patch `fs.rmSync` 只让它失败一次）
+  把三条结论一次钉住：
+    ① 响应必须说"没删净"（`ok:false` + 残留数 + 可读的 `error`），不能说"已擦除"；
+    ② 擦除锚点 `pii_erased_at` **不得前移**（否则保留期扫描再也不会重试 ⇒ 盘上的数据永远留着）；
+    ③ 目录恢复后重试必须成功（锚点落定、残留归零）——即"失败是**可见的**未完成，而不是静默的成功"。
+  这三条正是界面文案 `piiEraseOutcomeText` 依赖的契约（它按这三个读数分叉，不接受"已擦除"以外的猜）。
+*/
+test('删盘失败：响应必须说"没删净"、锚点不得前移，且重试能自愈（三条一起守）', async () => {
+  const fsMod = await import('node:fs');
+  const realRm = fsMod.default.rmSync;
+
+  const p = await listProduct(productPayload({ kind: 'physical', title: '删盘失败用例商品' }));
+  const { order: o, stored } = await draftWithEvidenceAndFile(
+    p.slug,
+    { name: '删盘失败', phone: '13600000002', address: '删盘地址-1' },
+    '删盘失败用例备注',
+    '删盘失败陈述'
+  );
+  assert.ok(stored && fs.existsSync(diskPath(o.id, stored)), '前置：这一单的附件必须真的在盘上');
+  assert.equal(applyEvent('ReceiptConfirmed', { orderId: o.escrowOrderId }, { txHash: payHash(), block: 96 }), 1);
+
+  // 故意让"删附件目录"失败**一次**：其余 fs 调用照旧（只拦 rmSync）
+  let failedOnce = false;
+  fsMod.default.rmSync = (...args) => {
+    if (!failedOnce) {
+      failedOnce = true;
+      throw new Error('EBUSY: 文件被占用（本用例故意构造）');
+    }
+    return realRm(...args);
+  };
+  let first;
+  try {
+    first = await eraseViaApi(o.id);
+  } finally {
+    fsMod.default.rmSync = realRm;
+  }
+
+  assert.ok(first, '请求本身仍应成功返回（失败由响应体如实表达，不是 HTTP 错误）');
+  const d = first.body?.data || {};
+  assert.equal(d.attachmentFilesRemaining > 0, true, `必须报出磁盘残留数（实际 ${d.attachmentFilesRemaining}）`);
+  assert.equal(d.attachmentFilesRemoved, false, '三态读数必须明确说"确认没删净"（不是 null、更不是 true）');
+  assert.match(String(d.error || ''), /还剩|无法读取/, 'error 必须是一句可读的原因，界面要原样展示它');
+  assert.equal(rowOf(o.id).pii_erased_at, null, '删盘失败 ⇒ 锚点不得前移，否则保留期扫描再也不会重试');
+  assert.equal(rowOf(o.id).shipping_name, '', '库内字段该擦的仍要擦（只有磁盘那部分没做成）');
+
+  // 目录恢复后重试：必须成功并落定锚点（"失败是可见的未完成"这条承诺的后半句）
+  const second = await eraseViaApi(o.id);
+  const d2 = second.body?.data || {};
+  assert.equal(d2.attachmentFilesRemaining, 0, '重试后磁盘必须干净');
+  assert.equal(d2.attachmentFilesRemoved, true, '重试后必须明确说"确认删净"');
+  assert.ok(rowOf(o.id).pii_erased_at, '重试成功 ⇒ 锚点落定');
+});
+
+/*
+  ── 2026-10-14：擦除入口的**可见性判据**必须在出参里（前端不许自己按状态猜）──────────
+  背景：节点早有 ownerOnly 的擦除端点，但店主面板上**没有入口**（前端全仓 0 处引用 erase-pii），
+  而使用指南却写着"店主可在卖家面板执行擦除"——把读者支到一个不存在的按钮上。
+  修法不是在前端补一个 `status === 'confirmed' || …` 数组：可擦状态集合的唯一出处在
+  `src/orderStatus.js`（`PII_ERASABLE_STATUS`），前端再抄一份，集合一改就是**静默漂移**
+  （多出一个必败按钮，或少一个本该存在的入口）。所以由节点算好 `piiErasable` 下发，
+  这里守两件事：① 它确实是"状态能否擦"的忠实映射（逐状态对拍同一份集合）；
+  ② 它在**卖家列表出参**里真的带着（前端拿的就是这个列表）。
+  权限（ownerOnly）不在这里表达——那是登录角色的事，前端另行门控（见 utils/piiEraseAction）。
+*/
+test('订单出参带 piiErasable：与可擦状态集合逐状态一致，且在卖家列表里真实下发', async () => {
+  const p = await listProduct(productPayload({ kind: 'physical', title: '可擦判据商品' }));
+  const o = await createDraft(p.slug, {
+    shipping: { name: '判据甲', phone: '13700000001', address: '判据地址-1' },
+  });
+  escrowed(o);
+
+  /** 把这一单改成某状态后，从**卖家列表**（前端唯一取数入口）读回它的可擦判据 */
+  const erasableViaSellerList = async (status) => {
+    db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, o.id);
+    const r = await request(app).get('/api/orders/seller?pageSize=100').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+    assertOk(r);
+    const row = r.body.data.orders.find((x) => x.id === o.id);
+    assert.ok(row, `订单应出现在卖家列表里（status=${status}）`);
+    return row.piiErasable;
+  };
+
+  for (const status of PII_ERASABLE_STATUS) {
+    assert.equal(await erasableViaSellerList(status), true, `${status} 应可擦（在 PII_ERASABLE_STATUS 里）`);
+  }
+  for (const status of PII_PROTECTED_STATUS) {
+    assert.equal(
+      await erasableViaSellerList(status),
+      false,
+      `${status} 不可擦（在途单要按地址发货/联系买家）——界面据此不渲染入口`
+    );
+  }
+  // 两份集合的并集必须是全部状态：漏掉一个状态会让那一类单**永远**既不可擦也不被拦（静默）
+  assert.deepEqual(
+    [...PII_ERASABLE_STATUS, ...PII_PROTECTED_STATUS].sort(),
+    [...ORDER_STATUS].sort(),
+    '可擦 ∪ 受保护 = 全部订单状态'
+  );
+  // 擦除后仍可再次调用（幂等），但锚点会前移——界面用 piiErasedAt 显示"已擦过"而不是隐藏入口
+  assert.equal(applyEvent('ReceiptConfirmed', { orderId: o.escrowOrderId }, { txHash: payHash(), block: 95 }), 1);
+  const erased = await eraseViaApi(o.id);
+  assertOk(erased);
+  const after = await request(app).get('/api/orders/seller?pageSize=100').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const row = after.body.data.orders.find((x) => x.id === o.id);
+  assert.equal(row.piiErasable, true, '已擦过的单在状态上仍属"可擦"（重复调用幂等，不是错误）');
+  assert.ok(row.piiErasedAt, '擦除锚点必须下发，界面才不会把"已擦过"说成"从没擦过"');
 });

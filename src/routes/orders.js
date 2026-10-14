@@ -105,6 +105,7 @@ import {
   ACTIVE_IN,
   PRE_PAID_IN,
   DRAFT_OR_ACTIVE_IN,
+  PII_ERASABLE_STATUS,
 } from '../orderStatus.js';
 import { verifyToken, roleOf, isStaff } from '../auth.js';
 import { logAudit } from '../audit.js';
@@ -340,6 +341,20 @@ function orderToPublic(o, opts = {}) {
       : null,
     // 收货信息是否已修改过一次（发货前仅一次修改通道；0/1）
     shippingEdited: shippingVisible ? !!o.shipping_edit_count : null,
+    /**
+     * **这一单此刻能不能擦除个人信息**（店主侧的「擦除个人信息」入口按它显隐）。
+     *
+     * 为什么由节点下发而不是前端按状态判（2026-10）：可擦状态集合的**唯一出处**是
+     * `src/orderStatus.js` 的 `PII_ERASABLE_STATUS`（在途四种状态必须保留收货信息，否则卖家无法发货），
+     * 而 `PII_PROTECTED_STATUS` 与它互斥且并集 = 全部状态。前端若自己写一份 `['confirmed', …]`，
+     * 就多出第二份真相：集合一改，前端那处**不报错**，只会静默地少一个入口或多出一个必败按钮
+     * （用户看到的是"点了没反应/被拒"，而不是"这个功能没同步"）。
+     * 这里只反映"状态允许擦"，**不反映权限**——端点是 ownerOnly，店员看到入口也会被 401 拒绝，
+     * 所以调用方必须**同时**用登录角色（`vm.isOwner`）门控，两件事不要合并成一个布尔。
+     */
+    piiErasable: PII_ERASABLE_STATUS.includes(o.status),
+    /** 个人信息擦除锚点（毫秒；null = 从未擦过）。**只写这一列、绝不写 `updated_at`**（口径见 piiErase.js） */
+    piiErasedAt: o.pii_erased_at ?? null,
     amountWei: o.amount_wei,
     amountDecimal: weiToDecimal(o.amount_wei),
     /**

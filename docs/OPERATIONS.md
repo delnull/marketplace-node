@@ -3,7 +3,9 @@
 > 读者就是店主本人：节点在你自己的服务器上，数据在你自己的机器里，出问题只有你能处理。不需要懂运维，但请照做。
 > 三条原则：**动手前先备份**；**涉及资金先对账**；**看不懂的字段照表判，不要猜**。
 >
-> 本文是 **Docker 版**：宿主机上只有 Docker、一个数据卷、（可选）一个反向代理容器——**宿主机不装 Node，也没有 systemd 单元**。
+> 本文是 **Docker 版**：宿主机上只有 Docker、一个数据卷，**宿主机不装 Node，也没有 systemd 单元**。
+> 例外只有一处：选了 `--tls-mode nginx` 时脚本会在宿主装 nginx + certbot 并写 `/etc/nginx/conf.d`（详见 §6 与 `deploy.sh --help`）；
+> 默认的 `--tls-mode none` 不在宿主装任何东西，反代与证书都由你自己的入口负责。
 > 这是刻意的：宿主环境（发行版不同、包管理器不同、可能已经有别人的服务在跑）是最不可控的变量，Node 与依赖全在镜像里，
 > 于是**容器可以随时删掉重建**（升级就是换个镜像），搬家就是导出/导入那个卷。
 
@@ -146,12 +148,14 @@ docker start marketplace-node     # 起一个新空库，从 MK_ESCROW_START_BLO
 
 ```bash
 cd /opt/marketplace-node
-docker tag marketplace-node:latest marketplace-node:keep-$(date +%F)   # 升级前给旧镜像留个标签，回滚要用
-git pull --ff-only        # 让安装目录里的代码变成新版（当初不是 git clone 装的，就跳过这一步）
-bash deploy.sh --update   # 重新构建镜像 → 用同一个数据卷与配置重建容器
+git pull --ff-only              # 在安装目录里 git clone 装的：让代码变成新版
+bash deploy.sh --update         # 重新构建镜像 → 用同一个数据卷与配置重建容器
+# 安装目录里没有 git（当初用 ZIP 或 bash <(curl …) 装的）：跳过 git pull，改用
+#   bash deploy.sh --update --pull    ← 强制从公开仓拉最新代码（需要能访问 GitHub）
 ```
 
-- **`--update` 只做"用安装目录里现有的代码重建镜像 + 重建容器"，它不会替你拉代码**：所以那行 `git pull` 要不要跑，取决于你当初怎么装的（在安装目录里 `git clone` 装的要；用 `bash <(curl …)` 或下载 ZIP 解压装的，要自己把新代码换上去）。想记下升级前的代码版本：`cd /opt/marketplace-node && git rev-parse --short HEAD`。
+- **`--update` 本身只做"用安装目录里现有的代码重建镜像 + 重建容器"**；要它顺便把代码换成公开仓最新版，就加 `--pull`（脚本会在第 ② 步拉取）。想记下升级前的代码版本：`cd /opt/marketplace-node && git rev-parse --short HEAD`。
+- **回滚点脚本会自己留**：升级时它把当前镜像打成 `<服务名>-rollback:latest`（并打印出来），新容器探活失败会自动用那个镜像重建；所以上面那行 `docker tag` 只是给你自己多留一份带日期的备份。
 - `.env` 里**脚本管理的键**（端口、店主地址、域名、CORS 白名单等，共二十多个）会按本次参数与状态文件重写一遍；**你自己加的那些键**（兜底汇率、风控闸、`MK_OWNER_LOGIN_ALERT` 等）会原样保留，脚本还会把它们列出来告诉你保留了哪些。
 - **升级前先按 §2 备份**（代码能退回去，数据不会跟着退回去）；升级后必做两件事：`bash deploy.sh --health`（对照 §1 三块）与 `docker exec -u node marketplace-node npm run reconcile`（exit 0）。
 - **升级前先看计划**：`bash deploy.sh --update --dry-run` 什么都不改；非交互场景（脚本里 / `ssh` 不带 `-t`）加 `--yes`，例如 `bash deploy.sh --update --yes`。
@@ -195,7 +199,7 @@ docker run -d --name marketplace-node --restart unless-stopped \
 ### 6.2 换店主钱包（链上转让）
 
 - 店主身份 = 店主钱包地址（`.env` 的 `MK_SHOP_OWNER`）；**链上登记的 operator 就是登记时用的那个钱包**，链上更新登记 / 注销只能由它发起。
-- 换店主**不能只改 `.env`**：要走链上 Registry 的原子转让 `transferNode`——登记从旧 operator 直接换到新 operator，**没有抢注窗口**，也不用"先注销再注册"。转让要**双方各签一次**（旧店主 `fromSig` + 新店主 `toSig`，各自的 EIP-191 personal 签名；摘要 = `keccak256(abi.encode(from, to, endpoint, escrowAddress, deadline, chainId, registry))`，chainId = 2999）。**票据带 `deadline`（2026-10-13 起，`transferNode` 的第 5 个参数）**：它进签名消息体、由双方签字那一刻定死，`block.timestamp > deadline` 即 `TransferExpired`——**授权不再永久有效**。没有时效时，一份泄露的票据（截图/转发/误发/设备被读）可以在**任意未来时刻**被广播，把店铺连同编号与店龄一起拿走，而店主没有任何链上撤销手段；过期只需**重新签一份**（链上刻意没有"撤销"这种状态），所以给一个够用的窗口（例如几天）就行，别签成永久。**前端转让向导尚未实现**，目前只能用脚本 / 钱包直调合约——这一步建议找懂链上工具的人配合。
+- 换店主**不能只改 `.env`**：要走链上 Registry 的原子转让 `transferNode`——登记从旧 operator 直接换到新 operator，**没有抢注窗口**，也不用"先注销再注册"。转让要**双方各签一次**（旧店主 `fromSig` + 新店主 `toSig`，各自的 EIP-191 personal 签名；摘要 = `keccak256(abi.encode(from, to, endpoint, escrowAddress, deadline, chainId, registry))`，chainId = 2999）。**票据带 `deadline`（2026-10-13 起，`transferNode` 的第 5 个参数）**：它进签名消息体、由双方签字那一刻定死，过期即 `TransferExpired`。**别签成永久**——一份泄露的票据能在任意未来时刻被广播，把店铺连同编号与店龄一起拿走；给几天就够，过期重新签一份即可。界面在卖家面板「店铺设置 → 生命周期」：出票据（旧店主签）、粘贴票据接管（新店主签）。
 - **转让的是店铺经营权，不是历史订单的资金归属**：链上托管单的 `seller` 在下单时已锁定且不可更改，在途订单仍按 §6.3 处理。
 - 操作顺序：新服务器按 §5 恢复数据 → `.env` 设 `MK_SHOP_OWNER=新地址` → `bash deploy.sh --update`（重建容器）→ `docker exec -u node marketplace-node npm run reconcile` 对账 → 到店铺页确认「链上登记 operator」已变成新地址。
 - 旧店主**无法操作**（失能、身故）时：转让必须 `fromSig`，**拿不到旧私钥就转不了**——这是双签设计的必然代价；此时新店主只能用新地址另起一家店，搬走能搬的数据（商品 / 码池），并在原店公告与社区渠道公示。
