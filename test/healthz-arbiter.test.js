@@ -96,3 +96,47 @@ test('/healthz：确证读到仲裁人时给出地址与 known=true', async () =
   assert.equal(h.arbiter.arbiter, arbiterOnchain);
   assert.equal(h.arbiter.lastOk?.addr, arbiterOnchain, '最后一次成功读数可查（排障线索）');
 });
+
+/**
+ * `/healthz` 也要能看见"下单超时窗口这次没校验成"（2026-10-14 独立评审后补）。
+ *
+ * 背景：`checkOrderTimeoutBounds` 在启动期只跑一次，而它的 `unknown` 档
+ * （读不到链上界 / 配置值非法）**刻意不阻断启动**——否则一次 RPC 抖动就能停掉一个配置正确的节点。
+ * 代价是"这次没校验成"必须有个地方能看见，否则它随启动日志一起丢了；
+ * 而真越界的配置会让**每一笔下单**都在买家钱包里 revert（店面看起来完全正常）。
+ */
+test('/healthz：暴露下单超时窗口自检结论（含"没校验成"这一档）', async () => {
+  const { setOrderTimeoutSelfCheck } = await import('../src/chain.js');
+
+  // 未跑过（例如未配置 MK_ESCROW_ADDRESS 的分支）⇒ null，不是"通过"
+  setOrderTimeoutSelfCheck(null);
+  assert.equal((await health()).orderTimeout, null, '没跑过就是 null，不得伪装成 ok');
+
+  // unknown 档：如实转达，且**不是** ok
+  setOrderTimeoutSelfCheck({
+    verdict: 'unknown',
+    reason: 'unreadable',
+    configured: 120960,
+    min: null,
+    max: null,
+    message: '读不到链上下单超时窗口的上下界',
+  });
+  const unknown = (await health()).orderTimeout;
+  assert.equal(unknown.verdict, 'unknown');
+  assert.equal(unknown.reason, 'unreadable');
+  assert.notEqual(unknown.verdict, 'ok', '没校验成不得显示为通过');
+
+  // blocked 档：结论要能被运维直接看到（真越界时节点的下单会全灭）
+  setOrderTimeoutSelfCheck({
+    verdict: 'blocked',
+    reason: 'too-low',
+    configured: 1000,
+    min: 17280,
+    max: 518400,
+    message: 'MK_ESCROW_TIMEOUT_BLOCKS=1000 低于链上下界 17280',
+  });
+  const blocked = (await health()).orderTimeout;
+  assert.equal(blocked.verdict, 'blocked');
+  assert.equal(blocked.configured, 1000);
+  assert.equal(blocked.min, 17280);
+});

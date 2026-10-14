@@ -228,10 +228,19 @@ export async function assertChainId() {
  *
  * 判据只有一处：链上 `minTimeoutBlocks()` / `MAX_TIMEOUT_BLOCKS()`（合约自己的读数），
  * 不在节点里再抄一份常量（抄一份就是第二个真相，合约改常量时它必然漂移）。
- * 读不到 ⇒ `unknown`（本函数不把"读不到"说成"越界"；调用方按仓库纪律拒绝启动并给逃生口）。
  *
- * @returns {{ ok: boolean, reason: 'ok'|'too-low'|'too-high'|'unknown', configured: number,
- *             min: number|null, max: number|null, message: string }}
+ * **三档而不是两档**（2026-10-14 独立评审后收口）：只有"读到了链上界、且配置越界"才算
+ * `blocked`；`unknown`（读不到 / 配置值本身非法）**不阻断启动**，只把结论留在
+ * `orderTimeoutSelfCheck()` 里、由 `/healthz` 与启动日志说出来。理由：
+ *   · 把"读不到"升格成"拒绝启动"，等于让**一次 RPC 抖动**停掉一个本来配置正确的节点——
+ *     而缺省值（120960 = 7 天）本来就在合法区间内，停服换不来任何安全；
+ *   · 与仓库既有口径一致：`opsMetrics` / `feeStatus` / `arbiterStatus` 对"读不到"一律给
+ *     **独立的一档**（available:false / known:false），绝不与"确证有问题"合并。
+ * 代价如实写明：真读到越界之前，节点会带着一个"可能付不了款"的配置继续跑——所以
+ * `unknown` 在启动日志里是**显眼的警告**，且 `/healthz` 能查到。
+ *
+ * @returns {{ verdict: 'ok'|'blocked'|'unknown', reason: 'ok'|'too-low'|'too-high'|'unreadable'|'invalid-config',
+ *             configured: number, min: number|null, max: number|null, message: string }}
  */
 export async function checkOrderTimeoutBounds() {
   const configured = Number(config.escrow.timeoutBlocks);
@@ -239,8 +248,8 @@ export async function checkOrderTimeoutBounds() {
   if (!Number.isFinite(configured) || configured <= 0) {
     return {
       ...base,
-      ok: false,
-      reason: 'unknown',
+      verdict: 'unknown',
+      reason: 'invalid-config',
       message: `MK_ESCROW_TIMEOUT_BLOCKS 不是正整数（${String(config.escrow.timeoutBlocks)}）——这份草稿的超时窗口无法确定`,
     };
   }
@@ -253,22 +262,27 @@ export async function checkOrderTimeoutBounds() {
   } catch (e) {
     return {
       ...base,
-      ok: false,
-      reason: 'unknown',
+      verdict: 'unknown',
+      reason: 'unreadable',
       message: `读不到链上下单超时窗口的上下界（minTimeoutBlocks / MAX_TIMEOUT_BLOCKS）：${String(
         e?.shortMessage || e?.message || e
       ).slice(0, 80)}`,
     };
   }
   if (!Number.isFinite(min) || !Number.isFinite(max) || min <= 0 || max <= 0) {
-    return { ...base, ok: false, reason: 'unknown', message: `链上返回的窗口上下界不可用（min=${min} max=${max}）` };
+    return {
+      ...base,
+      verdict: 'unknown',
+      reason: 'unreadable',
+      message: `链上返回的窗口上下界不可用（min=${min} max=${max}）`,
+    };
   }
   base.min = min;
   base.max = max;
   if (configured < min) {
     return {
       ...base,
-      ok: false,
+      verdict: 'blocked',
       reason: 'too-low',
       message:
         `MK_ESCROW_TIMEOUT_BLOCKS=${configured} 低于链上下界 ${min}（Escrow.minTimeoutBlocks）：` +
@@ -278,14 +292,31 @@ export async function checkOrderTimeoutBounds() {
   if (configured > max) {
     return {
       ...base,
-      ok: false,
+      verdict: 'blocked',
       reason: 'too-high',
       message:
         `MK_ESCROW_TIMEOUT_BLOCKS=${configured} 超过链上上限 ${max}（Escrow.MAX_TIMEOUT_BLOCKS）：` +
         `每一笔 createOrder 都会被 InvalidTimeout 回滚。请设为 ≤ ${max} 后重启`,
     };
   }
-  return { ...base, ok: true, reason: 'ok', message: `下单超时窗口 ${configured} 块在链上允许区间 [${min}, ${max}] 内` };
+  return { ...base, verdict: 'ok', reason: 'ok', message: `下单超时窗口 ${configured} 块在链上允许区间 [${min}, ${max}] 内` };
+}
+
+/**
+ * 最近一次下单超时窗口自检的结论（进程内状态，供 `/healthz` 与排障）。
+ *
+ * 为什么要留这个读数：`checkOrderTimeoutBounds` 在启动期只跑一次，而它的 `unknown` 档
+ * **不阻断启动**（见上）——那一档必须有个地方能看见，否则"这次没校验成"就随日志一起丢了。
+ * 与 `arbiterStatus()` / `feeStatus()` 同款：**"读不到"要能作为一个独立结论被看见**。
+ */
+let _orderTimeoutCheck = null;
+/** @param {object|null} v 自检结论（`checkOrderTimeoutBounds` 的返回值） */
+export function setOrderTimeoutSelfCheck(v) {
+  _orderTimeoutCheck = v;
+}
+/** @returns {object|null} 最近一次自检结论；从未跑过时为 null */
+export function orderTimeoutSelfCheck() {
+  return _orderTimeoutCheck;
 }
 
 /**

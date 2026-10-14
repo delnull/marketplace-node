@@ -133,21 +133,37 @@ if (config.chain.escrowAddress) {
     `MK_ESCROW_TIMEOUT_BLOCKS` 是本节点自己填进草稿的值，合约对它另有常量上下界。
     配越界时节点会**绿灯启动**，而全网每一笔下单都在买家钱包里 revert ——
     运营方看到的现象是"没人下单"，与真实原因（一个环境变量）相隔十万八千里。
-    与"库缺一列/密钥是占位值/合约代次不对"同一道纪律：要么可用，要么拒绝启动并写明怎么改。
-    逃生口沿用 MK_CONTRACT_GEN_ACK（与代次自检同一个"我确实知道"的声明）。
+    与"库缺一列/密钥是占位值/合约代次不对"同一道纪律：配错就拒绝启动并写明怎么改。
+
+    **只有"读到了界、且确实越界"才拒绝启动**（verdict='blocked'）；`verdict='unknown'`
+    （读不到链上界 / 配置值本身非法）**只大声告警、照常启动**——把"读不到"升格成停服，
+    等于让一次 RPC 抖动停掉一个本来配置正确的节点（缺省值 120960 本就在合法区间内）。
+    那一档的结论留在 `orderTimeoutSelfCheck()` 里，由 /healthz 与这行告警说出来。
+
+    逃生口：MK_CONTRACT_GEN_ACK=1。⚠️ 它与**合约代次自检**共用同一个变量（见上面的 gen 分支）
+    ——放行这一条会**同时**放行代次不符，而那正是"旧一代 Escrow 没有 minTimeoutBlocks /
+    MAX_TIMEOUT_BLOCKS、因而在本闸报 unknown"的同一批实例。
   */
-  const { checkOrderTimeoutBounds } = await import('./chain.js');
+  const { checkOrderTimeoutBounds, setOrderTimeoutSelfCheck } = await import('./chain.js');
   const bounds = await checkOrderTimeoutBounds();
-  if (!bounds.ok) {
+  setOrderTimeoutSelfCheck(bounds);
+  if (bounds.verdict === 'blocked') {
     const why =
       `${bounds.message}\n` +
       `  影响：下单草稿里写的就是这个值，买家的 createOrder 必然回滚——店面能浏览、但一单也成不了。\n` +
-      `  处置：改 .env 里的 MK_ESCROW_TIMEOUT_BLOCKS 后**重建容器**（docker restart 读不到新 .env）。`;
+      `  处置：改 .env 里的 MK_ESCROW_TIMEOUT_BLOCKS 后**重建容器**（docker restart 读不到新 .env）。\n` +
+      `  注意：MK_CONTRACT_GEN_ACK=1 会**同时**放行合约代次自检，别为一个环境变量把它一起关掉。`;
     if (String(process.env.MK_CONTRACT_GEN_ACK || '') !== '1') {
-      console.error(`[server] 下单超时窗口自检未通过：\n  ${why}`);
+      console.error(`[server] 下单超时窗口自检未通过（配置确定越界）：\n  ${why}`);
       process.exit(1);
     }
     console.warn(`[server] 下单超时窗口自检未通过（MK_CONTRACT_GEN_ACK=1 已显式放行）：\n  ${why}`);
+  } else if (bounds.verdict === 'unknown') {
+    console.warn(
+      `[server] 下单超时窗口**这次没能校验**（不阻断启动）：${bounds.message}\n` +
+        `  含义：无法确认 MK_ESCROW_TIMEOUT_BLOCKS=${bounds.configured} 是否落在链上允许区间内。\n` +
+        `  若它其实越界，下单会全部失败而店面看起来正常——请核对 /healthz 的 orderTimeout 字段，或重启一次让本闸重跑。`
+    );
   } else {
     console.log(`[marketplace-node] 下单超时窗口自检通过（${bounds.message}）`);
   }

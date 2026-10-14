@@ -11,8 +11,8 @@ import { escrowWatcherStatus } from './escrowWatcher.js';
 import { piiRetentionStatus } from './piiErase.js';
 import { chainReconcileStatus } from './chainReconcile.js';
 import { escrowAnchorStatus } from './chainAnchor.js';
-// 仲裁人读数（三态：确证到了 / 读不到）。**读不到必须能看见**——见 /healthz 里的说明
-import { arbiterStatus } from './chain.js';
+// 仲裁人读数与下单超时窗口自检：两者都有"读不到"这一档，而**读不到必须能看见**
+import { arbiterStatus, orderTimeoutSelfCheck } from './chain.js';
 // 上传目录用量（视频把单个孤儿的成本从 2MB 抬到 50MB ⇒ 磁盘必须可见，见 productMedia.js）
 import { mediaUsage } from './productMedia.js';
 
@@ -179,6 +179,14 @@ export function createApp() {
         与 `fees.feeStatus()` 同款三态——"读不到"必须能作为一个独立结论被看见。
       */
       arbiter: arbiterStatus(),
+      /*
+        下单超时窗口自检的结论（2026-10-14）。为什么要暴露它：`checkOrderTimeoutBounds` 在启动期
+        只跑一次，而它的 `unknown` 档（读不到链上界 / 配置值本身非法）**刻意不阻断启动**——
+        否则一次 RPC 抖动就能停掉一个配置正确的节点。代价是"这次没校验成"必须有个地方能看见，
+        否则它随启动日志一起丢了，而越界的配置会让**每一笔下单**都在买家钱包里 revert。
+        从未跑过（例如未配置 MK_ESCROW_ADDRESS）时为 null。
+      */
+      orderTimeout: orderTimeoutSelfCheck(),
       /*
         商品媒体（upload dir）用量：孤儿媒体**刻意不删**（订单快照锁的是 URL 字符串），
         而视频把单个孤儿的成本从 2MB 抬到 50MB —— 磁盘是这个功能新引入的失败面，

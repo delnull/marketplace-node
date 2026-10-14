@@ -164,10 +164,10 @@ export async function tryAutoDeliverByEscrowOrder(orderIdHex) {
  * （`tryAutoDeliverOrder` 里的 `order.refund_status === 'requested'`），而镜像有 15s 轮询 +
  * 12 块确认深度的滞后窗口：买家已经在链上 `requestRefund`、watcher 还没落地的这段时间里，
  * 店主一导入码就会把码发给一个**即将退款**的买家（钱退回去、货也送出去）。
- * 同文件的 `flushAutoDeliverPending` 早就在做这件事（`fetchOnchainOrder` + 仅
- * `status=Created(1) 且 refundRequested=false` 才发），本函数是唯一漏网的那条自动交付入口。
+ * 复核由 `tryAutoDeliverByEscrowOrder` 一处承担（2026-10-14 起；此前它与
+ * `flushAutoDeliverPending` 各自内联了一份同样的判据）。
  * 复核失败（RPC 读不到）时**不发**：自动交付是"锦上添花"，宁可留给卖家面板手动交付，
- * 也不要在看不清链上状态时把码发出去（与 flush 的取舍一致）。
+ * 也不要在看不清链上状态时把码发出去。
  */
 export async function tryAutoDeliverPendingForProduct(productId) {
   const rows = getDb()
@@ -177,17 +177,13 @@ export async function tryAutoDeliverPendingForProduct(productId) {
     .all(Number(productId) || 0);
   let delivered = 0;
   for (const o of rows) {
-    // 无链上单号的行没有可复核的对象（理论上不会出现：paid 回写必然带单号）——交给手动交付
-    if (!o.escrow_order_id) continue;
-    let cur = null;
-    try {
-      cur = await fetchOrderFor(o.escrow_order_id);
-    } catch {
-      continue; // RPC 不可达：本轮跳过（下次补货/回放时再试），不冒险发码
-    }
-    const statusOk = String(cur?.status || '') === 'Created';
-    if (!statusOk || cur?.refundRequested) continue;
-    if (tryAutoDeliverOrder(o)) delivered += 1;
+    /*
+      **走唯一入口**，而不是在这里再抄一遍"链上 Created 且未申请退款"那条判据
+      （2026-10-14 独立评审指出：本函数与 `flushAutoDeliverPending` 各自内联了一份，
+      于是同一问题有三个答案层——正是本次要删掉的那个形状）。
+      行筛选仍留在这里（它表达的是"这条补跑路径该管哪些单"），交付判据交给 `ByEscrowOrder`。
+    */
+    if (await tryAutoDeliverByEscrowOrder(o.escrow_order_id)) delivered += 1;
   }
   return delivered;
 }
@@ -196,9 +192,9 @@ export async function tryAutoDeliverPendingForProduct(productId) {
  * 追赶回放收尾后的待交付冲刷跨批回放残留——OrderCreated 与其后的
  * RefundApproved 分属两个 SCAN_LIMIT 窗口时，前窗回放已把码发出、后窗才把单置 refunded，
  * 已退款买家免费得码）。回放期间 pollOnce 对未达链头的窗口抑制自动交付（behind 抑制），
- * 全部窗口追平后调用本函数：对仍 escrowed+有凭证的数字自动交付单逐单以**链上当前真值**
- * （getOrder）复核——仅 status=Created(1) 且 refundRequested=false 才补交付；
- * 已终局/退款冻结的行由后续事件迁移置终态，不发码。
+ * 全部窗口追平后调用本函数：对仍 escrowed+有凭证的数字自动交付单逐单**复核链上当前真值**
+ * （由 `tryAutoDeliverByEscrowOrder` 一处负责：仅 status=Created(1) 且 refundRequested=false 才补交付；
+ * 读不到就不发）；已终局/退款冻结的行由后续事件迁移置终态，不发码。
  * 返回本次补交付的订单数（幂等：行守卫由 tryAutoDeliverOrder/deliverDigitalFromPool 承担）。
  */
 export async function flushAutoDeliverPending() {
@@ -211,16 +207,9 @@ export async function flushAutoDeliverPending() {
   let checked = 0;
   for (const o of rows) {
     checked += 1;
-    try {
-      const cur = await fetchOrderFor(o.escrow_order_id);
-      const statusOk = String(cur?.status || '') === 'Created';
-      if (statusOk && !cur.refundRequested) {
-        if (tryAutoDeliverOrder(o)) delivered += 1;
-      }
-    } catch {
-      // RPC 不可达：保留 escrowed 待手动交付/下次冲刷，不阻断收尾
-      console.warn(`[autoDeliver] 冲刷 ${o.id.slice(0, 8)}… 链上真值读取失败，保留待手动交付`);
-    }
+    // 同 `tryAutoDeliverPendingForProduct`：判据只有 `tryAutoDeliverByEscrowOrder` 一处
+    // （链上 Created 且未申请退款才发；读不到就不发）——这里不再内联第二份。
+    if (await tryAutoDeliverByEscrowOrder(o.escrow_order_id)) delivered += 1;
   }
   if (checked > 0) console.log(`[autoDeliver] 追赶收尾冲刷完成：复核 ${checked} 单，补交付 ${delivered} 单`);
   return delivered;

@@ -81,7 +81,7 @@ async function runWith(configured, bounds) {
 
 test('界内通过：默认 7 天（120960）落在链上 [17280, 518400] 之间', async () => {
   const r = await runWith(120_960, { min: 17_280n, max: 518_400n });
-  assert.equal(r.ok, true);
+  assert.equal(r.verdict, 'ok');
   assert.equal(r.reason, 'ok');
   assert.equal(r.min, 17_280);
   assert.equal(r.max, 518_400);
@@ -89,22 +89,22 @@ test('界内通过：默认 7 天（120960）落在链上 [17280, 518400] 之间
 });
 
 test('边界值本身通过（等于下界 / 等于上限都不算越界）', async () => {
-  assert.equal((await runWith(17_280, { min: 17_280n, max: 518_400n })).ok, true, '恰好等于下界');
-  assert.equal((await runWith(518_400, { min: 17_280n, max: 518_400n })).ok, true, '恰好等于上限');
+  assert.equal((await runWith(17_280, { min: 17_280n, max: 518_400n })).verdict, 'ok', '恰好等于下界');
+  assert.equal((await runWith(518_400, { min: 17_280n, max: 518_400n })).verdict, 'ok', '恰好等于上限');
 });
 
-test('配得太低：必须判 too-low 并给出可照做的下一值（TimeoutTooShort 的现场）', async () => {
+test('配得太低：必须判 blocked/too-low 并给出可照做的下一值（TimeoutTooShort 的现场）', async () => {
   const r = await runWith(1_000, { min: 17_280n, max: 518_400n });
-  assert.equal(r.ok, false);
+  assert.equal(r.verdict, 'blocked', '确证越界 ⇒ 拒绝启动');
   assert.equal(r.reason, 'too-low');
   assert.equal(r.min, 17_280);
   assert.match(r.message, /TimeoutTooShort/, '要说清链上会以哪个错误拒绝（否则只看到"没人下单"）');
   assert.match(r.message, /17280/, '要给出该改成什么值');
 });
 
-test('配得太高：必须判 too-high（InvalidTimeout 的现场）', async () => {
+test('配得太高：必须判 blocked/too-high（InvalidTimeout 的现场）', async () => {
   const r = await runWith(999_999, { min: 17_280n, max: 518_400n });
-  assert.equal(r.ok, false);
+  assert.equal(r.verdict, 'blocked');
   assert.equal(r.reason, 'too-high');
   assert.equal(r.max, 518_400);
   assert.match(r.message, /InvalidTimeout/);
@@ -112,33 +112,52 @@ test('配得太高：必须判 too-high（InvalidTimeout 的现场）', async ()
 
 test('下界随治理调整：合约把 minTimeoutBlocks 提到 7 天后，原来合法的 1 天就变成 too-low', async () => {
   // 同一个配置值 17280，在两个不同的链上读数下结论相反 —— 证明判据取自链上而不是抄来的常量
-  assert.equal((await runWith(17_280, { min: 17_280n, max: 518_400n })).ok, true);
+  assert.equal((await runWith(17_280, { min: 17_280n, max: 518_400n })).verdict, 'ok');
   const raised = await runWith(17_280, { min: 120_960n, max: 518_400n });
-  assert.equal(raised.ok, false);
+  assert.equal(raised.verdict, 'blocked');
   assert.equal(raised.reason, 'too-low');
   assert.match(raised.message, /120960/);
 });
 
-test('读不到链上读数：判 unknown，**不得**说成越界（"读不到"与"越界"是两件事）', async () => {
+/**
+ * 读不到 ⇒ `unknown`，且**这一档不阻断启动**（2026-10-14 独立评审后收口）。
+ *
+ * 旧实现把"读不到"与"越界"合并成 `ok:false`，于是**一次 RPC 抖动就能停掉一个配置正确的节点**
+ * （缺省 120960 本来就在合法区间内）——停服换不来任何安全，因为越界这件事根本还没被证实。
+ * 本仓既有口径也是这么分的：`opsMetrics` / `feeStatus` / `arbiterStatus` 对"读不到"一律给
+ * **独立的一档**，绝不与"确证有问题"合并。所以这里同时断言"不得说成越界"与"不是 blocked"。
+ */
+test('读不到链上读数：判 unknown（verdict≠blocked），**不得**说成越界', async () => {
   for (const bounds of [
     { min: null, max: 518_400n },
     { min: 17_280n, max: null },
     { min: null, max: null },
+    // 链上返回 0/负数（读法存在但值不可用）同样归"读不到"，不是"越界"
+    { min: 0n, max: 518_400n },
+    { min: 17_280n, max: 0n },
   ]) {
     const label = `min=${String(bounds.min)} max=${String(bounds.max)}`;
     const r = await runWith(120_960, bounds);
-    assert.equal(r.ok, false, `读不到必须不放行：${label}`);
-    assert.equal(r.reason, 'unknown', `读不到不得报成越界：${label}`);
+    assert.notEqual(r.verdict, 'blocked', `读不到不得当成"确证越界"而拒绝启动：${label}`);
+    assert.equal(r.verdict, 'unknown', `读不到要给独立的一档：${label}`);
+    assert.equal(r.reason, 'unreadable');
     assert.equal(r.min, null);
-    assert.match(r.message, /读不到/);
+    assert.match(r.message, /读不到|不可用/);
   }
 });
 
-test('配置值本身非法（0 / 负数 / 非数字）：判 unknown 而不是默默用它下单', async () => {
+/**
+ * 配置值本身非法（0 / 负数 / NaN）也**不阻断启动**：
+ * `intEnv` 对非法/缺失值会回退到默认 120960（合法），所以能走到这里的只有"显式设了 0/负数"
+ * 这种形状；它与"读不到链上界"同属"无法确证"，按同一档处理（告警 + /healthz 可见）。
+ * 反向断言同样重要：它**不能**被报成 `blocked`（那会让节点在启动期起不来）。
+ */
+test('配置值本身非法（0 / 负数 / 非数字）：判 unknown 且不阻断启动，但必须说出来', async () => {
   for (const bad of [0, -1, Number.NaN]) {
     const r = await runWith(bad, { min: 17_280n, max: 518_400n });
-    assert.equal(r.ok, false, `非法配置必须拦下：${String(bad)}`);
-    assert.equal(r.reason, 'unknown');
+    assert.equal(r.verdict, 'unknown', `非法配置要给独立的一档：${String(bad)}`);
+    assert.notEqual(r.verdict, 'blocked', `非法配置不得让节点起不来：${String(bad)}`);
+    assert.equal(r.reason, 'invalid-config');
     assert.match(r.message, /不是正整数/);
   }
 });
