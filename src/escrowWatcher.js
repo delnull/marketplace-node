@@ -52,14 +52,17 @@ import { getDb, kvGet, kvSet, txBegin, txCommit, txRollback } from './db.js';
 // **必漏不可**：少了它，pollOnce 里那句 await 会抛 ReferenceError 被当成"链上真值未取到"，
 // 于是**所有**退款/争议/仲裁类事件每轮失败、回退重扫 3 次后被隔离，链上镜像静默停摆。
 import { getEscrow, getProvider, fetchOnchainOrder } from './chain.js';
+// `chainParamsMatch` 住在 chainOrder.js——那里是「链上真值 → 要不要动钱/发货」这类判据的
+// 唯一实现地；本文件的轮询与 chainReconcile、三个交付入口共用同一份（见 chainOrder.js 的说明）
+import { chainParamsMatch } from './chainOrder.js';
 import { tryAutoDeliverByEscrowOrder, flushAutoDeliverPending } from './autoDeliver.js';
 import { releaseHoldsForOrderIds, releaseHoldsForReturnReceived, releaseRefundedEscrow, isDelivered, restockOrder } from './stockHold.js';
 import { notify, notifyRaw, typeForChainEvent } from './webhook.js';
 import { alertPoolEmptyForOrder } from './poolAlert.js';
 // 一次性告警的「投递成功才写幂等标记」（唯一实现；见 alertAck.js）
 import { alertOnceDelivered } from './alertAck.js';
-// 费率/创建时收取方快照的取值口径（唯一实现，见 src/fees.js 的 feeSnapshotOf）
-import { feeSnapshotOf } from './fees.js';
+// 费率/创建时收取方快照的三态判据与**唯一写入点**（见 src/fees.js）
+import { feeSnapshotOf, writeFeeSnapshot } from './fees.js';
 // 确认收货后的售后案件：本地镜像的**唯一写入口/判据**（事件路径、/sync、后台对账三者同源）
 import { applyAfterSaleOpened, applyAfterSaleClosed } from './afterSale.js';
 
@@ -242,27 +245,6 @@ export function applyEvent(name, args, meta = {}) {
     }
   }
   return changed;
-}
-
-/**
- * 链上真值与本地订单锁定参数逐项比对（买家/卖家/金额三者皆不可变）。
- * 缺字段（单测直调/兼容旧调用）时返回 true（跳过比对）。
- * 导出：链上状态对账（chainReconcile）同样必须据此拒绝「他人对同一 orderId 的诱饵单」——
- * orderId 自草稿起公开，不比对就等于让 1 wei 的假单驱动本地状态。
- */
-export function chainParamsMatch(local, p) {
-  if (!p) return true;
-  const buyerOk = !p.buyer || String(p.buyer).toLowerCase() === String(local.buyer || '').toLowerCase();
-  const sellerOk = !p.seller || String(p.seller).toLowerCase() === String(local.seller || '').toLowerCase();
-  let amountOk = true;
-  if (p.amount !== undefined && p.amount !== null) {
-    try {
-      amountOk = BigInt(p.amount) === BigInt(local.amount_wei || '0');
-    } catch {
-      amountOk = false;
-    }
-  }
-  return buyerOk && sellerOk && amountOk;
 }
 
 /**
@@ -1004,15 +986,14 @@ export async function pollOnce() {
         if (needsFeeFill) {
           try {
             const o = await escrow.getOrder(String(ev.args.orderId).toLowerCase());
-            // 费率与「创建时收取方」快照一并补录（**唯一实现**的取值函数，见 src/fees.js）：
-            // 合约按 feeCollectorAtCreate 决定这单扣不扣费，两列必须同时落库——
-            // 只补 fee_bps 会让账本退回全局口径（可能与这单的链上事实相反）。
-            // fee_collector_at_create 为空串且快照读不到（ABI 未同步/旧节点）时保持空串 = 未知。
-            const snap = feeSnapshotOf(o);
-            if (snap.feeBps > 0 || snap.feeCollectorAtCreate) {
-              db.prepare('UPDATE orders SET fee_bps = ?, fee_collector_at_create = ? WHERE id = ?')
-                .run(snap.feeBps, snap.feeCollectorAtCreate, localRowId);
-            }
+            /*
+              费率与「创建时收取方」快照一并补录——取值与写入都在 src/fees.js 的唯一实现里
+              （`feeSnapshotOf` 判三态、`writeFeeSnapshot` 是唯一写入点）：链上那两个字段没**同时**
+              读到就一个字节都不写，保持库里原值（可能是此前补录过的确证快照）。
+              旧实现在这里自己写 UPDATE 并配 `snap.feeBps > 0 || snap.feeCollectorAtCreate` 的条件，
+              等于把"该不该写"又判了一遍——而判据已经在返回值里了。
+            */
+            writeFeeSnapshot(db, localRowId, feeSnapshotOf(o));
           } catch (e) {
             console.warn(
               `[watcher] 订单 ${localRowId} 的费率快照补录失败（该单账本将退回全局口径）：${(e && e.message) || e}`

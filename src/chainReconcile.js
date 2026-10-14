@@ -18,7 +18,7 @@
  * `mapChainTerminal`（快照路径的唯一判据，/sync 手动同步同款）与 `settleByRefundSplit`
  * （RefundApproved/Arbitrated 的同一函数，含 refunded_amount_wei 与占位回补）、
  * `markEscrowDisputed`（DisputeRequested 的同一 SQL），防两处口径漂移；
- * 防"诱饵单"的买家/卖家/金额比对同样复用 watcher 的 `chainParamsMatch`。
+ * 防"诱饵单"的买家/卖家/金额比对同样复用 `chainOrder.chainParamsMatch`（交付闸与 watcher 也在用）。
  * 事件史用 orders.js 的 `appendSyncMirrorEvent`（与手动 /sync 同一条 `Sync:<状态>` 镜像）。
  *
  * 售后案件（2026-10 第二批）同样走这条纪律：链上真值由 `chainOrder.fetchAfterSaleCase`（与 /sync
@@ -37,9 +37,9 @@
  */
 import config from './config.js';
 import { getDb, kvGet, kvSet, txBegin, txCommit, txRollback } from './db.js';
-import { fetchOrderFor, fetchAfterSaleCase } from './chainOrder.js';
+import { fetchOrderFor, fetchAfterSaleCase, chainParamsMatch } from './chainOrder.js';
 import { getEscrow } from './chain.js';
-import { settleByRefundSplit, markEscrowDisputed, chainParamsMatch, mapChainTerminal, readRefundedWei } from './escrowWatcher.js';
+import { settleByRefundSplit, markEscrowDisputed, mapChainTerminal, readRefundedWei } from './escrowWatcher.js';
 import { appendSyncMirrorEvent, appendOrderCreatedEvent, applyRefundFlags } from './routes/orders.js';
 // 售后案件本地镜像的唯一判据层（事件/sync/对账三条路径同源，见 src/afterSale.js）
 import { AFTER_SALE_OPEN_SQL, AFTER_SALE_NOT_OPEN_SQL, AFTER_SALE_ELIGIBLE_STATUS, applyAfterSaleFromChain } from './afterSale.js';

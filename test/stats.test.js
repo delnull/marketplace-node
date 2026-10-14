@@ -35,11 +35,20 @@ async function createDraft(slug, qty = 1) {
   return res.body.data;
 }
 
-/** 直接落终局（模拟 watcher）；at 可指定入账时刻；refundedWei 落已退金额（部分/全额退款，2026-09 起退款额入列） */
-function settle(id, status, at = Date.now(), feeBps = 0, refundedWei = null) {
+/**
+ * 直接落终局（模拟 watcher）；at 可指定入账时刻；refundedWei 落已退金额（部分/全额退款，2026-09 起退款额入列）。
+ *
+ * `feeCollectorAtCreate` **必须**与 feeBps 成对给出（`ZERO` = 这单确证不扣费，非零 = 会扣）：
+ * 账本/看板的平台费是**三态**的——`fee_collector_at_create` 为空 = 两列都没补录过 = 费率未知
+ * ⇒ 净额是"不知道"（下发 null），而不是按 0 折算（见 node/src/fees.js 的 feeSnapshotReadOf）。
+ * 真实系统里这三条写入路径（/paid、watcher、/sync）也都是成对写的。
+ */
+const ZERO_COLLECTOR = '0x0000000000000000000000000000000000000000';
+const FEE_COLLECTOR = '0x1111111111111111111111111111111111111111';
+function settle(id, status, at = Date.now(), feeBps = 0, refundedWei = null, feeCollectorAtCreate = ZERO_COLLECTOR) {
   db.prepare(
-    "UPDATE orders SET status = ?, fee_bps = ?, updated_at = ?, refunded_amount_wei = COALESCE(?, refunded_amount_wei), paid_tx_hash = COALESCE(paid_tx_hash, ?) WHERE id = ?"
-  ).run(status, feeBps, at, refundedWei === null ? null : String(refundedWei), payHash(), id);
+    "UPDATE orders SET status = ?, fee_bps = ?, fee_collector_at_create = ?, updated_at = ?, refunded_amount_wei = COALESCE(?, refunded_amount_wei), paid_tx_hash = COALESCE(paid_tx_hash, ?) WHERE id = ?"
+  ).run(status, feeBps, feeCollectorAtCreate, at, refundedWei === null ? null : String(refundedWei), payHash(), id);
 }
 
 test('overview：入账净额与退款并列、件数/买家/复购去重、确认率', async () => {
@@ -49,7 +58,7 @@ test('overview：入账净额与退款并列、件数/买家/复购去重、确�
   const a1 = await createDraft(p1.slug, 2);
   const a2 = await createDraft(p1.slug);
   const b1 = await createDraft(p2.slug);
-  settle(a1.id, 'confirmed', Date.now() - 2 * 24 * 3600_000, 100);
+  settle(a1.id, 'confirmed', Date.now() - 2 * 24 * 3600_000, 100, null, FEE_COLLECTOR);
   settle(a2.id, 'expired');
   settle(b1.id, 'confirmed');
   // 退款单（不入 GMV）
@@ -84,6 +93,31 @@ test('overview：入账净额与退款并列、件数/买家/复购去重、确�
   // 全量口径（days=0）含窗口外单
   const oAll = await request(app).get('/api/shop/stats/overview?days=0').set('Authorization', `Bearer ${ownerToken}`).expect(200);
   assert.equal(oAll.body.data.orders, 4, '全量含 31 天前单');
+});
+
+test('费率快照未回填的行：GMV 是"不知道"（null + feeUnknownCount），不是按 0 折算的数', async () => {
+  const p = await listProduct(productPayload({ kind: 'physical', title: '未知费率商品', capacity: 9 }));
+  const known = await createDraft(p.slug);
+  settle(known.id, 'confirmed');
+  const before = await request(app).get('/api/shop/stats/overview?days=0').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  assertOk(before);
+  assert.equal(before.body.data.feeUnknownCount, 0, '前置：库里没有费率口径未知的入账单');
+
+  // 一行"两列都没补录过"的入账单（fee_collector_at_create 为空 = 未知，见 src/fees.js）
+  const unknown = await createDraft(p.slug);
+  db.prepare("UPDATE orders SET status = 'confirmed', updated_at = ? WHERE id = ?").run(Date.now(), unknown.id);
+  const after = await request(app).get('/api/shop/stats/overview?days=0').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  assertOk(after);
+  assert.equal(after.body.data.gmvNetWei, null, '有未知费率的行 ⇒ 净额是"不知道"，不下发一个偏小的数');
+  assert.ok(after.body.data.feeUnknownCount >= 1, '并如实给出未知行数（供界面说明原因）');
+  assert.ok(Number(after.body.data.orders) > Number(before.body.data.orders), '单数照常统计（它与费率无关，仍是确证的）');
+
+  // 补录两列（真实系统里 /paid、watcher、/sync 都是成对写）之后，数字自己回来——判据是数据，不是开关
+  db.prepare("UPDATE orders SET fee_bps = 100, fee_collector_at_create = ? WHERE id = ?").run(FEE_COLLECTOR, unknown.id);
+  const healed = await request(app).get('/api/shop/stats/overview?days=0').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  assertOk(healed);
+  assert.equal(healed.body.data.feeUnknownCount, 0);
+  assert.notEqual(healed.body.data.gmvNetWei, null);
 });
 
 test('trend：按天补零、退款额并入对应日', async () => {

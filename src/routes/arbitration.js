@@ -36,7 +36,7 @@ import { goodsMicroOf, usdtOf } from '../money.js';
 // 「已交付事实」的唯一实现（shipped_at / tracking_no / 交付行三要素）——不要在本文件重写判据
 import { hasDelivered } from '../returns.js';
 // 平台费**按单**判据的唯一实现（创建时收取方快照；见 src/fees.js）
-import { feeChargeableForOrder } from '../fees.js';
+import { feeChargeableForOrder, feeSnapshotReadOf } from '../fees.js';
 // 确认收货后的售后案件：在途判据与 DTO 字段的唯一实现（见 src/afterSale.js）
 import { AFTER_SALE_OPEN_SQL, afterSaleFieldsOf } from '../afterSale.js';
 // 队列等待读数（计数 + 最久等待）的唯一实现：本文件的两个列表与 /api/shop/metrics 共用
@@ -74,6 +74,13 @@ function disputeToPublic(o, kind = 'dispute') {
   } catch {
     onchainEvents = [];
   }
+  /*
+    本单费率快照的**唯一判据**（`fees.feeSnapshotReadOf`）：`fee_bps` 那一列是
+    `INTEGER NOT NULL DEFAULT 0`，分不开"没补录过"与"快照就是 0"；能分开它们的是
+    `fee_collector_at_create`（两列由同一条 UPDATE 成对写）。下面的 feeBps / feeCollectorAtCreate
+    两个字段都从它取，见那两行上的说明。
+  */
+  const feeSnap = feeSnapshotReadOf(o);
   return {
     // 判别位：同一份字段口径下的两类待办（'dispute'=争议中，'after_sale'=确认收货后的售后案件）
     kind,
@@ -164,9 +171,11 @@ function disputeToPublic(o, kind = 'dispute') {
       而链上实际按快照扣——前端为此专门区分 `null`（读不到）与 `0`（确实是 0，
       见 order-detail / arbiterMoney 的三态判据与 PendingDispute.feeBps 的类型 `number | null`）。
       旧实现写 `o.fee_bps || 0`，把这个三态压成了两态，等于让前端那半边的修复失效。
+      **判据不再在本文件手写**（2026-10-15）：与订单详情/流水/看板/CSV 共用
+      `fees.feeSnapshotReadOf`——这句话本身此前就在本注释里，而代码仍是第二份实现。
     */
-    feeBps: o.fee_collector_at_create ? Number(o.fee_bps) || 0 : null,
-    feeCollectorAtCreate: o.fee_collector_at_create ? String(o.fee_collector_at_create).toLowerCase() : null,
+    feeBps: feeSnap.known ? feeSnap.feeBps : null,
+    feeCollectorAtCreate: feeSnap.known ? feeSnap.feeCollectorAtCreate : null,
     feeChargeable: feeChargeableForOrder(o.fee_collector_at_create),
     evidenceCount: getDb().prepare('SELECT COUNT(*) AS c FROM dispute_evidence WHERE order_id = ?').get(o.id).c,
     // 进入争议时刻 = 最近一次状态迁移时间（watcher 回写 disputed 时更新）

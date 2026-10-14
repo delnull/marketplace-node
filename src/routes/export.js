@@ -11,9 +11,10 @@ import { verifyToken, roleOf } from '../auth.js';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
 import { sendCsv } from '../csv.js';
 import { logAudit } from '../audit.js';
-import { refreshFeeCollector, feeOf, feeChargeableForOrder, feeBasisOf } from '../fees.js';
-// 入账口径的唯一出处（与流水页/看板/可评价同源，见 src/orderStatus.js）
-import { INCOME_STATUS as ORDER_INCOME_STATUS } from '../orderStatus.js';
+import { refreshFeeCollector, feeOfRow, feeSnapshotReadOf, feeChargeableForOrder, feeBasisOf } from '../fees.js';
+// 入账口径与订单状态集合的唯一出处（与流水页/看板/可评价同源，见 src/orderStatus.js）；
+// 状态全集此前在本文件手抄了一份内联数组，不在 status-set-consistency 守卫的射程内
+import { INCOME_STATUS as ORDER_INCOME_STATUS, ORDER_STATUS } from '../orderStatus.js';
 
 const router = Router();
 const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true });
@@ -27,11 +28,17 @@ const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true });
  * （见 src/fees.js 文件头的两个方向）。所以把 `fee_bps`（费率快照）、
  * `fee_chargeable`（这一单判不判扣费）、`fee_basis`（判据来源：snapshot / fallback）
  * 一并落盘：任何一行都能在 Excel 里手算复核 net = amount − refunded − fee。
- * @returns {{bps:number, chargeable:0|1, basis:'snapshot'|'fallback'}}
+ *
+ * **三态（2026-10-14 收口）**：`fee_bps` 那一列是 `INTEGER NOT NULL DEFAULT 0`，"没补录过"与
+ * "快照就是 0"分不开（判据见 src/fees.js 的 feeSnapshotReadOf）。快照未回填时这一行的
+ * 费与净额**算不出来** —— 三个金额单元格一律留**空**（Excel 里是"没有值"），`fee_basis` 那列
+ * 写 `fallback` 说明原因。此前这里写 0，等于在月结文件里替链上宣布"这单不扣费"。
+ * @returns {{bps:number|'', chargeable:0|1, basis:'snapshot'|'fallback'}}
  */
 function feeCellsOf(o) {
+  const snap = feeSnapshotReadOf(o);
   return {
-    bps: Number(o.fee_bps) || 0,
+    bps: snap.known ? snap.feeBps : '',
     chargeable: feeChargeableForOrder(o.fee_collector_at_create) ? 1 : 0,
     basis: feeBasisOf(o.fee_collector_at_create),
   };
@@ -123,14 +130,17 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const csvRows = rows.map((o) => {
     // 已退金额参与净额：净额 = amount − refunded − fee（部分退款后只对未退部分计费）
     // 平台费按**该单**的创建时收取方快照判定（合约只读快照；全局 feeCollector() 事后可改，
-    // 用它会让导出与链上在途单的口径相反——见 src/fees.js 文件头）
+    // 用它会让导出与链上在途单的口径相反——见 src/fees.js 文件头）。
+    // 费率快照未回填 ⇒ fee 为 null ⇒ fee_wei / net_wei 留空（`fee_basis=fallback` 说明原因），
+    // 绝不写 0：那会让月结对账把"算不出来"当成"没扣费"。
     const refunded = BigInt(o.refunded_amount_wei || '0');
     const base = BigInt(o.amount_wei || '0') - refunded;
-    const fee = feeOf(base > 0n ? base : 0n, Number(o.fee_bps) || 0, o.fee_collector_at_create);
+    const fee = feeOfRow(base > 0n ? base : 0n, o);
     const fc = feeCellsOf(o);
     return [
-      o.id, o.product_slug, o.status, o.quantity || 1, o.amount_wei, refunded.toString(), fee.toString(),
-      (base - fee).toString(),
+      o.id, o.product_slug, o.status, o.quantity || 1, o.amount_wei, refunded.toString(),
+      fee === null ? '' : fee.toString(),
+      fee === null ? '' : (base - fee).toString(),
       fc.bps, fc.chargeable, fc.basis, String(o.accepted_partial_refund_wei || '0'),
       o.usdt_micro, o.updated_at, o.buyer, o.escrow_order_id || '', o.paid_tx_hash || '',
     ];
@@ -157,7 +167,8 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const params = [];
   if (req.query.status) {
     const st = String(req.query.status);
-    const valid = ['draft', 'escrowed', 'shipped', 'confirmed', 'disputed', 'settled', 'refunded', 'expired', 'cancelled'];
+    // 状态全集取 src/orderStatus.js（唯一出处；与 db.js 的 CHECK 逐字同源）
+    const valid = ORDER_STATUS;
     if (!valid.includes(st)) return fail(res, `status 无效（可选：${valid.join('/')}）`);
     where.push('status = ?');
     params.push(st);
@@ -184,12 +195,15 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const csvRows = rows.map((o) => {
     const refunded = BigInt(o.refunded_amount_wei || '0');
     const base = BigInt(o.amount_wei || '0') - refunded;
-    // 与 ledger.csv 同一口径（按单快照判定；两处必须逐字同源，见上方 orders.csv 的说明）
-    const fee = feeOf(base > 0n ? base : 0n, Number(o.fee_bps) || 0, o.fee_collector_at_create);
+    // 与 ledger.csv 同一口径（按单快照判定；两处必须逐字同源，见上方 orders.csv 的说明）。
+    // 费率快照未回填 ⇒ 费/净额留空（`fee_basis=fallback`），不写 0（同 ledger.csv）。
+    const fee = feeOfRow(base > 0n ? base : 0n, o);
     const fc = feeCellsOf(o);
     return [
       o.id, o.product_slug, o.status, o.quantity || 1, o.amount_wei,
-      refunded.toString(), fee.toString(), (base - fee).toString(),
+      refunded.toString(),
+      fee === null ? '' : fee.toString(),
+      fee === null ? '' : (base - fee).toString(),
       fc.bps, fc.chargeable, fc.basis, String(o.accepted_partial_refund_wei || '0'),
       o.usdt_micro, o.shipping_fee_usdt_micro ?? 0, o.invoice_needed ? 1 : 0,
       o.buyer, o.shipping_name, o.shipping_phone, o.shipping_address, o.shipping_edit_count ? '1' : '0', o.note || '',

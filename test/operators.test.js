@@ -20,6 +20,7 @@ kvSet('mk:shop_operators', JSON.stringify([operator.address.toLowerCase()]));
 let ownerToken;
 let operatorToken;
 let buyerToken;
+let strangerToken;
 let seq = 0;
 const payHash = () => '0x' + String(++seq).padStart(64, '0');
 
@@ -27,6 +28,7 @@ before(async () => {
   ownerToken = (await login(ctx, owner)).token;
   operatorToken = (await login(ctx, operator)).token;
   buyerToken = (await login(ctx, buyer)).token;
+  strangerToken = (await login(ctx, stranger)).token;
 });
 
 test('登录返回三元角色（owner/operator/user）', async () => {
@@ -74,6 +76,36 @@ test('操作员可经营（商品/码池/发货/订单列表/状态计数），�
   assertOk(ordersList);
   const counts = await request(app).get('/api/orders/seller/status-counts').set('Authorization', `Bearer ${operatorToken}`).expect(200);
   assertOk(counts);
+
+  /*
+    「同步链上状态」是运维动作（把漏扫/滞后的镜像拉回链上真值），店员本就能发货、登记 NFT 交付、
+    回复评价，唯独这一个按钮此前只认 `config.shop.owner`（2026-10-15 与全仓 staffOnly 规约对齐）。
+    验法：拿一张**别人的**真实订单（买家自己下的草稿）分别用店员与陌生人去同步——
+    陌生人必须 403，店员必须过得了鉴权（本测试的 RPC 指向必然拒连的端口，见 setup.mjs，
+    所以它会停在"读不到链上"那一步，就像真实 RPC 故障时一样）。
+  */
+  const draftRes = await request(app)
+    .post('/api/orders')
+    .set('Authorization', `Bearer ${buyerToken}`)
+    .send({ productSlug: p.body.data.slug })
+    .expect(200);
+  assertOk(draftRes);
+  const foreignOrderId = draftRes.body.data.id;
+
+  const asStranger = await request(app)
+    .post(`/api/orders/${foreignOrderId}/sync`)
+    .set('Authorization', `Bearer ${strangerToken}`);
+  assert.equal(asStranger.status, 403, '陌生人不得同步别人的订单');
+
+  const asOperator = await request(app)
+    .post(`/api/orders/${foreignOrderId}/sync`)
+    .set('Authorization', `Bearer ${operatorToken}`);
+  assert.notEqual(asOperator.status, 403, `店员必须过得了这道鉴权，实际：${asOperator.status} ${asOperator.body.message}`);
+  assert.notEqual(asOperator.status, 404, '订单确实存在 ⇒ 404 会说明请求根本没走到鉴权之后那一步');
+  assert.ok(
+    !/仅买家本人或店铺经营人员/.test(String(asOperator.body.message)),
+    '过不了鉴权才会出现这句文案'
+  );
 
   // 财务/敏感面 → 403
   await request(app).get('/api/orders/seller/ledger').set('Authorization', `Bearer ${operatorToken}`).expect(403);

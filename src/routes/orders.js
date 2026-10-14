@@ -99,9 +99,13 @@ import { ethers } from 'ethers';
 import { getDb, txBegin, txCommit, txRollback } from '../db.js';
 import config from '../config.js';
 import { getRates, usdtMicroToPayWei, isPayableAmount } from '../rates.js';
-// 订单状态集合的唯一出处（本文件是最大的使用者：入账/在途/已付款/草稿+在途 四套集合，见 src/orderStatus.js）
+// 订单状态集合的唯一出处（本文件是最大的使用者：入账/在途/已付款/草稿+在途 四套集合 + 状态全集校验，
+// 见 src/orderStatus.js）。本文件此前把状态全集内联抄了一份——那份抄写不在
+// `test/status-set-consistency.test.js` 的射程内（它扫的是 SQL 字面量与指定模块的导出数组），
+// 往枚举里加第 10 个状态时它会静默落后。
 import {
   INCOME_STATUS as ORDER_INCOME_STATUS,
+  ORDER_STATUS,
   ACTIVE_IN,
   PRE_PAID_IN,
   DRAFT_OR_ACTIVE_IN,
@@ -136,12 +140,21 @@ import {
 import { mapChainTerminal, applyAcceptedPartialRefund, readRefundedWei } from '../escrowWatcher.js';
 // 确认收货后的售后案件：DTO 字段与链上真值回填的**唯一实现**（watcher/对账/sync 同源）
 import { afterSaleFieldsOf, isAfterSaleOpen, applyAfterSaleFromChain, AFTER_SALE_OPEN_SQL } from '../afterSale.js';
-// 售后案件的链上只读读数（可注入；与后台对账共用同一个读取器，见 chainOrder.js）
-import { fetchAfterSaleCase } from '../chainOrder.js';
+// 售后案件的链上只读读数 + **交付闸**（可注入；三个手动交付入口与自动交付共用同一个判据，
+// 见 chainOrder.js 的 deliveryGate 说明）
+import { fetchAfterSaleCase, deliveryGate, chainParamsMatch } from '../chainOrder.js';
 import { notify } from '../webhook.js';
 // 下单风控闸（可选，默认关闭）：店主自配的建单前准入服务——见 orderGate.js 的边界说明
 import { checkOrderGate } from '../orderGate.js';
-import { refreshFeeCollector, feeStatus, feeOf, feeChargeableForOrder, feeSnapshotOf } from '../fees.js';
+import {
+  refreshFeeCollector,
+  feeStatus,
+  feeOfRow,
+  feeSnapshotReadOf,
+  feeChargeableForOrder,
+  feeSnapshotOf,
+  writeFeeSnapshot,
+} from '../fees.js';
 // 池式商品「已收款但无货可交」：判定口径与主动告警都在 poolAlert.js（唯一实现）——
 // 面板 poolEmpty 与托管落定后的 order.pool_empty webhook 用同一个 poolShortfallOf，
 // 避免"面板说缺货但没告警"这类两处口径漂移
@@ -172,8 +185,6 @@ const evidenceLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '�
 /** 管理审计便捷包装（仅 staff 记录，buyer 动作自动过滤） */
 const audit = (req, action, targetType, targetId, detail) =>
   logAudit({ req, actor: req.auth?.address, actorRole: roleOf(req.auth?.address || ''), action, targetType, targetId, detail });
-
-const ORDER_STATUS = ['draft', 'escrowed', 'shipped', 'confirmed', 'disputed', 'settled', 'refunded', 'expired', 'cancelled'];
 
 /** 链上事件史上限（与 escrowWatcher 一致） */
 const EVENT_HISTORY_LIMIT = 20;
@@ -463,7 +474,14 @@ function orderToPublic(o, opts = {}) {
       界面据此显示"还能举证多久"，不必自己拿 updated_at 再算一遍（那样必然与门控漂移）。
     */
     ...statementFieldsOf(o),
-    feeBps: o.fee_bps || 0,
+    /*
+      订单级费率快照（**三态**，判据与仲裁队列同源：`fees.feeSnapshotReadOf`）：
+      未回填 ⇒ `null`（读不到），**绝不落成 0** —— `fee_bps` 是 `INTEGER NOT NULL DEFAULT 0`，
+      "没补录过"与"快照就是 0"在那一列上分不开；当成 0 下发，收据就会印
+      「0%（本单费率快照为 0）」、账本按不扣费报净额，而链上 `_settle` 是按创建时快照扣的。
+      前端早已按三态消费（`utils/arbiterMoney.orderFeeBpsOf` → null 印「费率待读取」）。
+    */
+    feeBps: feeSnapshotReadOf(o).known ? Number(o.fee_bps) || 0 : null,
     /**
      * 链上**创建订单时**的平台费收取方快照（小写；'' = 未补录/未知 → null）。
      * 合约 `Escrow._settle` 只读这个快照决定这单扣不扣费（全局 feeCollector() 事后可改，
@@ -1019,6 +1037,16 @@ router.post('/seller/batch-ship', staffOnly, wrap(async (req, res) => {
   const byId = new Map(rows.map((r) => [r.id, r]));
   const failed = [];
   const okIds = [];
+  /*
+    本地条件先筛（同步、零成本），**链上判据留到最后一起问**：
+    `deliveryGate` 是"链上 status=Created 且 refundRequested=false"的唯一判据
+    （见 chainOrder.js），不再看本地镜像 `refund_status`（它按 finality 深度滞后）。
+    这里把候选单**并发**送进闸而不是逐单 await：ethers v6 会把同一 tick 发出的读取打包成
+    一次 JSON-RPC 请求（batchMaxCount 默认 100，与 chainOrder 里那句注释同款），
+    于是 50 单的网络往返从 50 次降到 1 次——逐单 await 的话，公共 RPC 上 50×几百毫秒
+    会让店主在浏览器里等到超时。闸本身不抛错（判别式），Promise.all 不会被单笔读失败带崩。
+  */
+  const candidates = [];
   for (const id of ids) {
     const o = byId.get(id);
     if (!o) {
@@ -1034,9 +1062,14 @@ router.post('/seller/batch-ship', staffOnly, wrap(async (req, res) => {
     if (snap.kind !== 'physical') failed.push({ id, reason: `非实物商品（kind=${snap.kind || '?'}），不支持批量发货` });
     else if (o.status !== 'escrowed') failed.push({ id, reason: `状态(${o.status})非待发货` });
     else if (!o.paid_tx_hash) failed.push({ id, reason: '缺少链上支付凭证，请先同步或取消' });
-    else if (o.refund_status === 'requested') failed.push({ id, reason: '退款申请待处理（冻结），请先处理' });
-    else okIds.push(id);
+    else candidates.push(o);
   }
+  const gates = await Promise.all(candidates.map((o) => deliveryGate(o)));
+  candidates.forEach((o, i) => {
+    const gate = gates[i];
+    if (!gate.ok) failed.push({ id: o.id, reason: gate.message });
+    else okIds.push(o.id);
+  });
   if (okIds.length) {
     const now = Date.now();
     const upMarks = okIds.map(() => '?').join(',');
@@ -1155,10 +1188,12 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
   //
   // 净额口径（与链上 Escrow._settle 一致，2026-09 起支持部分退款/拆分裁决）：
   //   卖家结算基数 = amount − refunded_amount_wei（已退买家的部分不参与结算、也不计费）
-  //   平台费       = feeChargeableForOrder(fee_collector_at_create) ? 基数 × fee_bps/10000 : 0
-  //                  ——**按单**判据：合约只读创建订单时的收取方快照（全局 feeCollector() 事后
-  //                  可改，用它会让在途单的费口径与链上相反），快照为空才退回全局保守口径。
+  //   平台费       = 基数 × fee_bps/10000，且只在"创建时收取方快照"非零时扣（**按单**判据：
+  //                  合约只读创建订单时的那个快照，全局 feeCollector() 事后可改，用它会让在途单的
+  //                  费口径与链上相反）——唯一实现见 src/fees.js 的 feeOfRow
   //   实收净额     = 基数 − 平台费
+  // **三态**：`fee_collector_at_create` 为空 = 两列都没补录过 = 费率未知 ⇒ 该行费/净额一律 null
+  // （feeUnknownCount 计数，汇总随之下发 null）——见 fees.feeSnapshotReadOf 的说明。
   // refunded_amount_wei 由 watcher/sync/paid 从链上 getOrder 补录；fee_collector_at_create 同批补录。
   const incomeRows = db
     .prepare(
@@ -1171,21 +1206,40 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
   let amountWei = 0n;
   let feeWei = 0n;
   let refundedWei = 0n;
+  /*
+    费率口径未知的行数（`fee_collector_at_create` 为空 = 两列都没补录过，见 fees.feeSnapshotReadOf）。
+    这类行的平台费**算不出来**，所以它们不进 feeWei/amountWeiNet 的累加：
+    汇总里只要有一行未知，"累计已扣平台费 / 实收净额"这两个数就不再是确证的总计——
+    下方据此下发 null（未知）而不是一个偏小的数。`count/usdtMicro/amountWei/refundedWei`
+    不受影响（毛额与已退额与费率无关，仍是确证的）。
+  */
+  let feeUnknownCount = 0;
   for (const r of incomeRows) {
     const refunded = BigInt(r.refunded_amount_wei || '0');
     const base = BigInt(r.amount_wei || '0') - refunded;
-    const fee = feeOf(base > 0n ? base : 0n, Number(r.fee_bps || 0), r.fee_collector_at_create);
+    // 平台费按**该行**的创建时收取方快照判定（唯一判据见 src/fees.js）；null = 费率快照未回填
+    const fee = feeOfRow(base > 0n ? base : 0n, r);
     const s = (byStatus[r.status] ??= { count: 0, usdtMicro: '0', amountWei: '0', feeWei: '0', refundedWei: '0', amountWeiNet: '0' });
     s.count += 1;
     s.usdtMicro = (BigInt(s.usdtMicro) + BigInt(Math.trunc(Number(r.usdt_micro) || 0))).toString();
     s.amountWei = (BigInt(s.amountWei) + BigInt(r.amount_wei)).toString();
-    s.feeWei = (BigInt(s.feeWei) + fee).toString();
     s.refundedWei = (BigInt(s.refundedWei) + refunded).toString();
-    s.amountWeiNet = (BigInt(s.amountWei) - BigInt(s.refundedWei) - BigInt(s.feeWei)).toString();
+    if (fee === null) {
+      feeUnknownCount += 1;
+      s.feeUnknownCount = (s.feeUnknownCount || 0) + 1;
+      s.feeWei = null;
+      s.amountWeiNet = null;
+    } else {
+      s.feeWei = s.feeWei === null ? null : (BigInt(s.feeWei) + fee).toString();
+      s.amountWeiNet =
+        s.amountWeiNet === null || s.feeWei === null
+          ? null
+          : (BigInt(s.amountWei) - BigInt(s.refundedWei) - BigInt(s.feeWei)).toString();
+    }
     totalCount += 1;
     usdtMicro += BigInt(Math.trunc(Number(r.usdt_micro) || 0));
     amountWei += BigInt(r.amount_wei);
-    feeWei += fee;
+    feeWei += fee ?? 0n;
     refundedWei += refunded;
   }
 
@@ -1196,16 +1250,17 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
     orders: rows.map((o) => {
       const refunded = BigInt(o.refunded_amount_wei || '0');
       const base = BigInt(o.amount_wei || '0') - refunded;
-      // 平台费按**该单**的创建时收取方快照判定（见 src/fees.js / 上方汇总段说明）
-      const fee = feeOf(base > 0n ? base : 0n, Number(o.fee_bps || 0), o.fee_collector_at_create);
+      // 平台费按**该单**的创建时收取方快照判定（唯一判据见 src/fees.js）；null = 费率快照未回填
+      const fee = feeOfRow(base > 0n ? base : 0n, o);
       const pub = orderToPublic(o, { as: 'owner' });
       return {
         ...pub,
-        feeBps: o.fee_bps || 0,
-        feeWei: fee.toString(),
+        feeBps: feeSnapshotReadOf(o).known ? Number(o.fee_bps) || 0 : null,
+        /** 该行平台费（null = 费率快照未回填 ⇒ 算不出来；绝不印 0，那会被读成"没扣费"） */
+        feeWei: fee === null ? null : fee.toString(),
         refundedWei: refunded.toString(),
-        /** 实收净额 = 托管额 − 已退买家 − 已扣平台费（与链上划款一致） */
-        amountWeiNet: (BigInt(o.amount_wei || '0') - refunded - fee).toString(),
+        /** 实收净额 = 托管额 − 已退买家 − 已扣平台费（与链上划款一致）；费率未知时同为 null */
+        amountWeiNet: fee === null ? null : (BigInt(o.amount_wei || '0') - refunded - fee).toString(),
       };
     }),
     total: totalCount,
@@ -1216,9 +1271,15 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
       /* 微 USDT 汇总与 wei 侧同款：BigInt 累加、字符串出参（Number 累加在 9.007e15 以上会漂） */
       usdtMicro: usdtMicro.toString(),
       amountWei: amountWei.toString(),
-      feeWei: feeWei.toString(),
+      /*
+        有行的费率快照没回填时，这两个数**不是确证的总计**（少算了那些行的费）⇒ 下发 null（未知）
+        而不是一个偏小的数；`feeUnknownCount` 说明有几行，前端据此印 `—` 并提示"先同步链上状态"。
+        补录完成后自动恢复成具体数字（判据是数据，不是开关）。
+      */
+      feeWei: feeUnknownCount > 0 ? null : feeWei.toString(),
       refundedWei: refundedWei.toString(),
-      amountWeiNet: (amountWei - refundedWei - feeWei).toString(),
+      amountWeiNet: feeUnknownCount > 0 ? null : (amountWei - refundedWei - feeWei).toString(),
+      feeUnknownCount,
       byStatus,
       // 费率披露口径（全局兜底 + 前端标注）：只有"本单没有创建时快照"的行才依赖 feeCollector；
       // feeCollectorKnown=false（RPC 读不到/新合约已移除该全局函数）时按 feeBps 折算并标注为
@@ -1413,8 +1474,7 @@ router.post('/:id/paid', requireAuth, paidLimiter, wrap(async (req, res) => {
     return;
   }
   // 订单级 feeBps + 已退金额 + **创建时收取方**快照补录（链上 getOrder 权威；供收款流水净额/退款口径。
-  // 合约按 `feeCollectorAtCreate` 决定这单扣不扣费（详见 src/fees.js），故两列必须同批落库——
-  // 只写 fee_bps 会让账本退回全局口径，与这单的链上事实可能相反。
+  // 合约按 `feeCollectorAtCreate` 决定这单扣不扣费（详见 src/fees.js），故两列必须同批落库。
   //
   // 补录失败**不改控制流**（链上那笔钱已经锁在托管里，这里绝不能变成 500 把买家拦在"托管已确认"
   // 之外），但也**不再完全静默**（2026-10）：读不到链上 getOrder 时这几列会留在默认值上
@@ -1422,13 +1482,22 @@ router.post('/:id/paid', requireAuth, paidLimiter, wrap(async (req, res) => {
   // 退回保守默认，直到 watcher/sync 路径再补——这件事必须留下一条可查的痕。
   try {
     const onchain = await fetchOnchainOrder(order.escrow_order_id);
-    const snap = feeSnapshotOf(onchain);
-    db.prepare('UPDATE orders SET fee_bps = ?, fee_collector_at_create = ?, refunded_amount_wei = ? WHERE id = ?').run(
-      snap.feeBps,
-      snap.feeCollectorAtCreate,
-      String(onchain.refundedAmount || '0'),
-      order.id
-    );
+    /*
+      费率快照走**唯一写入点**：链上那两个字段没同时读到 ⇒ 一个字节都不写（保持库里原值），
+      绝不把"未知"写成 `fee_bps = 0`——那会让账本把"没补录过"当成"确证不扣费"，
+      并且**覆盖掉**此前 watcher/sync 补录过的确证快照（2026-10-15 修）。
+    */
+    writeFeeSnapshot(db, order.id, feeSnapshotOf(onchain));
+    /*
+      已退金额是**另一个**链上事实，与费率快照无关，所以单独写、并且同样遵守三态：
+      链上没有这个字段（读到 undefined/null/非数字）时保持库里原值，不写 '0'——
+      `refunded_amount_wei` 参与"卖家实收净额"的口径，写一个凭空的 0 等于宣称"这单没退过款"。
+    */
+    const refundedRaw = onchain?.refundedAmount;
+    const refunded = refundedRaw === undefined || refundedRaw === null ? '' : String(refundedRaw).trim();
+    if (/^\d+$/.test(refunded)) {
+      db.prepare('UPDATE orders SET refunded_amount_wei = ? WHERE id = ?').run(refunded, order.id);
+    }
   } catch (e) {
     console.warn(
       `[paid] 链上补录失败（order=${order.id} escrowOrderId=${String(order.escrow_order_id).slice(0, 18)}…）：${e?.message || e}——` +
@@ -1547,14 +1616,13 @@ router.post('/:id/ship', staffOnly, wrap(async (req, res) => {
       '该订单缺少链上支付凭证（paid_tx_hash 为空），无法发货——请先对该订单执行同步补齐凭证；若同步后仍为空说明本地状态异常，可取消该单后由买家重新下单'
     );
   }
-  // 两级售后门控：买家退款申请待决（链上 refundRequested，资金冻结、超时释放被禁）期间拒绝发货——
-  // 发货后若卖家再同意退款将钱货两失；应先链上 rejectRefund 拒绝申请再发货，或直接 approveRefund
-  if (order.refund_status === 'requested') {
-    return fail(
-      res,
-      '买家退款申请待处理（资金冻结中）：请先在链上拒绝该退款申请（rejectRefund）后再发货，或同意退款（approveRefund）'
-    );
-  }
+  // 两级售后门控：**判据只有交付闸一处**（`chainOrder.deliveryGate` 读链上真值：
+  // status=Created 且 refundRequested=false 才放行；读不到则拒绝）——发货后若卖家再同意退款
+  // 将钱货两失，应先链上 rejectRefund 拒绝申请再发货，或直接 approveRefund。
+  // 此前这里读的是本地镜像 `refund_status`，而它是 watcher 按 finality 深度回写的，
+  // 买家"托管后立刻申请退款"的那 12 块里必然是 none ⇒ 货照发、钱冻住（见 deliveryGate 说明）。
+  const gate = await deliveryGate(order);
+  if (!gate.ok) return fail(res, gate.message);
   const db = getDb();
   let snap = {};
   try {
@@ -1636,13 +1704,10 @@ router.post('/:id/nft-deliveries', staffOnly, nftVerifyLimiter, wrap(async (req,
   if (!order.paid_tx_hash) {
     return fail(res, '该订单缺少链上支付凭证（paid_tx_hash 为空），无法交付——请先对该订单执行同步补齐凭证');
   }
-  // 两级售后门控：退款申请待决期间拒绝交付登记（同 /ship，防钱货两失）
-  if (order.refund_status === 'requested') {
-    return fail(
-      res,
-      '买家退款申请待处理（资金冻结中）：请先在链上拒绝该退款申请（rejectRefund）后再交付，或同意退款（approveRefund）'
-    );
-  }
+  // 两级售后门控：**判据只有交付闸一处**（链上 status=Created 且 refundRequested=false 才放行；
+  // 读不到则拒绝）——同 /ship，见 chainOrder.deliveryGate 的说明
+  const gate = await deliveryGate(order);
+  if (!gate.ok) return fail(res, gate.message);
   let snap = {};
   try {
     snap = JSON.parse(order.product_snapshot || '{}');
@@ -1715,6 +1780,13 @@ router.post('/:id/nft-deliveries', staffOnly, nftVerifyLimiter, wrap(async (req,
   }
 
   const now = Date.now();
+  /*
+    这两个值要活过 try 块（提交后的副作用在块外，见下方注释）——所以声明在**块外**。
+    写成块内 `const` 的话，块外引用会抛 ReferenceError：`node --check` 与 tsc 都看不出来，
+    只有真的走一遍"成功的 NFT 交付"才会暴露（2026-10-14 演示栈真链剧本抓到的正是这一处）。
+  */
+  let total = 0;
+  let toStatus = 'escrowed';
   txBegin();
   try {
     const claim = db.prepare("UPDATE product_nft_tokens SET status = 'used', order_id = ?, used_at = ? WHERE id = ? AND status = 'unused'");
@@ -1741,40 +1813,52 @@ router.post('/:id/nft-deliveries', staffOnly, nftVerifyLimiter, wrap(async (req,
     const ins = db.prepare('INSERT INTO order_delivery_items (order_id, kind, value, tx_hash, created_at) VALUES (?, ?, ?, ?, ?)');
     for (const it of items) ins.run(order.id, 'nft', it.tokenId, it.txHash.toLowerCase(), now);
     // 累计达 quantity → 自动 shipped；未达保持 escrowed（部分交付，进度见详情）
-    const total = freshDelivered + items.length;
-    const toStatus = total >= (order.quantity || 1) ? 'shipped' : 'escrowed';
+    total = freshDelivered + items.length;
+    toStatus = total >= (order.quantity || 1) ? 'shipped' : 'escrowed';
+    /*
+      条件更新里**只留并发守卫**（`status = 'escrowed'`），不留本地镜像条件
+      （2026-10-15 删掉 `AND refund_status != 'requested'`）：交付判据已经在进事务前由
+      `deliveryGate` 按**链上真值**判过，再拿镜像判一次就是第二个答案层——
+      镜像滞后（`rejectRefund` 之后、或 `RefundRejected` 事件漏扫）时它会把一次合法交付
+      挡回去，还要给出一个与链上相反的理由（"退款申请已在核验期间落地"）。
+      状态守卫仍然必要：并发请求/另一标签页可能已把这单推离 escrowed。
+    */
     const moved = db
       .prepare(
-        "UPDATE orders SET status = ?, shipped_at = COALESCE(shipped_at, ?), updated_at = ? WHERE id = ? AND status = 'escrowed' AND refund_status != 'requested'"
+        "UPDATE orders SET status = ?, shipped_at = COALESCE(shipped_at, ?), updated_at = ? WHERE id = ? AND status = 'escrowed'"
       )
       .run(toStatus, now, now, order.id).changes;
     if (moved !== 1) {
       txRollback();
-      return fail(
-        res,
-        `当前状态(${order.status})不可登记交付，或退款申请已在核验期间落地（冻结）——请刷新后确认状态再重试`
-      );
+      return fail(res, `当前状态(${order.status})不可登记交付——请刷新后确认状态再重试`);
     }
     txCommit();
-    if (toStatus === 'shipped') notify('order.shipped', order.id); // 卖家通知：NFT 全部交付
-    audit(req, 'order.nft_delivery', 'order', order.id, { tokenCount: items.length, delivered: total });
-    ok(
-      res,
-      {
-        id: order.id,
-        status: toStatus,
-        delivered: total,
-        quantity: order.quantity || 1,
-        deliveries: items.map((it) => ({ kind: 'nft', value: it.tokenId, txHash: it.txHash.toLowerCase() })),
-      },
-      toStatus === 'shipped'
-        ? 'NFT 已全部交付：链上 Transfer 凭证已登记，买家可自证持有'
-        : `NFT 已交付 ${total}/${order.quantity} 枚（部分交付），全部到齐后自动完成发货`
-    );
   } catch (e) {
     txRollback();
     throw e;
   }
+  /*
+    提交后的副作用（通知/审计/响应）**必须在事务 try 之外**（本仓的 afterCommit 纪律）：
+    `notify` 的同步段会碰库（webhook.js 的 kvGet + `SELECT * FROM orders`），它抛错时若还落在
+    上面那个 catch 里，就会对**已提交**的事务执行 txRollback —— 真错被替换成"无活动事务"
+    （db.js 的 txRollback 在深度 0 抛错），交付已生效却回 500，店主重试只会拿到"当前状态不可登记交付"。
+    与 autoDeliver.deliverDigitalFromPool 同一形状（2026-10-14 同批收口）。
+  */
+  if (toStatus === 'shipped') notify('order.shipped', order.id); // 卖家通知：NFT 全部交付
+  audit(req, 'order.nft_delivery', 'order', order.id, { tokenCount: items.length, delivered: total });
+  ok(
+    res,
+    {
+      id: order.id,
+      status: toStatus,
+      delivered: total,
+      quantity: order.quantity || 1,
+      deliveries: items.map((it) => ({ kind: 'nft', value: it.tokenId, txHash: it.txHash.toLowerCase() })),
+    },
+    toStatus === 'shipped'
+      ? 'NFT 已全部交付：链上 Transfer 凭证已登记，买家可自证持有'
+      : `NFT 已交付 ${total}/${order.quantity} 枚（部分交付），全部到齐后自动完成发货`
+  );
 }));
 
 /**
@@ -1857,10 +1941,8 @@ router.post('/:id/cancel', requireAuth, wrap(async (req, res) => {
     try {
       const onchain = await fetchOnchainOrder(order.escrow_order_id);
       if (onchain.status !== 'None') {
-        const match =
-          onchain.seller === String(order.seller || '').toLowerCase() &&
-          onchain.buyer === String(order.buyer || '').toLowerCase() &&
-          BigInt(onchain.amount || '0') === BigInt(order.amount_wei || '0');
+        // 「这个链上单号是不是我这一单」只有一处实现（chainParamsMatch，交付闸/watcher/对账共用）
+        const match = chainParamsMatch(order, onchain);
         if (match) {
           return fail(
             res,
@@ -1995,9 +2077,14 @@ export function applyRefundFlags(orderIdHex, onchain) {
 router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
   const order = findOrder(req.params.id);
   if (!order) return fail(res, '订单不存在', 404, 404);
-  const owner = (config.shop.owner || '').toLowerCase();
-  if (req.auth.address !== order.buyer && req.auth.address !== owner) {
-    return fail(res, '仅买家或店主可同步该订单', 403, 403);
+  /*
+    买家本人，或**店铺经营人员**（店主 ∪ 店员白名单）。原先只认 `config.shop.owner`——
+    而"同步链上状态"是运维动作（把漏扫/滞后的镜像拉回链上真值），店员本就能发货、
+    登记 NFT 交付、回复评价（都是 `staffOnly`），却唯独点不动这一个按钮。
+    判据与那些入口同一处（`isStaff`），不再各写一份"谁是经营人员"。
+  */
+  if (req.auth.address !== order.buyer && !isStaff(req.auth.address)) {
+    return fail(res, '仅买家本人或店铺经营人员（店主/店员）可同步该订单', 403, 403);
   }
   if (!order.escrow_order_id) return fail(res, '该订单尚未生成链上托管标识');
   if (!config.chain.escrowAddress) return fail(res, '本节点未接入托管合约（MK_ESCROW_ADDRESS 未配置）');
@@ -2019,10 +2106,10 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
     // 链上订单的金额/卖家/买家必须与本地锁定一致。买家比对尤其重要——他人钱包
     // 代付/伪造托管会把资金锁在他人 buyer 名下并可能误触发发货，只有 buyer 一致
     // 才是「本单买家真实入金」（Escrow 以 msg.sender 为 buyer）。
-    const match =
-      onchain.seller === String(order.seller || '').toLowerCase() &&
-      onchain.buyer === String(order.buyer || '').toLowerCase() &&
-      BigInt(onchain.amount || '0') === BigInt(order.amount_wei || '0');
+    // 判据只有一处实现（`chainParamsMatch`：交付闸、watcher 事件分支、后台对账共用）——
+    // 本文件此前在 /sync 与 /cancel 各抄了一份严格比较（严格到"缺字段即不匹配"，
+    // 与 chainParamsMatch 的"缺字段跳过"相反，于是同一个问题又有了两套语义）。
+    const match = chainParamsMatch(order, onchain);
     if (!match) {
       return fail(res, '链上订单的金额/卖家/买家与本单锁定不一致，疑似伪造托管或他人代付，已拒绝同步');
     }
@@ -2074,17 +2161,11 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
         // 网络/节点不可达：跳过补录，watcher 后续轮询仍会按事件落库
       }
     }
-    // 订单级 feeBps + **创建时收取方**快照权威补录（链上 getOrder；收款净额口径用，重复同步幂等覆盖同值）。
-    // 两列同批写：合约按 feeCollectorAtCreate 判这单扣不扣费（见 src/fees.js），只补费率会让
-    // 账本与链上口径漂移。快照读不到（ABI 未同步/旧节点）时 feeSnapshotOf 回空串 = 未知，不猜。
-    const feeSnap = feeSnapshotOf(onchain);
-    if (
-      feeSnap.feeBps !== Number(order.fee_bps || 0) ||
-      feeSnap.feeCollectorAtCreate !== String(order.fee_collector_at_create || '')
-    ) {
-      db.prepare('UPDATE orders SET fee_bps = ?, fee_collector_at_create = ? WHERE id = ?')
-        .run(feeSnap.feeBps, feeSnap.feeCollectorAtCreate, order.id);
-    }
+    // 订单级 feeBps + **创建时收取方**快照权威补录（链上 getOrder；收款净额口径用）。
+    // 两列同批写、且只在**链上两个字段都读到**时写（`writeFeeSnapshot` 是唯一写入点，见 src/fees.js）：
+    // 只补费率会让账本与链上口径漂移，而"读到一半就写 0"会把未知写成确证不扣费、
+    // 并覆盖掉此前补录过的确证快照。同步是补录动作，不该让库里已知的事实倒退。
+    writeFeeSnapshot(db, order.id, feeSnapshotOf(onchain));
     /*
       买家「精确金额授权」的链上镜像回填（契约 2026-09 新增 acceptPartialRefund）：
       链上 `acceptedPartialRefund(orderId)` 是卖家用 approveRefund 退部分金额时的**唯一**合法取值，
@@ -2364,7 +2445,7 @@ router.post('/:id/review/reply', staffOnly, wrap(async (req, res) => {
   const order = findOrder(req.params.id);
   if (!order) return fail(res, '订单不存在', 404, 404);
   const { content } = req.body || {};
-  const r = replyReview({ order, owner: req.auth.address, content });
+  const r = replyReview({ order, content });
   if (r.error) return fail(res, r.error);
   audit(req, 'review.reply', 'order', order.id, {});
   ok(res, reviewToPublic(findReviewByOrder(order.id)), '回复成功');

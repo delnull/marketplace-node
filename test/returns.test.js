@@ -119,6 +119,43 @@ test('已交付退款单：refunded 后占位保留 → 卖家收到退货后才
   assert.equal(commOf(p.slug), 0, '确认收到退货后回补占位（可再次销售）');
 });
 
+test('退回单号回填的并发竞态：卖家已确认收到时，买家那次回填必须**报错**而不是假装成功', async () => {
+  /*
+    回归（2026-10-15）：`setReturnTracking` 的 UPDATE 带 `AND status = 'open'` 守卫，
+    而"买家提交单号"与"卖家确认收到/放弃追索"改的是同一行。旧实现不看 `changes`，
+    写了 0 行仍回「已记录退回物流单号」——买家以为寄回凭据已登记，卖家那边状态早已是
+    received、单号仍是 NULL，退回件的唯一凭据静默丢失（同文件 settleReturn 早就修过这一类）。
+    这里直接喂一个**过期的退货单快照**（status 还是 open，库里已 received），复现那个竞态。
+  */
+  const { setReturnTracking, fetchReturnByOrder } = await import('../src/returns.js');
+  const p = await listProduct(productPayload({ kind: 'physical', title: '退回单号竞态', capacity: 5 }));
+  const order = await createDraft(p.slug);
+  escrowed(order);
+  await shipPhysical(order.id, 'SF-RACE-1');
+  const cr = await request(app)
+    .post(`/api/orders/${order.id}/return`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({})
+    .expect(200);
+  assertOk(cr);
+  const stale = fetchReturnByOrder(order.id); // 买家手里的那一份（status='open'）
+  assert.equal(stale.status, 'open', '前置：快照是 open');
+
+  // 卖家并发确认收到（库里变成 received）
+  const rc = await request(app)
+    .post(`/api/orders/${order.id}/return/receive`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .expect(200);
+  assertOk(rc);
+
+  // 买家拿过期快照回填 → 必须失败，且不得把单号写进去
+  const r = setReturnTracking({ order, returnRow: stale, buyer: buyer.address, trackingNo: 'SF-RACE-BACK' });
+  assert.ok(r.error, `写了 0 行却回成功 = 静默丢凭据；实际返回：${JSON.stringify(r)}`);
+  assert.match(r.error, /状态已变化/);
+  assert.equal(fetchReturnByOrder(order.id).tracking_no, null, '单号没有被静默写入');
+  assert.equal(fetchReturnByOrder(order.id).status, 'received', '状态也没被改回去');
+});
+
 test('receive 早于链上退款终局：挂起等待，watcher RefundApproved 后自动释放', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '退货先行收货', capacity: 5 }));
   const order = await createDraft(p.slug);

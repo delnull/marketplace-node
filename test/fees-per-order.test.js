@@ -7,7 +7,8 @@
  *   ① 创建时配了收取方 → 事后全局被置零：链上**照扣**（快照），账本若看全局就报"不扣" ⇒ 净额虚高；
  *   ② 创建时为 0 → 事后全局配了收取方：链上**一分不扣**，账本若看全局就按 feeBps 扣 ⇒ 净额虚低。
  * 本文件用真实 HTTP 端点（流水 / 两路 CSV / 看板 / 订单 DTO / 仲裁摘要）钉住这两条，外加：
- *   ③ 快照为空（未补录/ABI 未同步）= 未知 → 退回全局口径（保守：全局也读不到时按"会扣费"）；
+ *   ③ 快照为空（未补录/ABI 未同步）= **未知** → 费与净额一律"不知道"（null / CSV 留空），
+ *      但披露仍如实：`fee_basis=fallback` + `feeChargeable`/`feeCollectorKnown`（界面标「预计」）；
  *   ④ 快照 → 零地址（'' 之外的零地址）是**权威的"不扣费"**，不得再退回全局。
  *
  * 全局口径怎么伪造：账本的全局兜底走 `fees.js` → chain.js 的 ethers provider，而 **ethers v6
@@ -24,7 +25,7 @@ import { makeCtx, login, assertOk } from './setup.mjs';
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
 
-const { resetFeeCache, feeChargeableForOrder, feeOf } = await import('../src/fees.js');
+const { resetFeeCache, feeChargeableForOrder, feeOf, feeOfRow } = await import('../src/fees.js');
 const config = (await import('../src/config.js')).default;
 
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -127,6 +128,7 @@ test('漂移方向①：创建时配了收费方、事后全局被置零 → 账
   const detail = await request(app).get(`/api/orders/${id}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
   assert.equal(detail.body.data.feeCollectorAtCreate, FC_AT_CREATE);
   assert.equal(detail.body.data.feeChargeable, true);
+  assert.equal(detail.body.data.feeBps, 100, '订单 DTO 的快照费率（确证值）');
 
   // 两路 CSV 与流水同口径（amount_net_wei / net_wei 都按快照扣除），且各自带上判据三件套
   const ledgerCsv = await request(app).get('/api/shop/export/ledger.csv').set('Authorization', `Bearer ${ownerToken}`).expect(200);
@@ -165,41 +167,52 @@ test('漂移方向②：创建时为 0（快照零地址）、事后全局配了
   assert.equal(row.amountWeiNet, '1000');
 });
 
-test('快照为空（未知）→ 退回全局口径；全局也读不到时按"可能扣费"保守折算', async () => {
-  // ③a 未知 + 全局零地址（已知）→ 按全局口径：不扣
-  const unknownZero = insertIncome({ feeCollectorAtCreate: '' });
+test('快照为空（未回填）⇒ 费与净额**未知**（null / CSV 留空），不再按全局折算出一个具体数字', async () => {
+  /*
+    ③ 的语义在 2026-10-14 变了，变的是**数字怎么来**，不是披露：
+    旧实现拿"全局 feeCollector 现在配没配"去替一行**没有费率快照**的单折算出一个具体费用
+    （`fee_bps` 是列默认值 0 还是别的值无从分辨），折出来的数与链上按快照扣的数可能相反。
+    现在这一档一律 null/留空（不知道就是不知道），而"判据来自兜底"这件事仍如实披露
+    （`fee_basis=fallback` + `feeChargeable`/`feeCollectorKnown`），界面据此标「预计」而不是「已扣」。
+  */
+  // ③a 未知 + 全局零地址（已知）→ 披露"按全局口径不扣"，但金额仍是"不知道"
+  const unknownZero = insertIncome({ feeCollectorAtCreate: '', feeBps: 0 });
   await setGlobal(ZERO);
   const a = await rowInLedger(unknownZero);
   assert.equal(a.row.feeCollectorAtCreate, null, '空串 → null（未知，不是"零地址"）');
+  assert.equal(a.row.feeBps, null, '费率快照未回填 ⇒ feeBps=null（绝不落成 0%）');
   assert.equal(a.row.feeChargeable, false, '未知时退回全局口径：全局已知为零地址 ⇒ 不扣');
-  assert.equal(a.row.feeWei, '0');
+  assert.equal(a.row.feeWei, null, '算不出来 ⇒ null（旧实现这里写 0，等于替链上宣布不扣费）');
+  assert.equal(a.row.amountWeiNet, null, '净额随之未知');
 
-  // ③b 未知 + 全局非零（已知）→ 按全局口径：扣
-  const unknownGlobal = insertIncome({ feeCollectorAtCreate: '' });
+  // ③b 未知 + 全局非零（已知）→ 旧实现会按全局口径折出一个具体数字，现在只披露、不给数
+  const unknownGlobal = insertIncome({ feeCollectorAtCreate: '', feeBps: 0 });
   await setGlobal(FC_GLOBAL);
   const b = await rowInLedger(unknownGlobal);
-  assert.equal(b.row.feeChargeable, true);
-  assert.equal(b.row.feeWei, '10');
+  assert.equal(b.row.feeChargeable, true, '披露：兜底口径下"可能会扣"');
+  assert.equal(b.row.feeWei, null, '但费率本身没回填 ⇒ 具体费用是"不知道"，不编一个数');
 
   // ③c 未知 + 全局读不到（RPC 失败）→ known=false ⇒ 保守按会扣费（与 fees.js 的取舍一致）
-  const unknownDown = insertIncome({ feeCollectorAtCreate: '' });
+  const unknownDown = insertIncome({ feeCollectorAtCreate: '', feeBps: 0 });
   await setGlobal('THROW');
   const c = await rowInLedger(unknownDown);
   assert.equal(c.summary.feeCollectorKnown, false, 'RPC 读不到 ⇒ 披露 known=false（前端标"预计"）');
   assert.equal(c.row.feeChargeable, true, '未知 + 读不到 ⇒ 保守按可能扣费处理');
-  assert.equal(c.row.feeWei, '10');
+  assert.equal(c.row.feeWei, null);
   assert.ok(rpcCalls > 0, '全局口径确实触发了链上读取（这也是它必须只作兜底的原因）');
 
   /*
-    ③d 两路 CSV 的判据来源如实标注（源码审计 2026-09 续）：
-    没有这一列时，导出的 `fee_wei` 分不出「按本单快照确证扣了」与「快照缺失、按全局保守口径折算」——
+    ③d 两路 CSV 的判据来源如实标注（源码审计 2026-09 续；2026-10-14 补：金额单元格同样三态）：
+    没有 `fee_basis` 列时，导出的 `fee_wei` 分不出「按本单快照确证扣了」与「快照缺失、判据只是兜底」——
     后者**可能**与链上实际扣费相反，而店主拿着 CSV 对账时看到的两者一模一样。
   */
   const ledOffline = await request(app).get('/api/shop/export/ledger.csv').set('Authorization', `Bearer ${ownerToken}`).expect(200);
   const off = csvRow(ledOffline.text, unknownDown);
   assert.equal(off.fee_basis, 'fallback', '快照缺失 ⇒ 判据来源标 fallback（不得冒充 snapshot）');
   assert.equal(off.fee_chargeable, '1', '兜底保守：按会扣费折算');
-  assert.equal(off.fee_wei, '10');
+  assert.equal(off.fee_wei, '', '费率未回填 ⇒ 金额单元格留空（Excel 里是"没有值"），不写 0');
+  assert.equal(off.net_wei, '', '净额同理留空');
+  assert.equal(off.fee_bps, '', '费率单元格也留空（0 会被读成"确证不扣费"）');
 
   // 纯函数口径与账本一致（唯一实现）
   assert.equal(feeChargeableForOrder(ZERO), false);
@@ -208,6 +221,34 @@ test('快照为空（未知）→ 退回全局口径；全局也读不到时按"
   assert.equal(feeChargeableForOrder(undefined), feeChargeableForOrder(''), 'undefined 同样按未知处理');
   assert.equal(feeOf(1000n, 100, ZERO), 0n, '按单快照零地址 ⇒ 恒 0');
   assert.equal(feeOf(1000n, 100, FC_AT_CREATE), 10n, '按单快照非零 ⇒ 名义费率折算');
+  // 三态内核（fees.feeSnapshotReadOf 的消费口）：判据是"两列成对补录"，空快照 ⇒ null
+  assert.equal(feeOfRow(1000n, { fee_bps: 0, fee_collector_at_create: '' }), null, '未回填 ⇒ 不知道');
+  assert.equal(feeOfRow(1000n, { fee_bps: 100, fee_collector_at_create: ZERO }), 0n, '确证不扣费 ⇒ 0n（是结论，不是未知）');
+  assert.equal(feeOfRow(1000n, { fee_bps: 100, fee_collector_at_create: FC_AT_CREATE }), 10n);
+
+  /*
+    补录两列（真实系统里 /paid、watcher、/sync 都是成对写）之后，汇总自己恢复成具体数字——
+    判据是数据，不是开关：本文件后面的用例因此仍然能比较"具体金额"。
+  */
+  db.prepare('UPDATE orders SET fee_bps = 0, fee_collector_at_create = ? WHERE fee_collector_at_create = ?').run(ZERO, '');
+  const healed = await rowInLedger(unknownDown);
+  assert.equal(healed.row.feeWei, '0', '补录后：确证不扣费 ⇒ 0（这是结论，不是"不知道"）');
+  assert.notEqual(healed.summary.feeWei, null);
+
+  /*
+    订单详情这一腿同样必须是三态（2026-10-15 补）：收据/订单卡读的就是这个字段，
+    它的 null 会让界面印「费率待读取」而不是「本单费率快照为 0」——后者是替链上下的结论。
+    （上面那次"补录"把此前所有空快照的行都填了，所以这里新插两行来对拍。）
+  */
+  const dtoUnknown = insertIncome({ feeCollectorAtCreate: '', feeBps: 0 });
+  const detailUnknown = await request(app).get(`/api/orders/${dtoUnknown}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  assert.equal(detailUnknown.body.data.feeBps, null, '未回填 ⇒ 订单 DTO 的 feeBps = null');
+  assert.equal(detailUnknown.body.data.feeCollectorAtCreate, null, '同一响应里的收取方也如实为 null（两列同生共死）');
+  const dtoKnown = insertIncome({ feeCollectorAtCreate: ZERO, feeBps: 0 });
+  const detailKnown = await request(app).get(`/api/orders/${dtoKnown}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  assert.equal(detailKnown.body.data.feeBps, 0, '确证不扣费 ⇒ 0（是结论，不是未知）');
+  // 验完就把那行补录掉：本用例只借它证明 DTO 的三态，别让后面的聚合用例看见一行"未知"
+  db.prepare('UPDATE orders SET fee_bps = 0, fee_collector_at_create = ? WHERE id = ?').run(ZERO, dtoUnknown);
 });
 
 test('看板净额（GMV）同样按单快照：同一批行的净额等于逐行按单判定的和', async () => {
@@ -215,7 +256,6 @@ test('看板净额（GMV）同样按单快照：同一批行的净额等于逐�
   const mixed = [
     insertIncome({ feeCollectorAtCreate: ZERO, amountWei: '500' }), // 不扣
     insertIncome({ feeCollectorAtCreate: FC_AT_CREATE, amountWei: '500' }), // 扣 5
-    insertIncome({ feeCollectorAtCreate: '', amountWei: '500' }), // 未知 → 全局兜底 → 扣 5
   ];
   const before = await request(app).get('/api/shop/stats/overview?days=0').set('Authorization', `Bearer ${ownerToken}`).expect(200);
   assertOk(before);
@@ -224,7 +264,7 @@ test('看板净额（GMV）同样按单快照：同一批行的净额等于逐�
     const base = BigInt(r.amount_wei) - BigInt(r.refunded_amount_wei || '0');
     return sum + base - feeOf(base, r.fee_bps, r.fee_collector_at_create);
   }, 0n);
-  assert.equal(expectedDelta, 500n + 495n + 495n);
+  assert.equal(expectedDelta, 500n + 495n);
   // overview 的 gmvNetWei 含全库入账单：用"再加一次同样三行"的差值验证口径（与既有行无关）
   const after2 = await request(app).get('/api/shop/stats/overview?days=0').set('Authorization', `Bearer ${ownerToken}`).expect(200);
   assertOk(after2);

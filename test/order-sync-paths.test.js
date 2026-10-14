@@ -362,16 +362,30 @@ test('费率快照补录：/sync 同时写 fee_bps 与 fee_collector_at_create�
   );
   assert.equal(typeof detail.body.data.feeChargeable, 'boolean', 'DTO 同时下发**按单**的扣费判定');
 
-  // feeSnapshotOf 是三个补录入口共用的取值口径：ABI 同步后解出的字段必须原样小写落库
+  /*
+    feeSnapshotOf 是三个补录入口共用的取值与三态判据：ABI 同步后解出的字段必须原样小写落库，
+    并且**两个字段都读到才算读到**（`known`）——`known:false` 时调用方一个字节都不许写，
+    否则"没补录过"会被写成"确证不扣费"（写入点是 fees.writeFeeSnapshot，见 fee-snapshot-write.test.js）。
+  */
   assert.deepEqual(feeSnapshotOf({ feeBps: 250, feeCollectorAtCreate: FC_AT_CREATE.toUpperCase().replace('0X', '0x') }), {
+    known: true,
     feeBps: 250,
     feeCollectorAtCreate: FC_AT_CREATE,
   });
-  assert.deepEqual(feeSnapshotOf({ feeBps: 250 }), { feeBps: 250, feeCollectorAtCreate: '' }, '字段缺失 ⇒ 空串（未知）');
+  assert.deepEqual(
+    feeSnapshotOf({ feeBps: 250 }),
+    { known: false, feeBps: 0, feeCollectorAtCreate: '' },
+    '字段缺失 ⇒ 未知（known:false），占位值不得写库'
+  );
   assert.deepEqual(
     feeSnapshotOf({ feeBps: 250, feeCollectorAtCreate: null }),
-    { feeBps: 250, feeCollectorAtCreate: '' },
-    'null ⇒ 空串（未知），不得回落成零地址'
+    { known: false, feeBps: 0, feeCollectorAtCreate: '' },
+    'null ⇒ 未知，不得回落成零地址'
+  );
+  assert.deepEqual(
+    feeSnapshotOf({ feeBps: 0, feeCollectorAtCreate: '0x' + '0'.repeat(40) }),
+    { known: true, feeBps: 0, feeCollectorAtCreate: '0x' + '0'.repeat(40) },
+    '零地址是**确证不扣费**（known:true），与"没读到"不是一回事'
   );
 });
 

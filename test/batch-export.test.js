@@ -13,6 +13,30 @@ const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
 const stranger = Wallet.createRandom();
 
+/**
+ * 交付闸读的是**链上真值**（见 chainOrder.deliveryGate）：本文件只关心批量筛选的语义，
+ * 所以默认链上"这一单在托管中且未申请退款"；需要"链上已冻结"的单显式加进 `frozenOnChain`。
+ * （镜像滞后于链上那个窗口本身由 test/delivery-gate.test.js 钉住。）
+ */
+const { setChainOrderFetcher } = await import('../src/chainOrder.js');
+const frozenOnChain = new Set();
+setChainOrderFetcher((orderIdHex) => {
+  const id = String(orderIdHex || '').toLowerCase();
+  const row = db
+    .prepare('SELECT buyer, seller, amount_wei FROM orders WHERE escrow_order_id = ?')
+    .get(id);
+  if (!row) throw new Error('unit-test 链上桩：链上没有这一单');
+  return {
+    status: 'Created',
+    refundRequested: frozenOnChain.has(id),
+    refundRejected: false,
+    refundedAmount: '0',
+    buyer: row.buyer,
+    seller: row.seller,
+    amount: row.amount_wei,
+  };
+});
+
 let ownerToken;
 let buyerToken;
 let seq = 0;
@@ -58,6 +82,8 @@ test('batch-ship：实物多单同单号发货；拒绝数字/无凭证/退款�
   const frozen = await createDraft(ph.slug);
   escrowed(frozen);
   db.prepare("UPDATE orders SET refund_status = 'requested' WHERE id = ?").run(frozen.id);
+  // 镜像与链上一致：链上也确实冻结（交付闸判的是链上那个真值）
+  frozenOnChain.add(String(frozen.escrowOrderId).toLowerCase());
 
   const res = await request(app)
     .post('/api/orders/seller/batch-ship')

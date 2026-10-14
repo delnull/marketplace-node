@@ -64,8 +64,14 @@ export function submitReview({ order, buyer, rating, content }) {
   return { ok: true };
 }
 
-/** 店主回复评价（单次）。 */
-export function replyReview({ order, owner, content }) {
+/**
+ * 店主回复评价（单次）。
+ *
+ * 签名只吃 `order` 与 `content`（2026-10-14 移除一个 `owner` 形参）：它被解构出来后**从未使用**——
+ * 一个"看起来函数内会校验店主"的参数，实际鉴权全在调用点（路由的 `staffOnly`）。
+ * 留着它，下一个调用点就会以为这里已经校验过了。
+ */
+export function replyReview({ order, content }) {
   const text = String(content ?? '').trim();
   if (!text) return { error: '回复内容不能为空' };
   if (text.length > 1000) return { error: '回复内容不能超过 1000 字' };

@@ -118,6 +118,11 @@ export function createReturn({ order, address, note }) {
  * 买家回填退回物流单号（可带承运方名称）：open → shipped。
  * `carrier` 的归一与上限走 src/shipping.js（与发货侧**同一实现**）：空串/未填 → NULL，
  * 不留空串、也不编"其他"——它是"买家有没有告诉我们寄的是哪家"这个事实本身。
+ *
+ * **必须检查 `changes`**（2026-10-14 补齐，与同文件 `settleReturn` 同一形状）：UPDATE 带的
+ * `AND status = 'open'` 是竞态守卫，而买家提交单号与卖家「确认收到 / 放弃追索」改的是同一行。
+ * 不看 changes 就会在写了 0 行的前提下回"已记录退回物流单号"——买家以为寄回凭据已登记，
+ * 卖家那边状态早已是 received、单号仍是 NULL，退回件的唯一凭据静默丢失。
  */
 export function setReturnTracking({ order, returnRow, buyer, trackingNo, carrier }) {
   if (!returnRow) return { error: '退货单不存在（请先联系卖家创建退货单）' };
@@ -128,9 +133,12 @@ export function setReturnTracking({ order, returnRow, buyer, trackingNo, carrier
   if (!no) return { error: '退回物流单号不能为空' };
   if (no.length > 100) return { error: '退回物流单号不能超过 100 字符' };
   if (returnRow.status !== 'open') return { error: `退货单当前状态(${returnRow.status})不可再填单号（已寄出/已确认）` };
-  getDb()
+  const moved = getDb()
     .prepare("UPDATE order_returns SET status = 'shipped', tracking_no = ?, carrier = ?, updated_at = ? WHERE id = ? AND status = 'open'")
-    .run(no, normalizeCarrier(carrier), Date.now(), returnRow.id);
+    .run(no, normalizeCarrier(carrier), Date.now(), returnRow.id).changes;
+  if (moved !== 1) {
+    return { error: '退货单状态已变化（可能已被卖家处理），请刷新后重试——单号没有记录，请确认当前状态后再填' };
+  }
   return { ok: true, data: fetchReturnByOrder(order.id) };
 }
 

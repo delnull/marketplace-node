@@ -12,18 +12,24 @@
  *  - 趋势按天补零；全部 BigInt 精确累加（与 ledger 同模式，不依赖 SQLite SUM 精度）。
  */
 import { getDb } from './db.js';
-import { feeOf as feeOfChain, netOf as netOfChain } from './fees.js';
+// 入账状态集合的唯一出处（src/orderStatus.js，与 db.js 的 CHECK 逐字同源）：
+// 本文件此前手抄过一份 INCOME 内联数组——那份抄写不在 test/status-set-consistency.test.js
+// 的射程内，往枚举里加状态时会静默落后（看板漏掉一整档入账）。
+import { INCOME_STATUS } from './orderStatus.js';
+// 平台费/净额一律走 src/fees.js（**唯一实现**，三态）：判据是**每行**的创建时收取方快照
+// `fee_collector_at_create`（合约只读快照，全局 feeCollector() 事后可改，不能替代它），
+// 而 `fee_bps` 那一列分不开"没补录"与"就是 0" ⇒ 用 `*OfRow(base, 整行)` 拿 `bigint | null`
+// （null = 费率快照未回填，此时净额是"不知道"，不是 0；见 fees.feeSnapshotReadOf）
+import { feeOfRow, netOfRow } from './fees.js';
 
-const INCOME = ['confirmed', 'settled', 'expired'];
+const INCOME = INCOME_STATUS;
 
 const DAY_MS = 24 * 3600 * 1000;
 /** 看板窗口天数上限（含默认档；0=全量单列语义，不受此限） */
 export const STATS_MAX_DAYS = 366;
 
-// 平台费/净额一律走 src/fees.js（**唯一实现**；判据是**每单**的创建时收取方快照
-// fee_collector_at_create——合约只读快照，全局 feeCollector() 事后可改，不能替代它）
-const feeOf = (amountWei, feeBps, feeCollectorAtCreate) => feeOfChain(amountWei, feeBps, feeCollectorAtCreate);
-const netOf = (amountWei, feeBps, feeCollectorAtCreate) => netOfChain(amountWei, feeBps, feeCollectorAtCreate);
+// 平台费/净额一律走 src/fees.js 的 feeOfRow / netOfRow（**唯一实现**、三态）——本文件不再
+// 自己拼 (金额, 费率, 收取方) 三元组：那样就把"费率快照是否回填"这个判据又抄了一遍。
 
 /**
  * 看板 days 参数归一（D7：缺省/非法/越界统一钳制——此前 overview 缺省被 ||0 吞成全量、
@@ -90,15 +96,23 @@ export function overviewStats(days) {
   let refundWei = 0n;
   let units = 0;
   let confirmed = 0;
+  /*
+    费率快照未回填的行数（`fee_collector_at_create` 为空；判据见 fees.feeSnapshotReadOf）：
+    这些行的平台费算不出来 ⇒ 净额就不是确证的总计，下面下发 null（未知）而不是一个偏小的数。
+    毛额/单数/买家数不受影响（它们与费率无关，仍是确证的）。
+  */
+  let feeUnknownCount = 0;
   const buyers = new Set();
   const buyerOrders = new Map();
   const soldProducts = new Set();
   for (const r of rows) {
     // 净额 = 托管额 − 已退买家 − 平台费（部分退款后只对未退部分计费，与链上 Escrow._settle 一致；
-    // 平台费按该单的创建时收取方快照判定）
+    // 平台费按该行的创建时收取方快照判定，唯一实现见 src/fees.js）；null = 费率快照未回填
     const refunded = BigInt(r.refunded_amount_wei || '0');
     const base = BigInt(r.amount_wei || '0') - refunded;
-    gmvNetWei += netOf(base > 0n ? base : 0n, Number(r.fee_bps || 0), r.fee_collector_at_create);
+    const net = netOfRow(base > 0n ? base : 0n, r);
+    if (net === null) feeUnknownCount += 1;
+    else gmvNetWei += net;
     units += r.quantity || 1;
     confirmed += r.status === 'confirmed' ? 1 : 0;
     buyers.add(r.buyer);
@@ -112,7 +126,8 @@ export function overviewStats(days) {
   return {
     orders: rows.length,
     units,
-    gmvNetWei: gmvNetWei.toString(),
+    gmvNetWei: feeUnknownCount > 0 ? null : gmvNetWei.toString(),
+    feeUnknownCount,
     refundOrders: refunds.length,
     refundWei: refundWei.toString(),
     buyers: buyers.size,
@@ -158,7 +173,7 @@ export function trendStats(days) {
   const buckets = new Map();
   for (let i = 0; i < eff; i++) {
     const key = dayKey(start + i * DAY_MS);
-    buckets.set(key, { day: key, orders: 0, netWei: '0', refundWei: '0' });
+    buckets.set(key, { day: key, orders: 0, netWei: '0', refundWei: '0', feeUnknownCount: 0 });
   }
   const add = (key, field, v) => {
     const b = buckets.get(key);
@@ -171,7 +186,14 @@ export function trendStats(days) {
     if (b) {
       b.orders += 1;
       const base = BigInt(r.amount_wei || '0') - BigInt(r.refunded_amount_wei || '0');
-      b.netWei = (BigInt(b.netWei) + netOf(base > 0n ? base : 0n, Number(r.fee_bps || 0), r.fee_collector_at_create)).toString();
+      // 三态（同 overview）：本日有费率快照未回填的单 ⇒ 当日净额 null（未知），而不是少算一个费的数
+      const net = netOfRow(base > 0n ? base : 0n, r);
+      if (net === null) {
+        b.feeUnknownCount += 1;
+        b.netWei = null;
+      } else if (b.netWei !== null) {
+        b.netWei = (BigInt(b.netWei) + net).toString();
+      }
     }
   }
   for (const r of refunds) add(dayKey(r.updated_at), 'refundWei', BigInt(r.refunded_amount_wei || '0'));
@@ -199,11 +221,18 @@ export function productStats(days, sort = 'gmv', page = 1, pageSize = 20) {
   for (const r of rows) {
     const key = r.product_id;
     if (key == null) continue;
-    const a = agg.get(key) || { units: 0, orders: 0, netWei: 0n, buyers: new Set(), lastSaleAt: 0 };
+    const a = agg.get(key) || { units: 0, orders: 0, netWei: 0n, feeUnknownCount: 0, buyers: new Set(), lastSaleAt: 0 };
     a.orders += 1;
     a.units += r.quantity || 1;
     const baseP = BigInt(r.amount_wei || '0') - BigInt(r.refunded_amount_wei || '0');
-    a.netWei += netOf(baseP > 0n ? baseP : 0n, Number(r.fee_bps || 0), r.fee_collector_at_create);
+    // 三态（同 overview）：该商品有费率快照未回填的单 ⇒ 它的净额 null（未知）
+    const net = netOfRow(baseP > 0n ? baseP : 0n, r);
+    if (net === null) {
+      a.feeUnknownCount += 1;
+      a.netWei = null;
+    } else if (a.netWei !== null) {
+      a.netWei += net;
+    }
     a.buyers.add(r.buyer);
     a.lastSaleAt = Math.max(a.lastSaleAt, Number(r.updated_at || 0));
     agg.set(key, a);
@@ -219,7 +248,8 @@ export function productStats(days, sort = 'gmv', page = 1, pageSize = 20) {
       active: p ? !!p.active : false,
       orders: a.orders,
       units: a.units,
-      netWei: a.netWei.toString(),
+      netWei: a.netWei === null ? null : a.netWei.toString(),
+      feeUnknownCount: a.feeUnknownCount,
       refundWei: (refundWeiByProduct.get(productId) || 0n).toString(),
       refunds: refundCountByProduct.get(productId) || 0,
       buyers: a.buyers.size,
@@ -227,8 +257,13 @@ export function productStats(days, sort = 'gmv', page = 1, pageSize = 20) {
     });
   }
 
-  // 稳定排序：相等返回 0此前恒 -1 使等值项顺序依赖引擎、JS sort 不稳）
+  // 稳定排序：相等返回 0（此前恒 -1 使等值项顺序依赖引擎、JS sort 不稳）；
+  // 净额未知（费率快照未回填）的行**排在最后**——不拿"不知道"当 0 去参与比大小。
   const byNetDesc = (a, b) => {
+    if (a.netWei === null || b.netWei === null) {
+      if (a.netWei === null && b.netWei === null) return 0;
+      return a.netWei === null ? 1 : -1;
+    }
     const d = BigInt(b.netWei) - BigInt(a.netWei);
     return d > 0n ? 1 : d < 0n ? -1 : 0;
   };

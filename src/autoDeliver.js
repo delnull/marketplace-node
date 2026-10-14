@@ -14,7 +14,7 @@
 import config from './config.js';
 import { getDb, txBegin, txCommit, txRollback } from './db.js';
 import { notify } from './webhook.js';
-import { fetchOrderFor } from './chainOrder.js';
+import { deliveryGate } from './chainOrder.js';
 
 /**
  * 事务内从码池分配 quantity 个未用码并置订单 shipped（ship 手动发货与自动交付共用；
@@ -59,19 +59,21 @@ export function deliverDigitalFromPool(order) {
     const ins = db.prepare('INSERT INTO order_delivery_items (order_id, kind, value, created_at) VALUES (?, ?, ?, ?)');
     for (const c of codes) ins.run(order.id, 'code', c.code, now);
     txCommit();
-    /*
-      通知放在 try/catch **之外**（源码审计 2026-09 复审，P3）：`notify` 是 fire-and-forget，
-      但它自己（或将来某个包装）抛错时，会落到下面那个 catch 里执行 `txRollback()` —— 而事务
-      **已经 COMMIT 了**：真错会被替换成"无活动事务"，交付已生效却返回 500；更糟的是，
-      若将来有调用方在本函数外层还开着事务，这次 `txRollback` 会回滚**调用方**的事务。
-      提交后的副作用一律不许再碰事务，这是本仓反复强调的 `afterCommit` 纪律。
-    */
-    notify('order.shipped', order.id); // 卖家通知（P0-3）：自动交付完成
-    return { codes: codes.map((c) => c.code) };
   } catch (e) {
     txRollback();
     throw e;
   }
+  /*
+    通知放在**事务 try 之外**（源码审计 2026-09 复审，P3 —— 本条注释此前就写在这里，
+    但 `notify` 一直在 try 内，直到 2026-10-14 才真的搬出来）：`notify` 是 fire-and-forget，
+    但它的**同步段**会碰库（webhook.js 的 kvGet + `SELECT * FROM orders`，见 buildPayload），
+    抛错时若还在 try 内，就会落到上面那个 catch 执行 `txRollback()` —— 而事务**已经 COMMIT 了**：
+    真错被替换成"无活动事务"（db.js 的 txRollback 在深度 0 抛错），交付已生效却返回 500；
+    更糟的是，若将来有调用方在本函数外层还开着事务，这次 `txRollback` 会回滚**调用方**的事务。
+    提交后的副作用一律不许再碰事务，这是本仓反复强调的 `afterCommit` 纪律。
+  */
+  notify('order.shipped', order.id); // 卖家通知（P0-3）：自动交付完成
+  return { codes: codes.map((c) => c.code) };
 }
 
 /** 商品级自动交付开关（P1-③）：-1=跟随全局 MK_AUTO_DELIVER / 0=关 / 1=开 */
@@ -83,13 +85,20 @@ export function autoDeliverEnabledForProduct(productId) {
   return config.autoDeliver;
 }
 
-/** 单订单自动交付尝试（幂等；结果只影响本地订单，不抛错） */
+/**
+ * 单订单自动交付尝试（幂等；结果只影响本地订单，不抛错）。
+ *
+ * **本函数不再自带"该不该发"的判据**（2026-10-15 删掉了一处镜像判断）：
+ * 唯一调用方 `tryAutoDeliverByEscrowOrder` 已经在调它之前过了 `chainOrder.deliveryGate`
+ * （链上 `status == Created` 且 `refundRequested == false`，读不到就拒绝）。
+ * 这里原本还留着一句 `if (order.refund_status === 'requested') return false;`——
+ * 那是**按本地镜像**再判一次，而镜像按 finality 深度滞后：卖家 `rejectRefund` 之后、
+ * 或 `RefundRejected` 事件漏扫/被隔离时，镜像会长期停在 `requested`，
+ * 于是同一时刻"自动交付拒绝、手动 /ship 放行"，同一个问题又有了两个答案层。
+ * 行筛选（escrowed + 有凭证）仍在调用方，与本模块的分工不变。
+ */
 export function tryAutoDeliverOrder(order) {
   if (!order || order.status !== 'escrowed') return false;
-  // 退款冻结期拒发（与 /ship、/nft-deliveries、batch-ship 门控一致）：
-  // 码池导入补跑/paid 快路径/watcher 回写都经本函数——买家链上申请退款（requested，
-  // 资金冻结）后不得再自动发码，否则卖家随后 approveRefund = 钱退+码送出双损。
-  if (order.refund_status === 'requested') return false;
   let snap = {};
   try {
     snap = JSON.parse(order.product_snapshot || '{}');
@@ -120,9 +129,12 @@ export function tryAutoDeliverOrder(order) {
  * 让 `releaseExpired` 一直 revert），卖家只能拒绝 → 争议 → 仲裁——正是本文件
  * `tryAutoDeliverPendingForProduct` 注释里写的"双损"。
  *
- * 判据只有一条：**链上 `getOrder` 说 `status == Created(1)` 且 `refundRequested == false` 才发**；
- * 读不到（RPC 不可达/无此单）**不发**——自动交付是"锦上添花"，宁可留给卖家面板手动交付，
- * 也不要在看不清链上状态时把码发出去（与 `flushAutoDeliverPending` 的取舍逐字一致）。
+ * 判据只有一条，且**只有一处实现**：`chainOrder.deliveryGate` —— 链上 `getOrder` 说
+ * `status == Created(1)` 且 `refundRequested == false` 才发；读不到（RPC 不可达/无此单）**不发**
+ * ——自动交付是"锦上添花"，宁可留给卖家面板手动交付，也不要在看不清链上状态时把码发出去。
+ * 三个手动交付入口（`/ship`、`/seller/batch-ship`、`/:id/nft-deliveries`）走的是**同一个**闸
+ * （2026-10-14 收口）：此前它们只看本地镜像，于是同一个"该不该交付"的问题有两个答案层，
+ * 而两个答案在 finality 窗口里必然相反。
  *
  * **2026-10-14：这里原本还有一个 `tryAutoDeliverById(id)`**（只读本地镜像、供 `/paid` 快路径用）。
  * 它不是一个"少一层校验"的变体，而是**第二条判据**：同一个"该不该发码"的问题有两个答案层，
@@ -139,19 +151,27 @@ export function tryAutoDeliverOrder(order) {
 export async function tryAutoDeliverByEscrowOrder(orderIdHex) {
   const id = String(orderIdHex || '').toLowerCase();
   if (!id) return false;
-  let cur = null;
-  try {
-    cur = await fetchOrderFor(id);
-  } catch {
-    console.warn(`[autoDeliver] ${id.slice(0, 18)}… 链上真值读取失败，本轮不自动交付（保留 escrowed 等手动交付/下轮再试）`);
-    return false;
-  }
-  if (String(cur?.status || '') !== 'Created' || cur?.refundRequested) return false;
+  /*
+    先取本地行，再走**交付闸**（`chainOrder.deliveryGate`）——判据只有那一处：
+    链上 `status == Created` 且 `refundRequested == false`，读不到则不放行。
+    这里不再内联一份"链上 Created 且未申请退款"的判断：三个手动交付入口（/ship、
+    /seller/batch-ship、/:id/nft-deliveries）与自动交付必须回答同一个问题、给出同一个答案
+    （2026-10-14：此前自动交付读链、手动交付读本地镜像，同一问题两个答案层）。
+    顺序也顺带改为"先看有没有可交付的本地行"：没有就不打这次 RPC。
+  */
   const order = getDb()
     .prepare(
       "SELECT * FROM orders WHERE escrow_order_id = ? AND status = 'escrowed' AND paid_tx_hash IS NOT NULL"
     )
     .get(id);
+  if (!order) return false;
+  const gate = await deliveryGate(order);
+  if (!gate.ok) {
+    if (gate.code === 'unreadable') {
+      console.warn(`[autoDeliver] ${id.slice(0, 18)}… 链上真值读取失败，本轮不自动交付（保留 escrowed 等手动交付/下轮再试）`);
+    }
+    return false;
+  }
   return tryAutoDeliverOrder(order);
 }
 
@@ -161,11 +181,11 @@ export async function tryAutoDeliverByEscrowOrder(orderIdHex) {
  * 返回本次成功补跑的订单数（幂等：不满足条件/池仍不足的订单保持 escrowed 等手动交付）。
  *
  * **必须先做链上复核**（源码评审 2026-09，P1）：本函数原先只看本地镜像
- * （`tryAutoDeliverOrder` 里的 `order.refund_status === 'requested'`），而镜像有 15s 轮询 +
- * 12 块确认深度的滞后窗口：买家已经在链上 `requestRefund`、watcher 还没落地的这段时间里，
- * 店主一导入码就会把码发给一个**即将退款**的买家（钱退回去、货也送出去）。
- * 复核由 `tryAutoDeliverByEscrowOrder` 一处承担（2026-10-14 起；此前它与
- * `flushAutoDeliverPending` 各自内联了一份同样的判据）。
+ * （`tryAutoDeliverOrder` 里那句 `order.refund_status === 'requested'`，2026-10-15 已删），
+ * 而镜像有 15s 轮询 + 12 块确认深度的滞后窗口：买家已经在链上 `requestRefund`、
+ * watcher 还没落地的这段时间里，店主一导入码就会把码发给一个**即将退款**的买家
+ *（钱退回去、货也送出去）。复核由 `tryAutoDeliverByEscrowOrder` 一处承担（2026-10-14 起；
+ * 此前它与 `flushAutoDeliverPending` 各自内联了一份同样的判据）。
  * 复核失败（RPC 读不到）时**不发**：自动交付是"锦上添花"，宁可留给卖家面板手动交付，
  * 也不要在看不清链上状态时把码发出去。
  */

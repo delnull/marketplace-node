@@ -15,7 +15,15 @@ const buyers = [buyer, Wallet.createRandom(), Wallet.createRandom(), Wallet.crea
 let seq = 0;
 const payHash = () => '0x' + String(++seq).padStart(64, '0');
 
-/** 上架商品（66 USDT）→ 店主代买家下单 → 模拟 watcher/paid 回写 escrowed（落支付凭证），返回 { slug, order } */
+/**
+ * 上架商品（66 USDT）→ 店主代买家下单 → 模拟 watcher/paid 回写 escrowed（落支付凭证），返回 { slug, order }。
+ *
+ * **同时落费率快照的两列**（`fee_bps` + `fee_collector_at_create`）：真实的 /paid、watcher、/sync
+ * 三处都是成对补录的，而账本的平台费是**三态**的——`fee_collector_at_create` 为空 = 费率未知
+ * ⇒ 费与净额下发 null（见 node/src/fees.js 的 feeSnapshotReadOf）。这里模拟"链上费率 0、
+ * 创建时未配收取方"（零地址 = 这单确证不扣费）。
+ */
+const ZERO_COLLECTOR = '0x0000000000000000000000000000000000000000';
 async function settledEscrow(slug, who = buyer.address) {
   const ownerLogin = await login(ctx, owner);
   const res = await request(app)
@@ -25,8 +33,8 @@ async function settledEscrow(slug, who = buyer.address) {
     .expect(200);
   assertOk(res);
   const o = res.body.data;
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run(payHash(), Date.now(), o.id);
+  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, fee_bps = 0, fee_collector_at_create = ?, updated_at = ? WHERE id = ?")
+    .run(payHash(), ZERO_COLLECTOR, Date.now(), o.id);
   return o;
 }
 
@@ -157,9 +165,16 @@ test('仲裁判卖家计入流水（settled），分页返回按入账时间倒�
 
 test('订单级 feeBps 快照折算净额：feeWei/amountWeiNet 与毛额口径分离', async () => {
   const ownerLogin = await login(ctx, owner);
-  // 第五单：escrowed → confirmed，并补录订单级费率快照 fee_bps=100（1%）
+  /*
+    第五单：escrowed → confirmed，并补录订单级费率快照。
+    **两列必须成对写**（`fee_bps` + `fee_collector_at_create`）：账本的平台费是**三态**的，
+    `fee_collector_at_create` 为空 = 两列都没补录过 = 费率未知 ⇒ 费与净额下发 null
+    （见 node/src/fees.js 的 feeSnapshotReadOf）。真实系统里 /paid、watcher、/sync 也都是成对写。
+    这里用非零收取方 ⇒ 这单确证扣 1%。
+  */
+  const FEE_COLLECTOR = '0x1111111111111111111111111111111111111111';
   const o5 = await settledEscrow(productSlug, buyers[0].address);
-  db.prepare("UPDATE orders SET fee_bps = 100 WHERE id = ?").run(o5.id);
+  db.prepare('UPDATE orders SET fee_bps = 100, fee_collector_at_create = ? WHERE id = ?').run(FEE_COLLECTOR, o5.id);
   db.prepare("UPDATE orders SET status = 'confirmed', updated_at = ? WHERE id = ?").run(Date.now(), o5.id);
 
   const amt = BigInt(o5.amountWei);
@@ -180,4 +195,30 @@ test('订单级 feeBps 快照折算净额：feeWei/amountWeiNet 与毛额口径�
   assert.equal(summary.feeWei, fee.toString());
   assert.equal(summary.amountWeiNet, (gross - BigInt(summary.feeWei)).toString(), '净额 = 毛额 − 费用（自洽）');
   assert.equal(summary.byStatus.confirmed.feeWei, fee.toString());
+});
+
+test('费率快照未回填的行：该行费/净额与汇总都是 null（不是 0），并给出未知行数', async () => {
+  const ownerLogin = await login(ctx, owner);
+  // 一行"两列都没补录过"的入账单：fee_bps 是列默认值 0，fee_collector_at_create 为空 = 未知
+  const o6 = await settledEscrow(productSlug, buyers[0].address);
+  db.prepare("UPDATE orders SET fee_bps = 0, fee_collector_at_create = '' WHERE id = ?").run(o6.id);
+  db.prepare("UPDATE orders SET status = 'confirmed', updated_at = ? WHERE id = ?").run(Date.now() + 1, o6.id);
+  const row = db.prepare('SELECT fee_bps, fee_collector_at_create FROM orders WHERE id = ?').get(o6.id);
+  assert.equal(Number(row.fee_bps), 0, '前置：费率列是默认值（分不开"没补录"与"就是 0"）');
+  assert.equal(row.fee_collector_at_create, '', '前置：收取方快照为空 = 两列都没补录过 = 未知');
+
+  const ledger = await request(app)
+    .get('/api/orders/seller/ledger')
+    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .expect(200);
+  assertOk(ledger);
+  const { summary, orders } = ledger.body.data;
+  const mine = orders.find((o) => o.id === o6.id);
+  assert.equal(mine.feeBps, null, '费率未知 ⇒ null（绝不落成 0："快照为 0" 是对链上的断言）');
+  assert.equal(mine.feeWei, null, '平台费算不出来 ⇒ null（不是 0）');
+  assert.equal(mine.amountWeiNet, null, '净额随之未知 ⇒ null（不按"不扣费"报净额）');
+  assert.equal(summary.feeWei, null, '汇总里只要有一行未知，累计已扣费用就不是确证的总计');
+  assert.equal(summary.amountWeiNet, null);
+  assert.ok(summary.feeUnknownCount >= 1, '如实给出未知行数，界面据此说明原因');
+  assert.ok(BigInt(summary.amountWei) > 0n, '毛额不受影响（它与费率无关，仍是确证的）');
 });

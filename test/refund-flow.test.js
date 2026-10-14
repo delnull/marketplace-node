@@ -35,6 +35,28 @@ let seq = 0;
 const payHash = () => '0x' + String(++seq).padStart(64, '0');
 
 const { applyEvent } = await import('../src/escrowWatcher.js');
+/*
+  交付闸（/ship）读的是**链上真值**，而本文件的用例用 `applyEvent` 直接推本地镜像
+  （模拟 watcher 已回写）。所以这里装一个"链上与镜像一致"的读数桩：镜像说 requested 时链上也
+  就是 refundRequested=true（真实系统里这正是 watcher 追平之后的形态）。
+  **镜像滞后于链上**那个窗口由 test/delivery-gate.test.js 专门钉住（那里链上说冻结、镜像说没冻结）。
+*/
+const { setChainOrderFetcher } = await import('../src/chainOrder.js');
+setChainOrderFetcher((orderIdHex) => {
+  const row = db
+    .prepare('SELECT buyer, seller, amount_wei, refund_status FROM orders WHERE escrow_order_id = ?')
+    .get(String(orderIdHex || '').toLowerCase());
+  if (!row) throw new Error('unit-test 链上桩：链上没有这一单');
+  return {
+    status: 'Created',
+    refundRequested: row.refund_status === 'requested',
+    refundRejected: row.refund_status === 'rejected',
+    refundedAmount: '0',
+    buyer: row.buyer,
+    seller: row.seller,
+    amount: row.amount_wei,
+  };
+});
 
 before(async () => {
   ownerToken = (await login(ctx, owner)).token;
@@ -218,7 +240,7 @@ test('退款申请待决期间拒绝发货（ship 门控）：先链上拒绝申
     .send({ trackingNo: 'SF-001' })
     .expect(200);
   assert.notEqual(ship.body.code, 0);
-  assert.match(ship.body.message || '', /退款申请待处理/);
+  assert.match(ship.body.message || '', /已申请退款/);
   assert.equal(
     db.prepare('SELECT status FROM orders WHERE id = ?').get(order.id).status,
     'escrowed',

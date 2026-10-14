@@ -13,7 +13,8 @@
  *
  * 读取策略（三级）：
  *  1. **每单快照**（orders.fee_collector_at_create，由 paid / watcher / sync 从链上补录）——
- *     权威，不需要任何 RPC。非空 → 直接按它判（零地址=不扣，非零=扣）；
+ *     权威，不需要任何 RPC。非空 → 直接按它判（零地址=不扣，非零=扣）；**空 = 未知**
+ *     （见 `feeSnapshotReadOf`：`fee_bps` 那一列分不开"没补录"与"就是 0"，所以判据取两列）；
  *  2. 快照为空（旧数据/补录失败/ABI 尚未同步）= **未知** → 退回全局口径 `feeChargeable()`
  *     （见下），并在响应里如实标注"未知"；
  *  3. 全局口径：`refreshFeeCollector()` 带 60s 缓存读链上全局 `feeCollector()`；**读不到就是读不到**
@@ -132,25 +133,58 @@ export function feeStatus() {
  * 三个补录入口共用）。
  *
  * `feeCollectorAtCreate` 是 `getOrder` 返回元组末尾新增的一项（契约层 2026-09，ABI 已同步）。
+ * **两个字段必须都读到才算读到**（`known`）：它们在库里的两列由**同一条 UPDATE** 成对写
+ * （见 `writeFeeSnapshot`），只写一半会让"没补录过"和"确证 0%"在 `fee_bps`（`INTEGER NOT NULL
+ * DEFAULT 0`）上同形——那正是账本/看板曾经把"不知道"印成"不扣费"的根因。
+ * 所以缺任一个字段 ⇒ `known:false`（此时 `feeBps`/`feeCollectorAtCreate` 是占位值，**不得写库**）。
+ *
  * 字段缺失/为 null 时返回空串 = **未知**（绝不回落成零地址——那等于凭空宣称"这单不扣费"）。
- * @returns {{feeBps:number, feeCollectorAtCreate:string}} feeCollectorAtCreate 小写地址或 ''（未知）
+ * @returns {{known:boolean, feeBps:number, feeCollectorAtCreate:string}} feeCollectorAtCreate 小写地址或 ''（未知）
  */
 export function feeSnapshotOf(onchain) {
-  const raw = onchain?.feeCollectorAtCreate;
-  const snap = raw === undefined || raw === null ? '' : String(raw).trim().toLowerCase();
-  return {
-    feeBps: Number(onchain?.feeBps || 0),
-    feeCollectorAtCreate: snap,
-  };
+  const rawCollector = onchain?.feeCollectorAtCreate;
+  const collector = rawCollector === undefined || rawCollector === null ? '' : String(rawCollector).trim().toLowerCase();
+  const rawBps = onchain?.feeBps;
+  const bps =
+    rawBps === undefined || rawBps === null || String(rawBps).trim() === '' ? null : Number(rawBps);
+  const known = collector !== '' && bps !== null && Number.isFinite(bps) && bps >= 0;
+  return { known, feeBps: known ? bps : 0, feeCollectorAtCreate: known ? collector : '' };
 }
 
 /**
- * 平台费折算：**结算基数** × feeBps / 10000（与链上同款下取整）；不扣费时恒为 0。
+ * 费率快照的**唯一写入点**（三态判据与写入放在一起，2026-10-15）：
+ * `known:false`（链上那两个字段没同时读到）时**什么都不写**，返回 false——
+ * 绝不把"未知"写成 `fee_bps = 0 + 空串`，也绝不覆盖掉此前补录过的确证快照。
+ *
+ * 为什么把写入也收到这里：此前三处补录各自写 UPDATE，判据（`feeSnapshotOf` 的返回值）与
+ * 写入点分离，于是"忘了判 known"这件事在调用点无法被发现——structurally，
+ * 判据与它保护的那次写入必须在同一个函数里。
+ *
+ * 注意：本函数**不碰** `refunded_amount_wei`（那是另一个链上事实，口径见调用方），
+ * 也不动 `updated_at`（补录不是状态迁移，重复补录同值幂等）。
+ * @returns {boolean} 是否真的写了（false = 快照未知，保持库里原值）
+ */
+export function writeFeeSnapshot(db, orderId, snap) {
+  if (!snap || !snap.known) return false;
+  db.prepare('UPDATE orders SET fee_bps = ?, fee_collector_at_create = ? WHERE id = ?').run(
+    snap.feeBps,
+    snap.feeCollectorAtCreate,
+    orderId
+  );
+  return true;
+}
+
+/**
+ * 平台费**折算内核**：**结算基数** × feeBps / 10000（与链上同款下取整）；不扣费时恒为 0。
  * 注意 `amountWei` 是**结算基数**，不是托管总额：调用方要传 `amount − refunded`
  * （部分退款/拆分裁决的单，费只对卖家实收的那部分计）。
  *
  * 第三个参数 = 该行的 `orders.fee_collector_at_create`（**按单**判定，见 feeChargeableForOrder）。
- * 不传时退回全局口径（旧行为），便于逐点迁移；账本调用点必须传。
+ *
+ * ⚠ 业务代码不该直接调它来算"某一行订单的费"——那一层的判据是 `feeOfRow`（三态：
+ * 快照未回填 ⇒ `null`，不是 0）。本函数是**算术内核**，只回答"给定费率与收取方，费是多少"；
+ * `feeOfRow` 与它自己的测试是唯一的两类调用方（2026-10-15：`netOf` 那份两态旧实现已删除，
+ * 它会在快照缺失时退回全局口径，正是被取代的那条路径）。
  */
 export function feeOf(amountWei, feeBps, feeCollectorAtCreate) {
   const bps = Number(feeBps);
@@ -159,10 +193,51 @@ export function feeOf(amountWei, feeBps, feeCollectorAtCreate) {
   return (BigInt(amountWei) * BigInt(bps)) / 10000n;
 }
 
-/** 卖家实收净额 = **传入的结算基数** − 平台费（调用方传 `amount − refunded`）；
- *  第三个参数同 feeOf（按单的创建时收取方快照）。 */
-export function netOf(amountWei, feeBps, feeCollectorAtCreate) {
-  return BigInt(amountWei) - feeOf(amountWei, feeBps, feeCollectorAtCreate);
+/**
+ * 该行的**费率快照读数**（三态）——"这一单的费率口径"的**唯一判据**。
+ *
+ * 为什么必须有它（2026-10-14 收口）：`orders.fee_bps` 是 `INTEGER NOT NULL DEFAULT 0`，
+ * 于是「从没补录过」与「快照确实是 0」在那一列上是**同一个值**，分不开。能分开它们的是
+ * `fee_collector_at_create`：两列由**同一条 UPDATE** 成对补录（`/paid`、watcher、`/sync` 三处
+ * 都是成对写），所以
+ *   · 空串 ⇒ 两列都没补录过 ⇒ **未知**（当成 0 就是替链上宣布"本单不扣费"：收据会印
+ *     「0%（本单费率快照为 0）」、账本会按不扣费报净额，而链上 `_settle` 恰恰是按创建时快照扣的）；
+ *   · 非空 ⇒ 已知（零地址 = 创建时没配收取方 ⇒ 这单永不扣费）。
+ * 这条判据 `src/routes/arbitration.js` 早就写在自己的注释里了，但订单详情、流水、看板、CSV
+ * 四处仍在读裸列 ⇒ 同一件事四个答案。现在只有这一份，四个消费点都调它。
+ *
+ * @param {object} row 订单行（需 `fee_bps` 与 `fee_collector_at_create`）
+ * @returns {{known:false} | {known:true, feeBps:number, feeCollectorAtCreate:string}}
+ */
+export function feeSnapshotReadOf(row) {
+  const snap = String(row?.fee_collector_at_create ?? '').trim();
+  if (!snap) return { known: false };
+  return {
+    known: true,
+    feeBps: Number(row?.fee_bps) || 0,
+    feeCollectorAtCreate: snap.toLowerCase(),
+  };
+}
+
+/**
+ * 某行的平台费（**三态**）：`bigint`，或 **null = 费率快照未回填 ⇒ 不知道**。
+ *
+ * 为什么返回 null 而不是 0：这个数会被印在「已扣平台费」与「实收净额」上，而"不知道"
+ * 与"不扣费"在店主的账上是两件事（一个是待补录，一个是链上一分没扣）。调用方拿到 null
+ * 时应当如实报未知（`—` + "费率快照未回填"），而不是印一个 0。
+ * @param {bigint|string|number} baseWei 结算基数（= amount − 已退买家）
+ * @param {object} row 订单行（整行，因为"未知"这个结论要两列一起看，见 feeSnapshotReadOf）
+ * @returns {bigint|null}
+ */
+export function feeOfRow(baseWei, row) {
+  const s = feeSnapshotReadOf(row);
+  return s.known ? feeOf(baseWei, s.feeBps, s.feeCollectorAtCreate) : null;
+}
+
+/** 某行的卖家实收净额（**三态**）：`bigint`，或 null = 费率快照未回填（见 feeOfRow） */
+export function netOfRow(baseWei, row) {
+  const fee = feeOfRow(baseWei, row);
+  return fee === null ? null : BigInt(baseWei) - fee;
 }
 
 /** 仅供测试：清空缓存（含"最后一次成功读数"——用例之间不得互相看见对方的读数） */

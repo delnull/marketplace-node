@@ -25,7 +25,7 @@
 import { getDb } from './db.js';
 import config from './config.js';
 import { getEscrow, getProvider, isZeroAddress, weiToDecimal } from './chain.js';
-import { ACTIVE_IN, ESCROW_RELEASABLE_IN, ORDER_STATUS } from './orderStatus.js';
+import { ACTIVE_IN, ESCROW_RELEASABLE_IN, INCOME_IN, ORDER_STATUS } from './orderStatus.js';
 import { AFTER_SALE_OPEN_SQL } from './afterSale.js';
 import { refreshFeeCollector, feeStatus } from './fees.js';
 import { reputationSummary, DELIVERY_MIN_SAMPLES, parseOnchainEvents, escrowedAtOf } from './reputation.js';
@@ -104,7 +104,7 @@ export function sellerTodoCounts() {
   const returnsToConfirm = db.prepare("SELECT COUNT(*) AS c FROM order_returns WHERE status = 'shipped'").get().c;
   const pendingReviewReply = db
     .prepare(
-      "SELECT COUNT(*) AS c FROM reviews r JOIN orders o ON o.id = r.order_id WHERE r.reply_content = '' AND o.status IN ('confirmed','settled','expired')"
+      `SELECT COUNT(*) AS c FROM reviews r JOIN orders o ON o.id = r.order_id WHERE r.reply_content = '' AND o.status IN ${INCOME_IN}`
     )
     .get().c;
   // 低库存按「商品」计数：任一组合余量 ≤ 商品级阈值即计入（卖家务必要一并看那些组合）

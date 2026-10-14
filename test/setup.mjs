@@ -4,6 +4,9 @@
  * 注意：业务模块必须动态 import——config/db 等在模块顶层读取 process.env，
  * 需确保 env 在模块首次求值前已设置。汇率外部网络被禁用（mock fetch 抛错），
  * 统一走 config 兜底汇率（stale=true），保证测试不依赖公网。
+ *
+ * 另外装一个**交付闸的默认链上桩**（见下方 setChainOrderFetcher）：交付类端点现在按链上真值放行，
+ * 而单测的 RPC 是拒连的——没有这个桩，所有发货用例都会以"读不到链上状态"被正确地拒绝。
  */
 import { Wallet } from 'ethers';
 import request from 'supertest';
@@ -43,6 +46,31 @@ export async function makeCtx() {
 
   const { initDb, getDb } = await import('../src/db.js');
   initDb(':memory:');
+  /*
+    交付闸的默认链上桩（2026-10-14）：`/ship`、`/seller/batch-ship`、`/:id/nft-deliveries` 与自动交付
+    现在一律经 `chainOrder.deliveryGate` 读**链上真值**（status=Created 且 refundRequested=false；
+    读不到即拒绝）。单测默认的 MK_RPC_URL 指向一个必然拒连的本地端口，所以这里装一个
+    "链上确实有这一单、仍在托管、未被申请退款"的读数桩：按 escrow_order_id 回读本地行并原样回显
+    buyer/seller/amount —— 这正是 chainParamsMatch 期待的"链上就是这一单"的正常形态。
+    需要"链上冻结 / 已终局 / 读不到 / 诱饵单"这些档的用例自己调 setChainOrderFetcher 覆盖
+    （见 test/delivery-gate.test.js 与 test/auto-deliver.test.js，传 null 恢复本桩）。
+  */
+  const { setChainOrderFetcher } = await import('../src/chainOrder.js');
+  setChainOrderFetcher((orderIdHex) => {
+    const row = getDb()
+      .prepare('SELECT buyer, seller, amount_wei FROM orders WHERE escrow_order_id = ?')
+      .get(String(orderIdHex || '').toLowerCase());
+    if (!row) throw new Error('unit-test 链上桩：链上没有这一单');
+    return {
+      status: 'Created',
+      refundRequested: false,
+      refundRejected: false,
+      refundedAmount: '0',
+      buyer: row.buyer,
+      seller: row.seller,
+      amount: row.amount_wei,
+    };
+  });
   const { createApp } = await import('../src/app.js');
   return { app: createApp(), db: getDb(), owner, buyer, request };
 }
