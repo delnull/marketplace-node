@@ -26,6 +26,10 @@
  * 量级：单节点一家店，全表扫描 + 行内 JSON 解析为毫秒级，公开只读低频端点不做缓存。
  */
 import { getDb } from './db.js';
+// 本店身份锚点（seller 过滤的判据，见 reputationSummary 的说明）
+import config from './config.js';
+// 「这一单有没有争过」的唯一判据（本模块与 buyerSignal 共用，见 orderFacts.js 的说明）
+import { rowEverDisputed } from './orderFacts.js';
 
 /** 时间窗（键按 JSON 输出；days=0 表示累计全量） */
 const WINDOWS = [
@@ -127,7 +131,13 @@ export function computeReputation(rows, nowMs = Date.now()) {
   for (const row of rows) {
     // 事件史解析与"托管入账近似时刻"都走本模块的唯一实现（画像/SLA/买家信号同源）
     const events = parseOnchainEvents(row.onchain_events);
-    if (!events.length) continue;
+    /*
+      ⚠️ **不按"有没有事件史"跳过整单**（2026-10-15 修 D3 的最后一段）：
+      事件史是**可变长度**的镜像（上限 20 条、可被可重复事件挤空），"这单托管过"的凭据不是它，
+      而是 `paid_tx_hash`（见下面那段说明）。留着 `if (!events.length) continue;`
+      就等于把"整单是否进画像"仍然挂在事件史上——事件被清空的老店照样会显示成「新店」。
+      没有事件时下面各计数自然是 0（分子不受影响），单量与非空凭证同源。
+    */
 
     // 交付时刻（本地账：卖家发货写入）
     const deliveredAt = Number(row.delivered_at || 0) || null;
@@ -140,38 +150,57 @@ export function computeReputation(rows, nowMs = Date.now()) {
     // 比率分子分母同源：窗内不会出现「窗外创建的旧单在窗内确认/裁决」的孤儿分子，
     // confirmRate/disputeRate/refundRate 恒 ∈ [0,1]。
     /*
-      **历史里找不到 `OrderCreated` 就整单跳过**（源码审计 2026-09 复审，P2）。
-      `orders.onchain_events` 上限 20 条且保留**最后** 20 条（`slice(-20)`），而
-      `PartialRefundAccepted` 是**可重复事件**（每次不同授权额各记一条）——买家对自己的一单
-      调 20 次授权，就能把 `OrderCreated` 挤出历史。此时上面的兜底会把窗口锚点落到
-      **最早的那些事件**上，于是这一单 `orders += 0` 而 `confirmed/disputes += 1`：
-      比率的分母不含它、分子含它 ⇒ `confirmRate`/`disputeRate` **可以 > 1**（与上面那句
-      "恒 ∈ [0,1]" 的承诺矛盾），而且是一个**低成本的画像操纵面**。
-      宁可少统计一笔（画像本来只是参考信号），也不要让分子脱离分母。
+      ── 托管**证明**与窗口锚点都不再依赖"事件史里还留着 OrderCreated"（2026-10-15 修 D3）──
+      旧实现的判据是"事件史里找得到 OrderCreated"，而 `onchain_events` 只保留**最后 20 条**
+      （`slice(-20)`），`PartialRefundAccepted` 又是**可重复**事件（买家每授权一次记一条）——
+      审计实测：对同一单授权 20 次即可把 `OrderCreated` 挤出去，于是那一单在公开画像里
+      **整单消失**（连它有过的争议、确认、判向一起消失），店铺页印「新店：还没有任何托管记录」——
+      一句关于这家店的**具体断言**，而依据是本地事件史被挤掉。
+      现在两件事各用一件**不会被挤掉**的凭据：
+        · 证明 = `paid_tx_hash`（链上支付凭证本身；发货闸用的也是它——"缺凭证"的单连发货都会被拒），
+          它由 paid / watcher / sync 三条链上路径写入，与事件史的裁剪无关；
+        · 锚点 = `OrderCreated` 的落库时刻；真被挤掉时退回本行的 `created_at`
+          （同一单的本地起始时刻，通常与托管时刻相差一次草稿存活时间；只影响有界窗口的边界，
+          不影响 all 窗口——公开画像读的是 all）。
+      代价如实写：没有支付凭证的单（历史异常行）从此**不进画像**——比"把一家有记录的店说成新店"划算。
     */
-    if (escrowedAt === null) continue;
-    const anchorAt = escrowedAt;
-    if (!anchorAt) continue; // 全部事件无时刻：无法归属窗口
+    const proven = !!String(row.paid_tx_hash || '').trim();
+    if (!proven) continue;
+    const anchorAt = escrowedAt || Number(row.created_at || 0) || 0;
+    if (!anchorAt) continue; // 连本地起始时刻都没有：无法归属窗口
     const orderWindows = WINDOWS.filter((w) => inWindow(w, anchorAt));
+    /*
+      **托管单量每行只加一次**（不再由"事件里有没有 OrderCreated"决定）：计数与证明同源之后，
+      下面的逐事件计数最多每行各一次 ⇒ `分子 ≤ 分母` 是**结构上**成立的，
+      而不是靠"跳过没有 OrderCreated 的行"来回避（旧口径的代价是整单消失，见上）。
+    */
+    for (const w of orderWindows) {
+      win[w.key].orders += 1;
+      const key = pairKeyOf(row);
+      win[w.key].pairs.set(key, (win[w.key].pairs.get(key) || 0) + 1);
+    }
+    if (firstOrderAt === null || anchorAt < firstOrderAt) firstOrderAt = anchorAt;
+
+    /*
+      **"这一单有没有争过"只判一次**（2026-10-15 修 D1/D2）：判据在 `orderFacts.rowEverDisputed`
+      （状态 ∨ DisputeRequested ∨ Arbitrated），本模块与 buyerSignal 共用同一份实现。
+      旧实现只在事件名恰好是 `DisputeRequested` 时给 `disputes += 1`，于是**镜像被 /sync 或后台
+      对账按链上真值修好的争议**（事件名是 `Sync:disputed`）一律读成 0：审计实测 7 张
+      `status='disputed'`、钱冻在链上的单，公开页印「争议率 0%」，而同一时刻 buyerSignal 印「争议 7 单」。
+      更要紧的是它让**分子脱离分母**：判向计数（`refundedToBuyer`/`settledToSeller`）是
+      **按行**数的（行上有 `Arbitrated` 就算），而分母是**按事件**数的 —— 混合口径能算出
+      `refundRate = 1.4`（「争议 5 笔中判买家 7 笔」）。现在两者同源（都以本行为单位），
+      因此 `refundedToBuyer + settledToSeller ≤ disputes` 恒成立，比率回到 [0,1]。
+    */
+    if (rowEverDisputed(row, events)) for (const w of orderWindows) win[w.key].disputes += 1;
 
     for (const ev of events) {
       const at = Number(ev && ev.at) || 0;
       if (!at) continue;
-      if (ev.name === 'OrderCreated') {
-        for (const w of orderWindows) {
-          win[w.key].orders += 1;
-          // 交易对计数与成交计数**同源同窗**（都以这一单的 OrderCreated 归属窗口）：
-          // 分子分母必须来自同一批单，否则比率会像历史上 confirmRate 那样算出 > 1 的怪值。
-          const key = pairKeyOf(row);
-          win[w.key].pairs.set(key, (win[w.key].pairs.get(key) || 0) + 1);
-        }
-        if (firstOrderAt === null || at < firstOrderAt) firstOrderAt = at;
-      } else if (ev.name === 'ReceiptConfirmed') {
+      if (ev.name === 'ReceiptConfirmed') {
         for (const w of orderWindows) win[w.key].confirmed += 1;
       } else if (ev.name === 'OrderExpiredReleased') {
         for (const w of orderWindows) win[w.key].timeouts += 1;
-      } else if (ev.name === 'DisputeRequested') {
-        for (const w of orderWindows) win[w.key].disputes += 1;
       } else if (ev.name === 'Arbitrated') {
         // 判向以终局状态反推（refunded=买家 / settled=卖家）；异常终局不计入判向
         if (row.status === 'refunded') {
@@ -267,23 +296,40 @@ export function computeReputation(rows, nowMs = Date.now()) {
   };
 }
 
-/** 路由用便捷入口：全表统计（订单行含草稿/取消，无链上事件则自动跳过）。
+/**
+ * 路由用便捷入口：全表统计（订单行含草稿/取消；**没有链上支付凭证的行不进画像**，见 computeReputation）。
  * 交付时刻已随 v2 数量模型迁至 order_delivery_items 子表（一单多行交付）：
  * 聚合取最晚交付行时刻，语义与原 delivered_at 列一致（发货耗时口径不变）。
  * **实物单兜底取 shipped_at**：实物单没有交付行（子表只记码/NFT），
  * 不兜底的话已发货的实物单会被算成"从未交付"，发货耗时中位数会丢掉这一大块样本。
  * buyer/seller 两列是**重复交易对信号**的分组键（见文件头；两者都是 OrderCreated 事件的
- * indexed 字段 ⇒ 口径可由第三方扫链复算）。 */
+ * indexed 字段 ⇒ 口径可由第三方扫链复算）。
+ *
+ * **必须按 `seller` 过滤**（2026-10-15 修 D6）：`orders.seller` 是**逐行**写入的
+ * （= 写入时的 `config.shop.owner`），而本函数此前不带任何 WHERE —— 于是换过店主地址
+ * （店铺转手 / 换绑钱包）或复用别人库启动的节点，会把**上一家店**的订单算进新店的公开画像
+ * （单量、确认率、发货耗时全被稀释/抬高），而这份画像是买家用来判断"这家店靠不靠谱"的。
+ * 判据只有一个来源：`config.shop.owner`（本店身份锚点）；未配置时**不猜**——返回空画像，
+ * 由路由按"未接店铺身份"处理（宁可没有画像，也不把别人的记录说成自己的）。
+ */
 export function reputationSummary() {
+  const seller = String(config.shop?.owner || '').toLowerCase();
+  /*
+    店主地址配了 ⇒ 只算本店的单（判据见上面的说明）；**没配**（`MK_SHOP_OWNER` 空，节点处于
+    "只读展示"模式）⇒ 不加过滤：此时没有任何身份可比对，而这份库只可能装本节点自己镜像的东西
+    （写入者只有本节点的订单路由与 watcher），把它们全排除只会得到一份空画像——
+    "读不到店铺身份"与"这家店没有记录"是两件事，这里只有前者，不该顺手说成后者。
+  */
   const rows = getDb()
     .prepare(
-      `SELECT o.status, o.onchain_events, o.buyer, o.seller,
+      `SELECT o.status, o.onchain_events, o.buyer, o.seller, o.paid_tx_hash, o.created_at,
               COALESCE(
                 (SELECT MAX(created_at) FROM order_delivery_items WHERE order_id = o.id),
                 o.shipped_at
               ) AS delivered_at
-       FROM orders o`
+       FROM orders o
+       ${seller ? 'WHERE lower(o.seller) = ?' : ''}`
     )
-    .all();
+    .all(...(seller ? [seller] : []));
   return computeReputation(rows, Date.now());
 }

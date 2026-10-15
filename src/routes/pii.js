@@ -91,8 +91,17 @@ router.post('/orders/:id/erase-pii', ownerOnly, erasePiiLimiter, wrap(async (req
        它与 `attachmentFilesRemaining` 一起给出，界面不必自己把残留数翻译成结论。 */
     attachmentFilesRemoved: r.attachmentFilesRemoved,
     walTruncated: r.walTruncated,
-    /* 盘上没删净：界面要原样展示 `error` 那句（它比通用文案具体到原因） */
-    attachmentFailed: !r.ok,
+    /*
+      这一单是否**仍欠一次清理**（附件文件未删净，或 WAL 未截断）。
+      它是界面该看的那个结论：`ok` 现在是"两条腿都干净"（2026-10-15 起 WAL 也算一条腿），
+      而界面原先只看 `attachmentFailed`（= !ok）——同义词，但名字只提附件，会让人以为 WAL 那段不算。
+      三态同款：pending=true 表示"已排队等下一轮重试"（候选判据里有 `OR pii_cleanup_pending = 1`），
+      不是"永远不会重来"。
+    */
+    cleanupPending: r.cleanupPending,
+    /* 清理未完成（等价于 !ok，但命名为"清理"以覆盖两条腿：附件文件 + WAL 截断） */
+    cleanupFailed: !r.ok,
+    /* 未清干净时原样给出原因（它比通用文案具体到是哪条腿、下一步该做什么） */
     ...(r.ok ? {} : { error: r.error }),
   };
   // 管理审计：detail 只记**计数**与来源，绝不把擦掉的内容再抄进审计表（那就等于没擦）
@@ -118,18 +127,12 @@ router.post('/orders/:id/erase-pii', ownerOnly, erasePiiLimiter, wrap(async (req
   });
   if (!r.ok) {
     /*
-      删盘失败：**业务码非 0**（调用方据此知道"这次没做成"），但读数照给。
-      文案必须与"盘上到底还有没有东西"一致：擦除失败时锚点会被回退以便自动重试，
-      于是下一次调用 `changed` 可能是 0——旧文案会把它说成"此前已擦除（幂等）"，
-      而真相是"上一轮没删干净"。谎报比不报更糟，所以这里按失败态单独给一句。
+      没清干净：**业务码非 0**（调用方据此知道"这次没做成"），但读数照给。
+      文案直接用内核给的那句（2026-10-15 起它覆盖两条腿：附件文件 + WAL 截断），
+      不再在这里写死"磁盘上的附件文件没能删掉"——那在 WAL 那条腿失败时是错的话，
+      而这一屏是店主判断"要不要去清目录"的唯一依据。
     */
-    return fail(
-      res,
-      '库内的收货信息/备注/陈述正文/附件索引已清空，但**磁盘上的附件文件没能删掉**——请检查附件目录权限/占用后重试（系统会在下一轮保留期扫描中自动重试）',
-      1,
-      200,
-      payload
-    );
+    return fail(res, r.error || '个人信息的清理没能完成，请稍后重试', 1, 200, payload);
   }
   return ok(
     res,
@@ -177,13 +180,21 @@ router.post('/retention/run', ownerOnly, retentionLimiter, wrap(async (req, res)
     action: 'retention.run',
     targetType: 'shop',
     targetId: '-',
-    detail: { days: r.days, disabled: r.disabled, candidates: r.candidates, erased: r.erased, ...r.counts },
+    detail: { days: r.days, disabled: r.disabled, candidates: r.candidates, erased: r.erased, diskFailed: r.diskFailed, cleanupPending: r.cleanupPending, ...r.counts },
   });
   const data = {
     days: r.days,
     disabled: r.disabled,
     candidates: r.candidates,
     erased: r.erased,
+    /*
+      半成品的两个读数必须下发（2026-10-15 修）：旧实现在 `erased === 0` 时一律回
+      「无到期订单（…为 0）」，而"有候选、但每一单的附件都没删净/WAL 没截断"正是 `erased === 0`
+      的常见形态之一 —— 运维按 OPS_RUNBOOK 先跑这个接口再归档，于是**在盘上还留着个人数据时
+      被告知"没有到期订单"**。这两个数也是运维判断"要不要去清目录权限"的唯一依据。
+    */
+    diskFailed: r.diskFailed,
+    cleanupPending: r.cleanupPending,
     truncated: r.truncated,
     counts: r.counts,
     orderIds: r.orderIds.slice(0, MAX_REPORTED_IDS),
@@ -192,8 +203,10 @@ router.post('/retention/run', ownerOnly, retentionLimiter, wrap(async (req, res)
   const message = r.disabled
     ? '自动擦除已关闭（MK_PII_RETENTION_DAYS=0）：本次未擦除任何数据；如需立即执行，请在请求体给出天数（如 {"days":180}）'
     : r.erased > 0
-      ? `已擦除 ${r.erased} 个终局订单的个人信息（资金流终结且静置 > ${r.days} 天）${r.truncated ? '；本次达到单轮上限，可再次运行处理剩余订单' : ''}`
-      : `无到期订单（终局且静置 > ${r.days} 天的订单为 0）`;
+      ? `已擦除 ${r.erased} 个终局订单的个人信息（资金流终结且静置 > ${r.days} 天）${r.truncated ? '；本次达到单轮上限，可再次运行处理剩余订单' : ''}${r.cleanupPending > 0 ? `；另有 ${r.cleanupPending} 单只擦了一半（附件文件未删净或 WAL 未截断），已排队等待下一轮重试` : ''}`
+      : r.candidates > 0
+        ? `本次扫到 ${r.candidates} 单到期，但一单都没能擦干净（${r.cleanupPending} 单只擦了一半：附件文件未删净或 WAL 未截断）——这些单仍欠清理，已排队等待下一轮重试；若是目录权限/文件占用，请先处理附件目录`
+        : `无到期订单（终局且静置 > ${r.days} 天的订单为 0）`;
   // 记下这次运行，供 2 秒内的重复请求复用（见文件上方单飞说明）
   retentionLast = { at: Date.now(), days, data, message };
   ok(res, data, message);

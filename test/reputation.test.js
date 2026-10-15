@@ -22,7 +22,8 @@ let buyerToken;
 let slug;
 
 const { applyEvent } = await import('../src/escrowWatcher.js');
-const { computeReputation } = await import('../src/reputation.js');
+const { computeReputation, reputationSummary } = await import('../src/reputation.js');
+const { default: appConfig } = await import('../src/config.js');
 
 const DAY_MS = 24 * 3600 * 1000;
 
@@ -146,7 +147,8 @@ test('履约画像：近窗事件计数与比率全对（5 争议 ≥ 样本阈�
 
 test('单元：paid 快路径订单（OrderCreated 由 paid 补写）参与单量/确认率统计', async () => {
   const now = Date.now();
-  const mk = (status, events) => ({ status, delivered_at: null, onchain_events: JSON.stringify(events) });
+  // 真实可达的行都带链上支付凭证（paid_tx_hash）——画像是**按它证明托管发生过**的（2026-10-15）
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events), ...over });
   const e = (name, at) => ({ name, txHash: '0x' + 'f'.repeat(64), block: 1, at });
   // paid 快路径（watcher 不迁移该单）：OrderCreated 由 paid/sync 补写（见 orders.js
   // appendOrderCreatedEvent），ReceiptConfirmed 由 watcher 回写——两事件齐全才能计单
@@ -165,6 +167,9 @@ test('单元：争议 <5 样本不足时争议率/判买家率置 null（防小�
   const mk = (status, events, delivered_at = null) => ({
     status,
     delivered_at,
+    // 托管证明（画像按它计入单量，见 computeReputation 的说明）+ OrderCreated 被挤掉时的锚点兜底
+    paid_tx_hash: '0x' + 'ab'.repeat(32),
+    created_at: 1,
     onchain_events: JSON.stringify(events),
   });
   const e = (name, at) => ({ name, txHash: null, block: null, at });
@@ -197,11 +202,15 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
     {
       status: 'confirmed',
       delivered_at: now - 1000,
+      paid_tx_hash: '0x' + 'ab'.repeat(32),
+      created_at: now - 2000,
       onchain_events: JSON.stringify([e('OrderCreated', now - 2000), e('ReceiptConfirmed', now - 1000)]),
     },
     {
       status: 'confirmed',
       delivered_at: now - 3000,
+      paid_tx_hash: '0x' + 'ab'.repeat(32),
+      created_at: now - 6000,
       onchain_events: JSON.stringify([e('OrderCreated', now - 6000), e('ReceiptConfirmed', now - 3000)]),
     },
   ];
@@ -216,6 +225,8 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
       {
         status: 'confirmed',
         delivered_at: now - 40 * DAY_MS,
+        paid_tx_hash: '0x' + 'ab'.repeat(32),
+        created_at: now - 50 * DAY_MS,
         onchain_events: JSON.stringify([e('OrderCreated', now - 50 * DAY_MS), e('ReceiptConfirmed', now - 40 * DAY_MS)]),
       },
     ],
@@ -230,6 +241,8 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
     {
       status: 'confirmed',
       delivered_at: null,
+      paid_tx_hash: '0x' + 'ab'.repeat(32),
+      created_at: now - 1000,
       onchain_events: JSON.stringify([e('OrderCreated', now - 1000), e('ReceiptConfirmed', now - 500)]),
     },
   ], now);
@@ -261,6 +274,8 @@ test('单元：重复交易对占比 =（总成交 − 不同交易对数）/ �
     buyer,
     seller,
     delivered_at: null,
+    paid_tx_hash: '0x' + 'ab'.repeat(32),
+    created_at: at,
     onchain_events: JSON.stringify([e('OrderCreated', at), e('ReceiptConfirmed', at + 10)]),
   });
   const A = '0x' + 'aa'.repeat(20);
@@ -314,4 +329,200 @@ test('单元：重复交易对占比 =（总成交 − 不同交易对数）/ �
   assert.equal(old.windows.all.sybil.repeatOrders, 1);
   assert.equal(old.windows.d30.orders, 0);
   assert.equal(old.windows.d30.sybil.repeatOrders, 0, '分子分母同源：窗外单不会在窗内冒出重复笔数');
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   争议口径：**一个判据、两个消费方**（2026-10-15 修 D1/D2）
+   ──────────────────────────────────────────────────────────────────────
+   病：公开画像只在事件名恰好是 `DisputeRequested` 时计争议，而镜像会被 `/sync` 与后台对账
+   按链上真值修好（那一路写的事件名是 `Sync:disputed`）⇒ 争议读成 0；同一时刻 buyerSignal
+   用"状态 ∨ 事件"读出 7 单 —— 同一批单两个答案。且判向计数是按**行**数的、分母是按**事件**
+   数的，混合口径能算出 `refundRate = 1.4`（公开页会印「争议 5 笔中判买家 7 笔」）。
+   药：判据收进 `orderFacts.rowEverDisputed`（状态 ∨ DisputeRequested ∨ Arbitrated），
+   两处共用；分子分母都以**本行**为单位。
+   ══════════════════════════════════════════════════════════════════════ */
+
+test('争议计数：被 /sync 或对账修好的争议（事件名 Sync:disputed）也必须计入', async () => {
+  const now = Date.now();
+  const e = (name, at) => ({ name, txHash: null, block: null, at });
+  // 真实可达的行都带链上支付凭证（paid_tx_hash）——画像是**按它证明托管发生过**的（2026-10-15）
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events), ...over });
+  /*
+    5 单争议：镜像 status='disputed'、事件史里**没有** DisputeRequested（只有 Sync:disputed 这种修复痕迹）。
+    旧实现给 disputes=0 且 sampleTooSmall=false ⇒ 公开页印「争议率 0%」——一个**看起来确证的健康 0**。
+  */
+  const rows = [
+    mk('disputed', [e('OrderCreated', now - 5000), e('Sync:disputed', now - 4000)]),
+    mk('disputed', [e('OrderCreated', now - 4900), e('Sync:disputed', now - 3900)]),
+    mk('disputed', [e('OrderCreated', now - 4800), e('Sync:disputed', now - 3800)]),
+    mk('disputed', [e('OrderCreated', now - 4700), e('Sync:disputed', now - 3700)]),
+    mk('disputed', [e('OrderCreated', now - 4600), e('Sync:disputed', now - 3600)]),
+  ];
+  const r = computeReputation(rows, now);
+  assert.equal(r.windows.all.disputes, 5, '状态为 disputed 的单必须计入争议（不许因为事件名不同就漏掉）');
+  assert.equal(r.windows.all.disputeRate, 1, '5/5');
+  assert.equal(r.windows.all.sampleTooSmall, false, '这 5 单是确证发生过争议，不该被当成"样本不足"');
+});
+
+test('判向比率：分子分母同源 ⇒ refundRate ≤ 1（不再出现"争议 5 笔中判买家 7 笔"）', async () => {
+  const now = Date.now();
+  const e = (name, at) => ({ name, txHash: null, block: null, at });
+  // 真实可达的行都带链上支付凭证（paid_tx_hash）——画像是**按它证明托管发生过**的（2026-10-15）
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events), ...over });
+  const rows = [
+    // 7 单"有 Arbitrated、但没有 DisputeRequested"（事件被挤掉/漏扫后镜像推进到 refunded）
+    ...Array.from({ length: 7 }, (_, i) =>
+      mk('refunded', [e('OrderCreated', now - 5000 + i), e('Arbitrated', now - 4000 + i)])
+    ),
+    // 另加 5 单正常争议，把事件口径的分母抬过小样本阈值
+    ...Array.from({ length: 5 }, (_, i) =>
+      mk('disputed', [e('OrderCreated', now - 3000 + i), e('DisputeRequested', now - 2000 + i)])
+    ),
+  ];
+  const w = computeReputation(rows, now).windows.all;
+  assert.equal(w.disputes, 12, '7 单仲裁 + 5 单在途争议 = 12 单"争过"');
+  assert.equal(w.refundedToBuyer, 7);
+  assert.ok(w.refundRate !== null && w.refundRate <= 1, `判买家率必须 ≤ 1（实际 ${w.refundRate}）`);
+  assert.ok(
+    w.refundedToBuyer + w.settledToSeller <= w.disputes,
+    '判向计数是分母的子集——分子不许脱离分母（这正是旧口径算出 1.4 的原因）'
+  );
+});
+
+test('托管证明是耐久凭据：OrderCreated 被 20 条可重复事件挤掉，这一单也不会从画像里消失', async () => {
+  const now = Date.now();
+  const e = (name, at) => ({ name, txHash: null, block: null, at });
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events), ...over });
+  /*
+    病（2026-10-15 审计 D3）：`onchain_events` 只留最近 20 条（`slice(-20)`），
+    而 `PartialRefundAccepted` 是**可重复**事件（买家每授权一次记一条）——20 次授权即可把
+    `OrderCreated` 挤出去，而旧口径的判据正是"事件史里找得到 OrderCreated"：
+    那一单于是**整单消失**（连它自己的争议/确认一起消失），店铺页印「新店：还没有任何托管记录」。
+    药：证明换成 `paid_tx_hash`（链上支付凭证，发货闸用的也是它，写入与事件裁剪无关），
+    锚点退回本行 `created_at`；单量**每行只加一次**，所以"分子 ≤ 分母"是结构上成立的，
+    不再靠"跳过整单"来回避。
+  */
+  const spammed = [
+    // 这一单的 OrderCreated 被 20 条 PartialRefundAccepted 挤掉了，但凭证在、争议也在
+    mk('refunded', [e('PartialRefundAccepted', now - 100), e('DisputeRequested', now - 200), e('Arbitrated', now - 150)], {
+      buyer: '0x' + 'a1'.repeat(20),
+      seller: '0x' + 'c1'.repeat(20),
+    }),
+    mk('confirmed', [e('OrderCreated', now - 800), e('ReceiptConfirmed', now - 700)], {
+      buyer: '0x' + 'b1'.repeat(20),
+      seller: '0x' + 'c1'.repeat(20),
+    }),
+  ];
+  const w = computeReputation(spammed, now).windows.all;
+  assert.equal(w.orders, 2, '凭证在 ⇒ 这一单必须计入（不许因为事件被挤掉就整单消失）');
+  assert.equal(w.disputes, 1, '它争过，争议也要计');
+  assert.equal(w.refundedToBuyer, 1, '判向按行数，与争议同源');
+  assert.equal(w.confirmed, 1);
+  assert.equal(w.confirmRate, 0.5, '1/2——分母含它，分子自然也含得住');
+  assert.equal(w.sybil.distinctPairs, 2, '交易对计数同样不因事件裁剪而丢（重复交易对信号的分母）');
+
+  /*
+    极端情形：事件史**被清空**（不是挤掉一条，而是整列没有内容）。
+    "这单托管过"的凭据是 `paid_tx_hash`，所以它照样进画像——分子那些计数自然是 0，
+    而单量照计；这正是"一家有 20 单记录的老店不会因为镜像被清空就显示成新店"。
+  */
+  const emptied = computeReputation(
+    [
+      mk('confirmed', [], { buyer: '0x' + 'a2'.repeat(20), seller: '0x' + 'c2'.repeat(20) }),
+      mk('confirmed', [], { buyer: '0x' + 'b2'.repeat(20), seller: '0x' + 'c2'.repeat(20) }),
+    ],
+    now
+  ).windows.all;
+  assert.equal(emptied.orders, 2, '事件史为空但凭证在 ⇒ 仍然计入单量（老店不会变新店）');
+  assert.equal(emptied.confirmed, 0, '事件没了，确认计数自然是 0（分子不凭空出现）');
+  assert.equal(emptied.confirmRate, 0, '0/2 = 0——是"确实没有确认记录"，不是 null');
+});
+
+test('没有链上支付凭证的行不进画像（证明在哪一层，计数就在哪一层）', async () => {
+  const now = Date.now();
+  const e = (name, at) => ({ name, txHash: null, block: null, at });
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, onchain_events: JSON.stringify(events), ...over });
+  const rows = [
+    // 有事件、没凭证：历史异常行（也不是"托管发生过"的证明）⇒ 不进画像
+    mk('confirmed', [e('OrderCreated', now - 1000), e('ReceiptConfirmed', now - 900)]),
+    mk('confirmed', [e('OrderCreated', now - 800), e('ReceiptConfirmed', now - 700)], { paid_tx_hash: '0x' + 'cd'.repeat(32), created_at: now - 800 }),
+  ];
+  const w = computeReputation(rows, now).windows.all;
+  assert.equal(w.orders, 1, '只有带凭证的那一单进画像');
+  assert.equal(w.confirmed, 1);
+  assert.equal(w.confirmRate, 1, '分子分母同源 ⇒ 不会 > 1');
+});
+
+test('三个比率恒 ∈ [0,1]（口径承诺的机器判据）', async () => {
+  const now = Date.now();
+  const e = (name, at) => ({ name, txHash: null, block: null, at });
+  const mk = (status, events, delivered_at = null) => ({ status, delivered_at, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events) });
+  const rows = [
+    mk('confirmed', [e('OrderCreated', now - 9000), e('ReceiptConfirmed', now - 8000)], now - 7000),
+    mk('settled', [e('OrderCreated', now - 6000), e('DisputeRequested', now - 5500), e('Arbitrated', now - 5000)]),
+    mk('refunded', [e('OrderCreated', now - 4000), e('DisputeRequested', now - 3500), e('Arbitrated', now - 3000)]),
+    mk('expired', [e('OrderCreated', now - 2000), e('OrderExpiredReleased', now - 1000)]),
+    mk('disputed', [e('OrderCreated', now - 900), e('Sync:disputed', now - 800)]),
+    mk('settled', [e('OrderCreated', now - 700), e('PartialRefundAccepted', now - 650), e('Arbitrated', now - 600)]),
+  ];
+  for (const key of ['all', 'd30']) {
+    const w = computeReputation(rows, now).windows[key];
+    for (const [name, v] of [
+      ['disputeRate', w.disputeRate],
+      ['refundRate', w.refundRate],
+      ['confirmRate', w.confirmRate],
+      ['timeoutRate', w.timeoutRate],
+    ]) {
+      if (v === null) continue;
+      assert.ok(v >= 0 && v <= 1, `${key}.${name} = ${v} 超出 [0,1]`);
+    }
+    assert.ok(
+      w.refundedToBuyer + w.settledToSeller <= w.disputes,
+      `${key}：判向计数（${w.refundedToBuyer}+${w.settledToSeller}）不得超过争议数（${w.disputes}）`
+    );
+  }
+});
+/* ══════════════════════════════════════════════════════════════════════
+   seller 过滤：画像必须只算**本店**的单（2026-10-15 修 D6）
+   ──────────────────────────────────────────────────────────────────────
+   `orders.seller` 是逐行写入的（= 写入时的 `config.shop.owner`），而旧查询不带任何 WHERE：
+   换过店主地址（店铺转手 / 换绑钱包）或拿别人的库启动时，**上一家店**的订单会被算进新店的
+   公开画像（单量、确认率、发货耗时一起被稀释/抬高）——而这份画像正是买家用来判断靠不靠谱的。
+   ══════════════════════════════════════════════════════════════════════ */
+test('seller 过滤：换过店主的库不会把上一家店的单算进本店画像', async () => {
+  const A = '0x' + 'a1'.repeat(20);
+  const B = '0x' + 'b2'.repeat(20);
+  const at = Date.now() - 1000;
+  const insert = (id, seller) =>
+    db
+      .prepare(
+        `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
+           amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash, created_at, updated_at)
+         VALUES (?, 'p-rep-filter', '{}', '0x00', '', '0xbuyer', ?, '1000', 1000000, '0.1', 'confirmed', ?, ?, ?, ?)`
+      )
+      .run(id, seller, '0x' + id.padEnd(64, '0'), '0x' + id.padEnd(64, 'a'), at, at);
+  insert('rep-filter-a1', A);
+  insert('rep-filter-a2', A);
+  insert('rep-filter-b1', B);
+
+  const prev = appConfig.shop.owner;
+  try {
+    appConfig.shop.owner = A;
+    assert.equal(reputationSummary().windows.all.orders, 2, '只算本店（A）的单');
+    appConfig.shop.owner = B;
+    assert.equal(reputationSummary().windows.all.orders, 1, '换成 B 之后只算 B 的单');
+    /*
+      未配店主（只读展示模式）⇒ 不过滤：那时没有任何身份可比对，而这份库只可能装本节点自己
+      镜像的行。把"读不到店铺身份"说成"这家店没有记录"才是更糟的那个答案。
+      （期望值按**同一条证明判据**从库里算出来——本文件别的用例也往这个内存库插过单。）
+    */
+    const proven = db
+      .prepare("SELECT COUNT(1) AS c FROM orders WHERE paid_tx_hash IS NOT NULL AND TRIM(paid_tx_hash) != ''")
+      .get().c;
+    appConfig.shop.owner = '';
+    assert.equal(reputationSummary().windows.all.orders, proven, '没有店铺身份时不猜（不过滤），而不是清空画像');
+    assert.ok(proven > 3, `前置：库里除本用例这 3 单还有别的行（实际 ${proven}）——上一条断言才有意义`);
+  } finally {
+    appConfig.shop.owner = prev;
+  }
 });

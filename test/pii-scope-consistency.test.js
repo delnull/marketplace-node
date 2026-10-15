@@ -67,6 +67,7 @@ const PRESERVED = [
   { name: '退货单地址与备注', re: /退货(单)?地址|退货单地址与备注|退货备注/ },
   { name: '已交付的码 / tokenId', re: /tokenId|已交付的码|兑换码/ },
   { name: '评价正文', re: /评价正文|评价（不含个人信息的部分）/ },
+  { name: '售后结案说明（链上公开文本）', re: /结案说明|AfterSaleClosed/ },
 ];
 
 /** 各文档里"承诺段"的锚词（该段必须逐项讲全保留清单） */
@@ -100,6 +101,19 @@ function promiseSpan(text, anchor, file) {
   }
   assert.ok(hit >= 0, `${file}：锚词定位失败（归一化后行号对不上）`);
   const isHeading = (l) => /^#{1,6}\s/.test(l.trim());
+  /*
+    ⚠️ 实现处（`piiErase.js` 文件头）**不是 markdown**：没有 `## ` 标题可切，旧实现于是退化成
+    "整个文件"——而那几个词在正文注释、字段名、SQL 里到处都有 ⇒ **把承诺清单整段删掉**它照样通过
+    （2026-10-15 审计 D6）。这里按**注释块**切：锚词所在的连续 `*` 注释块（上一行不是 `*` 开头就停），
+    清单只可能写在那里；删掉其中一项，窗口内就少一个词。
+  */
+  if (file.includes('piiErase.js')) {
+    let start = hit;
+    while (start > 0 && /^\s*\*/.test(lines[start - 1])) start--;
+    let end = hit + 1;
+    while (end < lines.length && /^\s*\*/.test(lines[end])) end++;
+    return lines.slice(start, end).join('\n');
+  }
   let start = hit;
   while (start > 0 && !isHeading(lines[start])) start--;
   let end = hit + 1;

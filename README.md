@@ -37,6 +37,18 @@ bash deploy.sh
 脚本只要求宿主有 **Docker**（没有就自己装）；**Node 与依赖全在容器镜像里**，宿主机不需要装任何运行时。
 所有数据在**命名卷**里，容器可以随时删掉重建——升级就是换个镜像，数据不会动。
 
+**连机器和域名都还没有？** 那先看 [`provision/`](provision/README.md)：给一把云 API key，
+它会按你的预算授权把**机器（非中国大陆）→ 域名（境外注册商）→ 解析 → HTTPS → 本仓库的节点**
+一次做完，最后把 `https://你的域名` 交给你 —— 不需要备案，也不用去控制台点任何东西。
+它与你手动跑 `deploy.sh` 用的是**同一个部署脚本**，所以装出来的东西完全一样。
+
+```bash
+node provision/cli.mjs providers                       # 还没拿到 API key：先看怎么拿（控制台入口 + 权限清单）
+node provision/cli.mjs check --provider aliyun --domain shop.example.com --owner 0x… --email me@…
+node provision/cli.mjs plan  --provider aliyun --domain shop.example.com --buy --owner 0x… --email me@… --max-monthly 60
+node provision/cli.mjs up    --provider aliyun --domain shop.example.com --buy --owner 0x… --email me@… --max-monthly 60
+```
+
 脚本会问你几件事（其余全部自动）：**店主钱包地址**、**对外域名**、**HTTPS 在哪终止**
 （别处负载均衡/CDN/另一台 nginx —— 默认 / 本机 Caddy 容器 / 本机宿主 nginx+certbot）、
 **是否现在就链上登记**（选"稍后"就在上面那个网页里登记，更安全）；只有选了"本机申请证书"才会问**证书邮箱**。

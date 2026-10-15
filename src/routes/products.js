@@ -63,7 +63,10 @@ import { usdtOf } from '../money.js';
 // 不再各自拼状态白名单——状态集每加一个终态就会漏一次，而漏的后果是超卖。
 import { stockPromiseSql, uncommittedPromiseSql } from '../stockHold.js';
 // 商品标签（类目）的键/展示形/归一化 —— **唯一实现**（两个写入入口、列表筛选与标签清单共用，见 src/tags.js 文件头）
-import { normalizeTags, parseTagsColumn, tagKeyOf } from '../tags.js';
+import { cleanLabel, normalizeTags, parseTagsColumn, tagKeyOf } from '../tags.js';
+// 商品参数（键值对）与商品级承诺（受控枚举 + 数字）—— **各自唯一实现**，两个写入入口共用
+import { normalizeAttributes, parseAttributesColumn } from '../attributes.js';
+import { EMPTY_TERMS, normalizeTerms, parseTermsColumn } from '../productTerms.js';
 // 主图区（图片 + 视频）的字节判据、上限与 URL 规则 —— **唯一实现**（与前端共用同一份常量）
 import {
   MAX_MEDIA_ITEMS,
@@ -129,7 +132,7 @@ function parseMediaColumn(json) {
 
 /** 快照规范化字段（顺序固定，勿改动）：
  *  slug / title / description / description_blocks / media / kind /
- *  shipping_fee_usdt_micro / age_restricted / specs / skus；
+ *  shipping_fee_usdt_micro / age_restricted / specs / skus / attributes / terms / sku_images；
  *  kind='nft' 时追加 nft_contract、nft_standard（nft_contract 在前）。
  *  新键插在 kind 之后、specs 之前，前端 utils/snapshot.ts 必须同位置同键。
  *
@@ -137,9 +140,19 @@ function parseMediaColumn(json) {
  *  买家据此核验「所选规格的价格」没有被事后改动。
  *  运费（shipping_fee_usdt_micro）与年龄限制（age_restricted）**必须**在快照里：
  *  前者是钱（事后加价运费等于改价），后者是商品属性（上架后静默增删限制，买家无从察觉）。
- *  主图区（media）**必须**在快照里：它是买家看到的那件商品本身。 */
+ *  主图区（media）**必须**在快照里：它是买家看到的那件商品本身。
+ *
+ *  ── 2026-10-15 新增的三键（attributes / terms / sku_images），判据是同一条 ──
+ *  「**买家据以付款的东西必须被哈希钉住**」：
+ *   · attributes   = 这件货**是什么**（成色/材质/产地/型号/批次/保质期）——"货不对板"争议的对照物；
+ *   · terms        = 店主**承诺了什么**（多久发出/退换规则/退换窗口/退货运费谁承担）——
+ *                   本商城的裁决不做事实调查，条款不进快照就等于没有客观判据；
+ *   · sku_images   = **所选规格**的那张图（选"黑色"看到的那张）——事后换图而哈希不变即所见非所得。
+ *  三者都**恒存在**（没有时是 `[]` / 空承诺对象，不是缺键）：键的存在性不再承担版本语义，
+ *  唯一的例外仍是 NFT 两键（它们的键存在性 = kind='nft'，语义来自商品类型而不是契约版本）。 */
 export function snapshotObject(row) {
   const skuRows = Array.isArray(row.skus) ? row.skus : [];
+  const sortedSkus = [...skuRows].sort((a, b) => (a.sku_key < b.sku_key ? -1 : a.sku_key > b.sku_key ? 1 : 0));
   const snap = {
     slug: row.slug,
     title: row.title,
@@ -156,10 +169,19 @@ export function snapshotObject(row) {
     // 年龄限制（0/1）——买家据此核验「下单那一刻这件商品是否声明了未成年人禁止购买」
     age_restricted: row.age_restricted ? 1 : 0,
     specs: parseSpecsColumn(row),
-    skus: [...skuRows]
-      .sort((a, b) => (a.sku_key < b.sku_key ? -1 : a.sku_key > b.sku_key ? 1 : 0))
-      .map((s) => [s.sku_key, s.price_usdt_micro]),
+    skus: sortedSkus.map((s) => [s.sku_key, s.price_usdt_micro]),
+    // 商品参数：逐条入快照（顺序 = 店主书写顺序，与库里一致；归一已在写入路径完成）
+    attributes: parseAttributesColumn(row.attributes),
+    // 承诺：**归一后**入快照（`parseTermsColumn` 只做形状兜底，不重新校验——判据在写入路径）
+    terms: parseTermsColumn(row.terms),
   };
+  /*
+    SKU 图单独一键（而不是把 `skus` 的二元组改成三元组）：
+    二元组是"所选规格的锁定价"这条核验的既有形状，商品快照的消费方（仲裁台按 key 反查锁定价）
+    都按 `[key, price]` 解构；把图塞进同一个元组会让**所有**按位置解码的地方同批改一遍，
+    而它们中的多数根本不关心图。独立键按 key 关联，读图的地方自己查一次即可。
+  */
+  snap.sku_images = sortedSkus.filter((s) => String(s.image_url || '')).map((s) => [s.sku_key, String(s.image_url)]);
   if (row.kind === 'nft') {
     snap.nft_contract = String(row.nft_contract || '').toLowerCase();
     snap.nft_standard = row.nft_standard === 'erc1155' ? 'erc1155' : 'erc721';
@@ -185,6 +207,15 @@ export function computeSnapshotHash(snap) {
     // 价格不在商品级：每个组合的单价都在 skus 里（[[sku_key, price_usdt_micro], …]，按 key 升序）
     specs: snap.specs,
     skus: snap.skus,
+    /*
+      下面三键与 snapshotObject 同键同位。**逐字透传**（不在这里补默认值）：
+      缺键时补成 `[]`/空承诺会让"手搓对象"与"库里那一份"算出同一个哈希——
+      听起来无害，实则把"这份快照丢了字段"这件事从哈希里抹掉（哈希就不再是完整内容的承诺）。
+      写入路径保证它们恒存在（snapshotRowOf / 建表默认值），所以缺键只可能来自测试手搓对象。
+    */
+    attributes: snap.attributes,
+    terms: snap.terms,
+    sku_images: snap.sku_images,
   };
   if ('nft_contract' in snap) {
     o.nft_contract = snap.nft_contract;
@@ -214,8 +245,10 @@ function snapshotRowOf(slug, value) {
     shipping_fee_usdt_micro: value.shippingFeeUsdtMicro,
     age_restricted: value.ageRestricted,
     specs: JSON.stringify(value.specs),
-    // 快照与 DB 行同形（sku_key / price_usdt_micro），便于同一套规范化逻辑复用
-    skus: value.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
+    // 快照与 DB 行同形（sku_key / price_usdt_micro / image_url），便于同一套规范化逻辑复用
+    skus: value.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro, image_url: s.imageUrl || '' })),
+    attributes: JSON.stringify(value.attributes),
+    terms: JSON.stringify(value.terms),
     nft_contract: value.nftContract,
     nft_standard: value.nftStandard,
   };
@@ -298,6 +331,19 @@ function normalizeSkus(input, specs) {
       errors.push(`SKU「${key || '(空)'}」不属于当前规格的任一组合`);
       continue;
     }
+    /*
+      组合条目只认这五个键。多一个键（例如把商品级的 `capacity` 写进组合、或拼错 `imageUrl`）
+      的表现同样是"提交了但没生效"，所以与顶层字段一样**带字段名拒绝**。
+    */
+    const unknownSkuKeys = Object.keys(rawSku || {}).filter(
+      (k) => !['key', 'priceUsdtMicro', 'capacity', 'active', 'imageUrl'].includes(k)
+    );
+    if (unknownSkuKeys.length) {
+      errors.push(
+        `SKU「${key || '(默认)'}」不认识这些字段：${unknownSkuKeys.map((k) => `「${k}」`).join('、')}（每个组合只认 key / priceUsdtMicro / capacity / active / imageUrl）`
+      );
+      continue;
+    }
     if (seen.has(key)) {
       errors.push(`SKU 重复：${key || '(默认)'}`);
       continue;
@@ -321,7 +367,18 @@ function normalizeSkus(input, specs) {
     // active=false 表示该组合停售 —— 与「售罄」是两回事：
     // 售罄可能补货，停售是店主不打算再卖。二者对买家的含义不同，故独立成字段。
     const active = rawSku?.active === undefined ? true : !!rawSku.active;
-    skus.push({ key, specs: expected.get(key), priceUsdtMicro: price, capacity: cap, active });
+    /*
+      该组合的主图（可选）：与商品主图**同一条 URL 判据**（`mediaUrlAllowed` + `normalizeMediaUrl`）——
+      两处白名单各写一份必然漂移，而漂移的表现是"主图区能用的地址，SKU 图用不了"（或反过来更糟：
+      一个 `javascript:` 从这里溜进渲染路径）。空/缺省 = 没有独立图（买家侧就显示商品主图区）。
+      它**入快照**（`sku_images` 键）：选"黑色"看到的图事后被换掉而哈希不变，等于所见非所得。
+    */
+    const imageUrl = normalizeMediaUrl(rawSku?.imageUrl);
+    if (imageUrl && !mediaUrlAllowed(imageUrl)) {
+      errors.push(`SKU「${key || '(默认)'}」的图只支持 http/https 外链或本站上传路径`);
+      continue;
+    }
+    skus.push({ key, specs: expected.get(key), priceUsdtMicro: price, capacity: cap, active, imageUrl });
   }
   return { errors, skus };
 }
@@ -356,8 +413,8 @@ function saveSkus(productId, skus, now) {
   );
   db.prepare('DELETE FROM product_skus WHERE product_id = ?').run(productId);
   const ins = db.prepare(
-    'INSERT INTO product_skus (product_id, sku_key, specs_json, price_usdt_micro, capacity, committed, active, created_at, updated_at) ' +
-      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO product_skus (product_id, sku_key, specs_json, price_usdt_micro, image_url, capacity, committed, active, created_at, updated_at) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   );
   for (const s of skus) {
     ins.run(
@@ -365,6 +422,7 @@ function saveSkus(productId, skus, now) {
       s.key,
       JSON.stringify(s.specs),
       s.priceUsdtMicro,
+      s.imageUrl || '',
       s.capacity,
       prev.get(s.key)?.committed || 0,
       s.active === false ? 0 : 1,
@@ -395,6 +453,24 @@ function saveTags(productId, tags) {
   for (const t of tags) ins.run(productId, tagKeyOf(t), t);
 }
 
+/** 写库：全量替换某商品的参数镜像行（`product_attributes`）。
+ *
+ *  与 `saveTags` 同一形状、同一理由：参数有**两份镜像**——`products.attributes`（JSON 数组，展示形，
+ *  供 DTO 与快照）与 `product_attributes`（一行一参数：名/值各自的键 + 展示形，供 `?attr=` 精确筛选
+ *  与按参数名聚合）。两者必须**同批**写入，否则"页面上写的参数"与"按它筛出来的商品"会各说一套。
+ *
+ *  **键与展示形同源**：键由本函数用 `tags.js` 的 `tagKeyOf` 现算（与 `normalizeAttributes` 去重时
+ *  用的是同一个函数），所以库里不会出现"两个形态对不上"。入参必须是 `normalizeAttributes` 的输出。
+ */
+function saveAttributes(productId, attributes) {
+  const db = getDb();
+  db.prepare('DELETE FROM product_attributes WHERE product_id = ?').run(productId);
+  const ins = db.prepare(
+    'INSERT INTO product_attributes (product_id, name_key, name_display, value_key, value_display) VALUES (?, ?, ?, ?, ?)'
+  );
+  for (const a of attributes) ins.run(productId, tagKeyOf(a.name), a.name, tagKeyOf(a.value), a.value);
+}
+
 /** DB 行 → 对外字段（camelCase）。价格与库存**一律来自 Skus**，商品级字段只是汇总值：
  *  - priceUsdtMicro/priceUsdt = 各组合最低价（列表页「起价」展示用；成交价一律取所选 SKU）
  *  - capacity/committed    = 各组合之和；任一组合不限量则 capacity 为 null（整体视为不限量）
@@ -414,6 +490,8 @@ function rowToPublic(row) {
     })(),
     priceUsdtMicro: s.price_usdt_micro,
     priceUsdt: usdtOf(s.price_usdt_micro),
+    /** 该组合的主图（空串 = 没有独立图）；与商品主图同一套 URL 判据，入快照的 `sku_images` */
+    imageUrl: s.image_url || '',
     capacity: s.capacity,
     committed: s.committed || 0,
     available: s.capacity === null ? null : Math.max(0, s.capacity - (s.committed || 0)),
@@ -455,6 +533,19 @@ function rowToPublic(row) {
      * 标签**不入快照**（理由与代价见 db.js 的 products.tags 列注释）。
      */
     tags: parseTagsColumn(r.tags),
+    /**
+     * 商品**参数**（[{name, value}]，≤20 条）：这件货**是什么**（成色/材质/产地/型号/批次/保质期）。
+     * 恒为数组、空数组 = 没有参数（**不是 null**，与 tags 同一条 DTO 契约）。
+     * 与 tags 的分工：标签是检索维度（不进快照），参数是商品本身（**进快照**，见文件头快照契约）。
+     */
+    attributes: parseAttributesColumn(r.attributes),
+    /**
+     * 商品级**承诺**（handling_days / return_policy / return_window_days / return_freight）。
+     * 恒为对象、未声明时是"空承诺"（各键为 null / `unspecified`）——**不是 null**：
+     * "店主没声明"与"读不出来"在展示与仲裁上同形，消费方不必再判一次 null。
+     * 键名保持 snake_case 与库/快照逐字一致（JSON 内容不翻译，与 media/specs 同一条纪律）。
+     */
+    terms: parseTermsColumn(r.terms),
     skus,
     // 汇总口径（列表页展示；逐组合的权威值在 skus 里）
     priceUsdtMicro: minMicro,
@@ -466,10 +557,71 @@ function rowToPublic(row) {
     committed,
     outOfStock: skus.length > 0 && skus.every((s) => !s.active || (s.capacity !== null && s.available <= 0)),
     active: !!r.active,
+    /**
+     * 首次上架时刻（unix ms；`null` = **从未发布过**）。
+     * 它不是状态：可见性只看 `active`；这一列只让界面把"未上架"分成两档——
+     * 从未发布（草稿）与已下架（曾发布）。下架不清空（"卖过"这件事不因撤下而消失）。
+     */
+    publishedAt: r.published_at ?? null,
     snapshotHash: r.snapshot_hash,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
+}
+
+/*
+  ── 商品写入口认识的字段（**唯一实现**：上架 POST / 编辑 PATCH / 批量 PATCH 三处共用）──
+
+  为什么必须有这道门：`validateProduct` 只从入参里**挑**它认识的键，于是"提交了本接口不处理的
+  字段"的表现是 **200 OK 且什么也没发生**——店主以为设了、实际没设。三种形态同形且都无痕：
+  字段名拼错、把只读的汇总字段当成可写字段、将来新增字段时老调用方继续提交旧名。
+
+  本仓对这类失败的口径是"绝不静默"：认识就处理，不认识就**带字段名拒绝**并说清去哪提交。
+
+  ⚠ 下面两个**不是**商品写入口的字段，它们由 `skus` 派生、只读（`rowToPublic` 的汇总口径）：
+    · `priceUsdtMicro` —— 商品级价 = 各组合最低价；只读汇总。批量改价端点 `/batch` 收它
+      （语义是"把全部组合统一改成这个价"），单个商品的上架/编辑不收；
+    · `capacity` —— 商品级库存 = 各组合之和；逐组合库存在 `skus[].capacity`。
+  把它们放进 `ProductInput`（前端类型）曾让"提交了但不生效"成为常态，故两份集合同批对齐。
+*/
+const PRODUCT_WRITE_KEYS = new Set([
+  'title',
+  'description',
+  'descriptionBlocks',
+  'media',
+  'kind',
+  'nftContract',
+  'nftStandard',
+  'specs',
+  'skus',
+  'tags',
+  'attributes',
+  'terms',
+  'shippingFeeUsdtMicro',
+  'ageRestricted',
+  'autoDeliver',
+  'stockAlertAt',
+  'active',
+]);
+
+/** 批量修改的 patch 键（同一道门的第二个入口；集合不同——批量不展开规格明细） */
+const PRODUCT_BATCH_PATCH_KEYS = new Set(['priceUsdtMicro', 'active', 'autoDeliver', 'stockAlertAt']);
+
+/**
+ * 未知键检查（**唯一实现**；三个写入口共用）。
+ * @param {unknown} body 请求体
+ * @param {Set<string>} allowed 该入口认识的键
+ * @param {string} where 人类可读的入口名（错误里要指出"是哪个接口不认识"）
+ * @returns {string|null} 可读中文错（含字段名与处置办法）；null = 全部认识
+ */
+function unknownKeysError(body, allowed, where) {
+  const bad = Object.keys(body || {}).filter((k) => !allowed.has(k));
+  if (!bad.length) return null;
+  return (
+    `${where}不认识这些字段：${bad.map((k) => `「${k}」`).join('、')}——` +
+    '请检查字段名（提交了不生效的字段多半是拼写或接口用错）。' +
+    `本接口接受：${[...allowed].join(' / ')}`
+  );
 }
 
 /**
@@ -616,6 +768,28 @@ function validateProduct(v) {
   } catch (e) {
     errors.push(e.message);
   }
+  /*
+    商品参数（attributes）：可选字段（`undefined`/`null` = 无参数）。归一化/上限/去重/键口径
+    全部在 src/attributes.js（**唯一实现**，与标签共用 tags.js 的清洗）。**入快照**（见 snapshotObject）：
+    它是店主对"这件货是什么"的陈述，是"货不对板"争议里唯一能被逐条对照的东西。
+  */
+  let attributes = [];
+  try {
+    attributes = normalizeAttributes(v.attributes);
+  } catch (e) {
+    errors.push(e.message);
+  }
+  /*
+    商品承诺（terms）：可选字段（`undefined`/`null` = 未声明）。唯一实现在 src/productTerms.js。
+    **入快照**：它是条款本身——本商城的裁决不做事实调查，承诺不进快照就等于"晚发货/不给退"
+    在机制内没有客观判据（见 src/productTerms.js 文件头）。
+  */
+  let terms = { ...EMPTY_TERMS };
+  try {
+    terms = normalizeTerms(v.terms);
+  } catch (e) {
+    errors.push(e.message);
+  }
   return {
     errors,
     value: {
@@ -632,6 +806,8 @@ function validateProduct(v) {
       specs,
       skus,
       tags,
+      attributes,
+      terms,
       autoDeliver,
       stockAlertAt,
       active,
@@ -704,6 +880,45 @@ router.get('/', wrap(async (req, res) => {
     }
   }
 
+  /*
+    参数筛选 `?attr=参数名:值`。
+    与标签同一套口径（唯一实现在 src/tags.js 的 cleanLabel/tagKeyOf）：两侧都归一成**键**再做全等匹配，
+    所以"店主写 `成色: 全新未拆封`"与"买家筛 `成色:全新未拆封`"必然落在同一对键上。
+    分隔符是**第一个**冒号：值里可以再出现冒号（"接口: USB-C: 3.2"这种写法不该被截断成两个字段）。
+    三种失败都按"查不到"处理并把原因放进 attrError（不静默忽略、也不 500），与 tagError 同款：
+      · 没有冒号 / 任一侧为空 ⇒ 说清正确形状；
+      · 重复给了多个 attr（`?attr=a:b&attr=c:d`）⇒ 明确说"一次只能给一个"；
+      · 超长/非法字符（cleanLabel 之后为空）⇒ 原样报出中文原因。
+  */
+  const rawAttrParam = req.query.attr;
+  let attrNameKey = null;
+  let attrValueKey = null;
+  let attrDisplay = null;
+  let attrError = null;
+  if (Array.isArray(rawAttrParam)) {
+    attrError = 'attr 一次只能给一个（多个参数请分次查询，或与 kind/q/tag 组合）';
+  } else if (rawAttrParam !== undefined && rawAttrParam !== null && String(rawAttrParam).trim() !== '') {
+    const s = String(rawAttrParam);
+    const i = s.indexOf(':');
+    if (i < 0) {
+      attrError = 'attr 的形状是「参数名:值」，例如 attr=成色:全新未拆封（这次没找到冒号）';
+    } else {
+      try {
+        const name = cleanLabel(s.slice(0, i));
+        const value = cleanLabel(s.slice(i + 1));
+        if (!name || !value) {
+          attrError = 'attr 的参数名与值都不能为空（形状是「参数名:值」）';
+        } else {
+          attrNameKey = tagKeyOf(name);
+          attrValueKey = tagKeyOf(value);
+          attrDisplay = `${name}:${value}`;
+        }
+      } catch (e) {
+        attrError = e.message;
+      }
+    }
+  }
+
   const db = getDb();
   const where = ['active = 1'];
   const args = [];
@@ -723,7 +938,14 @@ router.get('/', wrap(async (req, res) => {
     where.push('EXISTS (SELECT 1 FROM product_tags pt WHERE pt.product_id = products.id AND pt.tag_key = ?)');
     args.push(tagKey);
   }
-  if (tagError) {
+  if (attrNameKey && attrValueKey) {
+    // 参数同样走镜像表 + 索引：一对键全等才算命中（值里的写法差异已被键吸收）
+    where.push(
+      'EXISTS (SELECT 1 FROM product_attributes pa WHERE pa.product_id = products.id AND pa.name_key = ? AND pa.value_key = ?)'
+    );
+    args.push(attrNameKey, attrValueKey);
+  }
+  if (tagError || attrError) {
     /*
       非法/超长标签 = **查不到**（空结果），但绝不静默：结果里带 tagError、message 里说明，
       调用方不会把"标签写错了"误读成"这家店没有这个类目"。
@@ -785,8 +1007,15 @@ router.get('/', wrap(async (req, res) => {
       // 展示形可以有很多种写法，键才是这次查询真正使用的东西（调用方要用它做后续判断）。
       tag: tagKey,
       tagError,
+      // 本次实际生效的参数筛选（键对 + 展示形）与未生效的原因：与 tag/tagError 同一套三态
+      attr: attrNameKey && attrValueKey ? { nameKey: attrNameKey, valueKey: attrValueKey, display: attrDisplay } : null,
+      attrError,
     },
-    tagError ? `标签未生效：${tagError}（本次结果为空，请改用合法标签）` : 'success'
+    tagError
+      ? `标签未生效：${tagError}（本次结果为空，请改用合法标签）`
+      : attrError
+        ? `参数筛选未生效：${attrError}（本次结果为空，请改用「参数名:值」的形状）`
+        : 'success'
   );
 }));
 
@@ -876,23 +1105,174 @@ router.get('/tags', wrap(async (req, res) => {
   ok(res, { tags, total, truncated });
 }));
 
-/** 店主全量列表（含已下架，卖家面板管理用；需 owner 登录）—— 必须在 /:slug 之前注册。
+/**
+ * 本店在用**商品参数**清单（公开只读）：供店铺页做参数筛选面（"成色 → 全新未拆封 ×3"）。
+ *
+ * 与 `/tags` 同一套口径与同一条展示形选取规则（只数上架商品、不按库存过滤、
+ * 展示形取"多数写法，并列取字典序最小"、排序稳定），差别只有一处：
+ *   **参数是二维的**（名字 × 值），所以按 `(name_key, value_key)` 成对计数，
+ *   每项同时给名与值两侧的键（`?attr=名:值` 用的就是这一对）与展示形（界面直接显示）。
+ *
+ * 排序：`name_key` 升序 → `count` 降序 → `value_key` 升序。
+ * 为什么按**名**先排（而不是像标签那样按 count）：界面是按参数名分组的（成色一组、产地一组），
+ * 先按名排才能让同名的值稳定地连在一起；组内按出现次数排，最常出现的值排最前。
+ * 仍然是全序、仍然不含展示形——同库多次调用逐字相同。
+ *
+ * 分页与三态：`limit` 缺省 {@link ATTRS_LIMIT_DEFAULT}、上限 {@link ATTRS_LIMIT_MAX}（非法值明确拒绝）；
+ * 响应 `{ attributes: [{ name, nameKey, value, valueKey, count }], total, truncated }`，
+ * `total` = **按 (名,值) 对去重后的总数**（截断时前端必须知道还有多少没显示）。
+ */
+const ATTRS_LIMIT_DEFAULT = 200;
+const ATTRS_LIMIT_MAX = 500;
+
+router.get('/attributes', wrap(async (req, res) => {
+  const raw = req.query.limit;
+  const limit = raw === undefined || raw === '' ? ATTRS_LIMIT_DEFAULT : Number(raw);
+  if (!Number.isInteger(limit) || limit < 1 || limit > ATTRS_LIMIT_MAX) {
+    return fail(res, `limit 需为 1..${ATTRS_LIMIT_MAX} 的整数（缺省 ${ATTRS_LIMIT_DEFAULT}）`);
+  }
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `WITH active AS (
+         SELECT pa.name_key AS name_key, pa.name_display AS name_display,
+                pa.value_key AS value_key, pa.value_display AS value_display
+           FROM product_attributes pa JOIN products p ON p.id = pa.product_id
+          WHERE p.active = 1
+       ),
+       counts AS (
+         SELECT name_key, name_display, value_key, value_display, COUNT(*) AS c
+           FROM active GROUP BY name_key, name_display, value_key, value_display
+       ),
+       best AS (
+         SELECT name_key, name_display, value_key, value_display, c,
+                ROW_NUMBER() OVER (PARTITION BY name_key, value_key ORDER BY c DESC, name_display ASC, value_display ASC) AS rn
+           FROM counts
+       ),
+       /* counts 是按「键 + 展示形」分组的，同一对键可能有多种写法（iPhone 15 / iphone 15）——
+          总数必须**按键对求和**，否则 count 只等于"被选中的那种写法"的条数（测试抓过：3 件写成两种写法时印 2）。
+          这与 /tags 的 totals CTE 是同一个理由。 */
+       totals AS (
+         SELECT name_key, value_key, SUM(c) AS count FROM counts GROUP BY name_key, value_key
+       )
+       SELECT b.name_display AS name, t.name_key AS nameKey,
+              b.value_display AS value, t.value_key AS valueKey, t.count AS count
+         FROM totals t JOIN best b ON b.name_key = t.name_key AND b.value_key = t.value_key AND b.rn = 1
+        ORDER BY t.name_key ASC, t.count DESC, t.value_key ASC
+        LIMIT ?`
+    )
+    .all(limit + 1);
+  const truncated = rows.length > limit;
+  const attributes = truncated ? rows.slice(0, limit) : rows;
+  const total = truncated
+    ? db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM (
+             SELECT pa.name_key, pa.value_key FROM product_attributes pa JOIN products p ON p.id = pa.product_id
+              WHERE p.active = 1 GROUP BY pa.name_key, pa.value_key)`
+        )
+        .get().c
+    : attributes.length;
+  ok(res, { attributes, total, truncated });
+}));
+
+/**
+ * 「这件商品**还缺什么**」的**唯一判据**（SQL 表达式，别名 `p`）。
+ *
+ * 为什么是 SQL 而不是 JS：它有两个消费方——卖家列表的筛选（`?incomplete=1`，服务端分页过滤）
+ * 与逐行提示。写在 JS 里就只能先把整页取回来再过滤，于是"筛出来的条数"与"翻页"两套语义
+ * （返回不满一页但后面还有）。写成一段表达式则两个用途读的是同一份判据，不可能说岔。
+ *
+ * 判据（每一条都对应"买家看不到/看不懂就会问店主"的东西）：
+ *  · `media`        没有主图——商品卡与详情页都是一张占位图；
+ *  · `description`  没有说明（纯文本摘要为空；详情块为空时 DTO 的 description 就是它）；
+ *  · `attributes`   没有参数——"这货是什么"只剩自由文本，仲裁时无法逐条对照；
+ *  · `handling_days` 未承诺发货时效（**仅实物**：数字/NFT 没有"发货"这件事）。
+ *
+ * 空串 = 资料齐全。键名是稳定标识（前端映射成中文标签，措辞只有一处）。
+ */
+export const COMPLETENESS_MISSING_SQL = `TRIM(
+  CASE WHEN json_array_length(COALESCE(p.media, '[]')) = 0 THEN 'media ' ELSE '' END ||
+  CASE WHEN TRIM(COALESCE(p.description, '')) = '' THEN 'description ' ELSE '' END ||
+  CASE WHEN json_array_length(COALESCE(p.attributes, '[]')) = 0 THEN 'attributes ' ELSE '' END ||
+  CASE WHEN p.kind = 'physical' AND (p.terms IS NULL OR json_extract(p.terms, '$.handling_days') IS NULL)
+       THEN 'handling_days ' ELSE '' END
+)`;
+
+/**
+ * 店主全量列表（含已下架与草稿，卖家面板管理用；需 owner 登录）—— 必须在 /:slug 之前注册。
  *  额外附池口径统计（poolBuilt/poolUnused，仅 digital/nft）：卖家设的总量承诺 vs
  *  码池/NFT 交付池实际未用资源——供面板做「口径冲突预警」（池未用 < 可售余量提示补货）。
- *  公开列表/详情不返回该字段（交付池资源是店主持有信息）。 */
+ *  公开列表/详情不返回该字段（交付池资源是店主持有信息）。
+ *
+ *  可选 `q`：标题/标识的模糊搜索。**为什么在服务端**：面板是分页拉的，前端过滤只能搜到
+ *  "已加载的那几页"——商品一多就等于搜不到（与本仓"没拉到 ≠ 没有"的三态纪律同一取向）。
+ *
+ *  额外附 `pendingPromises`（**仅 staff 视图**）：该商品每个组合上"库存承诺还没结清"的单数与件数
+ *  （判据是 `stockHold.stockPromiseSql` 的唯一实现）。它是商品编辑表单"改规格选项名之前该先看一眼"
+ *  的读数：改选项名会换掉组合键，而服务端会**拒绝**删除仍被在途订单占用的组合
+ *  （见 PATCH 的规格键守卫）。前端据此**提前**提示，而不是等保存时才撞上拒绝——
+ *  判据仍只有服务端一处，这里只是把它下发给店主看。 */
 router.get('/all', staffOnly, wrap(async (req, res) => {
   const cursor = Math.max(0, parseInt(req.query.cursor, 10) || 0);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
+  const q = String(req.query.q ?? '').trim().slice(0, 60);
+  /*
+    只看"资料不全"的（店主补资料的工作队列）。判据是 COMPLETENESS_MISSING_SQL 那一处——
+    与行内下发的 `missing` 同源，所以"筛出来 3 条"与"这 3 条各自缺什么"必然一致。
+  */
+  const incompleteOnly = String(req.query.incomplete ?? '') === '1';
+  const where = ['p.id > ?'];
+  const args = [cursor];
+  if (incompleteOnly) where.push(`(${COMPLETENESS_MISSING_SQL}) != ''`);
+  if (q) {
+    /*
+      LIKE 通配符转义（与公开列表同一口径）。
+      **店主侧的搜索面比买家侧宽**：买家按标题/描述找货，店主是在自己店里找"那一件"
+      ——他手里的线索可能是标题、对外标识（分享链接里那串）、描述里的一句话，或参数里的值
+      （"上次那件成色全新未拆封的"）。四种都命中，否则他只能一页页翻。
+      参数与承诺是 JSON 列：这里直接对**列文本**做 LIKE，不解析——它们由
+      `attributes.js` / `productTerms.js` 归一化写入（键序稳定、无空白歧义），
+      所以"值出现在列文本里"与"值出现在某个字段里"是同一件事（不会因为嵌套而漏match）。
+    */
+    const like = `%${q.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
+    where.push(
+      "(p.title LIKE ? ESCAPE '\\' OR p.slug LIKE ? ESCAPE '\\' OR p.description LIKE ? ESCAPE '\\'" +
+        " OR p.attributes LIKE ? ESCAPE '\\' OR p.terms LIKE ? ESCAPE '\\')"
+    );
+    args.push(like, like, like, like, like);
+  }
   const rows = getDb()
     .prepare(
-      `SELECT p.*,
+      `SELECT p.*, (${COMPLETENESS_MISSING_SQL}) AS missing_keys,
          (SELECT COUNT(*) FROM product_codes c WHERE c.product_id = p.id) AS codes_built,
          (SELECT COUNT(*) FROM product_codes c WHERE c.product_id = p.id AND c.status = 'unused') AS codes_unused,
          (SELECT COUNT(*) FROM product_nft_tokens t WHERE t.product_id = p.id) AS tokens_built,
          (SELECT COUNT(*) FROM product_nft_tokens t WHERE t.product_id = p.id AND t.status = 'unused') AS tokens_unused
-       FROM products p WHERE p.id > ? ORDER BY p.id ASC LIMIT ?`
+       FROM products p WHERE ${where.join(' AND ')} ORDER BY p.id ASC LIMIT ?`
     )
-    .all(cursor, pageSize);
+    .all(...args, pageSize);
+  /*
+    在途承诺：一次 GROUP BY 取回本页全部商品（不逐行查 = 不引入 N+1）。
+    没结清的单一件都没有 → 该商品不下发这个键之外的空数组（前端拿到 [] 即"改规格无阻碍"）。
+  */
+  const pendingByProduct = new Map();
+  if (rows.length) {
+    const marks = rows.map(() => '?').join(',');
+    const pending = getDb()
+      .prepare(
+        `SELECT o.product_id AS pid, o.sku_key AS sku_key, COUNT(*) AS orders, COALESCE(SUM(o.quantity), 0) AS units
+           FROM orders o
+          WHERE o.product_id IN (${marks}) AND ${stockPromiseSql('o')}
+          GROUP BY o.product_id, o.sku_key`
+      )
+      .all(...rows.map((r) => r.id));
+    for (const p of pending) {
+      const list = pendingByProduct.get(p.pid) || [];
+      list.push({ key: String(p.sku_key ?? ''), orders: p.orders, units: p.units });
+      pendingByProduct.set(p.pid, list);
+    }
+  }
   // 池口径：poolBuilt=已建池资源总数（0=未建池，手动交付型）；poolUnused=未用数（0 且已建池=池空）
   const products = rows.map((r) => {
     const base = rowToPublic(r);
@@ -908,6 +1288,13 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
       autoDeliver: r.auto_deliver,
       stockAlertAt: r.stock_alert_at,
       lowStock,
+      pendingPromises: pendingByProduct.get(r.id) ?? [],
+      /*
+        这件商品还缺哪些资料（空数组 = 齐全）。键名是稳定标识，中文标签由前端一处映射；
+        判据就是筛选用的那一段 SQL（`missing_keys` 列）——"筛出来的是这几条"与"它们各自缺什么"
+        因此必然一致，不需要两处判断。
+      */
+      missing: String(r.missing_keys || '').trim() ? String(r.missing_keys).trim().split(/\s+/) : [],
       ...(r.kind === 'digital'
         ? { poolBuilt: r.codes_built, poolUnused: r.codes_unused }
         : r.kind === 'nft'
@@ -955,6 +1342,8 @@ router.get('/:slug/reviews', wrap(async (req, res) => {
 
 /** 店主上架 */
 router.post('/', staffOnly, wrap(async (req, res) => {
+  const unknown = unknownKeysError(req.body, PRODUCT_WRITE_KEYS, '上架商品（POST /api/products）');
+  if (unknown) return fail(res, unknown);
   const { errors, value } = validateProduct(req.body || {});
   if (errors.length) return fail(res, errors.join('；'));
   const db = getDb();
@@ -971,20 +1360,36 @@ router.post('/', staffOnly, wrap(async (req, res) => {
   // 一次写入（snapshot_hash NOT NULL）：先由规范化字段算好哈希（kind='nft' 时快照含 nft_contract/nft_standard 键；
   // 运费与年龄限制同键同位进快照——契约见文件头）
   const hash = computeSnapshotHash(snapshotObject(snapshotRowOf(slug, value)));
+  /*
+    `active` 取 `value.active`（= 请求体里的 active，缺省 1）——**草稿**就是它。
+    为什么必须由上架入口自己认这个字段（而不是"先建后改"）：商品的完整性（图/说明/规格/承诺）
+    要在**发布之前**就填完，而"先建成在售再改"会让半成品在聚合首页短暂可见，
+    并且把下架/上架两件事混成一次误操作面。草稿是同一个 active 列的一个取值，
+    不引入新状态机：买家侧列表恒为 `WHERE active = 1`，下架/草稿对匿名都是 404。
+  */
   db.prepare(
-    'INSERT INTO products (slug, title, description, description_blocks, media, kind, shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, specs, tags, auto_deliver, stock_alert_at, snapshot_hash, active, created_at, updated_at) ' +
-      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
+    'INSERT INTO products (slug, title, description, description_blocks, media, kind, shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, specs, attributes, terms, tags, auto_deliver, stock_alert_at, snapshot_hash, active, published_at, created_at, updated_at) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).run(
     slug, value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.media),
     value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard,
-    JSON.stringify(value.specs), JSON.stringify(value.tags), value.autoDeliver, value.stockAlertAt, hash, now, now
+    JSON.stringify(value.specs), JSON.stringify(value.attributes), JSON.stringify(value.terms),
+    JSON.stringify(value.tags), value.autoDeliver, value.stockAlertAt, hash,
+    // 首次上架时刻只在这两种情况下写：建单时就是"在售"（→ now），或建单时是草稿（→ NULL，等第一次上架再写）
+    value.active, value.active ? now : null, now, now
   );
   const productId = db.prepare('SELECT id FROM products WHERE slug = ?').get(slug).id;
   saveSkus(productId, value.skus, now);
   // 标签镜像同批写入（products.tags 与 product_tags 必须一起落，见 saveTags 注释）
   saveTags(productId, value.tags);
-  audit(req, 'product.create', 'product', slug, { kind: value.kind, skuCount: value.skus.length, specs: value.specs.map((s) => s.name), tags: value.tags, shippingFeeUsdtMicro: value.shippingFeeUsdtMicro, ageRestricted: value.ageRestricted });
-  ok(res, rowToPublic(db.prepare('SELECT * FROM products WHERE slug = ?').get(slug)), '上架成功');
+  // 参数镜像同批写入（products.attributes 与 product_attributes 必须一起落，见 saveAttributes 注释）
+  saveAttributes(productId, value.attributes);
+  audit(req, 'product.create', 'product', slug, { kind: value.kind, skuCount: value.skus.length, specs: value.specs.map((s) => s.name), tags: value.tags, shippingFeeUsdtMicro: value.shippingFeeUsdtMicro, ageRestricted: value.ageRestricted, active: value.active });
+  ok(
+    res,
+    rowToPublic(db.prepare('SELECT * FROM products WHERE slug = ?').get(slug)),
+    value.active ? '上架成功' : '已存为草稿（买家看不到；在商品列表里点「上架」后才会出现在聚合首页）'
+  );
 }));
 
 /** 店主批量更新（P1-②：改价/上下架/经营开关；安全字段子集——不动 kind/合约/池语义）。
@@ -1000,6 +1405,8 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
   if (!slugs.length) return fail(res, 'slugs 需为非空数组（≤100）');
   const b = req.body?.patch || {};
   if (typeof b !== 'object' || !Object.keys(b).length) return fail(res, 'patch 需为 {priceUsdtMicro?/active?/autoDeliver?/stockAlertAt?}');
+  const unknownPatch = unknownKeysError(b, PRODUCT_BATCH_PATCH_KEYS, '批量修改（PATCH /api/products/batch 的 patch）');
+  if (unknownPatch) return fail(res, unknownPatch);
   // 字段合法性（整体校验）
   if (b.priceUsdtMicro !== undefined) {
     const micro = Number(b.priceUsdtMicro);
@@ -1047,13 +1454,20 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
       snapshotObject({
         ...row,
         skus: next.priceUsdtMicro !== null
-          ? skuRows.map((s) => ({ sku_key: s.sku_key, price_usdt_micro: next.priceUsdtMicro }))
+          /*
+            改价时**必须把 image_url 一起带上**：快照的 skus 只取二元组，但 sku_images 键取自
+            同一批行的 image_url——这里手挑字段漏掉它，等于"批量改一次价，所有规格图从快照里消失"，
+            而买家侧立刻报假的「商品内容已被修改」（与当年漏 description_blocks 是同一类错误）。
+          */
+          ? skuRows.map((s) => ({ sku_key: s.sku_key, price_usdt_micro: next.priceUsdtMicro, image_url: s.image_url }))
           : skuRows,
       })
     );
+    // 首次上架时刻：与单商品 PATCH 同一条规则（已有值保留、无值且在售则记 now、无值且未上架保持 NULL）
+    const publishedAt = row.published_at ?? (next.active ? Date.now() : null);
     db.prepare(
-      'UPDATE products SET active = ?, auto_deliver = ?, stock_alert_at = ?, snapshot_hash = ?, updated_at = ? WHERE id = ?'
-    ).run(next.active, next.autoDeliver, next.stockAlertAt, hash, Date.now(), row.id);
+      'UPDATE products SET active = ?, auto_deliver = ?, stock_alert_at = ?, published_at = ?, snapshot_hash = ?, updated_at = ? WHERE id = ?'
+    ).run(next.active, next.autoDeliver, next.stockAlertAt, publishedAt, hash, Date.now(), row.id);
     updated.push(slug);
   }
   ok(res, { updated, failed }, updated.length ? `已更新 ${updated.length} 个商品` : '无商品被更新');
@@ -1066,6 +1480,8 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
   const row = db.prepare('SELECT * FROM products WHERE slug = ?').get(String(req.params.slug || ''));
   if (!row) return fail(res, '商品不存在', 404, 404);
   const b = req.body || {};
+  const unknown = unknownKeysError(b, PRODUCT_WRITE_KEYS, `编辑商品（PATCH /api/products/${req.params.slug}）`);
+  if (unknown) return fail(res, unknown);
   let baseMedia = parseMediaColumn(row.media);
   const prevSkuMap = new Map(loadSkus(row.id).map((s) => [s.sku_key, s]));
   const merged = {
@@ -1111,17 +1527,20 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
                 （前端只发 `{active:false}` / `{active:true}`）就把它**静默重新上架**。
               */
               active: s.active !== 0,
+              // 同理必须带上 imageUrl：它是快照字段（`sku_images`），漏了就等于"改一次库存把规格图全删了"
+              imageUrl: s.image_url || '',
             }));
             const byKey = new Map(base.map((s) => [s.key, s]));
             for (const s of Array.isArray(b.skus) ? b.skus : []) {
               const key = String(s?.key ?? '').trim();
-              const prev = byKey.get(key) || { priceUsdtMicro: undefined, capacity: null, active: true };
+              const prev = byKey.get(key) || { priceUsdtMicro: undefined, capacity: null, active: true, imageUrl: '' };
               byKey.set(key, {
                 key,
                 priceUsdtMicro: s?.priceUsdtMicro !== undefined ? s.priceUsdtMicro : prev.priceUsdtMicro,
                 capacity: s?.capacity !== undefined ? s.capacity : prev.capacity,
                 // 停售：该组合不再可下单，但不影响其它组合（与「售罄」是两回事）
                 active: s?.active !== undefined ? !!s.active : (prev.active !== false),
+                imageUrl: s?.imageUrl !== undefined ? s.imageUrl : prev.imageUrl,
               });
             }
             // specs 一旦变更，组合集合必须由提交方完整给出（否则会残留已不存在的旧组合）
@@ -1133,12 +1552,18 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
             priceUsdtMicro: s.price_usdt_micro,
             capacity: s.capacity,
             active: s.active !== 0,
+            imageUrl: s.image_url || '',
           })),
     autoDeliver: b.autoDeliver !== undefined ? b.autoDeliver : row.auto_deliver,
     stockAlertAt: b.stockAlertAt !== undefined ? b.stockAlertAt : row.stock_alert_at,
     // 标签：未提交则沿用现有（DB 行 → 数组）；提交 `[]` = 显式清空（与 media 同款三态：
     // 未提交=不动、提交空数组=清空）。归一化在 validateProduct → src/tags.js（唯一实现）
     tags: b.tags !== undefined ? b.tags : parseTagsColumn(row.tags),
+    // 参数与承诺：三态与 media/tags 同款（未提交=不动、提交空数组/空对象=清空、提交内容=覆盖）。
+    // 未提交时**必须**沿用现有值：它们是快照字段，漏传等于把商品悄悄改回"没有参数、没有承诺"
+    // （买家手里的哈希随即对不上，而店主只是改了个标题）。
+    attributes: b.attributes !== undefined ? b.attributes : parseAttributesColumn(row.attributes),
+    terms: b.terms !== undefined ? b.terms : parseTermsColumn(row.terms),
     active: b.active !== undefined ? b.active : !!row.active,
   };
   // 已建交付池的商品禁止跨类型变更（码池/tokenId 池与 kind 绑定，避免履约语义错乱）；
@@ -1297,16 +1722,27 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
   }
 
   const hash = computeSnapshotHash(snapshotObject(snapshotRowOf(row.slug, value)));
+  /*
+    「首次上架时刻」的**唯一写入规则**：`published_at = 已有值 ?? (本次是否在售 ? now : null)`。
+      · 已有值 ⇒ 永远保留（下架/再上架都不改写——它回答的是"有没有发布过"，不是"最后一次上架"）；
+      · 没有值且本次在售 ⇒ 记 now（这就是"首次上架"，无论它来自下架恢复、批量上架还是直接编辑）；
+      · 没有值且本次未上架 ⇒ 保持 NULL（还没发布过）。
+    三态在这一行里闭合，所以三处写入口（上架 POST / 编辑 PATCH / 批量 PATCH）都套同一个表达式，
+    不存在"某条路径忘了写"的可能（漏写的表现是列表把已发布的商品说成"从未发布"）。
+  */
+  const publishedAt = row.published_at ?? (value.active ? Date.now() : null);
   db.prepare(
-    'UPDATE products SET title = ?, description = ?, description_blocks = ?, media = ?, kind = ?, shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, specs = ?, tags = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, snapshot_hash = ?, updated_at = ? ' +
+    'UPDATE products SET title = ?, description = ?, description_blocks = ?, media = ?, kind = ?, shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, specs = ?, attributes = ?, terms = ?, tags = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, published_at = ?, snapshot_hash = ?, updated_at = ? ' +
       'WHERE id = ?'
-  ).run(value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.media), value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard, JSON.stringify(value.specs), JSON.stringify(value.tags), value.autoDeliver, value.stockAlertAt, value.active, hash, Date.now(), row.id);
+  ).run(value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.media), value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard, JSON.stringify(value.specs), JSON.stringify(value.attributes), JSON.stringify(value.terms), JSON.stringify(value.tags), value.autoDeliver, value.stockAlertAt, value.active, publishedAt, hash, Date.now(), row.id);
   // 写 SKU（保留同 key 的 committed，编辑商品不该把已售数量清零）
   saveSkus(row.id, value.skus, Date.now());
   // 标签镜像同批写入（与上面的 products.tags 列更新同一次提交；见 saveTags 注释）
   saveTags(row.id, value.tags);
+  // 参数镜像同批写入（同上；见 saveAttributes 注释）
+  saveAttributes(row.id, value.attributes);
 
-  audit(req, 'product.update', 'product', row.slug, { fields: Object.keys(b).filter((k) => ['title','description','descriptionBlocks','specs','skus','tags','autoDeliver','stockAlertAt','active','kind','shippingFeeUsdtMicro','ageRestricted'].includes(k)) });
+  audit(req, 'product.update', 'product', row.slug, { fields: Object.keys(b).filter((k) => ['title','description','descriptionBlocks','specs','skus','tags','attributes','terms','autoDeliver','stockAlertAt','active','kind','shippingFeeUsdtMicro','ageRestricted'].includes(k)) });
   ok(res, rowToPublic(db.prepare('SELECT * FROM products WHERE id = ?').get(row.id)), '已更新');
 }));
 

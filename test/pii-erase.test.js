@@ -526,35 +526,17 @@ test('保留期让路：有在途售后案件的终局单不自动擦除（证�
   审计时的原始字节取证与结论记在这里：问题**确实存在**（擦除后 `<db>-wal` 里能直接搜到
   手机号/地址/备注原文），但它作为自动化断言不稳定，所以不进测试。
 */
-test('擦除的两条腿都在位：secure_delete 已开启、擦除后 WAL 被截断', async () => {
-  const { getDb, checkpointTruncate } = await import('../src/db.js');
-  // 修法一：释放页清零（否则原文留在库文件空闲页里）
+test('擦除的两条腿：secure_delete 在整个库上开着', async () => {
+  /*
+    ⚠️ 这里**只**能断 secure_delete（内存库上确实成立）。"擦除后 WAL 被截断"那条断言**不能**放在这里：
+    本文件跑在 `:memory:` 库上，`journal_mode = memory` ⇒ `wal_checkpoint(TRUNCATE)` 是空操作且回
+    `{busy:0}`、磁盘上根本没有 -wal 文件 —— 把擦除路径里的 `checkpointTruncate()` 调用整个删掉，
+    它照样绿（2026-10-15 审计实测）。真正的判据在 `test/pii-erase-wal.test.js`：
+    文件库 + 字节级检索 + "被读者挡住"那一档。
+  */
+  const { getDb } = await import('../src/db.js');
   const sd = getDb().prepare('PRAGMA secure_delete').get();
   assert.equal(Number(sd?.secure_delete ?? 0), 1, 'PRAGMA secure_delete 必须为 ON（db.js initDb 里设置）');
-
-  const p = await listProduct(productPayload({ kind: 'physical', title: '磁盘残留检测商品' }));
-  const o = await createDraft(p.slug, {
-    shipping: { name: '残留检测', phone: '13900000099', address: '残留地址-A' },
-    note: '残留备注-A',
-  });
-  escrowed(o);
-  // 必须先终局：擦除只对资金流已终结的单开放（在途单要按地址发货，见 PII_ERASABLE_STATUS）
-  assert.equal(applyEvent('ReceiptConfirmed', { orderId: o.escrowOrderId }, { txHash: payHash(), block: 91 }), 1);
-
-  const dbFile = appConfig.db.file;
-  assert.ok(dbFile, '本用例需要真实的库文件路径');
-
-  const r = await eraseViaApi(o.id);
-  assertOk(r);
-  assert.equal(rowOf(o.id).shipping_phone, '', '查询侧确实读不到了');
-  /*
-    修法二：擦除路径**自己**截断 WAL（响应里的 walTruncated 就是它的读数）。
-    断它而不是断"文件当前大小"：TRUNCATE 成功后 wal 会回到 0，但当前大小还受本轮之后
-    有没有别的写影响（其它用例/后台任务），拿它当断言同样会漂。响应字段是这一单擦除动作的
-    直接读数，与修法一一对应。再单测直调一次（保留期路径走的是同一个原语）。
-  */
-  assert.equal(r.body?.data?.walTruncated, true, '擦除必须顺带把 WAL 截断（否则原文留在 -wal 里）');
-  assert.equal(checkpointTruncate(), true, 'checkpointTruncate 在无写者时应返回 true');
 });
 
 /*
@@ -605,14 +587,65 @@ test('删盘失败：响应必须说"没删净"、锚点不得前移，且重试
   assert.equal(d.attachmentFilesRemaining > 0, true, `必须报出磁盘残留数（实际 ${d.attachmentFilesRemaining}）`);
   assert.equal(d.attachmentFilesRemoved, false, '三态读数必须明确说"确认没删净"（不是 null、更不是 true）');
   assert.match(String(d.error || ''), /还剩|无法读取/, 'error 必须是一句可读的原因，界面要原样展示它');
-  assert.equal(rowOf(o.id).pii_erased_at, null, '删盘失败 ⇒ 锚点不得前移，否则保留期扫描再也不会重试');
+  assert.equal(d.cleanupFailed, true, '清理未完成（附件那条腿）要有一个明确的布尔');
+  assert.equal(d.cleanupPending, true, '必须记成"仍欠一次清理"');
+  assert.equal(rowOf(o.id).pii_cleanup_pending, 1, '待清理标记要落库——保留期扫描据此重试');
+  /*
+    锚点**照常落定**（2026-10-15 改口径）：`pii_erased_at` 的语义是"库内那批字段已擦"（这是事实，
+    库内确实没有个人信息了），它的活是给保留期扫描去重与排序；"还欠一次清理"由 `pii_cleanup_pending`
+    单独表达。旧实现靠"把锚点回退成 NULL"来表达未完成，于是同一个语义有两个机制，
+    而那个机制**根本不起作用**（候选判据是纯时间的，回退锚点不会让这一单重新入选——见下面那段）。
+    真正的判据在下一段：不推进任何时间，保留期扫描必须把这一单当候选。
+  */
+  assert.ok(rowOf(o.id).pii_erased_at, '锚点落定（= 库内已擦这个事实），未完成由 pii_cleanup_pending 表达');
   assert.equal(rowOf(o.id).shipping_name, '', '库内字段该擦的仍要擦（只有磁盘那部分没做成）');
 
-  // 目录恢复后重试：必须成功并落定锚点（"失败是可见的未完成"这条承诺的后半句）
+  /*
+    ── "系统会在下一轮保留期扫描中自动重试"这句承诺必须是真的（2026-10-15 修）──────────
+    旧实现把重试寄托在"锚点回退"上，而候选判据是**纯时间**的（MAX(锚点, updated_at) <= 截止）：
+    这一单的 updated_at 就是刚才那一下 ⇒ 要等整个保留期（默认 180 天）才可能被扫到，
+    MK_PII_RETENTION_DAYS=0 时则永远等不到。现在"还欠清理"是独立的一列，候选判据里有
+    `OR pii_cleanup_pending = 1`，所以**不推进任何时间**、直接跑一轮保留期扫描，它就必须进候选。
+
+    这一轮故意**继续让删盘失败**（fs 仍被拦着）：于是 `erased` 会是 0 —— 而路由不许把这说成
+    "无到期订单"（运维按 OPS_RUNBOOK 正是先跑这个接口再归档，看到"没有到期单"就会把还留着
+    个人数据的卷归档走）。这是 D2 那条谎报的现场。
+  */
+  let failedAgain = false;
+  fsMod.default.rmSync = (...args) => {
+    if (!failedAgain) {
+      failedAgain = true;
+      throw new Error('EBUSY: 文件被占用（本用例故意构造第二轮）');
+    }
+    return realRm(...args);
+  };
+  let retention;
+  try {
+    retention = await request(app)
+      .post('/api/shop/retention/run')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ days: 180 })
+      .expect(200);
+  } finally {
+    fsMod.default.rmSync = realRm;
+  }
+  assertOk(retention);
+  const rd = retention.body?.data || {};
+  assert.ok(rd.candidates >= 1, `欠清理的单必须在同一时间点就成为候选（实际 ${rd.candidates}）`);
+  assert.equal(rd.erased, 0, '这一轮磁盘那条腿仍失败 ⇒ 一单都没擦干净');
+  assert.ok(rd.cleanupPending >= 1, `必须如实给出"还欠清理"的单数（实际 ${rd.cleanupPending}）`);
+  assert.ok(rd.diskFailed >= 1, '半成功的单数也要下发（运维据此决定要不要去清目录）');
+  assert.match(String(retention.body.message || ''), /没清完|欠清理|重试/, '文案要说清"有候选、但没清干净"');
+  assert.doesNotMatch(String(retention.body.message || ''), /无到期订单/, '有候选却报"无到期订单"就是谎报（运维据此归档）');
+  assert.equal(rowOf(o.id).pii_cleanup_pending, 1, '这一轮失败后仍欠清理（不会因为"试过了"就丢掉）');
+
+  // 目录/占用恢复后重试：必须成功、标记归零、锚点落定（"失败是可见的未完成"这条承诺的后半句）
   const second = await eraseViaApi(o.id);
   const d2 = second.body?.data || {};
   assert.equal(d2.attachmentFilesRemaining, 0, '重试后磁盘必须干净');
   assert.equal(d2.attachmentFilesRemoved, true, '重试后必须明确说"确认删净"');
+  assert.equal(d2.cleanupPending, false, '重试成功后不该再挂待清理');
+  assert.equal(rowOf(o.id).pii_cleanup_pending, 0, '待清理标记要归零（有界重试，不是反复入选）');
   assert.ok(rowOf(o.id).pii_erased_at, '重试成功 ⇒ 锚点落定');
 });
 
@@ -668,4 +701,64 @@ test('订单出参带 piiErasable：与可擦状态集合逐状态一致，且�
   const row = after.body.data.orders.find((x) => x.id === o.id);
   assert.equal(row.piiErasable, true, '已擦过的单在状态上仍属"可擦"（重复调用幂等，不是错误）');
   assert.ok(row.piiErasedAt, '擦除锚点必须下发，界面才不会把"已擦过"说成"从没擦过"');
+});
+
+/*
+  ── "刻意保留"的那一半必须有**行为**判据（2026-10-15 审计 D7）────────────────────
+  承诺清单（`piiErase.js` 文件头 + 三份文档）由 `pii-scope-consistency.test.js` 守文字的**一致性**，
+  而"擦除动作真的没碰那些列/表"此前只被断了一部分（金额/托管单号/凭证/事件史/评价）。
+  清单里剩下的几类——平台费率快照与净额口径、物流单号、退货单地址与备注、已交付的码/ tokenId、
+  售后结案说明、开票标记（`invoice_needed` 是处理状态不是个人信息）——一旦被某次改动顺手清掉，
+  文字守卫**不会红**，而当事人按承诺行事就会踩空。这里逐项钉住。
+*/
+test('擦除只动 PII：保留清单里的每一类都逐项验一遍（不是只验金额与凭证）', async () => {
+  const p = await listProduct(productPayload({ kind: 'physical', title: '保留清单逐项商品' }));
+  const o = await createDraft(p.slug, {
+    shipping: { name: '保留甲', phone: '13500000001', address: '保留地址-1' },
+    note: '保留备注-1',
+  });
+  escrowed(o);
+  assert.equal(applyEvent('ReceiptConfirmed', { orderId: o.escrowOrderId }, { txHash: payHash(), block: 120 }), 1);
+
+  const before = rowOf(o.id);
+  // 逐项铺上"保留清单"里的数据（都走真实写入路径能写到的列/表）
+  db.prepare(
+    `UPDATE orders SET tracking_no = ?, carrier = ?, invoice_needed = 1, fee_bps = 250,
+       after_sale_note = ?, shipped_at = ? WHERE id = ?`
+  ).run('SF1234567890', '顺丰', '结案说明：双方已协商一致（链上公开文本）', Date.now(), o.id);
+  db.prepare(
+    `INSERT INTO order_returns (order_id, status, address, note, tracking_no, carrier, created_at, updated_at)
+     VALUES (?, 'shipped', '退货地址-保留', '退货说明-保留', 'RTN998877', '中通', ?, ?)`
+  ).run(o.id, Date.now(), Date.now());
+  db.prepare(
+    `INSERT INTO order_delivery_items (order_id, kind, value, created_at) VALUES (?, 'code', 'CODE-KEEP-1', ?)`
+  ).run(o.id, Date.now());
+
+  const kept = db
+    .prepare(
+      `SELECT tracking_no, carrier, invoice_needed, fee_bps, after_sale_note, shipped_at,
+              amount_wei, escrow_order_id, paid_tx_hash FROM orders WHERE id = ?`
+    )
+    .get(o.id);
+  assertOk(await eraseViaApi(o.id));
+
+  const after = db
+    .prepare(
+      `SELECT tracking_no, carrier, invoice_needed, fee_bps, after_sale_note, shipped_at,
+              amount_wei, escrow_order_id, paid_tx_hash, shipping_name FROM orders WHERE id = ?`
+    )
+    .get(o.id);
+  assert.equal(after.shipping_name, '', '前置：PII 确实被擦了（否则下面的"保留"是空转）');
+  for (const col of ['tracking_no', 'carrier', 'invoice_needed', 'fee_bps', 'after_sale_note', 'shipped_at', 'amount_wei', 'escrow_order_id', 'paid_tx_hash']) {
+    assert.deepEqual(after[col], kept[col], `${col} 属于"刻意保留"，擦除不许碰它`);
+  }
+  const ret = db.prepare('SELECT * FROM order_returns WHERE order_id = ?').get(o.id);
+  assert.ok(ret, '退货单行必须保留（售后事实记录）');
+  assert.equal(ret.address, '退货地址-保留');
+  assert.equal(ret.note, '退货说明-保留');
+  assert.equal(ret.tracking_no, 'RTN998877', '买家回填的退回物流单号同样保留');
+  const del = db.prepare('SELECT * FROM order_delivery_items WHERE order_id = ?').all(o.id);
+  assert.equal(del.length, 1, '已交付的码必须保留（"这个东西已经给他了"的证据）');
+  assert.equal(del[0].value, 'CODE-KEEP-1');
+  assert.ok(before.amount_wei, '前置：金额本来就有值');
 });

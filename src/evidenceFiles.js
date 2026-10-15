@@ -168,6 +168,23 @@ export const EVIDENCE_OPEN_STATUS = ACTIVE_STATUS; // 在途单才允许提交/�
 /** 状态门控：返回可读的中文原因或 null（允许）。两个写入端点共用同一实现 */
 export function evidenceStatusError(order) {
   const status = String(order?.status || '');
+  /*
+    ── 已擦除个人信息的单**不再接收**新的个人信息（2026-10-15 修 D3）─────────────────
+    擦除是数据主体的删除请求（手动端点或保留期扫描），而陈述正文与证据附件**本身就是个人信息**。
+    旧实现只按状态判：`isAfterSaleOpen(order)` 一成立就受理，于是「已擦除 → 买家在售后窗口内
+    再提交陈述与附件」会把刚删掉的东西**重新写回同一张单**；而保留期扫描又为在途售后案件让路
+    （见 piiErase.js 的 AFTER_SALE_NOT_OPEN_SQL），新写入的个人信息因此可能长期留存——
+    "删了又收"让删除请求形同虚设，且每一个入口都得各自记得这件事。
+    判据放在**唯一的阶段门**（本函数）：陈述提交与附件上传共用它，所以两处一起关门。
+    为什么是"拒绝"而不是"收下再擦"：擦除之后本地没有可核对的收货信息/联系方式，
+    收下的陈述无法被送达对方，只会变成一份谁也用不上的个人数据。
+  */
+  if (Number(order?.pii_erased_at || 0) > 0) {
+    return (
+      '该订单的个人信息已按删除请求擦除（陈述正文与证据附件本身即个人信息），不再受理新的售后陈述与附件——' +
+      '如仍需主张权利，请走链上仲裁或线下渠道；需要在本店留痕请另开一张订单'
+    );
+  }
   if (isAfterSaleOpen(order)) return null; // 在途售后案件：终局单也受理（见上方说明）
   if (EVIDENCE_OPEN_STATUS.includes(status)) return null;
   /*

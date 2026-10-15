@@ -176,7 +176,13 @@ export function rowLikeOf(p) {
     shipping_fee_usdt_micro: p.shippingFeeUsdtMicro ?? 0,
     age_restricted: p.ageRestricted ? 1 : 0,
     specs: JSON.stringify(p.specs || []),
-    skus: (p.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
+    skus: (p.skus || []).map((s) => ({
+      sku_key: s.key,
+      price_usdt_micro: s.priceUsdtMicro,
+      image_url: s.imageUrl || '',
+    })),
+    attributes: JSON.stringify(p.attributes || []),
+    terms: JSON.stringify(p.terms || {}),
     nft_contract: p.nftContract || '',
     nft_standard: p.nftStandard || 'erc721',
   };

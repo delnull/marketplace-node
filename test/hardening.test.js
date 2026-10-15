@@ -110,7 +110,18 @@ test('码池清空：需 confirm + 仅 owner；清空后可改商品类型', asy
   const changed = await ctx.request(ctx.app)
     .patch(`/api/products/${p.slug}`)
     .set('Authorization', `Bearer ${ownerToken}`)
-    .send({ kind: 'physical', title: '清池后改实物', capacity: 5 })
+    /*
+      写接口只认 `specs + skus`（商品级的 `capacity` 是各组合之和的只读汇总，提交它会被
+      **带字段名拒绝**——见 products.js 的 PRODUCT_WRITE_KEYS）。本用例只想验"清池后可改型"，
+      所以库存按真实形状写在组合上；同时把 skus 完整给出（含 priceUsdtMicro）：
+      改了 kind 就落在一件无规格商品上，唯一组合 key='' 给全字段最不易误读。
+    */
+    .send({
+      kind: 'physical',
+      title: '清池后改实物',
+      specs: [],
+      skus: [{ key: '', priceUsdtMicro: 88_000_000, capacity: 5 }],
+    })
     .expect(200);
   assertOk(changed);
   assert.equal(changed.body.data.kind, 'physical');
@@ -144,6 +155,9 @@ test('履约画像同源窗口：窗外创建、窗内确认的旧单不再污�
     {
       status: 'confirmed',
       delivered_at: null,
+      // 托管证明（画像按它计入单量）+ 锚点兜底（OrderCreated 被挤掉时用）——见 computeReputation 的说明
+      paid_tx_hash: '0x' + 'ab'.repeat(32),
+      created_at: oldCreated,
       onchain_events: JSON.stringify([
         e('OrderCreated', oldCreated),
         e('ReceiptConfirmed', now - 1000), // 窗内才确认（旧实现会把确认计进 d30 分子）

@@ -28,7 +28,11 @@ import { getEscrow, getProvider, isZeroAddress, weiToDecimal } from './chain.js'
 import { ACTIVE_IN, ESCROW_RELEASABLE_IN, INCOME_IN, ORDER_STATUS } from './orderStatus.js';
 import { AFTER_SALE_OPEN_SQL } from './afterSale.js';
 import { refreshFeeCollector, feeStatus } from './fees.js';
-import { reputationSummary, DELIVERY_MIN_SAMPLES, parseOnchainEvents, escrowedAtOf } from './reputation.js';
+import { reputationSummary, DELIVERY_MIN_SAMPLES, parseOnchainEvents, escrowedAtOf, percentile, shipLatencySpan } from './reputation.js';
+// 「这一单的货交出去了没有」的唯一判据（发货标记/物流单号/交付行/本地状态四者取并集）
+import { isDelivered, occupyingSql } from './stockHold.js';
+// 商品级承诺的解析（唯一实现在 src/productTerms.js）：这里只读 `handling_days` 一个字段
+import { parseTermsColumn } from './productTerms.js';
 
 /* ══════════════════════════════════════════════════════════════════════
    待办谓词（**唯一拼法**）——徽标、列表筛选、运营读数、SLA 清单共用
@@ -469,6 +473,106 @@ export const SLA_LIMIT_MAX = 100;
 export const SLA_LIMIT_DEFAULT = 20;
 
 /**
+ * 「承诺发货时效」对账读数（**唯一实现**）——把商品上的 `terms.handling_days` 变成可经营的指标。
+ *
+ * ── 为什么要有它 ────────────────────────────────────────────────────────
+ * `handling_days` 是店主自己声明的承诺（进快照、仲裁台照着判），但在它对面**此前没有任何读数**：
+ * 店主写完"2 天内发货"就再也没见过它。于是承诺只是文案，而不是他每天能看见的指标。
+ * 本函数把两侧摆到一起：
+ *   · **在途超承诺**（最可操作）：已托管、尚未交付、且距托管入账已超过承诺天数的单——
+ *     这些是"买家现在就能拿来主张"的单，数字越大越该先处理；
+ *   · **已交付实况**（近 30 天）：样本量、中位数、超承诺的单数与占比。
+ *
+ * ── 判据全部复用，不新增口径 ────────────────────────────────────────────
+ *  · 「已交付」= `stockHold.isDelivered`（发货标记 ∨ 物流单号 ∨ 交付行 ∨ 本地状态 shipped）；
+ *  · 「耗时」= `reputation.shipLatencySpan`（交付时刻 − OrderCreated 落库时刻）——与履约画像、
+ *    公开的"发货中位数"是**同一个减法**，否则同一家店会出现两个"发货要多久"；
+ *  · 「中位数/分位数」= `reputation.percentile`。
+ * 新增的只有一件事：把每条订单归到它**下单时那件商品**的承诺上（按 `orders.product_id` 关联商品行）。
+ * 商品在下单后被改过承诺也不影响归属：这里对的是"这件商品**现在**的承诺"——它是给店主看的
+ * 经营读数（要不要改承诺、哪些单该先发），不是对历史订单的追责；历史订单的条款在它自己的快照里。
+ *
+ * 三态：**没有承诺**的商品不进这份清单（不声明就没有可对账的东西，不拿 0 天冒充）；
+ * 样本不足时中位数照给样本量、`medianMs` 为 null（与 /api/shop/sla 的显示策略一致）。
+ *
+ * @param {number} now 当前时刻（毫秒；注入便于测试）
+ * @param {number} windowDays 实况窗口（天；与 SLA 面板的 d30 对齐）
+ */
+export function promiseSlaReading(now = Date.now(), windowDays = 30) {
+  const db = getDb();
+  /*
+    只取**已发布**且声明了发货时效的商品：草稿/已下架商品没有"该多久发出"的现实意义
+    （还没有买家能看到它），把它们算进来只会让面板出现永远超期的幽灵行。
+  */
+  const products = db
+    .prepare("SELECT id, slug, title, terms FROM products WHERE active = 1 AND terms IS NOT NULL AND terms != '{}'")
+    .all()
+    .map((p) => ({ ...p, handlingDays: parseTermsColumn(p.terms).handling_days }))
+    .filter((p) => p.handlingDays !== null);
+  if (!products.length) return [];
+
+  const since = now - windowDays * 24 * 3600 * 1000;
+  const rows = db
+    .prepare(
+      `SELECT o.id, o.product_id, o.status, o.onchain_events, o.paid_tx_hash, o.created_at, o.shipped_at, o.tracking_no,
+              (SELECT COUNT(*) FROM order_delivery_items d WHERE d.order_id = o.id) AS delivered_items,
+              (SELECT MAX(created_at) FROM order_delivery_items d WHERE d.order_id = o.id) AS delivered_at,
+              ${occupyingSql('o')} AS occupying
+         FROM orders o`
+    )
+    .all();
+
+  return products.map((p) => {
+    const mine = rows.filter((r) => r.product_id === p.id);
+    const limitMs = p.handlingDays * 24 * 3600 * 1000;
+    let overdueOrders = 0;
+    let worstMs = 0;
+    const samples = [];
+    let late = 0;
+    for (const r of mine) {
+      // 与履约画像同一批凭据：没有链上支付凭证的单不进任何统计（"这单托管过"的证据是它）
+      if (!String(r.paid_tx_hash || '').trim()) continue;
+      const escrowedAt = escrowedAtOf(parseOnchainEvents(r.onchain_events)) || Number(r.created_at || 0) || null;
+      if (!escrowedAt) continue;
+      const deliveredAt = Number(r.delivered_at || 0) || Number(r.shipped_at || 0) || null;
+      if (!isDelivered(r)) {
+        /*
+          在途且未交付：只统计"这一单还占着库存承诺"的行（occupied）或在途状态的行——
+          已终结（取消/退款/超时释放）的单不该被算成"还没发货"。
+        */
+        if (!r.occupying && !ACTIVE_IN.includes(r.status)) continue;
+        const waited = now - escrowedAt;
+        if (waited > limitMs) {
+          overdueOrders += 1;
+          worstMs = Math.max(worstMs, waited);
+        }
+        continue;
+      }
+      // 已交付：只统计窗口内交付的样本（与 /api/shop/sla 的 d30 同窗口）
+      const span = shipLatencySpan({ deliveredAt, escrowedAt });
+      if (span === null || !deliveredAt || deliveredAt < since) continue;
+      samples.push(span);
+      if (span > limitMs) late += 1;
+    }
+    return {
+      slug: p.slug,
+      title: p.title,
+      handlingDays: p.handlingDays,
+      /** 在途且已超过承诺的单数 + 最久等了多久（0 = 确实没有，不是读不到——本地帐恒可读） */
+      overdueOrders,
+      overdueWorstMs: overdueOrders ? worstMs : null,
+      /** 近 windowDays 天已交付的样本：条数恒给，中位数在样本不足时为 null（与 SLA 同策略） */
+      sampleCount: samples.length,
+      medianMs: samples.length >= DELIVERY_MIN_SAMPLES ? percentile(samples, 0.5) : null,
+      p90Ms: samples.length >= DELIVERY_MIN_SAMPLES ? percentile(samples, 0.9) : null,
+      lateCount: late,
+      lateRate: samples.length ? Math.round((late / samples.length) * 10000) / 10000 : null,
+      sampleTooSmall: samples.length < DELIVERY_MIN_SAMPLES,
+    };
+  });
+}
+
+/**
  * SLA 清单条目（前端契约 `SlaItem`）。
  * `ageMs` = 该条已等待毫秒数；**读不到就整个键不下发**（不是 null、更不是 0）——
  * 前端的 `rowsOf` 对缺失值渲染"读不到已等待时长"，而 `null` 会被 `Number(null)=0` 渲染成
@@ -564,6 +668,13 @@ export async function slaReading({ limit = SLA_LIMIT_DEFAULT, now = Date.now() }
     shipWindow: 'd30',
     shipBasis: 'OrderCreated 事件落库时刻 → 交付时刻（交付行最晚时刻；实物单兜底 shipped_at）',
     shipWindows: Object.fromEntries(Object.keys(delivery || {}).map((k) => [k, pick(k)])),
+    /*
+      承诺对账（商品级）：把 `terms.handling_days` 与**同一批**发货耗时样本摆到一起。
+      判据全部复用（isDelivered / shipLatencySpan / percentile），只新增"按商品归属"这一步。
+      **没有声明承诺的商品不进这份清单**（不声明就没有可对账的东西）。
+    */
+    promises: promiseSlaReading(now, 30),
+    promiseWindowDays: 30,
     generatedAt: now,
     limit: n,
     note:

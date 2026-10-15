@@ -235,7 +235,13 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     if (!skuByProduct.has(s.product_id)) skuByProduct.set(s.product_id, []);
     skuByProduct.get(s.product_id).push(s);
   }
-  const headers = ['slug', 'title', 'kind', 'shipping_fee_usdt_micro', 'age_restricted', 'specs', 'sku_key', 'sku_specs', 'price_usdt_micro', 'capacity', 'committed', 'available', 'sku_active', 'active', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused'];
+  /*
+    列清单 = 商品模型的可导出部分（**含快照里的每一项**：迁移/对账时要能凭它复算出 snapshot_hash）。
+    2026-10-15 补齐：`attributes`/`terms`/`sku_image_url`（三个进快照的新字段）与 `published_at`
+    （首次上架时刻：NULL = 从未发布，用于分辨"草稿"与"已下架"）。
+    逐字保持 JSON 原文（不解析后重排键序）：这一列的价值就是"与库里那一份一致"。
+  */
+  const headers = ['slug', 'title', 'kind', 'shipping_fee_usdt_micro', 'age_restricted', 'specs', 'attributes', 'terms', 'sku_key', 'sku_specs', 'price_usdt_micro', 'sku_image_url', 'capacity', 'committed', 'available', 'sku_active', 'active', 'published_at', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused'];
   const csvRows = [];
   for (const r of rows) {
     const skus = skuByProduct.get(r.id) || [];
@@ -250,11 +256,13 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     for (const s of list) {
       csvRows.push([
         r.slug, r.title, r.kind, r.shipping_fee_usdt_micro ?? 0, r.age_restricted ? 1 : 0, specs,
+        r.attributes || '[]', r.terms || '{}',
         s ? s.sku_key : '', s ? s.specs_json : '',
-        s ? s.price_usdt_micro : '', s ? (s.capacity ?? '') : '', s ? s.committed || 0 : '',
+        s ? s.price_usdt_micro : '', s ? (s.image_url || '') : '',
+        s ? (s.capacity ?? '') : '', s ? s.committed || 0 : '',
         s ? (s.capacity === null ? '' : Math.max(0, s.capacity - (s.committed || 0))) : '',
         s ? (s.active ? 1 : 0) : '',
-        r.active ? 1 : 0, r.auto_deliver, r.stock_alert_at ?? '', r.snapshot_hash,
+        r.active ? 1 : 0, r.published_at ?? '', r.auto_deliver, r.stock_alert_at ?? '', r.snapshot_hash,
         r.created_at, r.updated_at, r.codes_built, r.codes_unused, r.tokens_built, r.tokens_unused,
       ]);
     }

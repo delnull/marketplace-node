@@ -36,6 +36,7 @@
 import { getDb } from './db.js';
 import config from './config.js';
 import { INCOME_STATUS } from './orderStatus.js';
+import { rowEverDisputed } from './orderFacts.js';
 import { parseOnchainEvents } from './reputation.js';
 
 /**
@@ -99,16 +100,21 @@ export function computeBuyerSignal(rows, { address, minSamples = SIGNAL_MIN_SAMP
     const events = parseOnchainEvents(r?.onchain_events);
     const hasEvent = (name) => events.some((e) => e && e.name === name);
     if (status === 'expired' || hasEvent('OrderExpiredReleased')) expiredReleased += 1;
-    // ⑤ 曾进入争议：当前状态为 disputed，或事件史里有 DisputeRequested
-    if (status === 'disputed' || hasEvent('DisputeRequested')) disputed += 1;
+    // ⑤ 曾进入争议：**唯一判据** `orderFacts.rowEverDisputed`（状态 ∨ DisputeRequested ∨ Arbitrated）——
+    // 与公开履约画像共用同一份实现（此前两边各写一遍且判据不同：一边只看事件，于是被 /sync
+    // 修好的争议读成 0，而这边读出 7；同一批单两个答案）
+    if (rowEverDisputed(r, events)) disputed += 1;
     /*
       ⑤ 的"读不到"单独计数：本单**已终局**（钱已判走）却**没有 OrderCreated 镜像**
       （paid 与 watcher 两条路径都会补写它：没有它，这一单在本地的链上过程就无从复算）——
-      它到底有没有争议过，本地没有可复算的痕迹。这类单不进分子，也不当作"从没争议"。
+      它到底有没有争议过 / 超时释放过，本地没有可复算的痕迹。这类单不进分子，也不当作"从没发生过"。
       在途单（escrowed/shipped）排除在外：链上还在 Created 的单不可能已经争议过
       （合约不允许从争议退回 Created）。
+      2026-10-15 修一处判据与说明不一致：旧实现把它写成 `else if`，挂在"争议"那一支后面 ⇒
+      **有争议、又恰好丢了镜像的单**被判成"已验证"，而本字段的说明写着"已终局却没有镜像的单数"。
+      镜像缺失与争议史是**两件独立的事**，各自计数（缺失这件事不会因为"反正知道它争过"而消失）。
     */
-    else if (!hasEvent('OrderCreated') && status !== 'escrowed' && status !== 'shipped') unverified += 1;
+    if (!hasEvent('OrderCreated') && status !== 'escrowed' && status !== 'shipped') unverified += 1;
     /*
       ⑥ 提出过退款申请：取**耐久痕迹** `refund_requested_at`（而不是数 RefundRequested 事件）——
       终局迁移会复位 refund_status，却刻意保留这一列时刻（见 escrowWatcher 的两级售后分支），
@@ -125,7 +131,13 @@ export function computeBuyerSignal(rows, { address, minSamples = SIGNAL_MIN_SAMP
   const rate = (n) => (enough ? ratio(n, sample) : null);
   return {
     // ===== 前端契约字段（frontend/src/types.ts 的 BuyerSignal）=====
-    available: true, // 本读数全部来自本地镜像：对合法地址恒可读；读不到的单在 unverified 里单列
+    /*
+      ⚠️ 这里**没有** `available` 字段（2026-10-15 删）：本读数全部来自本地镜像，对合法地址
+      **恒可读**，所以"不提供"这个状态不存在——旧实现恒下发 `available: true`，而前端按它分了一条
+      `kind:'unavailable'` 的死分支，读起来像真的（后来者会以为能用它表达"这家店没开这个索引"）。
+      真正会发生的三种情形各有表达：请求失败 ⇒ 载荷为空；确实没有成交 ⇒ `sample: 0`；
+      某单的链上过程复算不出 ⇒ `unverified`（见下）。
+    */
     note: enough
       ? `样本 ${sample} 单（本店与该买家的订单共 ${localOrders} 张，其中真实发生托管的 ${sample} 张）：比率以它为分母。`
       : `本店与该买家共 ${localOrders} 张订单，其中真实发生托管的只有 ${sample} 张，不足 ${min} 张：` +
@@ -186,6 +198,17 @@ export function computeBuyerSignal(rows, { address, minSamples = SIGNAL_MIN_SAMP
 /** 端点用入口：读该买家在本店的订单行 → 纯函数（无链上读取、无跨店查询） */
 export function buyerSignal(address, opts = {}) {
   const addr = String(address || '').toLowerCase();
-  const rows = getDb().prepare('SELECT * FROM orders WHERE buyer = ? ORDER BY created_at DESC').all(addr);
+  /*
+    **必须按 `seller` 限定"本店"**（2026-10-15 修 D6，与 reputationSummary 同一条判据）：
+    `orders.seller` 是逐行写入的（= 写入时的 `config.shop.owner`），而这个读数的 `scope`
+    自称 `this_shop_only` —— 换过店主地址（店铺转手 / 换绑钱包）之后，不带这个 WHERE
+    会把**上一家店**与该买家的往来算进"他在本店的表现"（`localOrders`/`sample` 一起被抬高）。
+    未配店主（只读展示模式）时不加过滤：那时没有身份可比对，库里的行只可能来自本节点自己
+    （判据与代价见 reputation.js 的 reputationSummary）。
+  */
+  const seller = String(config.shop?.owner || '').toLowerCase();
+  const rows = getDb()
+    .prepare(`SELECT * FROM orders WHERE buyer = ? ${seller ? 'AND lower(seller) = ?' : ''} ORDER BY created_at DESC`)
+    .all(...(seller ? [addr, seller] : [addr]));
   return computeBuyerSignal(rows, { address: addr, ...opts });
 }

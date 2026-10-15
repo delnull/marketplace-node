@@ -174,10 +174,12 @@ test('快照：运费/年龄限制同键同位入快照；改其一必变哈希�
     shipping_fee_usdt_micro: p.shippingFeeUsdtMicro,
     age_restricted: p.ageRestricted ? 1 : 0,
     specs: JSON.stringify(p.specs || []),
-    skus: (p.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
+    skus: (p.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro, image_url: s.imageUrl || '' })),
+    attributes: JSON.stringify(p.attributes || []),
+    terms: JSON.stringify(p.terms || {}),
   });
   assert.equal(computeSnapshotHash(snap), p.snapshotHash, '公开字段可复算快照哈希');
-  // 键序契约：kind 之后是 shipping_fee_usdt_micro、age_restricted，然后才是 specs/skus
+  // 键序契约：kind 之后是 shipping_fee_usdt_micro、age_restricted，然后 specs/skus/attributes/terms/sku_images
   assert.deepEqual(Object.keys(snap), [
     'slug',
     'title',
@@ -189,6 +191,9 @@ test('快照：运费/年龄限制同键同位入快照；改其一必变哈希�
     'age_restricted',
     'specs',
     'skus',
+    'attributes',
+    'terms',
+    'sku_images',
   ]);
 
   const repriced = await patchProduct(p.slug, { shippingFeeUsdtMicro: 9_000_000 });

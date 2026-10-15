@@ -53,11 +53,13 @@ const ZERO_WIDTH_RE = /[\u200b-\u200d\ufeff]+/g;
 const WS_RUN_RE = /\s+/g;
 
 /**
- * 清洗（**不折大小写**）→ 展示形。
+ * 清洗（**不折大小写**）→ 展示形。**导出的唯一实现在这里**：标签与商品参数
+ * （`src/attributes.js`）共用同一套"什么算同一个字符串"的口径——两份清洗必然漂移，
+ * 而漂移的表现是"同一份输入在标签里被接受、在参数里被存成另一个样子"。
  * @param {string} raw
  * @returns {string} 清洗后的展示形；空串 = 该项清洗后为空
  */
-function cleanTag(raw) {
+export function cleanLabel(raw) {
   return raw.replace(CONTROL_TO_SPACE_RE, ' ').replace(ZERO_WIDTH_RE, '').replace(WS_RUN_RE, ' ').trim();
 }
 
@@ -72,7 +74,7 @@ function cleanTag(raw) {
  */
 export function tagKeyOf(raw) {
   const s = typeof raw === 'string' ? raw : String(raw ?? '');
-  return cleanTag(s).replace(/[A-Z]/g, (c) => c.toLowerCase());
+  return cleanLabel(s).replace(/[A-Z]/g, (c) => c.toLowerCase());
 }
 
 /**
@@ -100,7 +102,7 @@ export function normalizeTags(input) {
     if (typeof raw !== 'string') {
       throw new Error(`标签（tags）每一项都必须是字符串（第 ${uniq.length + 1} 项是 ${typeof raw}）`);
     }
-    const tag = cleanTag(raw);
+    const tag = cleanLabel(raw);
     if (!tag) continue; // 清洗后为空：这一项没写，丢弃（不是错误）
     const len = [...tag].length;
     if (len > TAG_MAX_LEN) {

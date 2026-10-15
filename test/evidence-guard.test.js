@@ -146,12 +146,44 @@ test('擦除不 sticky：cancel → erase-pii → 仍然无法在这张单上落
   // 关键断言：擦除之后，陈述与附件都进不来 —— 否则"已删除"的单上又会长出新的个人数据
   const stmt = await postEvidence(o.id, { phase: 'refund_request', content: '擦完我再写一段 2000 字的个人信息' });
   assert.notEqual(stmt.body.code, 0);
-  assert.match(stmt.body.message, /不接受新的售后陈述/);
+  /*
+    拒因现在是**擦除**那一句（2026-10-15 起擦除成了独立的一道门，见 evidenceStatusError）：
+    它比"状态不接受陈述"更贴事实——即使这一单之后又被开案/回到受理集，
+    "已按删除请求擦除"这条仍然成立，而"状态"那条会随状态变化而失效（判据挂错层的典型）。
+  */
+  assert.match(stmt.body.message, /已按删除请求擦除|不再受理新的售后陈述/);
   const up = await uploadFile(o.id, evId);
   assert.notEqual(up.body.code, 0);
   assert.equal(evidenceCount(o.id), 1, '陈述行数不变（只有那条已被墓碑化的历史)');
   assert.equal(db.prepare('SELECT COUNT(*) AS c FROM evidence_files WHERE order_id = ?').get(o.id).c, 0);
   assert.equal(rowOf(o.id).shipping_name, '', 'PII 仍然是空的（没有被新提交"喂"回来）');
+});
+
+test('已擦除的单即使有在途售后案件也不再收新陈述（否则"删了又收"，保留期还为该案让路）', async () => {
+  /*
+    2026-10-15 审计 D3 的现场：`isAfterSaleOpen(order)` 一成立，门就开着（终局单也受理售后陈述），
+    而**手动擦除**并不看在途案件（只有保留期扫描排除它，见 piiErase.js 的 AFTER_SALE_NOT_OPEN_SQL）。
+    于是这条路径成立：终局单开案 → 店主执行删除请求 → 买家在窗口内继续提交陈述与附件
+    ⇒ 刚删掉的个人信息被重新写回同一张单，而保留期扫描又为在途案件让路（跳过它）
+    ⇒ 新写入的个人信息**可能长期留存**，删除请求形同虚设。
+    判据落在唯一的阶段门（evidenceStatusError）：陈述与附件两个端点一起关门。
+  */
+  const o = insertOrder({ status: 'confirmed', paid: true });
+  db.prepare("UPDATE orders SET after_sale_status = 'open', after_sale_opened_at = ? WHERE id = ?").run(Date.now(), o.id);
+  // 前置：案件在途 ⇒ 这条单本来**受理**售后陈述（这正是洞的形状）
+  const before = await postEvidence(o.id, { phase: 'after_sale', content: '开案时的陈述' });
+  assert.equal(before.body.code, 0, '前置：在途售后案件受理陈述');
+  const evId = Number(before.body.data.evidenceId);
+
+  assertOk(await erasePii(o.id));
+  assert.ok(rowOf(o.id).pii_erased_at, '擦除已生效（confirmed 在可擦集里）');
+
+  const stmt = await postEvidence(o.id, { phase: 'after_sale', content: '擦完以后再写一段个人信息' });
+  assert.notEqual(stmt.body.code, 0, '擦除之后不许再落下新的个人信息');
+  assert.match(stmt.body.message, /已按删除请求擦除/);
+  const up = await uploadFile(o.id, evId);
+  assert.notEqual(up.body.code, 0, '附件端点同门控（同一个 evidenceStatusError）');
+  assert.equal(rowOf(o.id).after_sale_status, 'open', '案件本身不动（擦除不改案件状态，仍由仲裁台处理）');
 });
 
 test('阶段门控只有一份实现：陈述端点与附件端点对同一 (订单, 阶段) 给出**逐字相同**的拒绝', async () => {

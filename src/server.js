@@ -18,50 +18,12 @@ import { applyEscrowAnchor } from './chainAnchor.js';
 initDb();
 
 /*
-  库结构自检（源码评审 2026-10，P1）：本项目的约定是"全新项目、无存量数据，不做兼容/迁移，
-  删库重建"（见 db.js 文件头）——**建表语句就是最终结构**，`CREATE TABLE IF NOT EXISTS` 对已存在的表
-  是空操作。拿旧库（Docker 命名卷里的 `/data/marketplace-node.db`、或宿主机上的 `marketplace-node.db`）
-  跑新镜像时，表里没有新列，而节点会"启动正常"却处处错位：商品价格显示 0、快照校验失败
-  （买家看到假的「商品内容已被修改」）、售后案件状态永远是 none（仲裁队列空着而链上有案件）、
-  缺列的那条 SQL 直接抛错——故障现象与原因相隔十万八千里。
-  历史上标价单位由 CNY（分）改微 USDT 时就是这么爆的（当时只补了那几列）。所以这里的判据是
-  **结构性的**：凡"当前代码必须存在"的列都在清单里，缺任何一列就拒绝启动，并把"怎么办"写进日志。
-  ⚠️ 加了新列就要加进本清单（否则旧库会带着缺列的 schema 静默跑起来）。
+  必备列门禁在 `db.js` 的 `initDb` 里跑（`assertRequiredColumns`，2026-10-15 从本文件挪过去）：
+  它守的是"当前代码必须存在的列都在库里"，而建表/建索引是**同一层**的事——放在本文件时，
+  `initDb` 与它之间夹着一段 DDL，任何依赖较新列的语句（例如给新列建索引）会**抢在门禁之前**失败：
+  用户拿到的是一句 `SQL logic error`，而不是"缺列 ⇒ 删库重建 / 补 ALTER"的可照做提示。
+  挪进 db.js 后，"先建表 → 校验必备列 → 再建新列索引"这个顺序由那一处独占地保证。
 */
-const REQUIRED_COLUMNS = {
-  // media = 主图区（图片 + 视频）；旧库里的列叫 images ⇒ 缺 media 即拒绝启动（重建库 + 重新上架）
-  products: ['shipping_fee_usdt_micro', 'media'],
-  product_skus: ['price_usdt_micro'],
-  // after_sale_* = 确认收货后的售后案件（契约 2026-10 第二批，见 src/afterSale.js）
-  /*
-    refunded_amount_wei / accepted_partial_refund_wei（2026-10 补进清单）：
-    这两列缺席时**不会**像其它列那样当场炸出 "no such column"——订单 DTO 走的是 `SELECT *`，
-    缺列只是让 `o.refunded_amount_wei === undefined`，而 DTO 里曾用 `|| '0'` 把它说成
-    "链上确证没退过款"：面板净额虚高、卖家授权额显示为"未授权"，一切看起来正常。
-    这正是本清单存在的意义（"凡当前代码必须存在的列都在清单里"）：缺列 ⇒ 拒绝启动，
-    而不是让某一层凭一次读不到的读出一个结论。
-  */
-  orders: ['usdt_micro', 'shipping_fee_usdt_micro', 'after_sale_status', 'after_sale_opened_at', 'refunded_amount_wei', 'accepted_partial_refund_wei'],
-};
-{
-  const db = getDb();
-  const missing = [];
-  for (const [table, cols] of Object.entries(REQUIRED_COLUMNS)) {
-    const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
-    if (have.size === 0) {
-      missing.push(`${table}（表不存在）`);
-      continue;
-    }
-    for (const c of cols) if (!have.has(c)) missing.push(`${table}.${c}`);
-  }
-  if (missing.length) {
-    console.error(`[server] 本地库结构过旧，缺少列：${missing.join('、')}`);
-    console.error('[server] 本项目的建表语句即最终结构，不做存量迁移（见 src/db.js 文件头）。');
-    console.error('[server] 请删库重建：停节点 → 删除数据库文件（默认 marketplace-node.db；Docker 部署在命名卷里）→ 重新启动。');
-    console.error('[server] 删库不可逆，先备份；步骤见 docs/OPS_RUNBOOK.md。');
-    process.exit(1);
-  }
-}
 
 startOrderSweeper();
 // 个人信息保留期擦除（MK_PII_RETENTION_DAYS，默认 180 天；显式 0 = 关闭自动擦除）：

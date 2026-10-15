@@ -50,8 +50,89 @@ export function initDb(file = config.db.file) {
   // ⚠️ 部署纪律：一库一进程（事务深度计数为进程内状态），见 OPS_RUNBOOK。
   db.exec('PRAGMA busy_timeout = 5000');
   migrate(db);
+  assertRequiredColumns(db);
+  /*
+    **依赖新列的索引排在门禁之后**（2026-10-15 修一处自己造出来的晦涩失败）：
+    建表语句是 `CREATE TABLE IF NOT EXISTS` —— 它对**已存在的旧库**什么都不做，
+    于是"给新列建索引"会在旧库上报 `SQL logic error`（列不存在），
+    而且**发生在** `assertRequiredColumns` 之前：用户看到的是一句 SQL 错误，
+    而不是那句"缺列 ⇒ 删库重建"的可照做提示（门禁白设了）。
+    所以顺序是：建表 → 校验必备列（缺就带着怎么办退出）→ 建依赖新列的索引。
+  */
+  db.exec(NEW_COLUMN_INDEXES);
   return db;
 }
+
+/**
+ * 新增列上的索引（**只有这里**才允许出现"依赖较新列"的 DDL）。
+ *
+ * 为什么要单独一段：见 `initDb` 里的说明——这类 DDL 必须排在 `assertRequiredColumns` 之后，
+ * 否则旧库会在建索引那一步炸出一句与真正原因无关的 SQL 错误。
+ * 往这里加索引时**同时**把列加进 REQUIRED_COLUMNS（否则门禁放行、这里再炸一次）。
+ */
+const NEW_COLUMN_INDEXES = `
+  -- 待清理队列索引（部分索引：只收真正欠清理的行）：保留期扫描每轮优先重试它们
+  CREATE INDEX IF NOT EXISTS idx_orders_pii_cleanup ON orders(pii_cleanup_pending) WHERE pii_cleanup_pending = 1;
+`;
+
+/**
+ * 必备列门禁（**唯一实现**，2026-10-15 从 server.js 挪进来）。
+ *
+ * 为什么在 DB 层：它守的是"这份代码必须存在的列都在库里"，而那件事与**建表/建索引**是同一层——
+ * 放在 server.js 里时，`initDb` 与它之间还夹着一段 DDL，任何依赖新列的语句都会抢在门禁之前失败
+ * （见 initDb 的说明），用户于是拿到 SQL 错误而不是"怎么修"。判据挪到 DDL 旁边之后，
+ * "先建表 → 再校验 → 最后建新索引"这个顺序由本文件独占地保证。
+ *
+ * 缺列时的处置口径不变：本项目的建表语句即最终结构，不做存量迁移（见文件头），
+ * 所以是"带怎么办的拒绝启动"，而不是让某一层凭一次读不到的读出一个结论。
+ */
+export function assertRequiredColumns(d = getDb()) {
+  const missing = [];
+  for (const [table, cols] of Object.entries(REQUIRED_COLUMNS)) {
+    const have = new Set(d.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+    if (have.size === 0) {
+      missing.push(`${table}（表不存在）`);
+      continue;
+    }
+    for (const c of cols) if (!have.has(c)) missing.push(`${table}.${c}`);
+  }
+  if (!missing.length) return;
+  console.error(`[db] 本地库结构过旧，缺少列：${missing.join('、')}`);
+  console.error('[db] 本项目的建表语句即最终结构，不做存量迁移（见 src/db.js 的 migrate 说明）。');
+  console.error('[db] 请删库重建：停节点 → 删除数据库文件（默认 marketplace-node.db；Docker 部署在命名卷里）→ 重新启动。');
+  console.error('[db] 也等价的一次性做法：用 ALTER TABLE 把缺的列补上（列定义见建表语句），补完再启动——这是运维动作，不是代码里的兼容分支。');
+  console.error('[db] 删库不可逆，先备份；步骤见 docs/OPS_RUNBOOK.md。');
+  process.exit(1);
+}
+
+/**
+ * 当前代码必须存在的列（**凡新增列都要加进来**，见 `assertRequiredColumns`）。
+ *
+ * 为什么必须逐个列出来：缺列时**不一定**当场炸出 "no such column" —— 订单 DTO 走 `SELECT *`，
+ * 缺列只让 `o.xxx === undefined`，而某一层可能恰好把这个 undefined 读成一个结论
+ * （历史上的两次：`refunded_amount_wei` 缺席被 `|| '0'` 说成"链上确证没退过款"；
+ * `accepted_partial_refund_wei` 缺席让面板显示"未授权"）。缺列 ⇒ 拒绝启动，是最省事的那道防线。
+ */
+const REQUIRED_COLUMNS = {
+  // media = 主图区（图片 + 视频）；旧库里的列叫 images ⇒ 缺 media 即拒绝启动（重建库 + 重新上架）
+  // attributes/terms = 商品参数与承诺（2026-10-15）：两者都进快照，缺列会让 DTO 与快照**各算一份**
+  // （缺列的读法只会得到 undefined，而"读不到"与"没声明"在展示上同形 ⇒ 表现为静默的假承诺）
+  // published_at = 首次上架时刻（同批新增）：缺列会让"从未发布/已下架"两档显示都变成"没发布过"，
+  // 而那正是这一列唯一要回答的问题（读不到 ≠ 从未发布）
+  products: ['shipping_fee_usdt_micro', 'media', 'attributes', 'terms', 'published_at'],
+  product_skus: ['price_usdt_micro', 'image_url'],
+  // after_sale_* = 确认收货后的售后案件（契约 2026-10 第二批，见 src/afterSale.js）
+  // pii_cleanup_pending = "还欠一次清理"的工作状态（2026-10-15，见 src/piiErase.js 的说明）
+  orders: [
+    'usdt_micro',
+    'shipping_fee_usdt_micro',
+    'after_sale_status',
+    'after_sale_opened_at',
+    'refunded_amount_wei',
+    'accepted_partial_refund_wei',
+    'pii_cleanup_pending',
+  ],
+};
 
 /**
  * 把 WAL 里已经落库的内容并回主库并**截断 WAL 文件**（个人信息擦除后必须调用一次）。
@@ -113,6 +194,16 @@ function migrate(d) {
       nft_contract  TEXT NOT NULL DEFAULT '',          -- NFT 合约地址（kind='nft' 必填，小写）
       nft_standard  TEXT NOT NULL DEFAULT 'erc721' CHECK (nft_standard IN ('erc721','erc1155')), -- NFT 标准（交付核验按此选择事件签名；ERC721A 用 erc721）
       specs         TEXT NOT NULL DEFAULT '[]',       -- 规格定义 JSON：[{ name, options[] }]；空数组=无规格（此时 product_skus 只有一条 sku_key='' 的默认组合）
+      attributes    TEXT NOT NULL DEFAULT '[]',       -- 商品**参数** JSON：[{name, value}]，≤20 条、名 ≤24 字、值 ≤60 字（唯一实现在 src/attributes.js）。
+                                                      -- 与 tags 的分工是一句话：**参数是"这东西是什么"（入快照）**，标签是"买家按什么搜到它"（不入快照）。
+                                                      -- 入快照的理由：它是店主对这件货的陈述（成色/材质/产地/型号/批次/保质期），
+                                                      -- 事后改掉而买家手里的哈希不变就等于"货可被无声换掉"——这正是"货不对板"争议要对照的那份东西。
+      terms         TEXT NOT NULL DEFAULT '{}',       -- 商品级**承诺** JSON：{handling_days, return_policy, return_window_days, return_freight}
+                                                      -- （唯一实现在 src/productTerms.js；只有受控枚举与数字，没有自由文本）。
+                                                      -- 入快照的理由：它是要被仲裁人对照的**条款**——本商城的裁决不做事实调查，
+                                                      -- 手上只有链上事实与双方陈述；承诺不进快照，就等于"晚发货/不给退"在机制内没有客观判据。
+                                                      -- **刻意没有质保期字段**：链上售后窗口（afterSaleWindowBlocks，1..360 天、结算时按单快照）
+                                                      -- 才是"买家还能主张多久"的权利期限，商品级再声明一个质保期会让人以为它受机制保障。
       tags          TEXT NOT NULL DEFAULT '[]',       -- 商品标签（类目）JSON 数组，元素是**展示形**（店主写入时的大小写原样，
                                                       -- 只做清洗：去控制/零宽字符、空白折叠、trim；见 src/tags.js）。
                                                       -- 空数组 = 无标签（**不是 NULL**：标签本来就是可选项，DTO 契约恒为数组）。
@@ -126,7 +217,13 @@ function migrate(d) {
       snapshot_hash TEXT NOT NULL,                    -- 商品快照 keccak256（前端可校验）
       auto_deliver  INTEGER NOT NULL DEFAULT -1 CHECK (auto_deliver IN (-1,0,1)), -- 数字商品自动交付：-1 跟随全局 MK_AUTO_DELIVER / 0 关 / 1 开（不入快照）
       stock_alert_at INTEGER,                         -- 低库存提醒阈值（余量 ≤ 阈值时卖家面板警示；NULL=不提醒）
-      active        INTEGER NOT NULL DEFAULT 1,       -- 0=下架
+      active        INTEGER NOT NULL DEFAULT 1,       -- **买家能不能看到**：0=未上架（含"存为草稿"与"已下架"，两者是同一个取值），1=在售。
+                                                      -- 可见性**只有这一个判据**（公开列表 WHERE active=1、匿名详情 404、订单闸、导出…都读它）——
+                                                      -- 刻意不做 draft/on/off 三态：多一个状态列就多一处"谁才是权威"的分叉。
+      published_at  INTEGER,                          -- **首次上架时刻**（unix ms；NULL=从未发布过）。它不是状态，是事实：
+                                                      -- 与可见性正交（可见性仍只看 active），只回答"这件商品有没有发布过"——
+                                                      -- 于是列表能把"未上架"分成两档给店主看：从未发布（草稿）/ 已下架（曾发布）。
+                                                      -- 写入规则只有一条：**首次变为 active=1 时写 now，此后永不清空**（下架不抹掉"卖过"这件事）。
       created_at    INTEGER NOT NULL,                 -- unix ms
       updated_at    INTEGER NOT NULL
     );
@@ -213,12 +310,21 @@ function migrate(d) {
       paid_tx_hash  TEXT,                             -- 买家托管支付交易哈希（paid 确认时写入）
       onchain_events TEXT,                            -- 链上事件史 JSON [{name,txHash,block,at}]（watcher 回写时 append）
       pii_erased_at INTEGER,                          -- **PII 擦除锚点**（2026-09 复审新增）：保留期扫描按
-                                                       -- COALESCE(pii_erased_at, updated_at) 选候选与排序。
+                                                       -- MAX(COALESCE(pii_erased_at, updated_at)) 选候选与排序。
                                                        -- 为什么必须单独一列：扫描需要"擦过就不再重复入选"的锚点，
                                                        -- 而 updated_at 是**入账/争议起始时刻**的口径（流水页、GMV 窗口、
                                                        -- 趋势日桶、ledger.csv 全按它分窗）。旧实现靠刷新 updated_at 实现
                                                        -- 幂等，等于让一笔 180 天前的成交额重新落进"最近 30 天"的报表里、
                                                        -- 跨月各出现一次（见 piiErase.js 与 ARCHITECTURE §3.11）。
+      /*
+        **未清完的清理工作**（2026-10-15 新增，见 piiErase.js 里那段"假承诺"的说明）：
+        1 = 这一单还有没做完的清理（附件文件未删净，或 WAL 未截断），保留期扫描每轮都会重试它。
+        为什么必须是一列而不是"把锚点回退"：候选判据是**时间**判据（MAX(锚点, updated_at) <= 截止），
+        而"还欠一次清理"是**工作状态**——回退锚点根本不会让它重新入选（updated_at 就是刚刚那一下），
+        于是"系统会自动重试"这句承诺在最需要它的时候是假的：文件留在盘上、界面却说已擦除。
+        这一列与 pii_erased_at 由同一条 UPDATE 成对写（eraseOrderPii 是唯一写入点）。
+      */
+      pii_cleanup_pending INTEGER NOT NULL DEFAULT 0,
       created_at    INTEGER NOT NULL,
       updated_at    INTEGER NOT NULL,
       /*
@@ -245,8 +351,9 @@ function migrate(d) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_escrow_unique ON orders(escrow_order_id) WHERE escrow_order_id IS NOT NULL;
     -- 商品维度索引：自动交付补跑、池式商品在途需求核算、商品编辑时的在途清点都按 (product_id, status) 过滤
     CREATE INDEX IF NOT EXISTS idx_orders_product ON orders(product_id, status);
-    -- 保留期扫描索引：候选/排序都走 COALESCE(pii_erased_at, updated_at)（见 piiErase.runPiiRetention）
+    -- 保留期扫描索引：候选/排序都走 MAX(COALESCE(pii_erased_at, updated_at))（见 piiErase.runPiiRetention）
     CREATE INDEX IF NOT EXISTS idx_orders_pii_anchor ON orders(pii_erased_at, updated_at);
+    -- 待清理队列索引在 NEW_COLUMN_INDEXES 里建（它依赖较新的列，必须排在必备列门禁之后——见 initDb）
     -- 售后案件（在途队列 + 对账复查）索引：仲裁台列表、退货单窗口、保留期保护、对账轮转都按它过滤。
     -- 部分索引（只收非 none 的行）：绝大多数订单从未开案，索引应当只为真正有案件的行付费。
     CREATE INDEX IF NOT EXISTS idx_orders_after_sale ON orders(after_sale_status, after_sale_opened_at) WHERE after_sale_status != 'none';
@@ -371,12 +478,26 @@ function migrate(d) {
     -- 按标签筛选走它（key → product_id）；聚合（GROUP BY tag_key）也能用同一索引的前缀。
     CREATE INDEX IF NOT EXISTS idx_product_tags_key ON product_tags(tag_key, product_id);
 
+    CREATE TABLE IF NOT EXISTS product_attributes (
+      product_id    INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      name_key      TEXT NOT NULL,  -- 参数名的规范形（匹配/唯一/聚合只认它；唯一实现在 src/tags.js 的 tagKeyOf）
+      name_display  TEXT NOT NULL,  -- 参数名展示形（写入原样）
+      value_key     TEXT NOT NULL,  -- 参数值的规范形（attr=参数名:值 的匹配就是 (name_key, value_key) 全等）
+      value_display TEXT NOT NULL,  -- 参数值展示形（写入原样）
+      PRIMARY KEY (product_id, name_key)
+    );
+    -- 按参数筛选走它（(名,值) → product_id）；按参数名出分面也能用同一索引的前缀。
+    CREATE INDEX IF NOT EXISTS idx_product_attributes_kv ON product_attributes(name_key, value_key, product_id);
+
     CREATE TABLE IF NOT EXISTS product_skus (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       product_id    INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
       sku_key       TEXT NOT NULL,                      -- 按 specs 声明顺序用 '|' 拼接；无规格商品为 ''
       specs_json    TEXT NOT NULL,                      -- 该组合的规格值；无规格为 {}
       price_usdt_micro INTEGER NOT NULL CHECK (price_usdt_micro >= 0), -- 该组合单价（微 USDT，1 USDT = 1e6）——不同 SKU 可不同价
+      image_url     TEXT NOT NULL DEFAULT '',           -- 该组合的主图 URL（空 = 没有独立图，买家侧就只显示商品主图区）。
+                                                        -- 用途：选"黑色"就该看到黑色的那张图——它同时是"货不对板"争议里最直接的证据。
+                                                        -- 与商品主图同一套 URL 判据（src/mediaKinds.js 的 mediaUrlAllowed），**入快照**（sku_images 键）
       capacity      INTEGER,                            -- 该组合库存（NULL=不限量）
       committed     INTEGER NOT NULL DEFAULT 0 CHECK (committed >= 0), -- 该组合已占位件数（占位/释放的权威值）
       active        INTEGER NOT NULL DEFAULT 1,         -- 0=该组合停售（不影响其它组合）

@@ -95,7 +95,12 @@ test('鉴权：ownerOnly（无令牌 401 / 买家令牌 403），地址非法一
 
 test('纯函数：空样本 → 计数全 0 + 比率全 null + 样本不足说明（不编造 0 比率）', () => {
   const s = computeBuyerSignal([], { address: buyer.address });
-  assert.equal(s.available, true, '本读数全部来自本地镜像：对合法地址恒可读');
+  /*
+    这里**不再断 `available`**（2026-10-15 删）：本读数全部来自本地镜像、对合法地址恒可读，
+    所以"不提供"这个状态不存在；旧字段恒为 true，前端却按它分了一条永远不会发生的分支。
+    "确实没有成交"由 `sample: 0` 表达，"请求失败"由载荷为空表达——各有各的位置。
+  */
+  assert.equal('available' in s, false, '不该再有恒真的 available 字段（它的分支是死路径）');
   assert.equal(s.sample, 0);
   assert.equal(s.localOrders, 0);
   for (const k of ['settledToSeller', 'refundedToBuyer', 'disputed', 'afterSaleOpen', 'afterSaleClosed', 'expiredReleased']) {
@@ -142,6 +147,21 @@ test('三态：已终局但没有事件史的单进 unverified（不计入 dispu
   assert.equal(d.unverified.terminalWithoutEventMirror, 2, '它们必须被单列出来');
   assert.match(d.unverified.note, /读不到/);
   assert.match(d.caveats.join('\n'), /当前 2 单/, '边界说明里写明有多少单读不到（下界）');
+});
+
+test('unverified 与 disputed 是两件独立的事：丢了 OrderCreated 镜像的争议单，两边都要计', async () => {
+  const b = Wallet.createRandom().address.toLowerCase();
+  const at = Date.now() - 3000;
+  /*
+    病（2026-10-15 审计 D9）：`unverified` 的说明写着"已终局、却没有 OrderCreated 镜像的单数"，
+    而实现把它写成挂在"争议"那一支后面的 `else if` ⇒ **有争议、又恰好丢了镜像的单**判成"已验证"。
+    镜像缺失与争议史互相独立：知道"它争过"并不会让"复算链条断了一截"这件事消失
+    （这正是本读数自称下界的那个原因）。
+  */
+  insertOrder({ buyerAddr: b, status: 'disputed', events: [ev('DisputeRequested', at)] });
+  const d = (await getSignal(b)).body.data;
+  assert.equal(d.disputed, 1, '争议计数照给（判据是状态 ∨ 事件）');
+  assert.equal(d.unverified.terminalWithoutEventMirror, 1, '同一张单也要出现在"镜像缺失"里');
 });
 
 test('计数可独立复算：与"按链上事实手算"的结果逐项相同（分子 ⊆ 分母，比率 ≤ 1）', async () => {

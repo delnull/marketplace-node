@@ -19,7 +19,8 @@
  *  - 证据附件 → DB 行 + 磁盘文件一并删除（文件才是真正的个人数据，行只是索引；
  *    删行不删文件等于"数据还在磁盘上"，是最常见的假删除）。
  * 金额、状态、链上托管单号、支付交易哈希、链上事件史、平台费/净额、物流单号、退货单地址与备注、
- * 已交付的兑换码与 NFT tokenId、不带 PII 的评价正文**一律不动**：
+ * 已交付的兑换码与 NFT tokenId、不带 PII 的评价正文、**售后结案说明（`after_sale_note`：链上
+ * `AfterSaleClosed` 事件的公开文本，删掉本地副本只会与链上不一致，且它本来就是公开的）**一律不动：
  * 它们是账目、履约与链上凭证，删掉就等于篡改账本（也删不掉链上那份公开历史）。
  * ⚠️ 这份"刻意保留"清单是**对用户的承诺**，`node/test/pii-scope-consistency.test.js` 会核对它
  * 与 `node/docs/COMPLIANCE.md` §4、`docs/DEPLOY_NODE.md`、`docs/OPS_RUNBOOK.md` 三份文档逐项一致——
@@ -198,32 +199,35 @@ export function eraseOrderPii(orderId) {
   */
   const diskFailed = attachmentFiles.remaining !== 0;
   /*
-    锚点（`pii_erased_at`）只在**真的擦干净**时前移（2026-10-14）。
-    旧实现的注释写着"锚点已经前移，所以这一单不会自动重来"，把"永不重试"当成一个已接受的边界——
-    而它其实与"保留期自动擦除"这条产品承诺直接冲突：数据主体要求的删除，系统答复"已删除"、
-    盘上却还在，而且没有任何自动重试。现在删盘失败 ⇒ 把锚点回退（连同本轮写入的行内字段一起
-    已经没有个人信息了，回退锚点不会让信息复活），保留期扫描下一轮会**再试一次**；
-    重试全部成功之后锚点才落定。代价如实写：失败期间这一单会反复出现在候选集里，
-    直到目录权限/占用问题被解决（这正是我们要的——它是**可见的**未完成，而不是静默的成功）。
-  */
-  if (diskFailed) {
-    db.prepare('UPDATE orders SET pii_erased_at = NULL WHERE id = ?').run(id);
-  }
-  /*
     WAL 截断（2026-10-14 审计新增，"假删除"的第二条腿）：库内字段已置空、释放页由
     `secure_delete=ON` 清零，但**WAL 里的历史帧**不在那两条的作用范围内——实测擦除之后
     `<db>-wal` 里仍能直接搜到手机号/地址/备注原文，而 PASSIVE 自动 checkpoint 不截断文件。
-    所以每次擦除（手动与保留期都走这里）之后强制截断一次。失败不抛出：清 WAL 是加固，
-    不该让一次"没清成"回滚已经落库的擦除（返回 null 时由下次擦除再试）。
+    所以每次擦除（手动与保留期都走这里）之后强制截断一次。失败不抛出（这里是判定，不是异常）。
   */
   const walTruncated = checkpointTruncate();
+  const clean = !diskFailed && walTruncated;
+  /*
+    ── "还没清完"必须是一条**可查的工作记录**（2026-10-15 修一处假承诺）──────────────
+    旧实现把删盘失败表达成"把锚点回退成 NULL"，并在文案里承诺"系统会在下一轮保留期扫描中自动重试"。
+    而候选判据是 `MAX(COALESCE(pii_erased_at,0), updated_at) <= cutoff` —— **纯时间判据**：
+    锚点回退并不会让这一单重新入选，它的 `updated_at` 就是刚才那一下（订单终局时写的），
+    于是这一单要等到保留期（默认 180 天）之后才可能被扫到，`MK_PII_RETENTION_DAYS=0` 时则永远不会。
+    换句话说：**承诺的自动重试不存在**，买家的证据文件会一直躺在盘上，而所有界面都告诉店主"已擦除"。
+    根因是判据挂错了层——"还欠一次清理"是**工作状态**，不是时间锚点能表达的东西。
+    现在两者分开、各司其职：
+      · `pii_erased_at` = "库内这批字段已擦"（时间锚点，供保留期去重与排序）；
+      · `pii_cleanup_pending` = "这一单还有没清完的清理工作"（磁盘附件 / WAL 截断任一未完成）。
+    保留期候选判据里加上 `OR pii_cleanup_pending = 1`，于是"下一轮扫描会重试"变成真的，
+    而且是**有界的一次**（清干净即置 0，不再反复入选）。
+  */
+  db.prepare('UPDATE orders SET pii_cleanup_pending = ? WHERE id = ?').run(clean ? 0 : 1, id);
   return {
-    ok: !diskFailed,
-    error: diskFailed
-      ? attachmentFiles.remaining < 0
-        ? '附件目录无法读取（权限/挂载异常），无法确认磁盘上的附件是否已删除——请检查目录权限后重试（系统会在下一轮保留期扫描中自动重试）'
-        : `附件索引已清空，但磁盘上还剩 ${attachmentFiles.remaining} 个文件未删除（目录权限/文件被占用）——请处理后重试（系统会在下一轮保留期扫描中自动重试）`
-      : undefined,
+    ok: clean,
+    error: clean
+      ? undefined
+      : `${diskFailed ? (attachmentFiles.remaining < 0 ? '附件目录无法读取（权限/挂载异常），无法确认磁盘上的附件是否已删除' : `附件索引已清空，但磁盘上还剩 ${attachmentFiles.remaining} 个文件未删除（目录权限/文件被占用）`) : ''}${
+          diskFailed && !walTruncated ? '；' : ''
+        }${walTruncated ? '' : '数据库 WAL 未能截断（有其它连接持有数据库），原文可能仍在 <db>-wal 里'}——已记为待清理，下一轮保留期扫描会重试（也可再次调用本接口立即重试）`,
     orderId: id,
     status: order.status,
     // 磁盘上的附件文件也算"本次真的擦掉了东西"：DB 行早前已删、只剩孤儿文件的情形同样是一次
@@ -235,6 +239,8 @@ export function eraseOrderPii(orderId) {
     attachmentFilesRemaining: attachmentFiles.remaining,
     /** WAL 是否已截断（false = 原文可能仍在 `<db>-wal` 里；见 checkpointTruncate 的说明） */
     walTruncated,
+    /** 这一单是否仍欠一次清理（true ⇒ 保留期扫描会再试；见上面的说明） */
+    cleanupPending: !clean,
     counts,
   };
 }
@@ -272,7 +278,7 @@ export function runPiiRetention({ days = config.pii.retentionDays, now = Date.no
     throw new Error('PII 保留期天数无效（需 ≥ 0 的整数；0 = 关闭自动擦除）');
   }
   // 0 = 关闭（默认值来自 MK_PII_RETENTION_DAYS）：不扫描、不擦除，但显式删除请求不受影响
-  if (n === 0) return { days: 0, disabled: true, candidates: 0, erased: 0, orderIds: [], truncated: false, counts: empty };
+  if (n === 0) return { days: 0, disabled: true, candidates: 0, erased: 0, diskFailed: 0, cleanupPending: 0, orderIds: [], truncated: false, counts: empty };
   const cutoff = now - Math.floor(n) * 86_400_000;
   const db = getDb();
   const marks = PII_ERASABLE_STATUS.map(() => '?').join(',');
@@ -293,17 +299,19 @@ export function runPiiRetention({ days = config.pii.retentionDays, now = Date.no
   */
   const pick = db.prepare(
     `SELECT id FROM orders WHERE status IN (${marks}) AND ${AFTER_SALE_NOT_OPEN_SQL} ` +
-      `AND MAX(COALESCE(pii_erased_at, 0), updated_at) <= ? ` +
-      `ORDER BY MAX(COALESCE(pii_erased_at, 0), updated_at) ASC LIMIT ?`
+      `AND (MAX(COALESCE(pii_erased_at, 0), updated_at) <= ? OR pii_cleanup_pending = 1) ` +
+      `ORDER BY (pii_cleanup_pending = 1) DESC, MAX(COALESCE(pii_erased_at, 0), updated_at) ASC LIMIT ?`
   );
   const counts = { ...empty };
   const orderIds = [];
   let examined = 0;
   /**
-   * 本轮"库内已擦、但磁盘附件没删掉"的单数（见 eraseOrderPii 的磁盘失败分支）。
-   * 它不是成功也不是普通异常：锚点已前移 ⇒ 自动路径不会再来，必须让运维看得见。
+   * 本轮"库内已擦、但还有没清完的清理工作"的单数（见 eraseOrderPii 的 pending 分支）：
+   * 磁盘附件没删净，或 WAL 没截断。它们**不再是"永远不会重来"**——候选判据里有
+   * `OR pii_cleanup_pending = 1`，所以每一轮扫描都会把它们排在队首重试（`ORDER BY` 那一项）。
    */
   let diskFailed = 0;
+  let cleanupPending = 0;
   while (examined < limit) {
     const rows = pick.all(...PII_ERASABLE_STATUS, cutoff, RETENTION_BATCH);
     if (!rows.length) break;
@@ -314,6 +322,7 @@ export function runPiiRetention({ days = config.pii.retentionDays, now = Date.no
         const r = eraseOrderPii(row.id);
         if (r.error) {
           diskFailed += 1;
+          if (r.cleanupPending) cleanupPending += 1;
           console.error(`[pii] 保留期擦除 ${String(row.id).slice(0, 8)}… 未完全成功：${r.error}`);
           continue;
         }
@@ -344,6 +353,7 @@ export function runPiiRetention({ days = config.pii.retentionDays, now = Date.no
     candidates: examined,
     erased: orderIds.length,
     diskFailed,
+    cleanupPending,
     orderIds,
     truncated: examined >= limit,
     counts,
@@ -366,6 +376,8 @@ const retentionStatus = {
   lastScanned: 0,
   lastErased: 0,
   lastDiskFailed: 0,
+  /** 仍欠清理的单数（磁盘附件/WAL）：它们每轮都会被重试，运维据此判断"清目录"这件事做完没有 */
+  lastCleanupPending: 0,
   lastCounts: null,
 };
 
@@ -394,15 +406,16 @@ export function startPiiRetentionSweep() {
       retentionStatus.lastScanned = r.candidates ?? 0;
       retentionStatus.lastErased = r.erased ?? 0;
       retentionStatus.lastDiskFailed = r.diskFailed ?? 0;
+      retentionStatus.lastCleanupPending = r.cleanupPending ?? 0;
       retentionStatus.lastCounts = r.counts || null;
       /*
-        "库内已擦、磁盘附件没删掉"是**半成功**，不能报绿（源码审计 2026-09 复审）：
-        `pii_erased_at` 已前移 ⇒ 这一单不会再入选，而证据文件还留在磁盘上。
-        把它写进 lastError（/healthz 可见），让运维按提示去清目录权限/占用。
+        "库内已擦、但还有没清完的清理工作"是**半成功**，不能报绿（源码审计 2026-09 复审；
+        2026-10-15 起它同时涵盖 WAL 未截断）。这些单会被下一轮重试（候选判据里有
+        `OR pii_cleanup_pending = 1`），所以这里写的是"还剩几单待清"，而不是"再也不会重来"。
       */
       retentionStatus.lastError =
-        retentionStatus.lastDiskFailed > 0
-          ? `有 ${retentionStatus.lastDiskFailed} 单的附件索引已清空但磁盘文件未删净（目录权限/文件被占用）——请检查附件目录后手动清理`
+        retentionStatus.lastCleanupPending > 0
+          ? `有 ${retentionStatus.lastCleanupPending} 单的个人信息还没清完（附件文件未删净或 WAL 未截断）——已排队等待下一轮重试；若是目录权限/占用导致，请一并处理`
           : null;
       if (r.erased > 0) {
         console.log(`[pii] 保留期擦除：${r.erased} 个终局订单（静置 > ${r.days} 天）的收货信息/备注/陈述正文/证据附件已擦除`);

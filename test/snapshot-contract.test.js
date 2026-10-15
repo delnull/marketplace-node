@@ -29,18 +29,22 @@ const CROSS_LANG_FIXTURE = {
     '-0000-0000-0000-000000000000.mp4","poster":"/api/uploads/11111111-1111-1111-1111-111111111111.jp' +
     'g"}],"kind":"physical","shipping_fee_usdt_micro":5000000,"age_restricted":1,"specs":[{"name":"颜色' +
     '","options":["黑","白"]},{"name":"尺寸","options":["M"]}],"skus":[["尺寸=M|颜色=白",12000000],["尺寸=M|颜色=黑' +
-    '",10000000]]}',
-  hash: '0x19206bc018b76a2dcfc47377d50e450dbc9817e18426bb280585eaaed728a030',
-  /** NFT 单：两个键**追加在 skus 之后**（顺序错了哈希就变，而没人会报错） */
+    '",10000000]],"attributes":[{"name":"成色","value":"全新未拆封"},{"name":"材质","value":"304 不锈钢"}],' +
+    '"terms":{"handling_days":2,"return_policy":"no-reason","return_window_days":7,"return_freight":"seller","invoice_supported":null},' +
+    '"sku_images":[["尺寸=M|颜色=黑","https://a/black.png"]]}',
+  hash: '0x094fe9b8846ab6b7015ead6110d19786b76f1ce94c8467c1126ede9bbcbba5b8',
+  /** NFT 单：两个键**追加在 sku_images 之后**（顺序错了哈希就变，而没人会报错） */
   nftCanonical:
     '{"slug":"p-fix-nft","title":"NFT 商品","description":"","description_blocks":[],"media":[],"kind":' +
-    '"nft","shipping_fee_usdt_micro":0,"age_restricted":0,"specs":[],"skus":[["",3000000]],"nft_contr' +
+    '"nft","shipping_fee_usdt_micro":0,"age_restricted":0,"specs":[],"skus":[["",3000000]],"attributes":[],' +
+    '"terms":{"handling_days":null,"return_policy":"unspecified","return_window_days":null,"return_freight":null,"invoice_supported":null},' +
+    '"sku_images":[],"nft_contr' +
     'act":"0xabc0000000000000000000000000000000000001","nft_standard":"erc1155"}',
-  nftHash: '0x0a3b3e6affba38ea4f3034c1f13f02a5a1c7b86520b58494d7320df6c0cbd00f',
+  nftHash: '0xc7a23da865be9ae249a98974c3a4d8088cfd84682b520b2735beefed49a6334a',
 };
 
 test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 keccak（两侧必须逐字节一致）', () => {
-  // node 输入形状：DB 行（snake_case；media/description_blocks/specs 是 JSON 字符串列）
+  // node 输入形状：DB 行（snake_case；media/description_blocks/specs/attributes/terms 是 JSON 字符串列）
   const row = {
     slug: 'p-fix-1',
     title: '测试 "商品" & co', // 含引号与 &：转义差异会立刻改变 JSON
@@ -64,10 +68,27 @@ test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 
       { name: '颜色', options: ['黑', '白'] },
       { name: '尺寸', options: ['M'] },
     ]),
+    /*
+      三个新键（2026-10-15）都在这里**带真实内容**参与 fixture：
+      · attributes 顺序 = 店主书写顺序（不重排）；
+      · terms 的键序由实现固定（handling → policy → window → freight）；
+      · sku_images 只收**有图**的组合（白的那条 image_url 为空 → 不进快照），
+        且按 sku_key 升序（与 skus 同一套排序）。
+    */
     skus: [
-      { sku_key: '尺寸=M|颜色=白', price_usdt_micro: 12_000_000 },
-      { sku_key: '尺寸=M|颜色=黑', price_usdt_micro: 10_000_000 },
+      { sku_key: '尺寸=M|颜色=白', price_usdt_micro: 12_000_000, image_url: '' },
+      { sku_key: '尺寸=M|颜色=黑', price_usdt_micro: 10_000_000, image_url: 'https://a/black.png' },
     ],
+    attributes: JSON.stringify([
+      { name: '成色', value: '全新未拆封' },
+      { name: '材质', value: '304 不锈钢' },
+    ]),
+    terms: JSON.stringify({
+      handling_days: 2,
+      return_policy: 'no-reason',
+      return_window_days: 7,
+      return_freight: 'seller',
+    }),
   };
 
   const snap = snapshotObject(row);
@@ -75,7 +96,7 @@ test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 
   assert.equal(computeSnapshotHash(snap), CROSS_LANG_FIXTURE.hash, 'keccak256 与共享常量一致');
 });
 
-test('snapshot 契约：NFT 单的两键追加在 skus 之后（与前端同一 fixture）', () => {
+test('snapshot 契约：NFT 单的两键追加在 sku_images 之后（与前端同一 fixture）', () => {
   const row = {
     slug: 'p-fix-nft',
     title: 'NFT 商品',
@@ -87,6 +108,8 @@ test('snapshot 契约：NFT 单的两键追加在 skus 之后（与前端同一 
     age_restricted: 0,
     specs: '[]',
     skus: [{ sku_key: '', price_usdt_micro: 3_000_000 }],
+    attributes: '[]',
+    terms: '{}', // 未声明任何承诺：三态里的"空承诺"必须是这个形状（不是缺键）
     // 故意大写：实现必须归一成小写（否则同一件商品会得到两个哈希）
     nft_contract: '0xAbC0000000000000000000000000000000000001',
     nft_standard: 'erc1155',

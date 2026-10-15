@@ -113,6 +113,9 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
     kind 之后、specs 之前（实物运费要能被买家核验"没被事后加价"；年龄限制要被锁定，
     防上架后静默增删）。键序同时改在 node 端 snapshotObject/computeSnapshotHash 与
     前端 utils/snapshot.ts —— 两端不同位就会让每个买家看到假的「商品内容已被修改」。
+    2026-10-15 契约再 +1：**参数（attributes）/ 承诺（terms）/ 规格图（sku_images）**追加在
+    skus 之后、nft 两键之前（三者都是"买家据以付款的东西"：这件货是什么、店主承诺了什么、
+    所选规格长什么样）。三键**恒存在**（没有时是 `[]`/空承诺），键的存在性不再承担版本语义。
     ⚠️ 因此本用例的期望值也必须同步升级：旧哈希只对"按旧契约上架且从未重存"的商品有效，
     全新项目不做存量迁移（改动量最大的那部分历史数据不存在）。
   */
@@ -120,6 +123,14 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
     slug: 'p-abc', title: '旧商品', description: 'd', description_blocks: [], media: [], kind: 'digital',
     shipping_fee_usdt_micro: 0, age_restricted: 0,
     specs: [], skus: [['', 100]],
+    attributes: [],
+    terms: {
+      handling_days: null, return_policy: 'unspecified', return_window_days: null, return_freight: null,
+      // 2026-10-15 契约再 +0：开票声明（invoice_supported）是 terms 内部的第四个三态键，
+      // 恒存在（未声明时 null）——键序与 snapshotObject/前端 termsOf 逐字对齐
+      invoice_supported: null,
+    },
+    sku_images: [],
   });
   const { ethers } = await import('ethers');
   assert.equal(computeSnapshotHash(snap), ethers.keccak256(ethers.toUtf8Bytes(canonical)));
