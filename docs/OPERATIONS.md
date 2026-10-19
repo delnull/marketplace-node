@@ -19,9 +19,10 @@ docker logs -f marketplace-node
 内置 MySQL：
 
 ```bash
-cd /opt/marketplace-node
-docker exec -e MYSQL_PWD="$(cat .mysql-root)" <service>-mysql \
-  mysqldump -uroot --single-transaction --routines --triggers <db_name> \
+cd /opt/marketplace-node  # 普通用户安装目录为 $HOME/marketplace-node
+DB="$(sed -n 's/^MK_DB_NAME=//p' .env)"
+docker exec -e MYSQL_PWD="$(cat .mysql-root)" marketplace-node-mysql \
+  mysqldump -uroot --single-transaction --routines --triggers "$DB" \
   | gzip > "node-db-$(date +%F).sql.gz"
 ```
 
@@ -35,7 +36,7 @@ mysqldump -h <host> -u <user> -p --single-transaction --routines --triggers <db>
 ### 2.2 附件与商品媒体
 
 ```bash
-docker run --rm -v <service>-data:/data -v "$PWD":/backup --entrypoint tar \
+docker run --rm -v marketplace-node-data:/data -v "$PWD":/backup --entrypoint tar \
   marketplace-node:latest czf /backup/node-data-$(date +%F).tar.gz -C /data .
 ```
 
@@ -48,30 +49,31 @@ docker run --rm -v <service>-data:/data -v "$PWD":/backup --entrypoint tar \
 
 ## 3. 恢复
 
-先停节点：
+先停节点；如果是换机器，先把备份的 `.env` 与 `.mysql-root` 放回安装目录：
 
 ```bash
-docker stop <service>
+docker stop marketplace-node
 ```
 
 数据库：
 
 ```bash
+DB="$(sed -n 's/^MK_DB_NAME=//p' .env)"
 gunzip -c node-db-YYYY-MM-DD.sql.gz | \
-  docker exec -i -e MYSQL_PWD="$(cat .mysql-root)" <service>-mysql mysql -uroot <db>
+  docker exec -i -e MYSQL_PWD="$(cat .mysql-root)" marketplace-node-mysql mysql -uroot "$DB"
 ```
 
 附件：
 
 ```bash
-docker run --rm -v <service>-data:/data -v "$PWD":/backup --entrypoint tar \
+docker run --rm -v marketplace-node-data:/data -v "$PWD":/backup --entrypoint tar \
   marketplace-node:latest xzf /backup/node-data-YYYY-MM-DD.tar.gz -C /data
 ```
 
 再启动：
 
 ```bash
-docker start <service>
+docker start marketplace-node
 curl http://127.0.0.1:8090/healthz
 ```
 
@@ -81,15 +83,7 @@ curl http://127.0.0.1:8090/healthz
 bash deploy.sh --update
 ```
 
-会拉取/复制最新代码、重建镜像、用同一个数据卷和同一套 MySQL 重建容器。数据不动。新容器健康检查失败时脚本会自动回滚到上一个镜像。
-
-手动回滚：
-
-```bash
-docker images | grep marketplace-node
-docker tag <上一个镜像> marketplace-node:latest
-bash deploy.sh --update
-```
+会重建镜像，用同一个数据卷和同一套 MySQL 重建容器，数据不动。`--update` 默认只用安装目录里的代码；要拉公开仓最新版用 `--update --pull`，或重新跑一遍 `install.sh`。新容器健康检查失败时脚本会自动回滚到上一个镜像；回滚也失败时看上面的日志手工介入。
 
 ## 5. 数据库结构
 
