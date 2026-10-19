@@ -63,7 +63,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/mai
 - MySQL 8.x，库默认排序规则 `utf8mb4_0900_as_cs`；
 - 应用账号对该库有全部权限；
 - 应用账号有 `SESSION_VARIABLES_ADMIN`（节点启动时会设置 `binlog_row_image`）；
-- 允许节点在临时库重放 schema：需要建库/建表/建触发器/建视图权限（通常直接给全局 `ALL`，或给 `mk_schema_probe_%` 与相应全局权限）；
+- 允许节点在临时库重放 schema：需要建库/建表/建触发器/建视图权限；最省事是全局 `ALL`，或让 DBA 按启动日志补齐；
 - 若开启了 binlog：服务端 `log_bin_trust_function_creators=1`，或账号有 `SUPER`。
 
 这些权限不够时节点会在启动期拒绝运行，不会带着坏库继续跑。
