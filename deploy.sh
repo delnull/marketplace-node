@@ -105,6 +105,27 @@ KEEP_SECRET=''
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IN_REPO=0; [ -f "$HERE/package.json" ] && [ -f "$HERE/src/server.js" ] && IN_REPO=1
 CONSTANTS_FILE="$HERE/deploy-constants.json"
+# 一行安装（curl | bash）时 BASH_SOURCE 是 /dev/fd/63，旁边没有 deploy-constants.json。
+# 先把当批常量取到临时文件；后面仍然走“下载完整源码 → 安装目录”的同一条路径。
+if [ ! -r "$CONSTANTS_FILE" ]; then
+  if [ "$IN_REPO" = 1 ]; then
+    : # 仓库里缺文件，交给下面的结构门禁报错
+  elif ! command -v curl >/dev/null 2>&1; then
+    printf '%s\n' '[deploy.sh] 缺少 curl：一行安装需要 curl 下载当批 deploy-constants.json' >&2
+    exit 1
+  else
+    CONSTANTS_TMP="$(mktemp "${TMPDIR:-/tmp}/marketplace-constants.XXXXXX")" || exit 1
+    if ! curl -fsSL --max-time 30 \
+      'https://raw.githubusercontent.com/delnull/marketplace-node/main/deploy-constants.json' \
+      -o "$CONSTANTS_TMP"; then
+      rm -f "$CONSTANTS_TMP"
+      printf '%s\n' '[deploy.sh] 下载 deploy-constants.json 失败（检查网络/代理）' >&2
+      exit 1
+    fi
+    CONSTANTS_FILE="$CONSTANTS_TMP"
+    trap 'rm -f "${CONSTANTS_TMP:-}"' EXIT
+  fi
+fi
 
 # ── 部署常量：**唯一真相**在 deploy-constants.json（与 Windows 原生路径 deploy.ps1 共用同一份）
 # 从这里取，不在脚本里各留一份。取不到就当场失败 —— 绝不退回某个内建默认值
