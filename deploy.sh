@@ -1127,15 +1127,16 @@ if [ "$MODE" != register ]; then
       "$img" >/dev/null
   }
   # 探活：返回 0/1，同时把最后一次的 HTTP 码放进 PROBE_CODE。
-  # ⚠️ 判据是 **HTTP 200 + 正文 `"code":0`**（2026-10-16）：`/healthz` 现在在"进程在监听
-  # 但后台任务不健康"（watcher 停滞 / 有隔离事件）时返回 **503 + code=1** —— 只看 HTTP 码
-  # 或只 grep code 都会漏掉一半，而漏掉的后果是"发布成功"打印在一个根本没在处理链上
-  # 事件的节点上（旧实现无条件 200/code=0，三处探活都只证明进程在监听）。
+  # 首次安装要建库、跑完整 schema 自检、等 watcher 第一轮成功；30 秒会把“正在初始化”
+  # 误判成“起不来”。默认等 120 秒，可用 MK_DEPLOY_PROBE_SECONDS 覆盖。
+  # ⚠️ 判据是 **HTTP 200 + 正文 `"code":0`**：`/healthz` 在后台任务不健康时会返回 503；
+  # 只看 HTTP 码会漏掉一半，而漏掉的后果是“发布成功”打印在一个没处理链上事件的节点上。
   probe() {
-    local i body
+    local i body timeout="${MK_DEPLOY_PROBE_SECONDS:-120}"
+    case "$timeout" in ''|*[!0-9]*|0) timeout=120 ;; esac
     PROBE_CODE=''
     PROBE_BODY=''
-    for i in $(seq 1 30); do
+    for i in $(seq 1 "$timeout"); do
       body="$(curl -s -m 5 -w '\n%{http_code}' "http://127.0.0.1:$PORT/healthz" 2>/dev/null || true)"
       PROBE_CODE="$(printf '%s' "$body" | tail -n1)"
       if [ "$PROBE_CODE" = "200" ] && printf '%s' "$body" | grep -q '"code":0'; then
