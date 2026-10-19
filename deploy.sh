@@ -1497,6 +1497,4 @@ log "  附件与商品媒体都在卷 $VOLUME 里（备份命令见上面 ⑤ �
 log "  店铺资料（店名/公告/店员/通知）登录 $FRONTEND 的卖家面板网页维护，即改即生效"
 log ""
 log "  建议接着读（都在本目录的 docs/ 里）："
-log "    docs/OPERATIONS.md  运维手册（备份/恢复/升级/轮换密钥/故障速查/个人信息保留期）"
-log "  另有面向运营方的合规与责任说明（docs/OPERATOR_COMPLIANCE.md）与公开裁决规则（docs/DISPUTE_RULES.md），"
-log "  它们随完整仓库发布、不在本安装目录里 —— 开店前请读前者。"
+log "    docs/OPERATIONS.md  运维手册（备份/恢复/升级/卸载/个人信息）"
