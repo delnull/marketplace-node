@@ -1,11 +1,14 @@
 /**
  * 节点配置：全部经环境变量注入（.env / docker env），并提供默认值。
  *
- * 店铺模型：一个节点实例 = 一家店；SHOP_OWNER 为该店的钱包地址，
- * 商品上架/发货等写操作要求 SIWE 签名地址 == SHOP_OWNER。
+ * 店铺模型（2026-10 多店）：一个节点实例 = **一库多店**。`node.owner`（由 MK_SHOP_OWNER
+ * 种入 `node` 单例行）是**节点主**——提供基础设施、收抽成、做节点级治理；店铺是独立租户行
+ * （`shops.seller` 才是店主，一个地址在本节点至多一家）。商品上架/发货等写操作由
+ * `roleOf(address, shopCode)` 判"他在**这家店**里是什么角色"，不再与一个全局常量比。
  *
  * 环境变量注入：启动时经 `node --env-file-if-exists=.env` 加载（见 package.json scripts）。
  */
+import { isIP } from 'node:net';
 
 function intEnv(name, fallback) {
   const v = Number(process.env[name]);
@@ -18,6 +21,81 @@ function intEnvAllowZero(name, fallback) {
   if (raw === undefined || raw === '') return fallback;
   const v = Number(raw);
   return Number.isFinite(v) && v >= 0 ? Math.floor(v) : fallback;
+}
+
+/**
+ * 已配置的合约地址必须是**非零的 20 字节 hex**（唯一判据）。
+ *
+ * 为什么在配置入口响亮失败：`MK_ESCROW_ADDRESS=0x000…0`（或少一位、粘进一段说明文字）时
+ * 节点会**照常启动**——watcher 起来了、每轮也扫，但永远扫不到任何事件（零地址上没有代码），
+ * 表现为"节点是活的、订单永远不推进"，日志里一个字都没有。README/.env.example 里那句
+ * "不要填零地址"是文档，不是判据；判据必须先于任何消费点成立。
+ *
+ * 空串是合法的：它明确表示"未接入该能力"（纯展示节点），由各功能自行降级并如实说明。
+ */
+const CHAIN_ADDRESS_SHAPE = /^0x[0-9a-fA-F]{40}$/;
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+function chainAddressOf(name, raw) {
+  const v = String(raw ?? '').trim();
+  if (v === '') return '';
+  if (!CHAIN_ADDRESS_SHAPE.test(v)) {
+    throw new Error(
+      `${name}=${JSON.stringify(v)} 不是合法的合约地址：需要 0x + 40 位十六进制（20 字节）。` +
+        '这一项决定节点连的是哪个合约；填错的症状是"节点照常启动、但永远读不到链上事件"，所以拒绝启动。'
+    );
+  }
+  if (v.toLowerCase() === ZERO_ADDRESS) {
+    throw new Error(
+      `${name} 是零地址（0x000…0）：零地址上没有合约代码，节点会启动但永远扫不到任何事件。` +
+        '若只是暂不接入该能力，请把它留空（= 未配置），不要填零地址。'
+    );
+  }
+  return v;
+}
+
+/**
+ * 反向代理信任边界（`MK_TRUST_PROXY`）——**X-Forwarded-For 的唯一解析点**。
+ *
+ * 默认关闭（`false`）：相信任意客户端自带的 XFF 等于让任何人伪造来源 IP（限流换桶、
+ * 审计里写假地址）。取值：
+ *   · 留空            ⇒ 不信任任何代理（`req.ip` = TCP 对端地址）；
+ *   · `loopback`      ⇒ 只信任本机回环上的代理（本机 Caddy/nginx 的场景）；
+ *   · CIDR/IP 列表    ⇒ 例如 `10.0.0.0/8,172.17.0.0/16`（逗号分隔）；
+ *     也接受单个 IP。非法值在配置入口抛错：让 Express 在请求期才抛（或更糟：静默按
+ *     不匹配处理）都会把"反代之后所有人共用一个限流桶"变成看不见的现场。
+ *
+ * 代价如实写明：不配置时，反代后面的节点把**所有匿名客户端**记成同一个 IP——
+ * 一人刷满 `/login` 60 次/分即全网登不上，审计里的 ip 也恒为代理地址。
+ * 所以 `clientIp()` 在第一次收到带 XFF 的请求时会大声告警（见 src/http.js）。
+ */
+function trustProxyOf(raw) {
+  const v = String(raw ?? '').trim();
+  if (v === '') return false;
+  if (v === 'loopback') return 'loopback';
+  const parts = v
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!parts.length) return false;
+  for (const p of parts) {
+    const pieces = p.split('/');
+    if (pieces.length > 2 || !pieces[0] || !isIP(pieces[0])) {
+      throw new Error(
+        `MK_TRUST_PROXY=${JSON.stringify(v)} 非法：只支持空（关闭）、loopback、或逗号分隔的 IP/CIDR 列表。` +
+          `无法解析的项是 ${JSON.stringify(p)}。`
+      );
+    }
+    if (pieces.length === 2) {
+      const max = isIP(pieces[0]) === 6 ? 128 : 32;
+      const bits = Number(pieces[1]);
+      if (!Number.isInteger(bits) || bits < 0 || bits > max) {
+        throw new Error(
+          `MK_TRUST_PROXY 的网段 ${JSON.stringify(p)} 非法：前缀长度需为 0..${max}（IPv${isIP(pieces[0])}）。`
+        );
+      }
+    }
+  }
+  return parts;
 }
 
 /** 店铺默认名（首启/未在网页设置时使用；展示参数一律存 kv、网页编辑，不入配置文件） */
@@ -33,8 +111,42 @@ export const DEFAULT_SHOP_NAME = '我的联邦小店';
  */
 export const PII_RETENTION_DAYS = intEnvAllowZero('MK_PII_RETENTION_DAYS', 180);
 
+/**
+ * `POST /api/shop/retention/run` 的**结果复用窗口**（毫秒，`MK_PII_RETENTION_REUSE_MS`，默认 2000）。
+ *
+ * 同一 `days` 的重复请求在这个窗口内直接拿上次结果——它挡的是"前端超时重试/连点"，那会让
+ * 同一份重活跑第二遍而第二遍通常什么都擦不到。**它不是单飞闸**（真正的单飞在内核里，
+ * 见 routes/pii.js 的说明）。
+ *
+ * 为什么做成配置而不是写死在路由里：**测试要能把它拉长**。它是个时间窗，而测试在它两侧还要
+ * 造一张新的到期单（建草稿 → 托管 → 应用链上事件 → 改时间），那段准备在共享 MySQL 上
+ * 可能超过 2 秒 —— 于是"复用"那条断言会因为**测试自己的准备耗时**而随机变红，
+ * 与产品行为无关（本会话实测踩到过一次：769 例里就它一条红）。拉长窗口让判据
+ * 只回答"复用机制在不在"，不回答"这台机器多快"。
+ */
+export const PII_RETENTION_REUSE_MS = intEnvAllowZero('MK_PII_RETENTION_REUSE_MS', 2000);
+
+/**
+ * **优雅关闭的等待上限**（毫秒，`MK_SHUTDOWN_DRAIN_MS`，默认 10000）。
+ *
+ * 收到 SIGTERM/SIGINT 后：立刻停止接受新连接 → 等在途请求把响应写完 → 关连接池 → 退出。
+ * 超过这个上限就**强制退出**（并在日志里说"有几个请求没写完"）。
+ *
+ * 为什么要上限：没有它，一次卡住的请求（客户端读得极慢、或某个 handler 卡在未超时的
+ * 外部调用上）会让进程**永远不退出**，而容器编排在宽限期过后还是会 SIGKILL ——
+ * 结果是"我们自己以为在优雅关闭，实际什么都没关成"。上限让"优雅"这件事有界。
+ *
+ * 为什么默认 10 秒：与常见编排的默认宽限期同量级（Docker 10s、k8s 30s）。
+ * 调大它的前提是宽限期也一起调大，否则等于没调。
+ */
+export const SHUTDOWN_DRAIN_MS = intEnv('MK_SHUTDOWN_DRAIN_MS', 10_000);
+
 const config = {
   port: intEnv('MK_PORT', 8080),
+
+  /** 优雅关闭的等待上限（见 `SHUTDOWN_DRAIN_MS` 的说明）。放进 config 是为了让 server.js 与
+   *  `/healthz` 之外的运维脚本读同一个值，而不是各自 `process.env` 解析一遍。 */
+  shutdownDrainMs: SHUTDOWN_DRAIN_MS,
 
   shop: {
     // 店主钱包地址（0x...），必填——卖家身份锚点（SIWE 鉴权/收款人）。
@@ -52,12 +164,21 @@ const config = {
     // 留空 = 未接入对应能力（无 escrow 时仅浏览展示，不可下单）
     // 支付币种全局约定为原生 BTY（2026-09 收敛：BTY 主网无 USDT/USDC 稳定币、
     // WBTY 同名合约泛滥，不再支持 ERC20 支付配置，消除假币/approve 攻击面）
-    escrowAddress: process.env.MK_ESCROW_ADDRESS || '',
-    registryAddress: process.env.MK_REGISTRY_ADDRESS || '',
-    // 链上仲裁人地址（可选）：配置后免 RPC 即可开放订单详情「仲裁人视角」（裁决证据）；
-    // 未配置时运行时读合约 arbiter() 并短缓存（RPC 失败安全降级：不开放视角）。
-    // 注意：本配置只影响数据开放，链上裁决权限仍由合约 arbiter 唯一决定。
-    arbiterAddress: process.env.MK_ARBITER_ADDRESS || '',
+    escrowAddress: chainAddressOf('MK_ESCROW_ADDRESS', process.env.MK_ESCROW_ADDRESS),
+    registryAddress: chainAddressOf('MK_REGISTRY_ADDRESS', process.env.MK_REGISTRY_ADDRESS),
+    /*
+      链上黑名单合约（`Blocklist`，owner 维护、全网共享；2026-10 多店批新增的第四个合约）。
+      留空 = 本节点不读链上名单（**不是**"名单为空"）：节点的下单闸与公开列表过滤里的
+      地址类/商品类判据随之整体不生效，而店铺类条目**仍然生效**——那一条在链上
+      `MarketplaceRegistry.shopListed` 里，节点通过既有的 `shops.listed` 镜像就能拿到。
+      代价如实写明：不配它，节点就**不能替买家拦下"全网已冻结的地址"**（只剩前端界面那一层）。
+    */
+    blocklistAddress: chainAddressOf('MK_BLOCKLIST_ADDRESS', process.env.MK_BLOCKLIST_ADDRESS),
+    /*
+      2026-10-18：删掉 `MK_ARBITER_ADDRESS`。仲裁人是**链上当前届委员会**（多个地址 + 阈值），
+      节点侧只读 `Escrow.arbiters()`（见 chain.getCommittee）；留一份本地配置就是第二份真相——
+      它会让"已经解除的仲裁人"在节点侧继续被当成仲裁人，而链上早已不能裁决。
+    */
   },
 
   escrow: {
@@ -124,9 +245,6 @@ const config = {
   reconcile: {
     intervalMs: intEnv('MK_CHAIN_RECONCILE_MS', 600_000),
   },
-
-  // 证据附件存储目录（P0-2；默认 <db 目录>/attachments）
-  attachDir: process.env.MK_ATTACH_DIR || '',
 
   webhook: {
     // 通知 URL/签名密钥为经营参数（kv + 店铺设置网页维护，见 webhook.js 动态读取）；
@@ -212,12 +330,76 @@ const config = {
     secret: process.env.MK_TOKEN_SECRET || '',
   },
 
+  /*
+    MySQL 连接参数（**全节点唯一的持久化依赖**）。
+
+    为什么把端口/账号/池大小都做成配置：旧实现是一个 SQLite 文件，连接参数不存在；
+    换成 MySQL 之后这些值直接决定"能不能连上"和"能扛多少并发读"，必须可运维。
+
+    ## 节点的数据模型：**一个节点一个库，节点里的店铺都在这个库里**
+
+    库名（MK_DB_NAME）就是这个节点在那台 MySQL 上的身份，**不是**每家店一个库：
+    店铺是库里的行（`shops` 表 + 商品/订单上的 `shop_code`），一库多店由租户表承担。
+    同一台服务器上跑多个节点 ⇒ 每个节点填**不同的库名**，共用一个 MySQL 实例即可。
+    "两个节点接同一个库"会被 db.js 的实例锁**拒绝启动**（见那里的说明）——那不是可配项。
+
+    ## 这四个键**没有默认值**（缺失即拒绝启动，与 MK_TOKEN_SECRET 同款）
+
+    `MK_DB_HOST` / `MK_DB_USER` / `MK_DB_NAME` 缺失或为空 ⇒ db.js 的 `assertDbConfigured()`
+    带处置说明退出。为什么不给 `127.0.0.1` / `root` 这种"看起来能跑"的默认值：
+    那会让一个**根本没配过数据库**的节点连到某台碰巧在本机、碰巧账号也对得上的库上，
+    或者以一句 `ECONNREFUSED` /`Access denied` 失败——运维看不出"我还没配数据库"。
+    数据库服务器是**接线**，接线必须显式（本仓口径：配置极简 = 只放身份与接线，而接线不留默认）。
+  */
   db: {
-    // SQLite 文件路径（docker 部署挂卷到 /data）
-    file: process.env.MK_DB_FILE || 'marketplace-node.db',
+    /*
+      ⚠️ 这几个键一律走 **getter 动态读取**（与 autoDeliver / orderGate.url 同款），
+      不是一次性快照。原因是测试：`node --test` 每个测试文件一个进程，各进程要把库名
+      改成自己专属的那一个（`mk_test_<pid>_<随机>`）来互不干扰，而测试文件之间的 import 顺序
+      并不能保证 config 先于别的业务模块被求值——快照式读取会让某个文件的库名悄悄回落到默认值，
+      于是两个测试进程写同一个库（表现为随机失败，最难查的那一类）。
+    */
+    get host() { return (process.env.MK_DB_HOST || '').trim(); },
+    // 端口不是身份，3306 是标准端口 ⇒ 保留默认值（只有它保留）
+    get port() { return intEnv('MK_DB_PORT', 3306); },
+    get user() { return (process.env.MK_DB_USER || '').trim(); },
+    /*
+      口令：空值**只在库就在本机时**才允许（见 db.js 的 assertDbConfigured）。
+      远程库配一个空口令不是"简化"，是把它当成没有认证的库在用——那道门禁会拦下来。
+    */
+    get password() { return process.env.MK_DB_PASSWORD ?? ''; },
+    /*
+      本节点的库名。首次启动会自动建库（见 db.js 的 ensureDatabase），
+      所以运维**不需要**预先手工 CREATE DATABASE——但库名必须由他指定。
+    */
+    get name() { return (process.env.MK_DB_NAME || '').trim(); },
+    /*
+      连接池大小。写事务现在**真的会并发**跑在不同连接上（没有全局写锁了，见 db.js 文件头），
+      所以这个数同时决定了写并发度；调大到超过 MySQL 的 max_connections 会把节点自己挡在门外。
+    */
+    get poolSize() { return intEnv('MK_DB_POOL_SIZE', 10); },
+    /*
+      等**行锁**的上限（秒）。超过就报错而不是无限等——
+      旧实现设的是 5 秒的 busy_timeout，语义相同（宁可让请求明确失败，也不要挂住整个节点）。
+    */
+    get lockWaitSeconds() { return intEnv('MK_DB_LOCK_WAIT_SECONDS', 10); },
   },
 
+  /*
+    证据附件的落盘根目录。旧实现默认"取数据库文件所在目录"，
+    而 MySQL 没有库文件——留空时由 evidenceFiles.js 回落到进程工作目录下的 attachments/，
+    容器部署请用 MK_ATTACH_DIR 显式指向挂载卷（见 deploy/README.md）。
+  */
+  get attachDir() { return process.env.MK_ATTACH_DIR || ''; },
+
   corsOrigin: process.env.MK_CORS_ORIGIN || '*',
+
+  /**
+   * 反向代理信任边界（见 `trustProxyOf` 的说明）。默认关闭；
+   * `app.js` 用 `app.set('trust proxy', config.trustProxy)` 把它接到 Express——
+   * 这是 XFF 的**唯一**解析点，限流/审计/请求日志都只消费解析后的 `req.ip`。
+   */
+  trustProxy: trustProxyOf(process.env.MK_TRUST_PROXY),
 
   /**
    * 允许在**类生产环境**下也反射任意 Origin（默认关）。

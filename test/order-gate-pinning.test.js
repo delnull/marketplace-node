@@ -72,6 +72,6 @@ test('默认发送器：把响应体读回来并可通过 text()/json() 解析�
 
 test('默认发送器：没有已校验地址时拒绝发请求（fail-closed，不退回系统解析）', async () => {
   received = [];
-  await assert.rejects(() => pinnedGateSender(gateUrl(), { body: '{}', addresses: [], timeoutMs: 1000 }), /缺少已校验/);
+  await assert.rejects(async () => await pinnedGateSender(gateUrl(), { body: '{}', addresses: [], timeoutMs: 1000 }), /缺少已校验/);
   assert.equal(received.length, 0, '一个请求都不许发出');
 });

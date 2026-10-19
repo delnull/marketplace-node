@@ -3,37 +3,73 @@
  * 环境变量经 `node --env-file-if-exists=.env` 注入（见 package.json scripts）。
  */
 import config from './config.js';
-import { initDb, getDb } from './db.js';
+import { initDb } from './db.js';
 import { startWatcher } from './escrowWatcher.js';
 import { startChainReconcile } from './chainReconcile.js';
+import { startTermsReconciler } from './termsReconciler.js';
 import { startOrderSweeper } from './orderSweeper.js';
 import { startPiiRetentionSweep } from './piiErase.js';
 import { cleanupExpiredSiwe } from './auth.js';
+// 优雅关闭的库那一侧（关池 + 放实例锁）：唯一实现在 db.js，理由见那里的说明
+import { closeDb } from './db.js';
+// 退出路径内核（纯模块，可单测；理由见那里的文件头）
+import { createShutdown } from './shutdown.js';
 import { createApp } from './app.js';
-import { shopName } from './routes/shop.js';
+// 启动日志里的"本机叫什么"取**节点资料**（`node` 单例行的 name/notice，与任何一家店无关：
+// 开节点与开店铺是两个独立动作）。
+// ⚠️ `nodeNameOf` 的实现住在**路由层**（`routes/shop.js`：店名是"列 + 默认名"的一次读，
+// 而那张表的访问器就在那个文件里），它不是 `shops.js`（店铺行的访问层）的导出。
+// 这里此前写的是 `from './shops.js'`，而 ESM 对**不存在的具名导出**是**加载期直接抛错**：
+// 节点整台起不来（`SyntaxError: The requested module './shops.js' does not provide an export named 'shopNameOf'`）。
+// 七百多条接口测试全绿也照样漏掉——它们 import 的是 `app.js`，不经过本文件。
+import { nodeNameOf } from './routes/shop.js';
+// `node` 行的同步投影（`hostOperator()`）暖机点：见下方紧跟 initDb 的说明
+import { nodeRow, nodeOwnerOf } from './shops.js';
 // 下单风控闸（可选，默认关闭）：启动日志 + 启动门禁（URL 非空但非法 ⇒ 拒绝启动）
 import { orderGateEnabled, orderGateStartupError } from './orderGate.js';
 import { applyEscrowAnchor } from './chainAnchor.js';
 
-initDb();
+/*
+  初始化顺序**必须由 await 界定**（2026-10，MySQL 迁移）：`initDb` 现在是异步的
+  （建库 → 实例锁 → 服务器能力探测 → 建表与建触发器 → 必备列门禁 → 节点行 → 校验 changes 语义）。
+  旧实现（SQLite、同步）里它一返回就是"库已就绪"，本文件因此可以裸调用；
+  不 await 的话后面每一句都跑在**库还没就绪**的时候（`db not initialized`）、
+  `createApp()` 之后的请求撞上没建的表，而启动日志看起来一切正常。
+  这里是 ESM 入口，顶层 await 会阻塞模块求值直到库就绪（listen 在文件末尾，天然排在后面）。
+*/
+await initDb();
 
 /*
-  必备列门禁在 `db.js` 的 `initDb` 里跑（`assertRequiredColumns`，2026-10-15 从本文件挪过去）：
-  它守的是"当前代码必须存在的列都在库里"，而建表/建索引是**同一层**的事——放在本文件时，
-  `initDb` 与它之间夹着一段 DDL，任何依赖较新列的语句（例如给新列建索引）会**抢在门禁之前**失败：
-  用户拿到的是一句 `SQL logic error`，而不是"缺列 ⇒ 删库重建 / 补 ALTER"的可照做提示。
-  挪进 db.js 后，"先建表 → 校验必备列 → 再建新列索引"这个顺序由那一处独占地保证。
+  **暖 `node` 行的同步投影**（唯一的暖机点）。
+  `node`（owner/合约锚/游标/隔离事件/节点资料）是单例行，由 `initDb()` 种入；
+  而 `shops.js` 的 `hostOperator()` 是 `node.owner` 的**同步**投影（`src/shopCode.js` 必须在
+  同步上下文里拿它做 `codeOf` 的缓存键）——它在任何一次读那一行之前是空串。
+  空串的后果不是"少一个字段"：`shopDto`/`orderTermsOf` 在"要抽成却读不到收款人"时**抛错**
+  （刻意的响亮失败，见那里的说明），所以这里先读一次，让第一批请求拿到真实身份。
+*/
+await nodeRow();
+
+/*
+  结构门禁在 `db.js` 的 `initDb` 里跑（结构指纹：把 `SCHEMA_DDL` + `TRIGGER_DDL` 在一座临时库里
+  全量执行一遍得到期望形状，再与真实库逐项对拍；有差异就 exit(1) 并打印一份幂等的修复清单）：
+  它守的是"真实库的形状与建表语句一致"（列类型/可空/默认值/生成列/索引/CHECK/外键/视图/触发器），
+  而建表/建索引是**同一层**的事——门禁必须与建表语句住在同一处，否则中间夹一段 DDL 就会让
+  依赖较新列的语句（例如给新列建索引）**抢在门禁之前**失败：用户拿到的是一句 `SQL logic error`，
+  而不是"缺什么、执行哪几条修复 SQL"的可照做清单。这个顺序由 db.js 那一处独占地保证。
 */
 
 startOrderSweeper();
 // 个人信息保留期擦除（MK_PII_RETENTION_DAYS，默认 180 天；显式 0 = 关闭自动擦除）：
-// 终局订单静置超期后自动擦除收货信息/备注/售后陈述正文/证据附件——"存着不删"本身
-// 就是合规风险，不能指望店主记得手工执行（显式删除请求走 POST /api/shop/orders/:id/erase-pii）
+// 终局订单静置超期后自动擦除收货信息整行/备注/售后陈述正文/证据附件——"存着不删"本身
+// 就是合规风险，不能指望店主记得手工执行（显式删除请求走 POST /api/shop/orders/:orderNo/erase-pii）
 startPiiRetentionSweep();
 
 // 过期 SIWE nonce 定期清理（每 10 分钟；登录成功会删当前行，此处兜底防表膨胀）
-cleanupExpiredSiwe();
-const siweTimer = setInterval(() => cleanupExpiredSiwe(), 10 * 60_000);
+await cleanupExpiredSiwe();
+const siweTimer = setInterval(() => {
+  // 兜底清理也是异步的：失败只告警——表膨胀是慢问题，不该让一次库抖动把进程带崩
+  cleanupExpiredSiwe().catch((e) => console.error('[auth] 过期 nonce 清理失败（下轮重试）:', e?.message || e));
+}, 10 * 60_000);
 if (typeof siweTimer.unref === 'function') siweTimer.unref();
 
 if (config.chain.escrowAddress) {
@@ -43,7 +79,10 @@ if (config.chain.escrowAddress) {
     以为还在等发货，钱在旧合约里）。首次启动记地址；地址变了而本地还有在途链上单 ⇒ 默认
     拒绝启动，除非显式 MK_ESCROW_CHANGE_ACK=1（处置步骤见 src/chainAnchor.js 的报错正文）。
   */
-  const anchor = applyEscrowAnchor({
+  // 必须 await：锚定要读 `node.escrow_address` 与在途单计数（异步库调用），不 await 时
+  // `anchor.ok` 读的是 Promise（恒真），"有在途单就拒绝启动"那条分支永远走不到
+  // （见 chainAnchor.applyEscrowAnchor 的说明）
+  const anchor = await applyEscrowAnchor({
     envAddress: config.chain.escrowAddress,
     ack: String(process.env.MK_ESCROW_CHANGE_ACK || '') === '1',
   });
@@ -70,7 +109,7 @@ if (config.chain.escrowAddress) {
     下单最小超时窗口与释放静置期缺席），而日志里一个字都不会说。
     逃生口 MK_CONTRACT_GEN_ACK=1：显式声明"我知道它是旧实例，仍要以只读方式接"。
   */
-  const { assertEscrowGeneration } = await import('./chain.js');
+  const { assertEscrowGeneration, assertRegistryGeneration } = await import('./chain.js');
   const gen = await assertEscrowGeneration();
   if (!gen.ok) {
     const why =
@@ -89,6 +128,31 @@ if (config.chain.escrowAddress) {
     console.warn(`[server] 托管合约代次自检未通过（MK_CONTRACT_GEN_ACK=1 已显式放行）：\n  ${why}`);
   } else {
     console.log('[marketplace-node] 托管合约代次自检通过（2026-10 加固的入口齐全）');
+  }
+  /*
+    **Registry 代次自检**（与 Escrow 自检同批）：节点还会读 Registry 的 `ShopInfo` 元组、
+    员工名单（`staffNode` / `nodeStaff`）与按编号的在售判据（`shopListed`）。接上更早一代
+    Registry 时节点照样启动，然后店铺对账每轮解码失败、员工永远鉴权失败，日志里只有"读不到"。
+    判据见 chain.assertRegistryGeneration；未配置 Registry 时返回 skipped（纯浏览节点）。
+  */
+  const regGen = await assertRegistryGeneration();
+  if (!regGen.skipped && !regGen.ok) {
+    const why =
+      `链上店铺登记合约（${config.chain.registryAddress}）缺少本版本代码需要的入口：\n` +
+      `    - ${regGen.missing.join('\n    - ')}\n` +
+      `  这说明 Registry 是更早/更晚的一代（或地址指错了实例）。节点照常跑起来只会让\n` +
+      `  店铺对账与节点员工鉴权静默失效。\n` +
+      `  处置：把 MK_REGISTRY_ADDRESS / MK_ESCROW_ADDRESS / MK_ESCROW_START_BLOCK 同批换成当前\n` +
+      `  这一批并**重建容器**；若确实要以只读方式接旧实例，设 MK_CONTRACT_GEN_ACK=1 显式声明。`;
+    if (String(process.env.MK_CONTRACT_GEN_ACK || '') !== '1') {
+      console.error(`[server] Registry 代次自检未通过：\n  ${why}`);
+      process.exit(1);
+    }
+    console.warn(`[server] Registry 代次自检未通过（MK_CONTRACT_GEN_ACK=1 已显式放行）：\n  ${why}`);
+  } else if (!regGen.skipped) {
+    console.log(`[marketplace-node] Registry 代次自检通过（${regGen.probed} 个读法齐全）`);
+  } else {
+    console.log('[marketplace-node] 未配置 MK_REGISTRY_ADDRESS：跳过 Registry 代次自检（纯浏览模式）');
   }
   /*
     启动期**下单超时窗口自检**（2026-10-14，见 chain.checkOrderTimeoutBounds）：
@@ -130,6 +194,10 @@ if (config.chain.escrowAddress) {
     console.log(`[marketplace-node] 下单超时窗口自检通过（${bounds.message}）`);
   }
   startWatcher();
+  // 佣金条款/在售状态对账（多店改造）：把链上 `shopListed` 与当前 `commissionBps` 抄回本地镜像。
+  // 费率由节点主链上单方调整，节点只读链、不索引事件——不轮询就永远不知道本地那一份已经过期。
+  // 不启动时 /healthz 的 terms.enabled=false，运维看得见。
+  startTermsReconciler();
   // 链上状态对账（兜底）：watcher 只正向回放、从不回滚，事件漏扫一次就会让订单永久停在
   // 非终态（链上早已终局）——本扫描按 MK_CHAIN_RECONCILE_MS（默认 10 分钟）复查滞留住
   // 并复用 watcher 的映射修复；MK_ESCROW_ADDRESS 未配置时不启动（本分支即该条件）
@@ -138,7 +206,13 @@ if (config.chain.escrowAddress) {
   console.warn('[server] MK_ESCROW_ADDRESS 未配置：跳过 Escrow 事件轮询（仅商品浏览/展示模式，不可下单）');
 }
 if (!config.shop.owner) {
-  console.warn('[server] MK_SHOP_OWNER 未配置：本节点不可上架商品/发货（写操作要求店主 SIWE）');
+  /*
+    节点主地址是这台机器的**身份接线**（`node.owner`，与 `MK_DB_HOST` 同级）：
+    它既决定"谁能做节点级动作"，也是抽成收款人（`commissionTo`）的唯一答案。
+    缺失时 db.js 的建行那一步会如实拒绝启动；这里再喊一句是为了让"我还没配身份"
+    在日志里一眼可见，而不是只看到一句来自库层的报错。
+  */
+  console.warn('[server] MK_SHOP_OWNER 未配置：本节点没有身份（node.owner）——节点级动作与抽成收款人都无从判定');
 }
 // 仓库公开的占位/默认密钥一律拒绝启动（默认值 + .env.example 示例值，均可在仓库内查到——
 // 任何人都能用它们离线伪造店主令牌；弱密钥同样拒绝）
@@ -221,10 +295,22 @@ for (const k of LEGACY_RATE_ENV_KEYS) {
 }
 
 const app = createApp();
-app.listen(config.port, () => {
+const server = app.listen(config.port, async () => {
+  // 身份与展示资料都从 `node` 那一行读（不留"配置里一份、库里一份"）
+  const node = await nodeRow();
   console.log(`[marketplace-node] 联邦商城节点已启动 http://0.0.0.0:${config.port}`);
-  console.log(`[marketplace-node] 店主=${config.shop.owner || '(未配置)'} 店铺=${shopName()}`);
+  console.log(`[marketplace-node] 节点主=${nodeOwnerOf(node) || '(未配置)'} 节点名=${await nodeNameOf()}`);
   console.log(`[marketplace-node] 托管合约=${config.chain.escrowAddress || '(未配置)'} 支付币种=原生 BTY`);
+  /*
+    反向代理信任边界：默认关闭。反代之后（本机 Caddy/nginx 是默认拓扑）不配置它，
+    所有匿名客户端会共用代理那一个限流桶，audit_logs.ip 也恒为代理地址——
+    这两件事都不会自己报错，所以在启动日志里把当前口径说出来。
+  */
+  console.log(
+    `[marketplace-node] 反向代理信任边界（MK_TRUST_PROXY）=${
+      config.trustProxy ? JSON.stringify(config.trustProxy) : '未启用（按 TCP 对端地址记来源 IP）'
+    }`
+  );
   /*
     下单风控闸（可选，默认关闭）：开启时**必须**在启动日志里说出来。
     fail-closed 意味着"风控服务一挂，全店下不了单"——运维要能立刻从日志判断
@@ -237,3 +323,10 @@ app.listen(config.port, () => {
     );
   }
 });
+
+/*
+  退出路径：**接线**在这里，实现与全部理由在 `src/shutdown.js`（那是个纯模块，可被单测直接驱动
+  —— 本文件不能被 import，一被求值就会 initDb + listen，所以逻辑留在这里就等于测不到）。
+  三件事按顺序：停止收新连接 → 等在途响应 → 关库 → 退出；正常停机 0、崩溃非 0。
+*/
+createShutdown({ server, closeDb, config, proc: process });

@@ -9,10 +9,7 @@ dist/
 .env.bak*
 !.env.example
 
-# 数据与附件（店主的经营数据只存在于本机）
-*.db
-*.db-wal
-*.db-shm
+# 数据与附件（店主的经营数据只存在于本机；库在 MySQL 里，不在仓库内）
 data/
 attachments/
 uploads/

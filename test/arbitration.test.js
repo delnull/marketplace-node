@@ -3,7 +3,7 @@
  *  - GET /api/arbitration/pending：仅 disputed 单入列（按进入争议时间倒序分页），
  *    摘要含金额/双方/交付证据标志/链上事件史，不含交付内容原文（码/物流/tokenId）；
  *  - 详情码可见性矩阵：匿名与第三人不可见；买家已交付可见；店主可见；
- *    链上仲裁人（MK_ARBITER_ADDRESS 配置）仅对争议中（disputed）单开放（裁决证据语义——
+ *    链上仲裁人（当前届委员会；测试注入取值）仅对争议中（disputed）单开放（裁决证据语义——
  *    正常在途单的交付码不属于裁决证据，仲裁人无查看必要，收紧隐私面）；
  *  - 仲裁事件回写后待仲裁列表自动收敛（disputed → settled/refunded 出列）。
  * 状态推进不经真实链上（单测无 RPC）——与 watcher.test 同款：直调 applyEvent。
@@ -14,13 +14,17 @@ import { test, before } from 'node:test';
 const FULL_REFUND = '1000000000000000000';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 // 必须在 makeCtx 之前设置（config 模块求值时读取，见 setup.mjs 头注释）
 const arbiter = Wallet.createRandom();
-process.env.MK_ARBITER_ADDRESS = arbiter.address;
+// 2026-10-18：仲裁人不再是单个环境变量，改为链上当前届名单（测试注入取值）
 
 const ctx = await makeCtx();
+
+// 2026-10-18：仲裁人 = 链上当前届名单（注入取值，避免起假 RPC）
+const { setCommitteeReader } = await import('../src/chain.js');
+setCommitteeReader(async () => ({ arbiters: [arbiter.address.toLowerCase()], threshold: 1, epoch: 1 }));
 const { app, request, db, owner, buyer } = ctx;
 const stranger = Wallet.createRandom();
 
@@ -37,7 +41,7 @@ const { applyEvent } = await import('../src/escrowWatcher.js');
 async function listProduct(payload) {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(payload)
     .expect(200);
   assertOk(res);
@@ -48,7 +52,7 @@ async function createDraft(slug) {
   // 买家本人登录下单（本人=target）；buyerToken 在 before 中先于造单完成登录
   const res = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, buyer: buyer.address })
     .expect(200);
   assertOk(res);
@@ -56,16 +60,16 @@ async function createDraft(slug) {
 }
 
 /** 直接置为 escrowed（模拟 watcher/paid 已回写并落支付凭证，跳过链上） */
-function escrowed(order) {
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run(payHash(), Date.now(), order.id);
+async function escrowed(order) {
+  await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), order.id);
+  await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', payHash(), order.id);
 }
 
 /** 店主发货（physical 传物流单号 / digital 手动交付码） */
 async function ship(order, body) {
   const res = await request(app)
     .post(`/api/orders/${order.id}/ship`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(body)
     .expect(200);
   assertOk(res);
@@ -98,35 +102,73 @@ before(async () => {
   d3 = await createDraft(p3.slug);
   d4 = await createDraft(p4.slug);
   d5 = await createDraft(p5.slug);
-  escrowed(d1);
-  escrowed(d2);
-  escrowed(d3);
-  escrowed(d4);
-  escrowed(d5);
+  await escrowed(d1);
+  await escrowed(d2);
+  await escrowed(d3);
+  await escrowed(d4);
+  await escrowed(d5);
 
   // 已交付两单：卖家先发货再争议（shipped → disputed）
   await ship(d1, { trackingNo: 'SF-1001' });
   await ship(d2, { deliveryCode: 'CARD-777' });
   // 对照：已交付但未争议（shipped 在途正常单，买家已拿到码）
   await ship(d5, { deliveryCode: 'CARD-555' });
-  assert.equal(applyEvent('DisputeRequested', { orderId: d1.escrowOrderId }), 1);
-  assert.equal(applyEvent('DisputeRequested', { orderId: d2.escrowOrderId }), 1);
+  assert.equal(await applyEvent('DisputeRequested', { orderId: d1.escrowOrderId }), 1);
+  assert.equal(await applyEvent('DisputeRequested', { orderId: d2.escrowOrderId }), 1);
   // 未交付争议（escrowed → disputed）
-  assert.equal(applyEvent('DisputeRequested', { orderId: d3.escrowOrderId }), 1);
+  assert.equal(await applyEvent('DisputeRequested', { orderId: d3.escrowOrderId }), 1);
   // 对照：正常成交（confirmed）不得入待仲裁列表
-  assert.equal(applyEvent('ReceiptConfirmed', { orderId: d4.escrowOrderId }), 1);
+  assert.equal(await applyEvent('ReceiptConfirmed', { orderId: d4.escrowOrderId }), 1);
 });
 
 async function pending(page = 1, pageSize = 30) {
-  const res = await request(app).get(`/api/arbitration/pending?page=${page}&pageSize=${pageSize}`).expect(200);
+  /*
+    仲裁台以**已确证的链上仲裁人**身份读队列：匿名行不带本地句柄 `orderNo`（见
+    routes/arbitration.js 的隐私口径），而下面的用例要按 orderNo 索引行。
+  */
+  const res = await request(app)
+    .get(`/api/arbitration/pending?page=${page}&pageSize=${pageSize}`)
+    .set('Authorization', `Bearer ${arbiterToken}`)
+    .expect(200);
   assertOk(res);
   return res.body.data;
 }
 
+test('匿名队列不提供本地句柄 orderNo（链上事实仍公开）；非仲裁人令牌同样拿不到', async () => {
+  /*
+    `orderNo` 是"时间前缀 + 50 bit 随机段"的本地句柄，拿到它就能继续探测订单详情面；
+    链上 `escrowOrderId` / 金额 / 双方地址才是这一行对匿名者公开的事实（链上事件里就有）。
+    判据只在 disputeToPublic 一处：showLocalHandle = 已确证的链上仲裁人。
+  */
+  const anon = await request(app).get('/api/arbitration/pending').expect(200);
+  assertOk(anon);
+  assert.ok(anon.body.data.disputes.length > 0, '前置：队列里有争议单');
+  for (const r of anon.body.data.disputes) {
+    assert.equal(r.orderNo, null, '匿名行不下发本地句柄');
+    assert.match(r.escrowOrderId, /^0x[0-9a-f]{64}$/, '链上事实仍公开（裁决直调需要它）');
+    assert.equal(r.buyer, buyer.address.toLowerCase());
+  }
+  assert.equal(anon.body.data.waiting.count, anon.body.data.total, '等待读数不依赖句柄');
+
+  const third = await request(app)
+    .get('/api/arbitration/pending')
+    .set('Authorization', `Bearer ${strangerToken}`)
+    .expect(200);
+  assert.ok(third.body.data.disputes.every((r) => r.orderNo === null), '非仲裁人令牌不是本地句柄的凭证');
+
+  const arb = await pending();
+  assert.ok(arb.disputes.every((r) => typeof r.orderNo === 'string' && r.orderNo.length === 21), '仲裁人拿到句柄');
+});
+
 test('待仲裁列表：仅 disputed 入列，摘要含裁决要素但不含交付内容原文', async () => {
   const data = await pending();
   assert.equal(data.total, 3, '3 单争议中，成交对照单不入列');
-  const byId = Object.fromEntries(data.disputes.map((r) => [r.id, r]));
+  /*
+    摘要里的订单标识是 `orderNo`（对外单号，CHAR(21)）——旧字段 `id` 是内部自增键，
+    它不出本节点（换库/重建之后会变，而仲裁台的链接要长期指向同一张单，见 routes/arbitration.js）。
+    下面用接口给的 `id`（就是订单号，见 setup.mjs）去索引。
+  */
+  const byId = Object.fromEntries(data.disputes.map((r) => [r.orderNo, r]));
 
   const r1 = byId[d1.id];
   const r2 = byId[d2.id];
@@ -171,10 +213,10 @@ test('待仲裁列表：仅 disputed 入列，摘要含裁决要素但不含交�
  */
 test('待仲裁列表的平台费三态：快照缺失 ⇒ feeBps=null（不是 0）；有快照 ⇒ 如实给数', async () => {
   const { db } = ctx;
-  // ① 模拟"补录失败/未补录"的行：两列都是默认值（fee_bps=0、fee_collector_at_create=''）
-  db.prepare("UPDATE orders SET fee_bps = 0, fee_collector_at_create = '' WHERE id = ?").run(d1.id);
+  // ① 模拟"补录失败/未补录"的行：收费方列为 NULL（三态里的"从未补录"）
+  await db.run('UPDATE orders SET fee_bps = 0, fee_collector_at_create = NULL WHERE order_no = ?', d1.id);
   const data1 = await pending();
-  const row1 = data1.disputes.find((r) => r.id === d1.id);
+  const row1 = data1.disputes.find((r) => r.orderNo === d1.id);
   assert.equal(row1.feeBps, null, '快照缺失时必须是 null（读不到 ≠ 不扣费）');
   assert.equal(row1.feeCollectorAtCreate, null);
   // 兜底判定仍按**保守**口径给 true（"快照缺失 ⇒ 按全局口径假定会扣"是 fees.js 的既定语义），
@@ -182,23 +224,19 @@ test('待仲裁列表的平台费三态：快照缺失 ⇒ feeBps=null（不是 
   assert.equal(row1.feeChargeable, true, '快照缺失 ⇒ 保守假定会扣（fees.js 的既定兜底）');
 
   // ② 有快照（正常行）：如实给数（含"确实是 0 费率"这种合法情况）
-  db.prepare("UPDATE orders SET fee_bps = 500, fee_collector_at_create = ? WHERE id = ?").run(
-    '0x' + 'ab'.repeat(20),
-    d2.id
-  );
+  await db.run("UPDATE orders SET fee_bps = 500, fee_collector_at_create = ? WHERE order_no = ?", '0x' + 'ab'.repeat(20),
+    d2.id);
   const data2 = await pending();
-  const row2 = data2.disputes.find((r) => r.id === d2.id);
+  const row2 = data2.disputes.find((r) => r.orderNo === d2.id);
   assert.equal(row2.feeBps, 500);
   assert.equal(row2.feeCollectorAtCreate, '0x' + 'ab'.repeat(20));
   assert.equal(row2.feeChargeable, true);
 
   // ③ 有快照但费率确实是 0：给 0（而不是 null）——"确实不扣"与"读不到"必须分得开
-  db.prepare("UPDATE orders SET fee_bps = 0, fee_collector_at_create = ? WHERE id = ?").run(
-    '0x' + 'ab'.repeat(20),
-    d3.id
-  );
+  await db.run("UPDATE orders SET fee_bps = 0, fee_collector_at_create = ? WHERE order_no = ?", '0x' + 'ab'.repeat(20),
+    d3.id);
   const data3 = await pending();
-  const row3 = data3.disputes.find((r) => r.id === d3.id);
+  const row3 = data3.disputes.find((r) => r.orderNo === d3.id);
   assert.equal(row3.feeBps, 0, '快照在、费率确实是 0 ⇒ 给 0');
   assert.equal(row3.feeChargeable, true, '收取方非零地址 ⇒ 链上会按 0‰ 扣费（金额为 0，但口径是"会扣"）');
 });
@@ -211,7 +249,7 @@ test('待仲裁列表分页：倒序分页且 total 恒定', async () => {
   assert.equal(page2.disputes.length, 1);
   assert.equal(page2.total, 3);
   const all = [...page1.disputes, ...page2.disputes];
-  assert.equal(new Set(all.map((r) => r.id)).size, 3, '两页不重不漏');
+  assert.equal(new Set(all.map((r) => r.orderNo)).size, 3, '两页不重不漏');
   // 倒序：disputedAt 递减
   for (let i = 1; i < all.length; i++) {
     assert.ok(all[i - 1].disputedAt >= all[i].disputedAt, '按进入争议时间倒序');
@@ -222,7 +260,7 @@ test('详情码可见性矩阵：仲裁人对争议单开放裁决证据（码�
   const getDetail = async (token) =>
     request(app)
       .get(`/api/orders/${d2.id}`)
-      .set('Authorization', `Bearer ${token}`)
+      .set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value)
       .expect(200);
 
   // 匿名与第三人：不可见交付码
@@ -259,14 +297,14 @@ test('仲裁视角收紧：非争议单（正常在途 shipped）不对仲裁人
 
   const byBuyer = await request(app)
     .get(`/api/orders/${d5.id}`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(byBuyer);
   assert.equal(byBuyer.body.data.deliveries[0].value, 'CARD-555', '买家已交付可见');
 
   const byOwner = await request(app)
     .get(`/api/orders/${d5.id}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(byOwner);
   assert.equal(byOwner.body.data.deliveries[0].value, 'CARD-555', '店主始终可见');
@@ -274,7 +312,7 @@ test('仲裁视角收紧：非争议单（正常在途 shipped）不对仲裁人
   // 收紧断言：仅 disputed 属裁决证据，仲裁人对正常在途单不开码
   const byArbiter = await request(app)
     .get(`/api/orders/${d5.id}`)
-    .set('Authorization', `Bearer ${arbiterToken}`)
+    .set('Authorization', `Bearer ${arbiterToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(byArbiter);
   assert.deepEqual(byArbiter.body.data.deliveries, [], '仲裁人不对正常在途单开码');
@@ -283,7 +321,7 @@ test('仲裁视角收紧：非争议单（正常在途 shipped）不对仲裁人
 test('未交付争议单对仲裁人同样开放全字段（含 tracking 证据区）', async () => {
   const res = await request(app)
     .get(`/api/orders/${d1.id}`)
-    .set('Authorization', `Bearer ${arbiterToken}`)
+    .set('Authorization', `Bearer ${arbiterToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(res);
   assert.equal(res.body.data.status, 'disputed');
@@ -293,13 +331,13 @@ test('未交付争议单对仲裁人同样开放全字段（含 tracking 证据�
 
 test('仲裁裁决回写后待仲裁列表收敛（disputed → settled/refunded 出列）', async () => {
   // 判付卖家：d1 出列
-  assert.equal(applyEvent('Arbitrated', { orderId: d1.escrowOrderId, refundWei: 0n }), 1);
+  assert.equal(await applyEvent('Arbitrated', { orderId: d1.escrowOrderId, refundWei: 0n }), 1);
   // 判退款买家：d3 出列
-  assert.equal(applyEvent('Arbitrated', { orderId: d3.escrowOrderId, refundWei: d3.amountWei }), 1);
+  assert.equal(await applyEvent('Arbitrated', { orderId: d3.escrowOrderId, refundWei: d3.amountWei }), 1);
 
   const data = await pending();
   assert.equal(data.total, 1, '仅剩 d2 一单待仲裁');
-  const ids = data.disputes.map((r) => r.id);
+  const ids = data.disputes.map((r) => r.orderNo);
   assert.ok(ids.includes(d2.id), '未裁决单保留');
   assert.ok(!ids.includes(d1.id), 'settled 出列');
   assert.ok(!ids.includes(d3.id), 'refunded 出列');
@@ -307,7 +345,7 @@ test('仲裁裁决回写后待仲裁列表收敛（disputed → settled/refunded
   // 状态语义正确（与订单详情联动）
   const detail = await request(app)
     .get(`/api/orders/${d3.id}`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(detail.body.data.status, 'refunded');
 });

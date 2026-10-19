@@ -11,19 +11,35 @@
  *  - 正常收敛由 escrowWatcher 事件回写负责（秒级）；
  *  - 本模块只挑**很久没动过**的非终态单（默认 6 小时；刚变动的单由 watcher/paid 路径处理），
  *    每轮最多 20 单、最旧的先修，且只在 MK_ESCROW_ADDRESS 已配置时运行；
- *  - 候选集比单轮批量大时靠 kv 游标轮转复查（见 reconcileChainOnce），不改动 orders.updated_at
- *    ——那一列是入账/争议时刻的口径。
+ *  - 候选集比单轮批量大时靠 `node` 上的键集游标轮转复查（见 reconcileChainOnce），
+ *    不改动 orders.updated_at——那一列是入账/争议时刻的口径。
  *
  * 单一实现：链上终局 → 本地状态的映射**不在这里重写**，而是复用 watcher 导出的
  * `mapChainTerminal`（快照路径的唯一判据，/sync 手动同步同款）与 `settleByRefundSplit`
  * （RefundApproved/Arbitrated 的同一函数，含 refunded_amount_wei 与占位回补）、
  * `markEscrowDisputed`（DisputeRequested 的同一 SQL），防两处口径漂移；
  * 防"诱饵单"的买家/卖家/金额比对同样复用 `chainOrder.chainParamsMatch`（交付闸与 watcher 也在用）。
- * 事件史用 orders.js 的 `appendSyncMirrorEvent`（与手动 /sync 同一条 `Sync:<状态>` 镜像）。
+ * 事件史用 routes/orders.js 的 `appendSyncMirrorEvent`（与手动 /sync 同一条 `Sync:<状态>` 镜像）。
  *
  * 售后案件（2026-10 第二批）同样走这条纪律：链上真值由 `chainOrder.fetchAfterSaleCase`（与 /sync
  * 同一个读取器）取回，落列由 `afterSale.applyAfterSaleFromChain`（唯一写入口）决定；
  * 本模块只负责"哪些行该复查、不一致时怎么告警"。候选面见 reconcileAfterSaleOnce。
+ *
+ * ## 表与键（2026-10 MySQL 重设计）
+ *
+ *  - 整单读走读模型 `v_orders`；状态写 `orders`、链上镜像列写 `order_chain`——
+ *    `afterSale.js` 的两个谓词（AFTER_SALE_OPEN_SQL / AFTER_SALE_NOT_OPEN_SQL）**不带别名**，
+ *    就是为读模型写的（`NOT_OPEN` 里的 `IS NULL` 分支只在 LEFT JOIN 出的空镜像行上成立）；
+ *  - 子表写入与 `appendSyncMirrorEvent` / `restockOrder` 一律用**内部键** `order_id`，
+ *    日志、告警 payload 与 `/healthz` 用**对外单号** `order_no`（旧形状里两者同名 `orders.id`，
+ *    现在它只指内部键，见 db.js 的 v_orders 说明）；
+ *  - 两个轮转游标是 `(updated_at, id)` **键集分页对**（`node.reconcile_at` +
+ *    `node.reconcile_order_id`、`node.reconcile_after_sale_at` + `node.reconcile_after_sale_order_id`），
+ *    与 `ORDER BY updated_at, id` 同序；**NULL = 从未对账过**（不是 0：0 会被读成"从时间原点开始"，
+ *    那是一次全表扫描）。两列一起才是"上次读到哪儿"的完整答案：updated_at 可以相同
+ *    （同一毫秒改了两单），只记时间会漏单或重复，只记 id 又用不上时间索引。
+ *  - 时间列一律 `Date`（`DATETIME(3)`）：比较阈值传 `Date`，**绝不传毫秒整数**（MySQL 会把数字
+ *    当字面量解析成一个与真实时刻无关的时间，而且不报错）。
  *
  * 安全边界（宁可不动，也不乱动）：
  *  - 已终态的行绝不触碰；
@@ -33,10 +49,13 @@
  *  - 链上真值与本地锁定的买家/卖家/金额不一致（他人对同一 orderId 的诱饵单）→ 整单跳过。
  *
  * 幂等：修完的行已成终态，不会再被选中；重复运行不重复迁移（状态前置条件守卫）、不重复写
- * 事件史（appendSyncMirrorEvent 自带幂等）；告警用 kv 标记（按本地订单 id）保证每单至多一次。
+ * 事件史（appendSyncMirrorEvent 自带幂等）；持续状态的告警用 `order_alerts(order_id, kind)`
+ * 的主键去重（每单至多一次成功投递，见 alertAck.js）。
  */
 import config from './config.js';
-import { getDb, kvGet, kvSet, txBegin, txCommit, txRollback } from './db.js';
+import { getDb, withTransaction } from './db.js';
+// node 单例行的唯一读入口（游标落在它上面；行由 db.js 的 initDb() 在启动期建立）
+import { nodeRow } from './shops.js';
 import { fetchOrderFor, fetchAfterSaleCase, chainParamsMatch } from './chainOrder.js';
 import { getEscrow } from './chain.js';
 import { settleByRefundSplit, markEscrowDisputed, mapChainTerminal, readRefundedWei } from './escrowWatcher.js';
@@ -62,17 +81,6 @@ const NON_TERMINAL = ['draft', 'escrowed', 'shipped', 'disputed', 'cancelled'];
 const MIN_AGE_MS = 6 * 3600_000;
 /** 单轮批量上限（最旧的先修；对账是兜底路径，不追求一轮清空） */
 const BATCH_SIZE = 20;
-/**
- * 已告警标记的 kv 前缀（键 = 前缀 + 事件类型 + 本地订单 id；与 poolAlert/hold_missing 同款
- * 一次性告警）。按**事件类型**分键：同一单先"链上查不到"、后来真被修复，是两件不同的事实，
- * 各自都该让店主知道一次（共用一把键会让后一条被前一条静默吞掉）。
- */
-const NOTIFIED_KEY_PREFIX = 'mk:chain_reconcile_notified:';
-/**
- * 复查游标（kv，值 = JSON {ts,id}）：上一轮复查到的位置，保证候选集大于单轮批量时
- * 每一单最终都会被复查到（详见 reconcileChainOnce 的说明）。
- */
-const CURSOR_KEY = 'mk:chain_reconcile_cursor';
 
 /**
  * 售后案件扫描的单轮批量与候选窗口（见 reconcileAfterSaleOnce）：
@@ -80,12 +88,11 @@ const CURSOR_KEY = 'mk:chain_reconcile_cursor';
  *    取上限而不是默认值：部署方可以把窗口配到 360 天，而"链上有案件"必须能被扫到——用默认值会让
  *    180~360 天那一段的单永远进不了候选面（漏扫就永久分叉）。代价只是候选面更大，靠游标轮转摊平。
  *  - `AFTER_SALE_BATCH` 与主对账同量级（一轮 20 单）：这条路是兜底，不抢主路径的 RPC 配额。
- *  - 游标单独一把键：两条候选面的排序锚点不同（主对账 = updated_at 的非终态行，
- *    本路 = 终局成交单），共用一把会把彼此的位置覆盖掉。
+ *  - 游标单独一对列：两条候选面的排序锚点不同（主对账 = updated_at 的非终态行，
+ *    本路 = 终局成交单），共用一对会把彼此的位置覆盖掉。
  */
 const AFTER_SALE_SCAN_MS = 360 * 24 * 3600_000;
 const AFTER_SALE_BATCH = 20;
-const AFTER_SALE_CURSOR_KEY = 'mk:chain_reconcile_after_sale_cursor';
 
 /**
  * 链上订单读取器（测试注入点，与 netguard.setLookupAll / webhook.setWebhookSender 同款）：
@@ -102,9 +109,43 @@ export { setChainOrderFetcher } from './chainOrder.js';
  */
 export { setAfterSaleCaseFetcher } from './chainOrder.js';
 
+/* ─────────────────── node 单例行上的两对游标（读写口）─────────────────── */
+
+/** 主对账游标落库（`(null, null)` = 清空：本轮已覆盖到候选集末尾，下轮从头开始） */
+async function setReconcileCursor(at, id) {
+  await getDb().run(
+    'UPDATE node SET reconcile_at = ?, reconcile_order_id = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = 1',
+    at,
+    id
+  );
+}
+
+/** 售后案件对账游标落库（同上，独立一列对） */
+async function setAfterSaleCursor(at, id) {
+  await getDb().run(
+    'UPDATE node SET reconcile_after_sale_at = ?, reconcile_after_sale_order_id = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = 1',
+    at,
+    id
+  );
+}
+
+/**
+ * 读一对游标：**两列都在**才算有游标（NULL = 从未对账过）。
+ * `at` 从库里出来就是 `Date`（DATETIME(3)）；不是 Date（列被写坏）时按"没有游标"处理——
+ * 拿一个畸形值去比 `updated_at > ?` 只会得到空候选集，而"对账什么都没扫"与"候选集本来就空"
+ * 在读数上同形，那比重新从最旧的开始扫一遍贵得多。
+ */
+function cursorOf(row) {
+  const at = row?.at;
+  const id = row?.id;
+  if (!(at instanceof Date) || id === null || id === undefined) return null;
+  const n = Number(id);
+  return Number.isSafeInteger(n) && n > 0 ? { at, id: n } : null;
+}
+
 /**
  * 纯决策函数（不触库、不触链；单测直调）：链上状态 + 本地行 → 该做的修复动作。
- * @param {object} local orders 行（需 status/amount_wei/paid_tx_hash）
+ * @param {object} local 读模型行（需 status/amount_wei/paid_tx_hash）
  * @param {object} onchain fetchOnchainOrder 形状 {status, refundedAmount, ...}
  * @returns {{action:'none', reason:string, unreadable?:true}
  *          |{action:'repair', to:'disputed'|'settled'|'refunded', refundedAmountWei:string, reason:string}
@@ -142,7 +183,7 @@ export function planChainRepair(local, onchain) {
   if (chainStatus === 'Refunded' || chainStatus === 'Settled') {
     // 本地应有状态由**唯一实现** mapChainTerminal 决定（与 /sync 手动同步、与事件路径同判据）：
     // 全额退 → refunded；否则（含 refundedAmount=0 = 全额判卖家、部分退款/拆分裁决）→ settled。
-    // 部分金额有两条链上来源：仲裁人 arbitrate（任意比例，无需买家授权）与
+    // 部分金额有两条链上来源：仲裁人 voteSettlement 票决（任意比例，无需买家授权）与
     // approveRefund == acceptedPartialRefund[orderId]（**买家精确授权过**的部分退款；
     // 2026-09 契约：其它金额一律 RefundAmountNotAccepted，旧的 RefundNotFull 已删除），
     // 所以本节里"部分金额"既可能来自裁决、也可能来自双方谈拢后的卖家执行。
@@ -205,26 +246,39 @@ export function planChainRepair(local, onchain) {
  * **缺字段**的读数去调它等于"断言链上从未申请过退款"——那会把一条真实的冻结标记抹掉。
  * 生产路径（chain.js 的 fetchOnchainOrder）恒带这两项；这里加门禁是为了防测试桩/未来实现漏字段。
  */
-function applyRefundFlagsIfKnown(orderIdHex, onchain) {
+async function applyRefundFlagsIfKnown(orderIdHex, onchain) {
   if (!onchain) return 0;
   if (onchain.refundRequested === undefined && onchain.refundRejected === undefined) return 0;
-  return applyRefundFlags(orderIdHex, onchain);
+  return await applyRefundFlags(orderIdHex, onchain);
 }
 
 /**
- * 一次性告警（kv 标记按「事件类型 + 本地订单 id」；**投递成功后才写标记**，见 alertAck.js） */
-function alertOnce(orderId, type, data) {
-  return alertOnceDelivered({
-    ackKey: `${NOTIFIED_KEY_PREFIX}${type}:${orderId}`,
+ * 持续状态的一次性告警（`order_alerts` 主键去重；**投递成功后才留下标记**，见 alertAck.js）。
+ * `alertOnceDelivered` 是 async（预占与释放都碰库）：不 await 的话它抛出的错会变成
+ * unhandled rejection，而调用方以为"已经告过警了"——这里一律 await。
+ *
+ * 只有 `chain_missing` 走它：`order_alerts.kind` 的 ENUM 只收三类**持续状态**
+ * （pool_empty / chain_missing / hold_missing），而"已按链上真值修好某单"是一次性通知——
+ * 它天然不会重复（修完之后那一行不再是候选，条件不再成立），所以下面两处修复告警直接
+ * `notifyRaw`（旧形状给它们各配了一个 kv 标记，而那种标记在新 schema 里没有家，也不需要）。
+ */
+async function alertChainMissingOnce(order, data) {
+  return await alertOnceDelivered({
+    orderId: order.order_id,
+    kind: 'chain_missing',
     label: '[chainReconcile]',
-    what: `（${type}，order=${String(orderId).slice(0, 8)}…）`,
-    send: () => notifyRaw(type, data),
+    what: `（order.chain_missing，order=${String(order.order_no).slice(0, 8)}…）`,
+    // ⚠️ `shopCode` 必填：`webhook.deliver()` 按 `payload.shopCode` 查 `shop_webhook`（一行一店）；
+    // 缺了它投递会一次都不发就 resolve(false)，而日志写"未配置通知地址"（误导）。
+    send: () => notifyRaw('order.chain_missing', { ...data, shopCode: order.shop_code }),
   });
 }
 
 /**
  * 修复单个滞留订单（决策 + 落库 + 事件史 + 告警）。
  * 状态迁移与事件史同事务（与 watcher/sync 同原子形态：防进程中断后"状态变了但没人知道为什么"）。
+ * @param {object} row 读模型行（`v_orders`）：需 order_id / order_no / status / escrow_order_id /
+ *        paid_tx_hash / buyer / seller / amount_wei
  * @returns {Promise<'repaired'|'missing'|'none'|'skipped'>}（异常向上抛，由轮询逐行兜住）
  */
 export async function reconcileOrder(row) {
@@ -235,17 +289,17 @@ export async function reconcileOrder(row) {
   } catch (e) {
     // RPC 读取失败**不是**"链上没有"：本轮跳过，下一轮再试（绝不据此改状态）
     console.warn(
-      `[chainReconcile] 链上状态读取失败（order=${String(row.id).slice(0, 8)}…）：本轮跳过，下轮重试`,
+      `[chainReconcile] 链上状态读取失败（order=${String(row.order_no).slice(0, 8)}…）：本轮跳过，下轮重试`,
       e?.message || e
     );
     return 'skipped';
   }
-  // 防"诱饵单"（与 watcher/sync 同规则）：orderId 自草稿起公开，链上真值的买家/卖家/金额
-  // 必须与本行锁定值一致；不一致说明这是别人对同一 orderId 的单，不能据它改本地状态
+  // 防"诱饵单"（与 watcher/sync 同规则）：草稿的 orderId 对拿到详情链接的人可见，链上真值的
+  // 买家/卖家/金额必须与本行锁定值一致；不一致说明这是别人对同一 orderId 的单，不能据它改本地状态
   if (onchain && onchain.status && onchain.status !== 'None') {
     if (!chainParamsMatch(row, { buyer: onchain.buyer, seller: onchain.seller, amount: onchain.amount })) {
       console.warn(
-        `[chainReconcile] 跳过与链上真值不符的订单（order=${String(row.id).slice(0, 8)}…）：买家/卖家/金额与本地锁定不一致（疑似诱饵单）`
+        `[chainReconcile] 跳过与链上真值不符的订单（order=${String(row.order_no).slice(0, 8)}…）：买家/卖家/金额与本地锁定不一致（疑似诱饵单）`
       );
       return 'skipped';
     }
@@ -255,79 +309,99 @@ export async function reconcileOrder(row) {
     /* "这一轮不修"里有一类必须**说出来**：链上金额读不到 / 终态判不了（unreadable）。
        它不是"已一致"，静默跳过会让运维以为这一单被对账覆盖过了。 */
     if (plan.unreadable) {
-      console.warn(`[chainReconcile] 订单 ${String(row.id).slice(0, 8)}… 本轮无法判定终态：${plan.reason}`);
+      console.warn(`[chainReconcile] 订单 ${String(row.order_no).slice(0, 8)}… 本轮无法判定终态：${plan.reason}`);
     }
     return 'none';
   }
   if (plan.action === 'missing') {
     console.warn(
-      `[chainReconcile] 订单 ${String(row.id).slice(0, 8)}… 本地为 ${row.status} 且有支付凭证，链上却查不到该托管单——保留本地状态待人工核实（escrow=${String(row.escrow_order_id).slice(0, 18)}…）`
+      `[chainReconcile] 订单 ${String(row.order_no).slice(0, 8)}… 本地为 ${row.status} 且有支付凭证，链上却查不到该托管单——保留本地状态待人工核实（escrow=${String(row.escrow_order_id).slice(0, 18)}…）`
     );
-    alertOnce(row.id, 'order.chain_missing', {
-      orderId: row.id,
+    await alertChainMissingOnce(row, {
+      orderId: row.order_no,
       escrowOrderId: row.escrow_order_id || null,
       reason: plan.reason,
     });
     return 'missing';
   }
+  /*
+    补落支付凭证要的那次链上读（单块反查 OrderCreated 日志）**必须在事务之前**完成。
+
+    为什么：事务期间持有**行锁**（MySQL 里锁不是随连接走的，而是随事务到提交为止），
+    把 `await escrow.queryFilter(...)` 放进事务区段，就是让这几行在被锁住的同时等一次网络往返——
+    一次 RPC 抖动（默认重试 + 超时可达十几秒）会让**同一批行**上的所有写全部堵在那儿。
+    这是全仓唯一一处曾经把 RPC 放进事务的地方，2026-10 迁移时按同一条纪律搬了出来。
+    代价（如实写）：`restore` 分支的每一单都会先花掉一次只读 RPC，而其中一部分最终并不会恢复
+    （状态已被 watcher/别的路径改掉 ⇒ `restored = 0`）。这是刻意的方向：宁可多一次只读调用，
+    也不能把网络 I/O 放进持有行锁的区段。读失败只告警、不阻断恢复——凭证由下一次 /sync 或
+    watcher 重扫补上（凭证是发货闸的判据，缺它只是"暂时发不了货"，而状态不恢复是钱在链上、
+    本地却显示已取消）。
+  */
+  let paidTxHash = null;
+  if (plan.action === 'restore' && onchain?.createdAtBlock) {
+    try {
+      const escrow = getEscrow();
+      const logs = await escrow.queryFilter(
+        escrow.filters.OrderCreated(row.escrow_order_id),
+        onchain.createdAtBlock,
+        onchain.createdAtBlock
+      );
+      if (logs.length) paidTxHash = String(logs[0].transactionHash).toLowerCase();
+    } catch (e) {
+      console.warn(
+        `[chainReconcile] 恢复订单 ${String(row.order_no).slice(0, 8)}… 前补落支付凭证的链上读失败（不阻断恢复，下次 /sync 可补）：`,
+        e?.message || e
+      );
+    }
+  }
   let changed = 0;
-  txBegin();
-  try {
+  await withTransaction(async () => {
     if (plan.action === 'restore') {
       /*
         链上 Created + 本地 draft/cancelled：补回占位并置 escrowed（与 watcher 的
         「恢复已取消订单」同一形状）。占位恢复失败（= 取消期间限量库存已被别人买走）不改结果：
         链上资金真实存在，订单必须恢复，差额交店主人工核账扩容——所以只告警不中断。
-        补 paid_tx_hash：取消路径不允许带凭证取消，所以这里用链上创建块反查的凭证在后面
-        /sync 兜底补；此处先不编造哈希（宁可空着，也不写一个假凭证）。
+        补 paid_tx_hash：取消路径不允许带凭证取消，所以凭证由上面那次**事务外**的链上读带回；
+        读不到就先空着（宁可空着，也不写一个假凭证）。
       */
       if (plan.to !== undefined) throw new Error('restore 分支不应带 to');
-      const restored = db
-        .prepare(
-          "UPDATE orders SET status = 'escrowed', updated_at = ? WHERE escrow_order_id = ? AND status IN ('draft','cancelled')"
-        )
-        .run(Date.now(), row.escrow_order_id).changes;
+      const restored = (await db.run(
+        "UPDATE orders SET status = 'escrowed', updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status IN ('draft','cancelled')",
+        row.order_id
+      )).changes;
       if (restored > 0) {
-        if (!restockOrder(row.id)) {
+        if (!(await restockOrder(row.order_id))) {
           console.error(
-            `[chainReconcile] 恢复订单 ${String(row.id).slice(0, 8)}… 的库存占位失败（限量库存不足），请店主核账扩容`
+            `[chainReconcile] 恢复订单 ${String(row.order_no).slice(0, 8)}… 的库存占位失败（限量库存不足），请店主核账扩容`
           );
-          alertOnce(row.id, 'order.hold_missing', {
-            orderId: row.id,
-            escrowOrderId: row.escrow_order_id || null,
-            reason: '对账恢复订单时占位失败（取消期间限量库存已被他人买走）——请核对该商品余量并扩容或退款处理',
+          await alertOnceDelivered({
+            orderId: row.order_id,
+            kind: 'hold_missing',
+            label: '[chainReconcile]',
+            what: `（order.hold_missing，order=${String(row.order_no).slice(0, 8)}…，对账恢复时占位失败）`,
+            send: () =>
+              notifyRaw('order.hold_missing', {
+                orderId: row.order_no,
+                escrowOrderId: row.escrow_order_id || null,
+                reason: '对账恢复订单时占位失败（取消期间限量库存已被他人买走）——请核对该商品余量并扩容或退款处理',
+              }),
           });
         }
-        appendSyncMirrorEvent(row.id, 'escrowed', { block: onchain?.createdAtBlock || null });
+        await appendSyncMirrorEvent(row.order_id, 'escrowed', { block: onchain?.createdAtBlock || null });
         changed = restored;
         /*
           补落支付凭证：发货路径要求"有链上支付凭证"（空哈希拒发），所以恢复出来的单必须拿到哈希，
-          否则店主看着一张 `escrowed` 却发不了货。做法与 `/sync` **同一条**：按链上订单的创建块
-          单块反查 `OrderCreated` 日志，取规范交易哈希。RPC 异常不阻断恢复主流程
-          （状态已恢复=买家资金可被正确处理，凭证交给下一次 /sync 或 watcher 重扫补）。
-          先补哈希再回填退款标记：两者互不依赖，但哈希是发货闸的判据，失败面更小。
+          否则店主看着一张 `escrowed` 却发不了货。哈希来自**事务之前**那次单块反查（见上），
+          这里只做写入；条件 `paid_tx_hash IS NULL` 保证与 /sync、watcher 抢同一条记录时只写一次
+          （凭证列住在 `order_chain`，状态刚刚在同一事务里置成了 escrowed，所以不必再判状态）。
         */
-        if (onchain?.createdAtBlock) {
-          try {
-            const escrow = getEscrow();
-            const logs = await escrow.queryFilter(
-              escrow.filters.OrderCreated(row.escrow_order_id),
-              onchain.createdAtBlock,
-              onchain.createdAtBlock
-            );
-            if (logs.length) {
-              const txHash = String(logs[0].transactionHash).toLowerCase();
-              const wrote = db
-                .prepare("UPDATE orders SET paid_tx_hash = ? WHERE id = ? AND paid_tx_hash IS NULL AND status = 'escrowed'")
-                .run(txHash, row.id).changes;
-              if (wrote === 1) appendOrderCreatedEvent(row.id, { txHash, block: onchain.createdAtBlock });
-            }
-          } catch (e) {
-            console.warn(
-              `[chainReconcile] 恢复订单 ${String(row.id).slice(0, 8)}… 时补落支付凭证失败（不阻断恢复，下次 /sync 可补）：`,
-              e?.message || e
-            );
-          }
+        if (paidTxHash) {
+          const wrote = (await db.run(
+            'UPDATE order_chain SET paid_tx_hash = ? WHERE order_id = ? AND paid_tx_hash IS NULL',
+            paidTxHash,
+            row.order_id
+          )).changes;
+          if (wrote === 1) await appendOrderCreatedEvent(row.order_id, { txHash: paidTxHash, block: onchain.createdAtBlock });
         }
         /*
           退款冻结闸：链上 Created 态还要把 refundRequested/refundRejected 回填到本地镜像
@@ -337,34 +411,38 @@ export async function reconcileOrder(row) {
           店主看不到"买家已在链上冻结本单"，照常发货后同意退款 = 钱货两空。
           applyRefundFlags 是 /sync 用的同一实现（唯一实现）。
         */
-        applyRefundFlagsIfKnown(row.escrow_order_id, onchain);
+        await applyRefundFlagsIfKnown(row.escrow_order_id, onchain);
       }
     } else if (plan.to === 'disputed') {
       // 争议态同样要把退款冻结标记回填（链上 Disputed 之前必然经过 requestRefund/rejectRefund）
-      changed = markEscrowDisputed(db, row.escrow_order_id);
-      if (changed > 0) applyRefundFlagsIfKnown(row.escrow_order_id, onchain);
+      changed = await markEscrowDisputed(db, row.escrow_order_id);
+      if (changed > 0) await applyRefundFlagsIfKnown(row.escrow_order_id, onchain);
     } else {
       // 终局映射复用 watcher 的实现（唯一实现）：拆分结算走 settleByRefundSplit（内含
-      // refunded_amount_wei 落库与占位回补）
-      changed = settleByRefundSplit(db, row.escrow_order_id, plan.refundedAmountWei);
+      // 状态、refunded_amount_wei 与占位回补，两列分住 orders/order_chain，见那里的说明）
+      changed = await settleByRefundSplit(db, row.escrow_order_id, plan.refundedAmountWei);
     }
     if (changed > 0 && plan.action !== 'restore') {
       // `Sync:<状态>` 镜像（与 /sync 同一条）：UI 时间线上能看出"这一步不是链上事件推的，
       // 而是节点对账改的"，并附上链上创建块（getOrder 无事件块号，与 /sync 同款降级）
-      appendSyncMirrorEvent(row.id, plan.to, { block: onchain?.createdAtBlock || null });
+      await appendSyncMirrorEvent(row.order_id, plan.to, { block: onchain?.createdAtBlock || null });
     }
-    txCommit();
-  } catch (e) {
-    txRollback();
-    throw e;
-  }
+  });
   if (changed === 0) return 'none'; // 状态已被 watcher/其它路径修好（竞态）：无事可做
   const toLabel = plan.action === 'restore' ? 'escrowed' : plan.to;
   console.warn(
-    `[chainReconcile] 修复滞留订单 ${String(row.id).slice(0, 8)}…：${row.status} → ${toLabel}（${plan.reason}）`
+    `[chainReconcile] 修复滞留订单 ${String(row.order_no).slice(0, 8)}…：${row.status} → ${toLabel}（${plan.reason}）`
   );
-  alertOnce(row.id, 'order.chain_repaired', {
-    orderId: row.id,
+  /*
+    修复本身**不需要去重行**（见 alertChainMissingOnce 的说明）：修完之后这一行不再是候选，
+    同一条通知不会再产生。代价如实写：投递失败就是这一次通知丢了（状态已经修好，
+    没有"下一轮重试"的载体）——与旧形状一致（旧形状的 kv 标记同样只在投递成功后写，
+    而那时行也已不再是候选）。要它可重试就得给 `order_alerts.kind` 加取值，
+    而那会把"持续状态的待办"与"一次性回执"混进同一张表。
+  */
+  await notifyRaw('order.chain_repaired', {
+      shopCode: row.shop_code,
+    orderId: row.order_no,
     escrowOrderId: row.escrow_order_id || null,
     from: row.status,
     to: toLabel,
@@ -378,7 +456,8 @@ export async function reconcileOrder(row) {
  * 售后案件（确认收货后开的案）的对账复查——本模块的**第二路**候选，与上面那条候选面并列。
  *
  * 为什么必须单独一路：主对账的候选是"**非终态**订单"（`NON_TERMINAL`，靠链上终局把它们推平），
- * 而售后案件按定义只存在于**终局**单上（合约要求 chain status == Settled，本地 confirmed/settled/expired）。
+ * 而售后案件按定义只存在于**终局**单上（链上要求 Settled + buyerConfirmed + refundedAmount == 0；
+ * 本地候选面是 confirmed/settled/expired 的**超集**，最终由链上 afterSaleOpen 回答，见 afterSale.js）。
  * 主对账永远碰不到它们，于是事件漏扫时会出现两种静默分叉：
  *   · 链上有案件、本地 `none` ⇒ 仲裁台队列看不见这一单、售后陈述被门控拒掉、退货单建不了
  *     （买家的救济路径整条失效，且没有任何告警）；
@@ -420,7 +499,7 @@ export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_S
     } catch (e) {
       // 读不到**不是**"没有案件"：本轮跳过，下一轮再试（与主对账同口径，绝不据此改状态）
       console.warn(
-        `[chainReconcile] 售后案件链上读取失败（order=${String(row.id).slice(0, 8)}…）：本轮跳过，下轮重试`,
+        `[chainReconcile] 售后案件链上读取失败（order=${String(row.order_no).slice(0, 8)}…）：本轮跳过，下轮重试`,
         e?.message || e
       );
       skippedRows += 1;
@@ -433,7 +512,7 @@ export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_S
     */
     if (String(truth.status || 'None') === 'None') {
       console.warn(
-        `[chainReconcile] 售后案件跳过：链上查不到该托管单（order=${String(row.id).slice(0, 8)}…）——疑似 RPC/合约配置异常，需人工核实`
+        `[chainReconcile] 售后案件跳过：链上查不到该托管单（order=${String(row.order_no).slice(0, 8)}…）——疑似 RPC/合约配置异常，需人工核实`
       );
       skippedRows += 1;
       return;
@@ -442,36 +521,36 @@ export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_S
     // 只在"链上已结案而本地仍 open"或"链上有案件而本地非 open"两种分歧下动手；
     // 一致（都开/都没开）时不写库——避免每轮复查都把行改一遍（噪音写 + 无意义的告警）
     if (!!truth.open === localOpen) return;
-    const local = db.prepare('SELECT id, buyer, seller, amount_wei FROM orders WHERE id = ?').get(row.id);
-    if (!local || !chainParamsMatch(local, truth)) {
+    /*
+      防诱饵单：比对照旧要本行的 buyer/seller/amount_wei（它们在 orders 上），
+      所以按内部键补读一次——候选查询是从读模型取的，能直接带上就带上（见下面的 SELECT）。
+    */
+    if (!chainParamsMatch(row, truth)) {
       console.warn(
-        `[chainReconcile] 跳过与链上真值不符的售后案件（order=${String(row.id).slice(0, 8)}…）：买家/卖家/金额与本地锁定不一致（疑似诱饵单）`
+        `[chainReconcile] 跳过与链上真值不符的售后案件（order=${String(row.order_no).slice(0, 8)}…）：买家/卖家/金额与本地锁定不一致（疑似诱饵单）`
       );
       skippedRows += 1;
       return;
     }
     let changed = 0;
-    txBegin();
-    try {
-      changed = applyAfterSaleFromChain(row.escrow_order_id, truth).changed;
+    await withTransaction(async () => {
+      changed = (await applyAfterSaleFromChain(row.escrow_order_id, truth)).changed;
       if (changed > 0) {
         // 与 /sync 同一条镜像形状：UI 时间线上能看出"这一步不是链上事件推的，而是节点对账改的"
-        appendSyncMirrorEvent(row.id, truth.open ? 'after_sale_open' : 'after_sale_close', {
+        await appendSyncMirrorEvent(row.order_id, truth.open ? 'after_sale_open' : 'after_sale_close', {
           block: truth.openedAtBlock || null,
         });
       }
-      txCommit();
-    } catch (e) {
-      txRollback();
-      throw e;
-    }
+    });
     if (changed === 0) return;
     repaired += 1;
     console.warn(
-      `[chainReconcile] 售后案件对账回填 ${String(row.id).slice(0, 8)}…：after_sale ${row.after_sale_status} → ${truth.open ? 'open' : 'closed'}（事件漏扫兜底）`
+      `[chainReconcile] 售后案件对账回填 ${String(row.order_no).slice(0, 8)}…：after_sale ${row.after_sale_status} → ${truth.open ? 'open' : 'closed'}（事件漏扫兜底）`
     );
-    alertOnce(row.id, 'order.after_sale_repaired', {
-      orderId: row.id,
+    // 同上：一次性回执，不需要去重行（`order_alerts.kind` 也没有它的取值）
+    await notifyRaw('order.after_sale_repaired', {
+      shopCode: row.shop_code,
+      orderId: row.order_no,
       escrowOrderId: row.escrow_order_id || null,
       afterSale: truth.open ? 'open' : 'closed',
       afterSaleOpenedBlock: truth.openedAtBlock || null,
@@ -480,61 +559,54 @@ export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_S
   };
 
   // ① 在途案件复核（最旧的先查：等待最久的案件最可能因停机漏掉了结案事件）
-  const openRows = db
-    .prepare(
-      `SELECT id, status, escrow_order_id, after_sale_status, after_sale_opened_at
-         FROM orders WHERE ${AFTER_SALE_OPEN_SQL} AND escrow_order_id IS NOT NULL
-        ORDER BY after_sale_opened_at ASC LIMIT ?`
-    )
-    .all(batch);
+  const openRows = await db.all(`SELECT o.order_id, o.order_no, o.status, o.escrow_order_id, o.after_sale_status,
+              o.after_sale_opened_at, o.buyer, o.seller, o.shop_code, o.amount_wei
+         FROM v_orders o WHERE ${AFTER_SALE_OPEN_SQL} AND o.escrow_order_id IS NOT NULL
+        ORDER BY o.after_sale_opened_at ASC LIMIT ?`, batch);
   for (const row of openRows) {
     scanned += 1;
     try {
       await checkRow(row);
     } catch (e) {
       failed += 1;
-      console.error(`[chainReconcile] 售后案件复查异常（order=${String(row.id).slice(0, 8)}…，下轮重试）:`, e?.message || e);
+      console.error(`[chainReconcile] 售后案件复查异常（order=${String(row.order_no).slice(0, 8)}…，下轮重试）:`, e?.message || e);
     }
   }
 
   // ② 漏扫开案扫描（终局成交单 + 游标轮转；见上方成本说明）
-  const cutoff = now - AFTER_SALE_SCAN_MS;
-  const readCursor = () => {
-    try {
-      const v = JSON.parse(kvGet(AFTER_SALE_CURSOR_KEY, '') || 'null');
-      if (v && Number.isFinite(Number(v.ts)) && typeof v.id === 'string') return { ts: Number(v.ts), id: v.id };
-    } catch {
-      /* 游标损坏：当作没有游标（从头开始），不影响正确性 */
-    }
-    return null;
-  };
-  const pick = (cursor, limit) => {
-    const after = cursor ? ' AND (updated_at > ? OR (updated_at = ? AND id > ?))' : '';
-    const tail = cursor ? [cursor.ts, cursor.ts, cursor.id] : [];
-    return db
-      .prepare(
-        `SELECT id, status, escrow_order_id, after_sale_status, updated_at
-           FROM orders
-          WHERE status IN ${sqlIn(AFTER_SALE_ELIGIBLE_STATUS)}
-            AND escrow_order_id IS NOT NULL
+  const cutoff = new Date(now - AFTER_SALE_SCAN_MS);
+  const node = await nodeRow();
+  if (!node) throw new Error('chainReconcile: node 单例行（id=1）不存在——对账游标没有地方记账（行由 db.js 的 initDb() 建立）');
+  const cursor = cursorOf({ at: node.reconcile_after_sale_at, id: node.reconcile_after_sale_order_id });
+  /*
+    候选读走读模型：`AFTER_SALE_ELIGIBLE_STATUS` 与两个谓词常量都**不带别名**，正是为它写的
+    （`AFTER_SALE_NOT_OPEN_SQL` 里的 `IS NULL` 分支只在 LEFT JOIN 出的空镜像行上成立）。
+    `o.order_id` 既是对账要用的内部键，也是下面回写进子表/事件史的那个键。
+  */
+  const pick = async (cur, limit) => {
+    const after = cur ? ' AND (o.updated_at > ? OR (o.updated_at = ? AND o.order_id > ?))' : '';
+    const tail = cur ? [cur.at, cur.at, cur.id] : [];
+    return await db.all(`SELECT o.order_id, o.order_no, o.status, o.escrow_order_id, o.after_sale_status,
+              o.after_sale_opened_at, o.buyer, o.seller, o.shop_code, o.amount_wei, o.updated_at
+           FROM v_orders o
+          WHERE o.status IN ${sqlIn(AFTER_SALE_ELIGIBLE_STATUS)}
+            AND o.escrow_order_id IS NOT NULL
             AND ${AFTER_SALE_NOT_OPEN_SQL}
-            AND updated_at >= ?${after}
-          ORDER BY updated_at ASC, id ASC LIMIT ?`
-      )
-      .all(cutoff, ...tail, limit);
+            AND o.updated_at >= ?${after}
+          ORDER BY o.updated_at ASC, o.order_id ASC LIMIT ?`, cutoff, ...tail, limit);
   };
-  let cursor = readCursor();
-  let rows = pick(cursor, batch);
+  let rows = await pick(cursor, batch);
   let wrapped = false;
   if (!rows.length && cursor) {
-    cursor = null; // 游标已到候选集末尾：回绕到开头（与主对账同款）
     wrapped = true;
-    rows = pick(null, batch);
+    rows = await pick(null, batch); // 游标已到候选集末尾：回绕到开头（与主对账同款）
   }
-  if (rows.length && (rows.length < batch || wrapped)) kvSet(AFTER_SALE_CURSOR_KEY, '');
-  else if (rows.length) {
+  if (rows.length && (rows.length < batch || wrapped)) {
+    // 取不满一批（或刚回绕过）⇒ 本轮已覆盖到候选集末尾：清空游标，下轮从最旧的开始
+    await setAfterSaleCursor(null, null);
+  } else if (rows.length) {
     const last = rows[rows.length - 1];
-    kvSet(AFTER_SALE_CURSOR_KEY, JSON.stringify({ ts: Number(last.updated_at), id: String(last.id) }));
+    await setAfterSaleCursor(last.updated_at, last.order_id);
   }
   for (const row of rows) {
     scanned += 1;
@@ -542,7 +614,7 @@ export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_S
       await checkRow(row);
     } catch (e) {
       failed += 1;
-      console.error(`[chainReconcile] 售后案件扫描异常（order=${String(row.id).slice(0, 8)}…，下轮重试）:`, e?.message || e);
+      console.error(`[chainReconcile] 售后案件扫描异常（order=${String(row.order_no).slice(0, 8)}…，下轮重试）:`, e?.message || e);
     }
   }
   return { scanned, repaired, skippedRows, failed };
@@ -562,54 +634,46 @@ export async function reconcileChainOnce({ now = Date.now(), minAgeMs = MIN_AGE_
     return { skipped: true, reason: 'MK_ESCROW_ADDRESS 未配置' };
   }
   const db = getDb();
-  const cutoff = now - minAgeMs;
+  const cutoff = new Date(now - minAgeMs);
   const marks = NON_TERMINAL.map(() => '?').join(',');
   /*
     候选：本地非终态 + 有链上单号 + 静置超过阈值（刚动过的单由 watcher/paid 主路径处理），
     按 (updated_at, id) 升序 —— 滞留最久的先复查。
-    游标（kv，不进 orders 表）：候选集里**总会**有一批"正常但在途"的单（例如买家迟迟不确认收货、
-    等链上超时释放，几天都停在 escrowed）。若每轮都从最旧的一批重新取 LIMIT batch，这批行会永远
-    占满批量，后面的滞留单永远复查不到（对账等于失效）。也不能拿 orders.updated_at 当轮转锚点：
-    那一列是**入账时刻**（收款流水/看板/CSV 导出按它归属）与争议起始时刻（仲裁列表 disputedAt）
-    的口径，为了轮转去改它等于篡改账目时间。故游标单独存 kv，只表示"上一轮复查到哪儿"；
-    一轮取不满一批说明已到候选集末尾 → 下轮回绕到开头，保证没有订单被永久跳过。
+    游标存在 `node` 单行上（**不在 orders 表里**）：候选集里**总会**有一批"正常但在途"的单
+    （例如买家迟迟不确认收货、等链上超时释放，几天都停在 escrowed）。若每轮都从最旧的一批
+    重新取 LIMIT batch，这批行会永远占满批量，后面的滞留单永远复查不到（对账等于失效）。
+    也不能拿 orders.updated_at 当轮转锚点：那一列是**入账时刻**（收款流水/看板/CSV 导出按它归属）
+    与争议起始时刻（仲裁列表 disputedAt）的口径，为了轮转去改它等于篡改账目时间。
+    故游标单独存，只表示"上一轮复查到哪儿"；一轮取不满一批说明已到候选集末尾 → 下轮回绕到开头，
+    保证没有订单被永久跳过。
+    候选读走读模型 `v_orders`：`escrow_order_id` / `paid_tx_hash` 住在 `order_chain`（链上镜像，
+    watcher 独占写），buyer/seller/amount_wei 仍在 `orders` 上——视图一次给全。
   */
-  const readCursor = () => {
-    try {
-      const v = JSON.parse(kvGet(CURSOR_KEY, '') || 'null');
-      if (v && Number.isFinite(Number(v.ts)) && typeof v.id === 'string') return { ts: Number(v.ts), id: v.id };
-    } catch {
-      /* 游标损坏：当作没有游标（从头开始），不影响正确性 */
-    }
-    return null;
+  const node = await nodeRow();
+  if (!node) throw new Error('chainReconcile: node 单例行（id=1）不存在——对账游标没有地方记账（行由 db.js 的 initDb() 建立）');
+  const cursor = cursorOf({ at: node.reconcile_at, id: node.reconcile_order_id });
+  const pick = async (cur, limit) => {
+    const after = cur ? ' AND (o.updated_at > ? OR (o.updated_at = ? AND o.order_id > ?))' : '';
+    const tail = cur ? [cur.at, cur.at, cur.id] : [];
+    return await db.all(`SELECT o.order_id, o.order_no, o.status, o.escrow_order_id, o.paid_tx_hash,
+              o.buyer, o.seller, o.shop_code, o.amount_wei, o.updated_at
+           FROM v_orders o
+          WHERE o.status IN (${marks}) AND o.escrow_order_id IS NOT NULL AND o.updated_at <= ?${after}
+          ORDER BY o.updated_at ASC, o.order_id ASC LIMIT ?`, ...NON_TERMINAL, cutoff, ...tail, limit);
   };
-  const pick = (cursor, limit) => {
-    const after = cursor ? ' AND (updated_at > ? OR (updated_at = ? AND id > ?))' : '';
-    const tail = cursor ? [cursor.ts, cursor.ts, cursor.id] : [];
-    return db
-      .prepare(
-        `SELECT id, status, escrow_order_id, paid_tx_hash, buyer, seller, amount_wei, updated_at
-           FROM orders
-          WHERE status IN (${marks}) AND escrow_order_id IS NOT NULL AND updated_at <= ?${after}
-          ORDER BY updated_at ASC, id ASC LIMIT ?`
-      )
-      .all(...NON_TERMINAL, cutoff, ...tail, limit);
-  };
-  let cursor = readCursor();
-  let rows = pick(cursor, batch);
+  let rows = await pick(cursor, batch);
   let wrapped = false;
   if (!rows.length && cursor) {
     // 游标已到候选集末尾：回绕到开头（本轮从头复查，下一轮继续往后推进）
-    cursor = null;
     wrapped = true;
-    rows = pick(null, batch);
+    rows = await pick(null, batch);
   }
   if (rows.length && (rows.length < batch || wrapped)) {
     // 取不满一批（或刚回绕过）⇒ 本轮已覆盖到候选集末尾：清空游标，下轮从最旧的开始
-    kvSet(CURSOR_KEY, '');
+    await setReconcileCursor(null, null);
   } else if (rows.length) {
     const last = rows[rows.length - 1];
-    kvSet(CURSOR_KEY, JSON.stringify({ ts: Number(last.updated_at), id: String(last.id) }));
+    await setReconcileCursor(last.updated_at, last.order_id);
   }
   let repaired = 0;
   let missing = 0;
@@ -624,7 +688,7 @@ export async function reconcileChainOnce({ now = Date.now(), minAgeMs = MIN_AGE_
     } catch (e) {
       // 单行异常不打断整轮（其余滞留单仍应被修复）；游标已越过该行，下轮/回绕后重试（修复幂等）
       failed += 1;
-      console.error(`[chainReconcile] 订单 ${String(row.id).slice(0, 8)}… 对账异常（下轮重试）:`, e?.message || e);
+      console.error(`[chainReconcile] 订单 ${String(row.order_no).slice(0, 8)}… 对账异常（下轮重试）:`, e?.message || e);
     }
   }
   if (rows.length && (repaired || missing || failed)) {

@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -21,7 +21,7 @@ async function listDigital(overrides = {}) {
   const ownerLogin = await login(ctx, owner);
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload(overrides))
     .expect(200);
   assertOk(res);
@@ -33,13 +33,13 @@ async function escrowedOrder(slug, who = buyer.address) {
   const ownerLogin = await login(ctx, owner);
   const res = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, buyer: who })
     .expect(200);
   assertOk(res);
   const oid = res.body.data.id;
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run(payHash(), Date.now(), oid);
+  await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), oid);
+  await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', payHash(), oid);
   return oid;
 }
 
@@ -55,7 +55,7 @@ test('码池读写鉴权：未登录 401，普通买家 403', async () => {
   await request(app).get(`/api/products/${slug}/codes`).expect(401);
   await request(app)
     .post(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: ['X1'] })
     .expect(403);
   await request(app).delete(`/api/products/${slug}/codes/1`).expect(401);
@@ -65,20 +65,20 @@ test('导入校验：physical 商品拒绝、非法入参拒绝', async () => {
   const { ownerToken, slug: physSlug } = await listDigital({ kind: 'physical', priceUsdtMicro: 1_000_000 });
   const onPhys = await request(app)
     .post(`/api/products/${physSlug}/codes`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: ['X1'] })
     .expect(200);
   assert.notEqual(onPhys.body.code, 0);
 
   const noArr = await request(app)
     .post(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: 'X1' })
     .expect(200);
   assert.notEqual(noArr.body.code, 0);
   const empty = await request(app)
     .post(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: [] })
     .expect(200);
   assert.notEqual(empty.body.code, 0);
@@ -90,7 +90,7 @@ test('导入码池：去空白/去重/超长过滤，返回统计', async () => 
   const ownerLogin = await login(ctx, owner);
   const res = await request(app)
     .post(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: [' ABC-001 ', 'ABC-002', 'ABC-002', '', '   ', 'A'.repeat(300)] })
     .expect(200);
   assertOk(res);
@@ -101,7 +101,7 @@ test('导入码池：去空白/去重/超长过滤，返回统计', async () => 
   // 重复再导：全部跳过
   const dup = await request(app)
     .post(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: ['ABC-001', 'ABC-002'] })
     .expect(200);
   assertOk(dup);
@@ -113,7 +113,7 @@ test('查看码池：默认未用列表，all 含已用', async () => {
   const ownerLogin = await login(ctx, owner);
   const view = await request(app)
     .get(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(view);
   assert.equal(view.body.data.stats.unused, 2);
@@ -138,7 +138,7 @@ test('码池分配：在途需求占用池额度（并发草稿不得超卖）�
 
   const oversell = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, buyer: buyer3.address })
     .expect(200);
   assert.notEqual(oversell.body.code, 0, '未被在途订单占用的额度已用尽，新单应被拒（防付款后无码可发）');
@@ -146,7 +146,7 @@ test('码池分配：在途需求占用池额度（并发草稿不得超卖）�
 
   const s1 = await request(app)
     .post(`/api/orders/${o1}/ship`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({})
     .expect(200);
   assertOk(s1);
@@ -157,7 +157,7 @@ test('码池分配：在途需求占用池额度（并发草稿不得超卖）�
 
   const s2 = await request(app)
     .post(`/api/orders/${o2}/ship`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({})
     .expect(200);
   assertOk(s2);
@@ -166,7 +166,7 @@ test('码池分配：在途需求占用池额度（并发草稿不得超卖）�
   // 池已耗尽（unused=0）：新订单创建被拒（视为售罄，防付款后无码可发）
   const blocked = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, buyer: buyer.address })
     .expect(200);
   assert.notEqual(blocked.body.code, 0, '码池已兑完应拒绝新单');
@@ -179,32 +179,32 @@ test('码池分配：在途需求占用池额度（并发草稿不得超卖）�
   */
   const add = await request(app)
     .post(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: ['TMP-MANUAL'] })
     .expect(200);
   assertOk(add);
   const o3 = await escrowedOrder(slug, buyer3.address);
   const list = await request(app)
     .get(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   const tmpCodeId = list.body.data.codes.find((c) => c.code === 'TMP-MANUAL').id;
   const del = await request(app)
     .delete(`/api/products/${slug}/codes/${tmpCodeId}`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(del);
 
   const s3 = await request(app)
     .post(`/api/orders/${o3}/ship`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({})
     .expect(200);
   assert.notEqual(s3.body.code, 0, '码池空应拒绝自动分配');
   assert.match(s3.body.message, /未用码不足/);
   const manual = await request(app)
     .post(`/api/orders/${o3}/ship`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ deliveryCode: 'MANUAL-KEY-1' })
     .expect(200);
   assertOk(manual);
@@ -216,7 +216,7 @@ test('码池查看：已分配码标记 used 并记录订单号；未登录探�
   const ownerLogin = await login(ctx, owner);
   const view = await request(app)
     .get(`/api/products/${slug}/codes?status=all`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(view);
   assert.deepEqual(view.body.data.stats, { total: 2, unused: 0, used: 2 });
@@ -229,7 +229,7 @@ test('码池查看：已分配码标记 used 并记录订单号；未登录探�
   const buyerLogin = await login(ctx, buyer);
   await request(app)
     .get(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(403);
 });
 
@@ -239,27 +239,27 @@ test('买家订单：shipped 后凭登录令牌可见码，refunded 后码隐藏
   const buyerLogin = await login(ctx, buyer);
   const shipped = await request(app)
     .get(`/api/orders?address=${buyer.address}&status=shipped`)
-    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(shipped);
   const mine = shipped.body.data.orders.find((o) => o.id === poolOrderId);
   assert.ok(mine, '发货单应在买家列表');
   assert.ok(mine.deliveries.length > 0, '买家本人登录应可见交付码');
-  assert.ok(mine.deliveredAt > 0);
+  assert.ok(!Number.isNaN(Date.parse(mine.deliveredAt)), '交付时刻是 ISO-8601 时刻');
 
   // 买家确认收货（模拟 watcher ReceiptConfirmed）后码仍可见
-  db.prepare("UPDATE orders SET status = 'confirmed', updated_at = ? WHERE id = ?").run(Date.now(), poolOrderId);
+  await db.run("UPDATE orders SET status = 'confirmed', updated_at = ? WHERE order_no = ?", new Date(new Date()), poolOrderId);
   const confirmed = await request(app)
     .get(`/api/orders/${poolOrderId}`)
-    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(confirmed.body.data.deliveries[0].value, mine.deliveries[0].value);
 
   // 退款后码对买家隐藏（码已随交付发放，业务上由卖家自行追索/作废）
-  db.prepare("UPDATE orders SET status = 'refunded', updated_at = ? WHERE id = ?").run(Date.now(), poolOrderId);
+  await db.run("UPDATE orders SET status = 'refunded', updated_at = ? WHERE order_no = ?", new Date(new Date()), poolOrderId);
   const refunded = await request(app)
     .get(`/api/orders/${poolOrderId}`)
-    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.deepEqual(refunded.body.data.deliveries, [], '退款后买家不应再看到交付码');
 
@@ -267,7 +267,7 @@ test('买家订单：shipped 后凭登录令牌可见码，refunded 后码隐藏
   const ownerLogin = await login(ctx, owner);
   const ownerView = await request(app)
     .get(`/api/orders/${poolOrderId}`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(ownerView.body.data.deliveries[0].value, mine.deliveries[0].value, '店主详情应始终可见码');
 });
@@ -279,18 +279,18 @@ test('删除未用码成功、已用码拒绝；码池删空后新单回到手�
   // 补充一个未用码后删除它
   const add = await request(app)
     .post(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: ['TMP-DEL'] })
     .expect(200);
   assertOk(add);
   const list = await request(app)
     .get(`/api/products/${slug}/codes`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   const tmpId = list.body.data.codes.find((c) => c.code === 'TMP-DEL').id;
   const del = await request(app)
     .delete(`/api/products/${slug}/codes/${tmpId}`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(del);
   assert.deepEqual(del.body.data.stats, { total: 2, unused: 0, used: 2 });
@@ -298,12 +298,12 @@ test('删除未用码成功、已用码拒绝；码池删空后新单回到手�
   // 已用码不可删
   const usedView = await request(app)
     .get(`/api/products/${slug}/codes?status=used`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   const usedId = usedView.body.data.codes[0].id;
   const delUsed = await request(app)
     .delete(`/api/products/${slug}/codes/${usedId}`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.notEqual(delUsed.body.code, 0);
 });
@@ -314,7 +314,7 @@ test('实物订单发货写 trackingNo 且不受码池逻辑影响', async () =>
   const oid = await escrowedOrder(created.slug);
   const ship = await request(app)
     .post(`/api/orders/${oid}/ship`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ trackingNo: 'YT-998877' })
     .expect(200);
   assertOk(ship);

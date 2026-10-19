@@ -6,7 +6,7 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -24,7 +24,7 @@ before(async () => {
 });
 
 async function listProduct(payload) {
-  const res = await request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).send(payload).expect(200);
+  const res = await request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).send(payload).expect(200);
   assertOk(res);
   return res.body.data;
 }
@@ -32,7 +32,7 @@ async function listProduct(payload) {
 async function createDraft(productSlug, who = buyer.address, token = buyerToken) {
   const res = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${token}`)
+    .set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug, buyer: who })
     .expect(200);
   assertOk(res);
@@ -40,13 +40,13 @@ async function createDraft(productSlug, who = buyer.address, token = buyerToken)
 }
 
 /** 直接把草稿置为成交终局（模拟 watcher 迁移；updated_at=终局时刻） */
-function settleConfirmed(orderId, at = Date.now()) {
-  db.prepare("UPDATE orders SET status = 'confirmed', updated_at = ? WHERE id = ?").run(at, orderId);
+async function settleConfirmed(orderId, at = Date.now()) {
+  await db.run("UPDATE orders SET status = 'confirmed', updated_at = ? WHERE order_no = ?", new Date(at), orderId);
 }
 
 async function postReview(orderId, body, token) {
   const req = request(app).post(`/api/orders/${orderId}/review`);
-  if (token) req.set('Authorization', `Bearer ${token}`);
+  if (token) req.set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value);
   return req.send(body);
 }
 
@@ -61,7 +61,7 @@ test('成交订单买家可评价（一单一评）；非成交/他人/重复均
   assert.match(r.body.message || '', /不可评价/);
 
   // 成交后可评
-  settleConfirmed(o.id);
+  await settleConfirmed(o.id);
   r = await postReview(o.id, { rating: 5, content: '很好，卡密秒到' }, buyerToken);
   assertOk(r);
   assert.equal(r.body.data.rating, 5);
@@ -73,7 +73,7 @@ test('成交订单买家可评价（一单一评）；非成交/他人/重复均
 
   // 他人/匿名拒绝
   const o2 = await createDraft(slug);
-  settleConfirmed(o2.id);
+  await settleConfirmed(o2.id);
   const byStranger = await postReview(o2.id, { rating: 5 }, strangerToken);
   assert.notEqual(byStranger.body.code, 0);
   const anon = await postReview(o2.id, { rating: 5 });
@@ -83,18 +83,18 @@ test('成交订单买家可评价（一单一评）；非成交/他人/重复均
 test('退款/取消订单不可评；TTL 过期拒绝；rating/content 边界', async () => {
   const p = await listProduct(productPayload({ title: '评价边界商品' }));
   const refunded = await createDraft(p.slug);
-  db.prepare("UPDATE orders SET status = 'refunded', updated_at = ? WHERE id = ?").run(Date.now(), refunded.id);
+  await db.run("UPDATE orders SET status = 'refunded', updated_at = ? WHERE order_no = ?", new Date(new Date()), refunded.id);
   const r1 = await postReview(refunded.id, { rating: 5 }, buyerToken);
   assert.notEqual(r1.body.code, 0);
 
   const expired = await createDraft(p.slug);
-  settleConfirmed(expired.id, Date.now() - 31 * 24 * 3600_000); // 超 TTL（默认 30 天）
+  await settleConfirmed(expired.id, Date.now() - 31 * 24 * 3600_000); // 超 TTL（默认 30 天）
   const r2 = await postReview(expired.id, { rating: 5 }, buyerToken);
   assert.notEqual(r2.body.code, 0);
   assert.match(r2.body.message || '', /期限/);
 
   const bad = await createDraft(p.slug);
-  settleConfirmed(bad.id);
+  await settleConfirmed(bad.id);
   assert.notEqual((await postReview(bad.id, { rating: 0 }, buyerToken)).body.code, 0);
   assert.notEqual((await postReview(bad.id, { rating: 6 }, buyerToken)).body.code, 0);
   assert.notEqual((await postReview(bad.id, { rating: 5, content: 'x'.repeat(1001) }, buyerToken)).body.code, 0);
@@ -105,8 +105,8 @@ test('店主单次回复；订单对象 review 字段（rated/reviewable）', as
   const o = await createDraft(p.slug);
 
   // 未评时详情 review.rated=false 且成交后 reviewable=true
-  settleConfirmed(o.id);
-  const detail = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).expect(200);
+  await settleConfirmed(o.id);
+  const detail = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.equal(detail.body.data.review.rated, false);
   assert.equal(detail.body.data.review.reviewable, true);
 
@@ -115,28 +115,28 @@ test('店主单次回复；订单对象 review 字段（rated/reviewable）', as
   // 非店主不可回复
   const no = await request(app)
     .post(`/api/orders/${o.id}/review/reply`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ content: '买家自回' })
     .expect(403);
   assert.ok(no);
   // 店主回复一次
   const rep = await request(app)
     .post(`/api/orders/${o.id}/review/reply`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ content: '感谢支持' })
     .expect(200);
   assertOk(rep);
   // 二次回复拒绝
   const rep2 = await request(app)
     .post(`/api/orders/${o.id}/review/reply`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ content: '再回一次' })
     .expect(200);
   assert.notEqual(rep2.body.code, 0);
   assert.match(rep2.body.message || '', /已回复/);
 
   // 详情 review 带内容与回复
-  const after = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).expect(200);
+  const after = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.equal(after.body.data.review.rated, true);
   assert.equal(after.body.data.review.rating, 4);
   assert.equal(after.body.data.review.reply, '感谢支持');
@@ -147,7 +147,7 @@ test('商品评价列表聚合（count/avg/dist）与匿名短地址；详情带
   const ratings = [5, 5, 3];
   for (const rating of ratings) {
     const o = await createDraft(p.slug);
-    settleConfirmed(o.id);
+    await settleConfirmed(o.id);
     await postReview(o.id, { rating, content: `评价 ${rating} 星` }, buyerToken);
   }
   const list = await request(app).get(`/api/products/${p.slug}/reviews?pageSize=10`).expect(200);

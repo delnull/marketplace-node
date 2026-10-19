@@ -7,14 +7,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { assertOk, login, makeCtx, productPayload } from './setup.mjs';
+import { assertOk, login, makeCtx, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner } = ctx;
 const ownerToken = (await login(ctx, owner)).token;
 
 const post = (body) =>
-  request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).send(body);
+  request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).send(body);
 
 /** 颜色 × 尺寸 = 4 个组合 */
 const SPECS = [
@@ -28,19 +28,15 @@ const SKUS = [
   { key: '白|80', priceUsdtMicro: 130_000_000, capacity: 1 },
 ];
 
-const skuRow = (slug, key) =>
-  db
-    .prepare(
-      'SELECT s.* FROM product_skus s JOIN products p ON p.id = s.product_id WHERE p.slug = ? AND s.sku_key = ?'
-    )
-    .get(slug, key);
+const skuRow = async (slug, key) =>
+  await db.get('SELECT s.* FROM product_skus s JOIN products p ON p.id = s.product_id WHERE p.slug = ? AND s.sku_key = ?', slug, key);
 
 /** 新买家下单（每次独立钱包，避免草稿上限互相干扰） */
 async function draftAs(who, slug, skuKey) {
   const token = (await login(ctx, who)).token;
   const body = { productSlug: slug };
   if (skuKey !== undefined) body.skuKey = skuKey;
-  return request(app).post('/api/orders').set('Authorization', `Bearer ${token}`).send(body);
+  return request(app).post('/api/orders').set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value).send(body);
 }
 const newBuyer = () => Wallet.createRandom();
 
@@ -58,8 +54,8 @@ test('规格组合：笛卡尔积落库，key 按 specs 声明顺序拼接', asy
   const p = res.body.data;
   assert.deepEqual([...p.skus.map((s) => s.key)].sort(), ['白|65', '白|80', '黑|65', '黑|80'].sort(), '2×2 = 4 个组合，按 key 升序');
   assert.deepEqual(p.specs, SPECS);
-  assert.equal(skuRow(p.slug, '黑|65').price_usdt_micro, 100_000_000, '逐组合定价落库（微 USDT）');
-  assert.deepEqual(JSON.parse(skuRow(p.slug, '黑|65').specs_json), { 颜色: '黑', 尺寸: '65' });
+  assert.equal((await skuRow(p.slug, '黑|65')).price_usdt_micro, 100_000_000, '逐组合定价落库（微 USDT）');
+  assert.deepEqual((await skuRow(p.slug, '黑|65')).specs_json, { 颜色: '黑', 尺寸: '65' });
 });
 
 test('SKU 必须恰好覆盖全部组合：少一个 / 多一个 / 键不属于规格 都拒绝', async () => {
@@ -122,9 +118,9 @@ test('按所选 SKU 定价：不同组合不同价，与商品级「起价」无
   assert.equal(a.usdtMicro, 100_000_000, '黑|65 单价 100 USDT');
   // 期望 wei 取自节点自己的折算函数（兜底汇率 1 BTY = 0.1 USDT，向上取整）
   assert.equal(a.amountWei, await expectWei(a.usdtMicro), '按 SKU 单价折算 wei');
-  const frozen = db.prepare('SELECT sku_key, sku_specs FROM orders WHERE id = ?').get(a.id);
+  const frozen = await db.get('SELECT sku_key, sku_specs FROM v_orders WHERE order_no = ?', a.id);
   assert.equal(frozen.sku_key, '黑|65', '订单记录所选组合');
-  assert.deepEqual(JSON.parse(frozen.sku_specs), { 颜色: '黑', 尺寸: '65' }, '订单冻结所选规格');
+  assert.deepEqual(frozen.sku_specs, { 颜色: '黑', 尺寸: '65' }, '订单冻结所选规格');
 
   const b = (await draftAs(newBuyer(), p.slug, '白|80')).body.data;
   assert.equal(b.usdtMicro, 130_000_000, '白|80 单价 130 USDT');
@@ -146,7 +142,7 @@ test('多规格商品必须指定 skuKey；单组合商品可省略', async () =
   const auto = await draftAs(newBuyer(), single.slug);
   assertOk(auto);
   assert.equal(
-    db.prepare('SELECT sku_key FROM orders WHERE id = ?').get(auto.body.data.id).sku_key,
+    (await db.get('SELECT sku_key FROM v_orders WHERE order_no = ?', auto.body.data.id)).sku_key,
     '',
     '单组合自动选中，落库为空串'
   );
@@ -160,7 +156,7 @@ test('占位按 SKU：A 组合售罄不影响 B 组合；不限量组合不占�
   // 黑|65 容量 2：两单占满
   assertOk(await draftAs(newBuyer(), p.slug, '黑|65'));
   assertOk(await draftAs(newBuyer(), p.slug, '黑|65'));
-  assert.equal(skuRow(p.slug, '黑|65').committed, 2);
+  assert.equal((await skuRow(p.slug, '黑|65')).committed, 2);
 
   // 第三单同组合 → 售罄
   const soldOut = await draftAs(newBuyer(), p.slug, '黑|65');
@@ -169,11 +165,11 @@ test('占位按 SKU：A 组合售罄不影响 B 组合；不限量组合不占�
 
   // 白|80 容量 1 → 仍可下单（A 售罄不影响 B）
   assertOk(await draftAs(newBuyer(), p.slug, '白|80'));
-  assert.equal(skuRow(p.slug, '白|80').committed, 1);
+  assert.equal((await skuRow(p.slug, '白|80')).committed, 1);
 
   // 白|65 不限量 → 不占位
   assertOk(await draftAs(newBuyer(), p.slug, '白|65'));
-  assert.equal(skuRow(p.slug, '白|65').committed, 0, '不限量组合不占位');
+  assert.equal((await skuRow(p.slug, '白|65')).committed, 0, '不限量组合不占位');
 });
 
 test('取消只回补该组合的占位', async () => {
@@ -184,13 +180,13 @@ test('取消只回补该组合的占位', async () => {
   const d1 = (await draftAs(buyerA, p.slug, '黑|65')).body.data;
   await draftAs(buyerB, p.slug, '黑|65');
   await draftAs(buyerB, p.slug, '黑|80');
-  assert.equal(skuRow(p.slug, '黑|65').committed, 2);
-  assert.equal(skuRow(p.slug, '黑|80').committed, 1);
+  assert.equal((await skuRow(p.slug, '黑|65')).committed, 2);
+  assert.equal((await skuRow(p.slug, '黑|80')).committed, 1);
 
   const tokenA = (await login(ctx, buyerA)).token;
-  assertOk(await request(app).post(`/api/orders/${d1.id}/cancel`).set('Authorization', `Bearer ${tokenA}`).expect(200));
-  assert.equal(skuRow(p.slug, '黑|65').committed, 1, '只回补被取消的那单');
-  assert.equal(skuRow(p.slug, '黑|80').committed, 1, '其它组合不受影响');
+  assertOk(await request(app).post(`/api/orders/${d1.id}/cancel`).set('Authorization', `Bearer ${tokenA}`).set('X-Mk-Shop', shopRef.value).expect(200));
+  assert.equal((await skuRow(p.slug, '黑|65')).committed, 1, '只回补被取消的那单');
+  assert.equal((await skuRow(p.slug, '黑|80')).committed, 1, '其它组合不受影响');
 });
 
 // ── 编辑 ──
@@ -198,15 +194,15 @@ test('取消只回补该组合的占位', async () => {
 test('编辑商品：同 key 组合的销量保留；改价不影响占位', async () => {
   const p = (await post(productPayload({ title: '编辑保留销量', specs: SPECS, skus: SKUS }))).body.data;
   await draftAs(newBuyer(), p.slug, '黑|65');
-  assert.equal(skuRow(p.slug, '黑|65').committed, 1);
+  assert.equal((await skuRow(p.slug, '黑|65')).committed, 1);
 
   const edited = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ specs: SPECS, skus: SKUS.map((s) => (s.key === '黑|65' ? { ...s, priceUsdtMicro: 99_000_000 } : s)) })
     .expect(200);
   assertOk(edited);
-  const row = skuRow(p.slug, '黑|65');
+  const row = await skuRow(p.slug, '黑|65');
   assert.equal(row.price_usdt_micro, 99_000_000, '改价生效');
   assert.equal(row.committed, 1, '改价不触碰占位');
 });
@@ -217,20 +213,20 @@ test('编辑：总量不得小于该组合已占位（校验先于写入）；SK
 
   const tooSmall = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '黑|65', capacity: 0 }] })
     .expect(200);
   assert.notEqual(tooSmall.body.code, 0);
   assert.match(tooSmall.body.message, /不能小于已占位/);
-  assert.equal(skuRow(p.slug, '黑|65').capacity, 2, '被拒后库存不变——校验必须先于写入');
+  assert.equal((await skuRow(p.slug, '黑|65')).capacity, 2, '被拒后库存不变——校验必须先于写入');
 
   const onlyCap = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '黑|65', capacity: 7 }] })
     .expect(200);
   assertOk(onlyCap);
-  const row = skuRow(p.slug, '黑|65');
+  const row = await skuRow(p.slug, '黑|65');
   assert.equal(row.capacity, 7);
   assert.equal(row.price_usdt_micro, 100_000_000, '未提交价格时沿用原价');
 });
@@ -249,38 +245,38 @@ test('编辑规格：改选项名（换 sku_key）时若仍有在途单占着旧
   const buyerToken = (await login(ctx, wallet)).token;
   const draft = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: p.slug, skuKey: '黑|65' });
   assertOk(draft);
-  assert.equal(skuRow(p.slug, '黑|65').committed, 1, '前提：旧组合已有占位');
+  assert.equal((await skuRow(p.slug, '黑|65')).committed, 1, '前提：旧组合已有占位');
 
   // 把「黑」改成「纯黑」：key 从 黑|65 变成 纯黑|65 —— 旧组合即将消失，但还有在途单占着
   const renamed = SPECS.map((s) => (s.name === '颜色' ? { ...s, options: ['纯黑', '白'] } : s));
   const renamedSkus = SKUS.map((s) => ({ ...s, key: s.key.replace('黑', '纯黑') }));
   const r = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ specs: renamed, skus: renamedSkus })
     .expect(200);
   assert.notEqual(r.body.code, 0, '更换规格键而旧键仍有在途单时必须拒绝');
   assert.match(String(r.body.message || ''), /在途订单|规格组合将被删除/);
-  assert.equal(skuRow(p.slug, '黑|65').committed, 1, '被拒后旧组合的账目完好');
-  assert.equal(skuRow(p.slug, '纯黑|65'), undefined, '被拒后不得落新组合');
+  assert.equal((await skuRow(p.slug, '黑|65')).committed, 1, '被拒后旧组合的账目完好');
+  assert.equal(await skuRow(p.slug, '纯黑|65'), undefined, '被拒后不得落新组合');
 
   // 在途单取消（占位释放）之后，同样的改名就被放行
   assertOk(
     await request(app)
       .post(`/api/orders/${draft.body.data.id}/cancel`)
-      .set('Authorization', `Bearer ${buyerToken}`)
+      .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
       .expect(200)
   );
   const ok = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ specs: renamed, skus: renamedSkus })
     .expect(200);
   assertOk(ok);
-  assert.equal(skuRow(p.slug, '纯黑|65').committed, 0, '新键从 0 起算（旧占位已随取消释放）');
+  assert.equal((await skuRow(p.slug, '纯黑|65')).committed, 0, '新键从 0 起算（旧占位已随取消释放）');
 });
 
 /**
@@ -295,43 +291,43 @@ test('编辑商品：整体上下架不得把已停售的单个组合重新上�
   assertOk(
     await request(app)
       .patch(`/api/products/${p.slug}`)
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
       .send({ skus: [{ key: '黑|65', active: false }] })
       .expect(200)
   );
-  assert.equal(skuRow(p.slug, '黑|65').active, 0);
+  assert.equal((await skuRow(p.slug, '黑|65')).active, 0);
 
   // 只改商品级 active（= 前端下架按钮的真实请求体）
   assertOk(
     await request(app)
       .patch(`/api/products/${p.slug}`)
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
       .send({ active: false })
       .expect(200)
   );
-  assert.equal(skuRow(p.slug, '黑|65').active, 0, '整体下架后该组合仍为停售');
+  assert.equal((await skuRow(p.slug, '黑|65')).active, 0, '整体下架后该组合仍为停售');
 
   // 再上架回来，per-sku 的停售决策同样必须保持
   assertOk(
     await request(app)
       .patch(`/api/products/${p.slug}`)
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
       .send({ active: true })
       .expect(200)
   );
-  assert.equal(skuRow(p.slug, '黑|65').active, 0, '重新上架商品不得撤销单个组合的停售');
-  assert.equal(skuRow(p.slug, '白|65').active, 1, '其它组合不受影响');
+  assert.equal((await skuRow(p.slug, '黑|65')).active, 0, '重新上架商品不得撤销单个组合的停售');
+  assert.equal((await skuRow(p.slug, '白|65')).active, 1, '其它组合不受影响');
 
   // 只改价（同样不提交 active）
   assertOk(
     await request(app)
       .patch(`/api/products/${p.slug}`)
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
       .send({ skus: [{ key: '黑|65', priceUsdtMicro: 123_450_000 }] })
       .expect(200)
   );
-  assert.equal(skuRow(p.slug, '黑|65').active, 0, '改价同样不得改回上架');
-  assert.equal(skuRow(p.slug, '黑|65').price_usdt_micro, 123_450_000);
+  assert.equal((await skuRow(p.slug, '黑|65')).active, 0, '改价同样不得改回上架');
+  assert.equal((await skuRow(p.slug, '黑|65')).price_usdt_micro, 123_450_000);
 });
 
 // ── 快照 ──
@@ -341,13 +337,17 @@ test('快照覆盖规格与逐组合单价，且可复算；改任一组合价�
   const { snapshotObject, computeSnapshotHash } = await import('../src/routes/products.js');
   const p = (await post(productPayload({ title: '快照', specs: SPECS, skus: SKUS }))).body.data;
 
+  /*
+    JSON 列（media/specs）**不 stringify**：投影只收驱动解析好的数组/对象，
+    传字符串会被 `assertParsedJsonColumn` 响亮拒绝（见 setup.mjs 的 rowLikeOf）。
+  */
   const snap = snapshotObject({
     slug: p.slug,
     title: p.title,
     description: p.description,
-    media: JSON.stringify(p.media),
+    media: p.media,
     kind: p.kind,
-    specs: JSON.stringify(p.specs),
+    specs: p.specs,
     skus: p.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
   });
   assert.deepEqual(snap.specs, SPECS, '快照含规格定义');
@@ -360,7 +360,7 @@ test('快照覆盖规格与逐组合单价，且可复算；改任一组合价�
 
   await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: SKUS.map((s) => (s.key === '白|80' ? { ...s, priceUsdtMicro: 1 } : s)) })
     .expect(200);
   const after = (await request(app).get(`/api/products/${p.slug}`).expect(200)).body.data;
@@ -375,13 +375,13 @@ test('SKU 停售：该组合不可下单，但不影响其它组合；与「售�
   // 把「黑|65」停售（库存仍有 2，区别于点它售罄）
   const off = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '黑|65', active: false }] })
     .expect(200);
   assertOk(off);
-  assert.equal(skuRow(p.slug, '黑|65').active, 0, '停售落库');
-  assert.equal(skuRow(p.slug, '黑|65').capacity, 2, '停售不动库存（是「不卖了」不是「卖完了」）');
-  assert.equal(skuRow(p.slug, '黑|80').active, 1, '其它组合不受影响');
+  assert.equal((await skuRow(p.slug, '黑|65')).active, 0, '停售落库');
+  assert.equal((await skuRow(p.slug, '黑|65')).capacity, 2, '停售不动库存（是「不卖了」不是「卖完了」）');
+  assert.equal((await skuRow(p.slug, '黑|80')).active, 1, '其它组合不受影响');
 
   const buyer = newBuyer();
   const blocked = await draftAs(buyer, p.slug, '黑|65');
@@ -394,11 +394,11 @@ test('SKU 停售：该组合不可下单，但不影响其它组合；与「售�
   // 恢复上架
   const on = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '黑|65', active: true }] })
     .expect(200);
   assertOk(on);
-  assert.equal(skuRow(p.slug, '黑|65').active, 1);
+  assert.equal((await skuRow(p.slug, '黑|65')).active, 1);
   assertOk(await draftAs(newBuyer(), p.slug, '黑|65'));
 });
 
@@ -406,7 +406,7 @@ test('停售的 SKU 在对外 DTO 里 skus[i].active=false，全部停售时 out
   const p = (await post(productPayload({ title: '全停售', specs: SPECS, skus: SKUS }))).body.data;
   const off = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: SKUS.map((s) => ({ key: s.key, active: false })) })
     .expect(200);
   assertOk(off);
@@ -421,14 +421,14 @@ test('停售的 SKU 在对外 DTO 里 skus[i].active=false，全部停售时 out
 test('编辑保留同 key 的销量且不误改停售状态', async () => {
   const p = (await post(productPayload({ title: '保留状态', specs: SPECS, skus: SKUS }))).body.data;
   await draftAs(newBuyer(), p.slug, '黑|65');
-  assert.equal(skuRow(p.slug, '黑|65').committed, 1);
+  assert.equal((await skuRow(p.slug, '黑|65')).committed, 1);
 
   await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '黑|65', active: false }, { key: '黑|80' }] })
     .expect(200);
-  const row = skuRow(p.slug, '黑|65');
+  const row = await skuRow(p.slug, '黑|65');
   assert.equal(row.active, 0, '停售生效');
   assert.equal(row.committed, 1, '未提交 committed，销量保留');
 });

@@ -12,7 +12,7 @@ import { test, before } from 'node:test';
 const FULL_REFUND = '1000000000000000000';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, db, owner, buyer } = ctx;
@@ -37,31 +37,31 @@ const payHash = () => '0x' + String(++seq).padStart(64, '0');
 async function createOrder(buyerAddr) {
   const res = await ctx.request(ctx.app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, buyer: buyerAddr })
     .expect(200);
   assertOk(res);
   return res.body.data;
 }
-function ev(order, name, args = {}, meta = {}) {
+async function ev(order, name, args = {}, meta = {}) {
   // 真实链上事件必然带交易哈希：OrderCreated 一并落为支付凭证（与 watcher 回写语义一致）
   const m = name === 'OrderCreated' ? { txHash: payHash(), block: 1, ...meta } : meta;
-  assert.equal(applyEvent(name, { orderId: order.escrowOrderId, ...args }, m), 1, `${name} 应推进`);
+  assert.equal(await applyEvent(name, { orderId: order.escrowOrderId, ...args }, m), 1, `${name} 应推进`);
 }
 async function ship(order) {
   const res = await ctx.request(ctx.app)
     .post(`/api/orders/${order.id}/ship`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ deliveryCode: 'REP-CODE' })
     .expect(200);
   assertOk(res);
 }
 
 /** 把订单事件史的时刻整体前移（模拟历史单：只进 all 窗不进 d365/d90/d30） */
-function backdate(order, days) {
-  const row = db.prepare('SELECT onchain_events FROM orders WHERE id = ?').get(order.id);
-  const list = JSON.parse(row.onchain_events).map((e) => ({ ...e, at: e.at - days * DAY_MS }));
-  db.prepare('UPDATE orders SET onchain_events = ? WHERE id = ?').run(JSON.stringify(list), order.id);
+async function backdate(order, days) {
+  const row = await db.get('SELECT onchain_events FROM v_orders WHERE order_no = ?', order.id);
+  const list = (row.onchain_events || []).map((e) => ({ ...e, at: e.at - days * DAY_MS }));
+  await db.run('UPDATE order_chain SET events = ? WHERE order_id = (SELECT id FROM orders WHERE order_no = ?)', JSON.stringify(list), order.id);
 }
 
 // ── 顶层 before 需串行完成登录与造单（node:test 多个顶层 before 存在并发交错，见仓库测试惯例）──
@@ -72,22 +72,22 @@ before(async () => {
 
   const listed = await ctx.request(ctx.app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ kind: 'digital', title: '信誉-画像样本', capacity: null }))
     .expect(200);
   assertOk(listed);
   slug = listed.body.data.slug;
 
   // 近窗 8 单（d30/d90/d365 同口径）
-  const t1 = await createOrder(buyerAddrs[0]); ev(t1, 'OrderCreated'); ev(t1, 'ReceiptConfirmed'); // 买家确认
-  const t2 = await createOrder(buyerAddrs[1]); ev(t2, 'OrderCreated'); await ship(t2); ev(t2, 'ReceiptConfirmed'); // 已交付后确认（发货样本）
-  const t3 = await createOrder(buyerAddrs[2]); ev(t3, 'OrderCreated'); ev(t3, 'DisputeRequested'); ev(t3, 'Arbitrated', { refundWei: t3.amountWei }); // 判买家
-  const t4 = await createOrder(buyerAddrs[3]); ev(t4, 'OrderCreated'); await ship(t4); ev(t4, 'DisputeRequested'); ev(t4, 'Arbitrated', { refundWei: 0n }); // 判卖家（样本）
-  const t5 = await createOrder(buyerAddrs[4]); ev(t5, 'OrderCreated'); ev(t5, 'OrderExpiredReleased'); // 超时释放
-  const t6 = await createOrder(buyerAddrs[5]); ev(t6, 'OrderCreated'); ev(t6, 'DisputeRequested'); // 未裁决争议
-  const t7 = await createOrder(buyerAddrs[6]); ev(t7, 'OrderCreated'); ev(t7, 'ReceiptConfirmed'); await backdate(t7, 500); // 老单：仅进 all
-  const t8 = await createOrder(buyerAddrs[7]); ev(t8, 'OrderCreated'); ev(t8, 'DisputeRequested'); ev(t8, 'Arbitrated', { refundWei: t8.amountWei }); // 判买家 #2
-  const t9 = await createOrder(buyerAddrs[8]); ev(t9, 'OrderCreated'); await ship(t9); ev(t9, 'DisputeRequested'); ev(t9, 'Arbitrated', { refundWei: 0n }); // 判卖家 #2（样本）
+  const t1 = await createOrder(buyerAddrs[0]); await ev(t1, 'OrderCreated'); await ev(t1, 'ReceiptConfirmed'); // 买家确认
+  const t2 = await createOrder(buyerAddrs[1]); await ev(t2, 'OrderCreated'); await ship(t2); await ev(t2, 'ReceiptConfirmed'); // 已交付后确认（发货样本）
+  const t3 = await createOrder(buyerAddrs[2]); await ev(t3, 'OrderCreated'); await ev(t3, 'DisputeRequested'); await ev(t3, 'Arbitrated', { refundWei: t3.amountWei }); // 判买家
+  const t4 = await createOrder(buyerAddrs[3]); await ev(t4, 'OrderCreated'); await ship(t4); await ev(t4, 'DisputeRequested'); await ev(t4, 'Arbitrated', { refundWei: 0n }); // 判卖家（样本）
+  const t5 = await createOrder(buyerAddrs[4]); await ev(t5, 'OrderCreated'); await ev(t5, 'OrderExpiredReleased'); // 超时释放
+  const t6 = await createOrder(buyerAddrs[5]); await ev(t6, 'OrderCreated'); await ev(t6, 'DisputeRequested'); // 未裁决争议
+  const t7 = await createOrder(buyerAddrs[6]); await ev(t7, 'OrderCreated'); await ev(t7, 'ReceiptConfirmed'); await backdate(t7, 500); // 老单：仅进 all
+  const t8 = await createOrder(buyerAddrs[7]); await ev(t8, 'OrderCreated'); await ev(t8, 'DisputeRequested'); await ev(t8, 'Arbitrated', { refundWei: t8.amountWei }); // 判买家 #2
+  const t9 = await createOrder(buyerAddrs[8]); await ev(t9, 'OrderCreated'); await ship(t9); await ev(t9, 'DisputeRequested'); await ev(t9, 'Arbitrated', { refundWei: 0n }); // 判卖家 #2（样本）
   void t1; void t2; void t5; void t6; void t7; void t8; void t9;
 });
 
@@ -138,7 +138,9 @@ test('履约画像：近窗事件计数与比率全对（5 争议 ≥ 样本阈�
   assert.equal(r.delivery.all.count, 3, '老单无交付记录不进入样本');
 
   // 运营起点：最早 OrderCreated（老单前移后）
-  assert.ok(r.firstOrderAt <= Date.now() - 400 * DAY_MS, 'firstOrderAt 来自最早托管事件');
+  // `firstOrderAt` 对外是 **ISO-8601 串**（全仓只有这一种时刻表示），比较前先 Date.parse；
+  // 直接拿字符串与数字比会恒假——那种"形状变了而断言没变"在别处表现为静默的假绿，这里表现为假红。
+  assert.ok(Date.parse(r.firstOrderAt) <= Date.now() - 400 * DAY_MS, 'firstOrderAt 来自最早托管事件');
 
   // 隐私口径：不下发单笔订单字段
   assert.ok(!('orders' in r), '顶层不得直接挂订单列表');
@@ -148,7 +150,7 @@ test('履约画像：近窗事件计数与比率全对（5 争议 ≥ 样本阈�
 test('单元：paid 快路径订单（OrderCreated 由 paid 补写）参与单量/确认率统计', async () => {
   const now = Date.now();
   // 真实可达的行都带链上支付凭证（paid_tx_hash）——画像是**按它证明托管发生过**的（2026-10-15）
-  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events), ...over });
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: events, ...over });
   const e = (name, at) => ({ name, txHash: '0x' + 'f'.repeat(64), block: 1, at });
   // paid 快路径（watcher 不迁移该单）：OrderCreated 由 paid/sync 补写（见 orders.js
   // appendOrderCreatedEvent），ReceiptConfirmed 由 watcher 回写——两事件齐全才能计单
@@ -170,7 +172,7 @@ test('单元：争议 <5 样本不足时争议率/判买家率置 null（防小�
     // 托管证明（画像按它计入单量，见 computeReputation 的说明）+ OrderCreated 被挤掉时的锚点兜底
     paid_tx_hash: '0x' + 'ab'.repeat(32),
     created_at: 1,
-    onchain_events: JSON.stringify(events),
+    onchain_events: events,
   });
   const e = (name, at) => ({ name, txHash: null, block: null, at });
 
@@ -204,14 +206,14 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
       delivered_at: now - 1000,
       paid_tx_hash: '0x' + 'ab'.repeat(32),
       created_at: now - 2000,
-      onchain_events: JSON.stringify([e('OrderCreated', now - 2000), e('ReceiptConfirmed', now - 1000)]),
+      onchain_events: [e('OrderCreated', now - 2000), e('ReceiptConfirmed', now - 1000)],
     },
     {
       status: 'confirmed',
       delivered_at: now - 3000,
       paid_tx_hash: '0x' + 'ab'.repeat(32),
       created_at: now - 6000,
-      onchain_events: JSON.stringify([e('OrderCreated', now - 6000), e('ReceiptConfirmed', now - 3000)]),
+      onchain_events: [e('OrderCreated', now - 6000), e('ReceiptConfirmed', now - 3000)],
     },
   ];
   const r = computeReputation(rows, now);
@@ -227,7 +229,7 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
         delivered_at: now - 40 * DAY_MS,
         paid_tx_hash: '0x' + 'ab'.repeat(32),
         created_at: now - 50 * DAY_MS,
-        onchain_events: JSON.stringify([e('OrderCreated', now - 50 * DAY_MS), e('ReceiptConfirmed', now - 40 * DAY_MS)]),
+        onchain_events: [e('OrderCreated', now - 50 * DAY_MS), e('ReceiptConfirmed', now - 40 * DAY_MS)],
       },
     ],
     now
@@ -243,7 +245,7 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
       delivered_at: null,
       paid_tx_hash: '0x' + 'ab'.repeat(32),
       created_at: now - 1000,
-      onchain_events: JSON.stringify([e('OrderCreated', now - 1000), e('ReceiptConfirmed', now - 500)]),
+      onchain_events: [e('OrderCreated', now - 1000), e('ReceiptConfirmed', now - 500)],
     },
   ], now);
   assert.equal(clean.windows.all.disputes, 0);
@@ -256,7 +258,7 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
   assert.equal(empty.windows.all.orders, 0);
   assert.equal(empty.firstOrderAt, null);
   assert.equal(empty.delivery.all.medianMs, null);
-  const drafts = computeReputation([{ status: 'draft', delivered_at: null, onchain_events: '[]' }], now);
+  const drafts = computeReputation([{ status: 'draft', delivered_at: null, onchain_events: [] }], now);
   assert.equal(drafts.windows.all.orders, 0);
 });
 
@@ -276,7 +278,7 @@ test('单元：重复交易对占比 =（总成交 − 不同交易对数）/ �
     delivered_at: null,
     paid_tx_hash: '0x' + 'ab'.repeat(32),
     created_at: at,
-    onchain_events: JSON.stringify([e('OrderCreated', at), e('ReceiptConfirmed', at + 10)]),
+    onchain_events: [e('OrderCreated', at), e('ReceiptConfirmed', at + 10)],
   });
   const A = '0x' + 'aa'.repeat(20);
   const B = '0x' + 'bb'.repeat(20);
@@ -346,7 +348,7 @@ test('争议计数：被 /sync 或对账修好的争议（事件名 Sync:dispute
   const now = Date.now();
   const e = (name, at) => ({ name, txHash: null, block: null, at });
   // 真实可达的行都带链上支付凭证（paid_tx_hash）——画像是**按它证明托管发生过**的（2026-10-15）
-  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events), ...over });
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: events, ...over });
   /*
     5 单争议：镜像 status='disputed'、事件史里**没有** DisputeRequested（只有 Sync:disputed 这种修复痕迹）。
     旧实现给 disputes=0 且 sampleTooSmall=false ⇒ 公开页印「争议率 0%」——一个**看起来确证的健康 0**。
@@ -368,7 +370,7 @@ test('判向比率：分子分母同源 ⇒ refundRate ≤ 1（不再出现"争�
   const now = Date.now();
   const e = (name, at) => ({ name, txHash: null, block: null, at });
   // 真实可达的行都带链上支付凭证（paid_tx_hash）——画像是**按它证明托管发生过**的（2026-10-15）
-  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events), ...over });
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: events, ...over });
   const rows = [
     // 7 单"有 Arbitrated、但没有 DisputeRequested"（事件被挤掉/漏扫后镜像推进到 refunded）
     ...Array.from({ length: 7 }, (_, i) =>
@@ -392,7 +394,7 @@ test('判向比率：分子分母同源 ⇒ refundRate ≤ 1（不再出现"争�
 test('托管证明是耐久凭据：OrderCreated 被 20 条可重复事件挤掉，这一单也不会从画像里消失', async () => {
   const now = Date.now();
   const e = (name, at) => ({ name, txHash: null, block: null, at });
-  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events), ...over });
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: events, ...over });
   /*
     病（2026-10-15 审计 D3）：`onchain_events` 只留最近 20 条（`slice(-20)`），
     而 `PartialRefundAccepted` 是**可重复**事件（买家每授权一次记一条）——20 次授权即可把
@@ -441,7 +443,7 @@ test('托管证明是耐久凭据：OrderCreated 被 20 条可重复事件挤掉
 test('没有链上支付凭证的行不进画像（证明在哪一层，计数就在哪一层）', async () => {
   const now = Date.now();
   const e = (name, at) => ({ name, txHash: null, block: null, at });
-  const mk = (status, events, over = {}) => ({ status, delivered_at: null, onchain_events: JSON.stringify(events), ...over });
+  const mk = (status, events, over = {}) => ({ status, delivered_at: null, onchain_events: events, ...over });
   const rows = [
     // 有事件、没凭证：历史异常行（也不是"托管发生过"的证明）⇒ 不进画像
     mk('confirmed', [e('OrderCreated', now - 1000), e('ReceiptConfirmed', now - 900)]),
@@ -456,7 +458,7 @@ test('没有链上支付凭证的行不进画像（证明在哪一层，计数�
 test('三个比率恒 ∈ [0,1]（口径承诺的机器判据）', async () => {
   const now = Date.now();
   const e = (name, at) => ({ name, txHash: null, block: null, at });
-  const mk = (status, events, delivered_at = null) => ({ status, delivered_at, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: JSON.stringify(events) });
+  const mk = (status, events, delivered_at = null) => ({ status, delivered_at, paid_tx_hash: '0x' + 'ab'.repeat(32), created_at: 1, onchain_events: events });
   const rows = [
     mk('confirmed', [e('OrderCreated', now - 9000), e('ReceiptConfirmed', now - 8000)], now - 7000),
     mk('settled', [e('OrderCreated', now - 6000), e('DisputeRequested', now - 5500), e('Arbitrated', now - 5000)]),
@@ -483,46 +485,49 @@ test('三个比率恒 ∈ [0,1]（口径承诺的机器判据）', async () => {
   }
 });
 /* ══════════════════════════════════════════════════════════════════════
-   seller 过滤：画像必须只算**本店**的单（2026-10-15 修 D6）
+   seller 过滤：画像必须只算**指定的那一家店**的单（2026-10-15 修 D6；2026-10 多店改造改传参）
    ──────────────────────────────────────────────────────────────────────
-   `orders.seller` 是逐行写入的（= 写入时的 `config.shop.owner`），而旧查询不带任何 WHERE：
-   换过店主地址（店铺转手 / 换绑钱包）或拿别人的库启动时，**上一家店**的订单会被算进新店的
-   公开画像（单量、确认率、发货耗时一起被稀释/抬高）——而这份画像正是买家用来判断靠不靠谱的。
+   `orders.seller` 是逐行写入的（= 该单所属店铺的 shops.seller），而旧查询不带任何 WHERE：
+   一台节点上有多家店、或店铺转手/换绑钱包之后，**别家店**的订单会被算进这一家的公开画像
+   （单量、确认率、发货耗时一起被稀释/抬高）——而这份画像正是买家用来判断靠不靠谱的。
+   多店改造把"哪一家店"从**可变的全局常量**换成**显式入参**：调用方漏传即抛错，
+   于是"忘了按店过滤"不再可能悄悄发生（旧写法里只要有人改了全局，过滤条件就整体失效）。
    ══════════════════════════════════════════════════════════════════════ */
-test('seller 过滤：换过店主的库不会把上一家店的单算进本店画像', async () => {
+test('seller 过滤：只算指定那家店的单；显式 null 才是"全部在售店铺"', async () => {
   const A = '0x' + 'a1'.repeat(20);
   const B = '0x' + 'b2'.repeat(20);
   const at = Date.now() - 1000;
-  const insert = (id, seller) =>
-    db
-      .prepare(
-        `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-           amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash, created_at, updated_at)
-         VALUES (?, 'p-rep-filter', '{}', '0x00', '', '0xbuyer', ?, '1000', 1000000, '0.1', 'confirmed', ?, ?, ?, ?)`
-      )
-      .run(id, seller, '0x' + id.padEnd(64, '0'), '0x' + id.padEnd(64, 'a'), at, at);
-  insert('rep-filter-a1', A);
-  insert('rep-filter-a2', A);
-  insert('rep-filter-b1', B);
+  const insert = async (seq) =>
+    await insertOrderRow(db, {
+      status: 'confirmed',
+      productSlug: 'p-rep-f',
+      // 这一行**刻意不指向任何真实店铺**：本用例钉的是"画像按 seller 过滤"，
+      // 而 seller 列没有外键（它是逐行写入的事实），所以这里可以放两个不同的钱包
+      buyer: '0x' + 'b'.repeat(40),
+      seller: seq.seller,
+      amountWei: '1000',
+      usdtMicro: 1000000,
+      btyUsdtRate: '0.1',
+      escrowOrderId: `0x${String(seq.n).padStart(64, '0')}`,
+      paidTxHash: `0x${String(seq.n).padStart(63, 'a')}a`,
+      updatedAt: new Date(at),
+    });
+  await insert({ n: 1, seller: A });
+  await insert({ n: 2, seller: A });
+  await insert({ n: 3, seller: B });
 
-  const prev = appConfig.shop.owner;
-  try {
-    appConfig.shop.owner = A;
-    assert.equal(reputationSummary().windows.all.orders, 2, '只算本店（A）的单');
-    appConfig.shop.owner = B;
-    assert.equal(reputationSummary().windows.all.orders, 1, '换成 B 之后只算 B 的单');
-    /*
-      未配店主（只读展示模式）⇒ 不过滤：那时没有任何身份可比对，而这份库只可能装本节点自己
-      镜像的行。把"读不到店铺身份"说成"这家店没有记录"才是更糟的那个答案。
-      （期望值按**同一条证明判据**从库里算出来——本文件别的用例也往这个内存库插过单。）
-    */
-    const proven = db
-      .prepare("SELECT COUNT(1) AS c FROM orders WHERE paid_tx_hash IS NOT NULL AND TRIM(paid_tx_hash) != ''")
-      .get().c;
-    appConfig.shop.owner = '';
-    assert.equal(reputationSummary().windows.all.orders, proven, '没有店铺身份时不猜（不过滤），而不是清空画像');
-    assert.ok(proven > 3, `前置：库里除本用例这 3 单还有别的行（实际 ${proven}）——上一条断言才有意义`);
-  } finally {
-    appConfig.shop.owner = prev;
-  }
+  assert.equal((await reputationSummary(A)).windows.all.orders, 2, '只算 A 店的单');
+  assert.equal((await reputationSummary(B)).windows.all.orders, 1, '只算 B 店的单');
+  /*
+    漏传（undefined）⇒ **抛错**，不是"退化成全部"。这是刻意的：默认成"全部"就是一次静默的
+    跨店混算，表现是"画像数字看起来正常、只是把别人家的生意算进来了"——最难查的一类。
+  */
+  await assert.rejects(async () => await reputationSummary(undefined), /需要显式的 seller/, '漏传店铺必须响亮失败');
+  /*
+    显式 `null` = "该节点全部在售店铺的合计"（只有节点级读数才这么用）。
+    期望值按**同一条证明判据**从库里算出来——本文件别的用例也往这个内存库插过单。
+  */
+  const proven = (await db.get("SELECT COUNT(1) AS c FROM v_orders WHERE paid_tx_hash IS NOT NULL")).c;
+  assert.equal((await reputationSummary(null)).windows.all.orders, proven, 'null = 不过滤（节点级合计）');
+  assert.ok(proven > 3, `前置：库里除本用例这 3 单还有别的行（实际 ${proven}）——上一条断言才有意义`);
 });

@@ -11,8 +11,13 @@
  *  - `description` 保留，但降级为**由块派生的可搜索摘要**（服务端写入时派生）
  *    —— 商品搜索走 SQL LIKE，用户输入的是文字，不该去匹配 JSON 里的引号与 url
  *  - 块为空时，`description` 就是店主填的纯文本，前端直接按段落渲染（保持原有观感）
+ *
+ * 落库是 MySQL 的真 JSON 列（`products.description_blocks`）：JSON 类型会**重排对象的键**
+ * （按键长/字节，见 `src/db.js` 的说明），所以"块里键的顺序"以**读回值**为准——
+ * 快照哈希与 DTO 都用 {@link parseBlocks} 的同一次投影，两端因此逐字一致。
  */
 import { mediaUrlAllowed, normalizeMediaUrl } from './mediaKinds.js';
+import { assertParsedJsonColumn } from './tags.js';
 
 export const MAX_BLOCKS = 40;
 export const MAX_TEXT_LEN = 2000;
@@ -55,7 +60,7 @@ export function normalizeBlocks(input) {
     } else if (type === 'image') {
       const url = normalizeMediaUrl(raw?.url);
       if (!url) continue;
-      // URL 规则与商品主图**同一个判据**（shared/media.js）：同一条白名单只有一处实现
+      // URL 规则与商品主图**同一个判据**（`src/mediaKinds.js`）：同一条白名单只有一处实现
       if (!mediaUrlAllowed(url)) {
         errors.push('详情图片仅支持 http/https 外链或本站上传的图片');
         continue;
@@ -68,6 +73,21 @@ export function normalizeBlocks(input) {
   return { errors, blocks };
 }
 
+/**
+ * 解析 `products.description_blocks` 列的**读回值** → 块数组（DTO 与快照共用的投影）。
+ *
+ * 形状不对就是 `[]`（"没有详情块"与"读不出来"在渲染上同形），但**传进来一个字符串要报错**：
+ * 那说明调用方手里是列原文而不是读回值（MySQL 的 JSON 列由驱动解析成 JS 值），
+ * 静默判成"没有块"会让快照少一个键、哈希与前端对不上——见 `assertParsedJsonColumn`。
+ *
+ * @param {unknown} raw DB 读回的列值（⚠️ 不是列原文）
+ * @returns {Array<{type: string} & Record<string, unknown>>}
+ */
+export function parseBlocks(raw) {
+  const v = assertParsedJsonColumn(raw, 'products.description_blocks');
+  return Array.isArray(v) ? v : [];
+}
+
 /** 由块派生纯文本摘要（供 SQL LIKE 搜索；图片块以占位符保留段落节奏） */
 export function deriveDescription(blocks) {
   const text = (blocks || [])
@@ -75,14 +95,4 @@ export function deriveDescription(blocks) {
     .join('\n')
     .trim();
   return text.slice(0, MAX_DERIVED_DESC);
-}
-
-/** 解析库里的块 JSON（容错：脏数据当作无块） */
-export function parseBlocks(json) {
-  try {
-    const v = JSON.parse(json || '[]');
-    return Array.isArray(v) ? v : [];
-  } catch {
-    return [];
-  }
 }

@@ -15,7 +15,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { Interface } from 'ethers';
-import { makeCtx } from './setup.mjs';
+import { makeCtx, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { ESCROW_ABI, checkOrderTimeoutBounds } = await import('../src/chain.js');
@@ -124,7 +124,7 @@ test('下界随治理调整：合约把 minTimeoutBlocks 提到 7 天后，原�
  *
  * 旧实现把"读不到"与"越界"合并成 `ok:false`，于是**一次 RPC 抖动就能停掉一个配置正确的节点**
  * （缺省 120960 本来就在合法区间内）——停服换不来任何安全，因为越界这件事根本还没被证实。
- * 本仓既有口径也是这么分的：`opsMetrics` / `feeStatus` / `arbiterStatus` 对"读不到"一律给
+ * 本仓既有口径也是这么分的：`opsMetrics` / `feeStatus` / `committeeStatus` 对"读不到"一律给
  * **独立的一档**，绝不与"确证有问题"合并。所以这里同时断言"不得说成越界"与"不是 blocked"。
  */
 test('读不到链上读数：判 unknown（verdict≠blocked），**不得**说成越界', async () => {

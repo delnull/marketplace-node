@@ -10,7 +10,7 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef, rowLikeOf } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -32,12 +32,12 @@ const blocked = (res) => {
   return String(res.body.message || '');
 };
 
-const rowOf = (id) => db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+const rowOf = async (id) => await db.get('SELECT * FROM v_orders WHERE order_no = ?', id);
 
 async function listProduct(payload) {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(payload)
     .expect(200);
   assertOk(res);
@@ -47,7 +47,7 @@ async function listProduct(payload) {
 async function patchProduct(slug, body) {
   const res = await request(app)
     .patch(`/api/products/${slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(body)
     .expect(200);
   assertOk(res);
@@ -56,9 +56,9 @@ async function patchProduct(slug, body) {
 
 /** 下单请求（不预设 HTTP 状态：年龄门槛/发票校验按客户端错误返回 400 + 明确中文原因） */
 const postOrder = (body, token = buyerToken) =>
-  request(app).post('/api/orders').set('Authorization', `Bearer ${token}`).send(body);
+  request(app).post('/api/orders').set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value).send(body);
 
-const draftCount = () => db.prepare("SELECT COUNT(*) AS c FROM orders WHERE status = 'draft'").get().c;
+const draftCount = async () => (await db.get("SELECT COUNT(*) AS c FROM v_orders WHERE status = 'draft'")).c;
 
 // ══ B：年龄限制 ══
 
@@ -68,7 +68,7 @@ test('年龄限制商品：下单必须带买家显式确认；确认后留痕�
   );
   assert.equal(p.ageRestricted, true, '公开投影回传年龄限制标记');
 
-  const before = draftCount();
+  const before = await draftCount();
   // ① 不带 ageAck：拒单（机制不能"默认通过"）
   const missing = await postOrder({ productSlug: p.slug });
   assert.match(blocked(missing), /未成年人禁止购买/);
@@ -78,14 +78,14 @@ test('年龄限制商品：下单必须带买家显式确认；确认后留痕�
   // ③ 非法断言类型：拒（不给字符串留漂移空间）
   const badType = await postOrder({ productSlug: p.slug, ageAck: 'yes' });
   assert.match(blocked(badType), /ageAck 需为布尔值/);
-  assert.equal(draftCount(), before, '被拒的下单不产生草稿（也不占库存额度）');
+  assert.equal(await draftCount(), before, '被拒的下单不产生草稿（也不占库存额度）');
 
   // ④ 带断言：建单成功，留痕 + 快照锁定
   const okRes = await postOrder({ productSlug: p.slug, ageAck: true });
   assertOk(okRes);
   const o = okRes.body.data;
   assert.equal(o.ageAck, true, '订单记录买家确认');
-  assert.equal(rowOf(o.id).age_ack, 1);
+  assert.equal((await rowOf(o.id)).age_ack, 1);
   assert.equal(o.productSnapshot.age_restricted, 1, '年龄限制写入订单锁定的商品快照');
   assert.equal(o.productSnapshot.shipping_fee_usdt_micro, 0, '未设运费时为 0（包邮）');
   // 店主代下单同样受门槛约束（门槛在商品上，不在调用方身份上）
@@ -101,12 +101,12 @@ test('非年龄限制商品：ageAck 断言被忽略（恒 0，不留误导性�
 
   const noAck = (await postOrder({ productSlug: p.slug })).body.data;
   assert.equal(noAck.ageAck, false);
-  assert.equal(rowOf(noAck.id).age_ack, 0);
+  assert.equal((await rowOf(noAck.id)).age_ack, 0);
 
   const withAck = await postOrder({ productSlug: p.slug, ageAck: true });
   assertOk(withAck);
   assert.equal(withAck.body.data.ageAck, false, '商品未声明年龄限制时，客户端断言一律忽略');
-  assert.equal(rowOf(withAck.body.data.id).age_ack, 0);
+  assert.equal((await rowOf(withAck.body.data.id)).age_ack, 0);
   assert.equal(withAck.body.data.productSnapshot.age_restricted, 0);
 });
 
@@ -120,18 +120,13 @@ test('年龄限制标记入快照：加/去限制必变哈希，同值保存哈�
 
   const restricted = await patchProduct(p.slug, { ageRestricted: true });
   assert.notEqual(restricted.snapshotHash, base, '加上年龄限制必须重算快照哈希');
-  const snap = snapshotObject({
-    slug: restricted.slug,
-    title: restricted.title,
-    description: restricted.description,
-    description_blocks: JSON.stringify(restricted.descriptionBlocks || []),
-    media: JSON.stringify(restricted.media),
-    kind: restricted.kind,
-    shipping_fee_usdt_micro: restricted.shippingFeeUsdtMicro,
-    age_restricted: restricted.ageRestricted ? 1 : 0,
-    specs: JSON.stringify(restricted.specs || []),
-    skus: (restricted.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
-  });
+  /*
+    DB 行的形状：JSON 列（description_blocks / media / specs）**不 stringify**——驱动读回来
+    已经是解析好的数组，快照投影只收这个形状（传字符串会被响亮拒绝，见 setup.mjs 的 rowLikeOf）。
+    这里刻意用 setup.mjs 的同一份投影（`rowLikeOf`）而不是手抄一遍键序：快照键序就是契约，
+    抄第二份的下场是"哈希对不上"而看不出是谁漏了键。
+  */
+  const snap = snapshotObject(rowLikeOf(restricted));
   assert.equal(snap.age_restricted, 1, '快照含 age_restricted');
   assert.equal(computeSnapshotHash(snap), restricted.snapshotHash, '快照哈希可复算');
   // 1 与 true 等价（快照里归一为 0/1，避免 true/false 与 1/0 混用产生不同哈希）
@@ -144,7 +139,7 @@ test('年龄限制标记入快照：加/去限制必变哈希，同值保存哈�
 
   const bad = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ kind: 'physical', title: '非法限制值', ageRestricted: 'yes' }))
     .expect(200);
   assert.match(blocked(bad), /ageRestricted/);
@@ -162,7 +157,7 @@ test('开票信息：往返存读 + trim + 长度上限 + 类型校验；不影�
   assertOk(withInvoice);
   const o = withInvoice.body.data;
   assert.deepEqual(o.invoice, { needed: true, title: '某某科技有限公司', taxNo: '91310000MA1K35XXXX' });
-  const row = rowOf(o.id);
+  const row = await rowOf(o.id);
   assert.equal(row.invoice_needed, 1);
   assert.equal(row.invoice_title, '某某科技有限公司');
   assert.equal(row.invoice_tax_no, '91310000MA1K35XXXX');
@@ -174,7 +169,7 @@ test('开票信息：往返存读 + trim + 长度上限 + 类型校验；不影�
   // 未提交 invoice：默认空对象，不误标 needed
   const none = (await postOrder({ productSlug: p.slug })).body.data;
   assert.deepEqual(none.invoice, { needed: false, title: '', taxNo: '' });
-  assert.equal(rowOf(none.id).invoice_needed, 0);
+  assert.equal((await rowOf(none.id)).invoice_needed, 0);
 
   // 只填税号（抬头留空）也可（个人抬头/无需抬头的情形）
   const taxOnly = await postOrder({ productSlug: p.slug, invoice: { needed: true, taxNo: '91310000MA1K35YYYY' } });
@@ -215,10 +210,10 @@ test('开票信息可见性：仅买家本人/店主可见（同收货信息矩�
     await postOrder({ productSlug: p.slug, invoice: { needed: true, title: '某某商贸行', taxNo: '91440300MA5FXXXXXX' } })
   ).body.data;
 
-  const asBuyer = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).expect(200);
+  const asBuyer = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.equal(asBuyer.body.data.invoice.title, '某某商贸行');
 
-  const asOwner = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const asOwner = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.equal(asOwner.body.data.invoice.taxNo, '91440300MA5FXXXXXX', '店主可见（要照着开票）');
 
   const anon = await request(app).get(`/api/orders/${o.id}`).expect(200);
@@ -226,18 +221,18 @@ test('开票信息可见性：仅买家本人/店主可见（同收货信息矩�
 
   const asStranger = await request(app)
     .get(`/api/orders/${o.id}`)
-    .set('Authorization', `Bearer ${strangerToken}`)
+    .set('Authorization', `Bearer ${strangerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(asStranger.body.data.invoice, null, '第三人不可见开票信息');
 
   const listAnon = await request(app).get(`/api/orders?address=${buyer.address}`).expect(200);
-  assert.equal(listAnon.body.data.orders.find((x) => x.id === o.id).invoice, null, '匿名列表同样为 null');
+  assert.equal(listAnon.body.data.orders.find((x) => x.id === o.id), undefined, '匿名列表不出现草稿行');
   const listBuyer = await request(app)
     .get(`/api/orders?address=${buyer.address}`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(listBuyer.body.data.orders.find((x) => x.id === o.id).invoice.needed, true);
 
-  const sellerList = await request(app).get('/api/orders/seller').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const sellerList = await request(app).get('/api/orders/seller').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.ok(sellerList.body.data.orders.find((x) => x.id === o.id).invoice, '店主列表可见开票信息');
 });

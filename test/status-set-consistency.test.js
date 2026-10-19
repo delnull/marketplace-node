@@ -40,20 +40,26 @@ function srcFiles(dir = SRC) {
 const rel = (p) => path.relative(path.join(SRC, '..'), p).replace(/\\/g, '/');
 const texts = new Map(srcFiles().map((p) => [rel(p), fs.readFileSync(p, 'utf8')]));
 
-/** 权威集合：db.js 的 orders.status CHECK 约束 */
-function canonStatuses() {
-  const t = texts.get('src/db.js');
-  const m = t.match(/status\s+TEXT NOT NULL DEFAULT 'draft'\s*\n\s*CHECK \(status IN \(([^)]*)\)\)/);
-  assert.ok(m, 'db.js 里必须能找到 orders.status 的 CHECK 约束（找不到说明建表语句被改写了，先看这里）');
-  return m[1]
-    .split(',')
-    .map((s) => s.trim().replace(/^'|'$/g, ''))
-    .filter(Boolean);
-}
+/**
+   * 权威集合：db.js 建表语句里 `orders.status` 的 **ENUM 值域**。
+   *
+   * MySQL 8 把闭合集合落成 ENUM（值域写在列定义里、占 1 字节、SHOW COLUMNS 自带文档），
+   * 旧形状的 `CHECK (status IN (…))` 整条没了——所以这里按**列定义**取，取不到就响亮失败
+   * （"正则变成空集"必须比"守卫静默放行"先被发现）。
+   */
+  function canonStatuses() {
+    const t = texts.get('src/db.js');
+    const m = t.match(/status\s+ENUM\(([^)]*)\)\s+NOT NULL\s+DEFAULT\s+'draft'/);
+    assert.ok(m, 'db.js 里必须能找到 orders.status 的 ENUM 定义（找不到说明建表语句被改写了，先看这里）');
+    return m[1]
+      .split(',')
+      .map((s) => s.trim().replace(/^'|'$/g, ''))
+      .filter(Boolean);
+  }
 
 const CANON = canonStatuses();
 
-test('权威集合（db.js 的 CHECK）覆盖全部 9 个订单状态', () => {
+test('权威集合（db.js 的 ENUM 值域）覆盖全部 9 个订单状态', () => {
   assert.equal(CANON.length, 9, `期望 9 个状态，实际 ${CANON.length}：${CANON.join('/')}`);
   for (const s of ['draft', 'escrowed', 'shipped', 'confirmed', 'disputed', 'settled', 'refunded', 'expired', 'cancelled']) {
     assert.ok(CANON.includes(s), `权威集合缺少 ${s}`);
@@ -62,20 +68,59 @@ test('权威集合（db.js 的 CHECK）覆盖全部 9 个订单状态', () => {
 
 /**
  * 扫描"作用于 orders 的 status IN (...)"。
- * 用**整份文件文本**匹配（SQL 模板会跨行），再往**前**找最近一个 `FROM/UPDATE/JOIN <表>` 判断这条语句
- * 操作的是哪张表——`order_returns`（退货单）与 `product_codes`（码池）也有同名的 `status` 列，
+ * 用**整份文件文本**匹配（SQL 模板会跨行），再判断这条语句里的 `status` 属于哪张表——
+ * `order_returns`（退货单）与 `product_codes`（码池）也有同名的 `status` 列，
  * 它们各有一套状态，不能混进来。建表语句里的 `CHECK (...)` 直接跳过（那是 schema 定义，
  * 权威集合由第一个用例单独断言）。
+ *
+ * 判表规则（三条，先看触发器伪行、再看限定名、最后看最近的 FROM/JOIN）：
+ *   ① **触发器伪行**（`OLD.status` / `NEW.status`）⇒ 属于触发器**挂在哪张表上**（`AFTER UPDATE ON orders`）。
+ *      触发器里那批状态字面量是"加一个状态漏改一处"最贵的地方（订单离开在途集合时的池占位减量
+ *      就在那里，漏改的后果是永久多占/少占，而没有任何报错）——只按"最近的 FROM/JOIN"判表会把它们
+ *      整批漏在守卫之外（它们的最近表是 `products` / `order_delivery_items`）。
+ *   ② **列被限定**（`r.status`）⇒ 按别名反查它绑定的表。多店改造后出现了
+ *      `FROM order_returns r JOIN orders o ON … WHERE r.status IN ('open','shipped')`
+ *      这种形状：最近的表是 orders，但被判的列明明是 r.status（属于退货单）。
+ *      只看"最近的表"会把退货单自己的状态误判成 orders 的状态 —— 那是**守卫误报**，
+ *      而误报的代价是下一个人把守卫放宽（真正的漂移就再也拦不住了）。
+ *   ③ 未限定 ⇒ 沿用"最近的 FROM/UPDATE/JOIN 表"，与既有实现一致。
  */
 function collectOrdersInLists() {
   const found = [];
   for (const [file, text] of texts) {
-    for (const m of text.matchAll(/status\s+IN\s*\(([^)]*)\)/g)) {
+    /*
+      `NOT IN` 一起扫：它拼的是**同一个集合的补集**（"订单离开在途集合"那半边就在触发器里），
+      漏改它的后果与漏改 `IN` 一模一样（占位永久不释放/永久多占），而且更隐蔽——
+      只扫 `IN` 的话，这半边字面量在整个守卫之外，加一个状态时没有任何东西会红。
+    */
+    for (const m of text.matchAll(/status\s+(?:NOT\s+)?IN\s*\(([^)]*)\)/gi)) {
       const head = text.slice(Math.max(0, m.index - 400), m.index);
       if (/CHECK\s*\($/.test(head.trimEnd())) continue; // schema 的 CHECK 约束（db.js 建表）
       if (/CHECK\s*\([^)]*$/.test(head.slice(-120))) continue;
       const tables = [...head.matchAll(/\b(?:from|update|join)\s+([a-z_]+)/gi)].map((x) => x[1].toLowerCase());
-      if (tables[tables.length - 1] !== 'orders') continue; // 只认 orders 的列表（退货单/码池另有一套状态）
+      const qual = /([A-Za-z_]\w*)\s*\.\s*$/.exec(head);
+      let table = tables[tables.length - 1];
+      if (qual && /^(?:old|new)$/i.test(qual[1])) {
+        // 在**整份文件**里回看最近一个触发器头（不用 400 字窗口：触发器体比窗口长，
+        // 一旦回看不到就会把这一处静默漏掉——那正是本测试要消灭的那种失效）
+        const t = /(?:after|before)\s+(?:insert|update|delete)\s+on\s+([a-z_]+)/gi;
+        const upto = text.slice(0, m.index);
+        let last = null;
+        for (const x of upto.matchAll(t)) last = x[1];
+        table = last ? last.toLowerCase() : table;
+      } else if (qual) {
+        const aliasMap = new Map();
+        for (const j of head.matchAll(/\b(?:from|join)\s+([a-z_]+)(?:\s+(?:as\s+)?([a-z_]\w*))?/gi)) {
+          const t = j[1].toLowerCase();
+          const a = (j[2] || t).toLowerCase();
+          // 别名的下一个词若是 SQL 关键字（on/where/…），说明它其实没写别名（形如 `FROM orders WHERE`）
+          if (/^(on|where|and|or|group|order|limit|join|left|inner|using|set)$/.test(a)) aliasMap.set(t, t);
+          else aliasMap.set(a, t);
+        }
+        if (aliasMap.has(qual[1].toLowerCase())) table = aliasMap.get(qual[1].toLowerCase());
+      }
+      // `v_orders` 是 orders 的读模型（同一份 status 列），写在它上面的字面量同样会静默腐烂
+      if (table !== 'orders' && table !== 'v_orders') continue; // 退货单/码池/店铺申请另有一套状态
       const raw = m[1];
       // 占位符列表（`IN (${marks})`）没有字面量：它的内容由数组断言覆盖，这里跳过
       if (/\$\{|`/.test(raw)) continue;
@@ -119,7 +164,7 @@ test('任何 `UPDATE orders … SET status = 字面量` 的写入都是合法状
       const m = seg.match(/SET\s+status\s*=\s*'([a-z_]+)'/i);
       if (!m) continue;
       hits += 1;
-      if (!CANON.includes(m[1])) bad.push(`${file}: UPDATE orders SET status = '${m[1]}' 不是合法状态`);
+      if (!CANON.includes(m[1])) bad.push(`${file}: UPDATE orders SET status = '${m[1]}' 不在 status 的 ENUM 值域里`);
     }
   }
   assert.ok(hits >= 5, `扫到的 orders 状态写入只有 ${hits} 处，低于下限 5：扫描正则可能失效`);
@@ -155,7 +200,7 @@ test('orderStatus.js 的集合与 SQL 片段自洽（抽取后的新护栏）', 
   const mod = await import('../src/orderStatus.js');
   const { ORDER_STATUS, ACTIVE_STATUS, PRE_PAID_STATUS, DRAFT_OR_ACTIVE_STATUS, INCOME_STATUS, PII_ERASABLE_STATUS, PII_PROTECTED_STATUS, sqlIn, ACTIVE_IN, PRE_PAID_IN, DRAFT_OR_ACTIVE_IN, INCOME_IN } = mod;
 
-  assert.deepEqual([...ORDER_STATUS], [...CANON], 'ORDER_STATUS 必须与 db.js 的 CHECK 逐字同序');
+  assert.deepEqual([...ORDER_STATUS], [...CANON], 'ORDER_STATUS 必须与 db.js 的 ENUM 逐字同序');
   const sets = {
     ACTIVE_STATUS,
     PRE_PAID_STATUS,

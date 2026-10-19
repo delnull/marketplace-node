@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { login, makeCtx, productPayload, assertOk } from './setup.mjs';
+import { login, makeCtx, productPayload, assertOk, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, owner } = ctx;
@@ -41,7 +41,7 @@ const WEBM = Buffer.concat([
 const upload = (buf, { token = ownerToken, type = 'application/octet-stream' } = {}) =>
   request(app)
     .post('/api/uploads')
-    .set('Authorization', `Bearer ${token}`)
+    .set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value)
     .set('Content-Type', type)
     .send(buf);
 
@@ -140,7 +140,7 @@ test('读取：路径穿越与不存在的文件名都 404', async () => {
 
 test('media：形状、上限、URL 白名单、视频只收本站、封面必填', async () => {
   const post = (body) =>
-    request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).send(productPayload(body));
+    request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).send(productPayload(body));
 
   // 形状不对
   const badShape = await post({ media: ['https://example.com/a.jpg'] }).expect(200);
@@ -186,7 +186,7 @@ test('media：形状、上限、URL 白名单、视频只收本站、封面必�
 test('media 入快照：顺序与元素都是校验输入，改媒体/改顺序都必须重算哈希', async () => {
   const created = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(
       productPayload({
         title: '主图区快照',
@@ -211,7 +211,7 @@ test('media 入快照：顺序与元素都是校验输入，改媒体/改顺序�
   // 只调换顺序也要换哈希（顺序是展示语义，买家据此核验主图没被换）
   const swapped = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ media: [p.media[1], p.media[0]] })
     .expect(200);
   assertOk(swapped);
@@ -220,7 +220,7 @@ test('media 入快照：顺序与元素都是校验输入，改媒体/改顺序�
   // 换封面（poster）同样要变
   const reposter = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({
       media: [
         { ...swapped.body.data.media[1], poster: 'https://example.com/new-poster.jpg' },
@@ -234,7 +234,7 @@ test('media 入快照：顺序与元素都是校验输入，改媒体/改顺序�
   // 未提交 media 时沿用现有（三态：未提交=不动）
   const untouched = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ title: '主图区快照（改名）' })
     .expect(200);
   assertOk(untouched);
@@ -247,7 +247,7 @@ test('media 入快照：顺序与元素都是校验输入，改媒体/改顺序�
 test('详情块：空块丢弃、相邻文字合并、图片 URL 白名单', async () => {
   const ok1 = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(
       productPayload({
         title: '富说明商品',
@@ -271,7 +271,7 @@ test('详情块：空块丢弃、相邻文字合并、图片 URL 白名单', asy
   // javascript: 之类的 scheme 必须被拒（将来换渲染上下文就是 XSS）
   const bad = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ descriptionBlocks: [{ type: 'image', url: 'javascript:alert(1)' }] }))
     .expect(200);
   assert.notEqual(bad.body.code, 0);
@@ -279,7 +279,7 @@ test('详情块：空块丢弃、相邻文字合并、图片 URL 白名单', asy
 
   const badType = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ descriptionBlocks: [{ type: 'script', text: 'x' }] }))
     .expect(200);
   assert.notEqual(badType.body.code, 0);
@@ -289,7 +289,7 @@ test('详情块：空块丢弃、相邻文字合并、图片 URL 白名单', asy
 test('description 与块的关系：有块则由块派生（供搜索），无块则保留原文', async () => {
   const withBlocks = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(
       productPayload({
         title: '派生摘要',
@@ -318,7 +318,7 @@ test('description 与块的关系：有块则由块派生（供搜索），无�
 
   const plain = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '纯文本说明', description: '只有一段纯文本' }))
     .expect(200);
   assertOk(plain);
@@ -329,7 +329,7 @@ test('description 与块的关系：有块则由块派生（供搜索），无�
 test('详情块入快照：改块必须重算哈希，否则详情可被无声篡改', async () => {
   const created = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '快照含块', descriptionBlocks: [{ type: 'text', text: '原始说明' }] }))
     .expect(200);
   assertOk(created);
@@ -339,7 +339,7 @@ test('详情块入快照：改块必须重算哈希，否则详情可被无声�
 
   const patched = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ descriptionBlocks: [{ type: 'text', text: '原始说明' }, { type: 'image', url: 'https://e.com/x.png' }] })
     .expect(200);
   assertOk(patched);
@@ -351,7 +351,7 @@ test('详情块数量上限', async () => {
   const many = Array.from({ length: 41 }, (_, i) => ({ type: 'text', text: `第 ${i} 段` }));
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ descriptionBlocks: many }))
     .expect(200);
   assert.notEqual(res.body.code, 0);
@@ -367,7 +367,7 @@ test('批量改价：快照重算必须带上描述块与主图区（漏一个�
   */
   const created = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(
       productPayload({
         title: '批量改价一致性',
@@ -388,7 +388,7 @@ test('批量改价：快照重算必须带上描述块与主图区（漏一个�
 
   const res = await request(app)
     .patch('/api/products/batch')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ slugs: [p.slug], patch: { priceUsdtMicro: 99_000_000 } })
     .expect(200);
   assertOk(res);

@@ -1,11 +1,15 @@
 /**
  * 「免费草稿锁库存」两道闸的**并发原子性**（2026-09 源码评审修复的回归网）。
  *
- * 背景：这两道闸（同买家活跃草稿 ≤10、同买家同商品草稿占用合计 ≤99）原先读在 `txBegin()` **之前**，
+ * 背景：这两道闸（同买家活跃草稿 ≤10、同买家同商品草稿占用合计 ≤99）原先读在**事务之外**，
  * 而它们的"读计数"与后面的"插单"之间隔着 `await checkOrderGate(...)`——一次外部外呼。
  * Node 是单线程，但 `await` 会让出执行权：15 个并发请求会**全部**在各自插入之前读到同一份旧计数，
  * 于是两道闸同时失效（本意"单地址同商品最多锁 99 件"实际可以被打成群）。
- * 修法是把闸移进事务（读计数 + 插单在同一段同步代码里），由 SQLite 单写者串行保证原子。
+ * 修法是把闸移进 `withTransaction` 的回调里（读计数 + 插单在同一个事务里），
+ * 并把"读计数再判断"换成**带守卫的 UPDATE**（`buyer_draft_quota` / `buyer_product_quota`，
+ * 见 src/draftQuota.js）：越界在那条 UPDATE 自己身上失败，不再依赖任何一把锁串行化。
+ * （历史：中间态曾靠 db.js 的全局写锁让写事务串行；那把锁 2026-10-16 已删，
+ * 本文件正是"闸在真并发下仍然成立"的证据。）
  *
  * 为什么这个文件必须存在：既有的草稿上限用例是**串行**发请求的（`for` + `await`），
  * 那种写法下旧实现也"恰好对"——**它证明不了闸在并发下有效**。这里用一次性并发提交来证伪，
@@ -14,7 +18,7 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { assertOk, login, makeCtx, productPayload, skuInv } from './setup.mjs';
+import { assertOk, login, makeCtx, productPayload, skuInv, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner } = ctx;
@@ -29,7 +33,7 @@ before(async () => {
 async function listProduct(payload) {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(payload)
     .expect(200);
   assertOk(res);
@@ -42,7 +46,7 @@ function burstDrafts(slug, buyerAddr, { n, quantity = 1 }) {
     Array.from({ length: n }, () =>
       request(app)
         .post('/api/orders')
-        .set('Authorization', `Bearer ${ownerToken}`)
+        .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
         .send({ productSlug: slug, quantity, buyer: buyerAddr })
         .expect(200)
         .then((r) => r.body)
@@ -50,10 +54,8 @@ function burstDrafts(slug, buyerAddr, { n, quantity = 1 }) {
   );
 }
 
-const draftRows = (buyerAddr) =>
-  db
-    .prepare("SELECT id, quantity FROM orders WHERE buyer = ? AND status = 'draft'")
-    .all(String(buyerAddr).toLowerCase());
+const draftRows = async (buyerAddr) =>
+  await db.all("SELECT order_no AS id, quantity FROM v_orders WHERE buyer = ? AND status = 'draft'", String(buyerAddr).toLowerCase());
 
 test('并发下单：同买家活跃草稿上限恰好 10 张（闸在事务内才拦得住）', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '并发草稿上限商品', capacity: 500 }));
@@ -65,7 +67,7 @@ test('并发下单：同买家活跃草稿上限恰好 10 张（闸在事务内�
   const rejected = bodies.filter((b) => b.code !== 0);
 
   assert.equal(ok, 10, `并发下同买家只能有 10 张活跃草稿（实际成功 ${ok}）`);
-  assert.equal(draftRows(heavy.address).length, 10, '库里的 draft 行数必须与成功数一致（不多不少）');
+  assert.equal((await draftRows(heavy.address)).length, 10, '库里的 draft 行数必须与成功数一致（不多不少）');
   assert.match(
     rejected.map((b) => b.message).join(' '),
     /草稿过多/,
@@ -81,14 +83,14 @@ test('并发下单：同买家同商品草稿占用合计不超过 99 件（边�
   // 6 个并发请求各 20 件：只有 4 个能过（80 ≤ 99；第 5 个 100 > 99）
   const bodies = await burstDrafts(p.slug, heavy.address, { n: 6, quantity: 20 });
   const ok = bodies.filter((b) => b.code === 0).length;
-  const rows = draftRows(heavy.address);
+  const rows = await draftRows(heavy.address);
   const units = rows.reduce((s, r) => s + Number(r.quantity || 0), 0);
 
   assert.equal(ok, 4, `6×20 件并发下只能成功 4 单（实际成功 ${ok}）`);
   assert.equal(units, 80, `草稿占用合计必须是 80（实际 ${units}）`);
   assert.ok(units <= 99, '合计不得超过 99 件——这是该闸存在的全部意义');
   // 库存占位必须与草稿占用同步（置位与释放都走 stockHold 的单点契约）
-  const inv = skuInv(db, p.slug);
+  const inv = await skuInv(db, p.slug);
   assert.equal(Number(inv.committed), 80, `限量占位应与草稿占用一致（实际 ${inv.committed}）`);
   assert.match(
     bodies

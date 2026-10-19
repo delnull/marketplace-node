@@ -8,7 +8,7 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, owner } = ctx;
@@ -22,16 +22,23 @@ const { usdtMicroToPayWei } = await import('../src/rates.js');
 
 before(async () => {
   ownerToken = (await login(ctx, owner)).token;
-  // 操作员：经营面可用，财务面/ownerOnly 不可用（白名单 kv：登录前写入，auth 实时读取即生效）
+  /*
+    店员：经营面可用，财务面/ownerOnly 不可用（白名单**按店铺分**、一行一人：登录前写入，
+    auth 每次请求实时读 `shop_operators` 即生效）。
+    键是**店铺编号**（fixture 落的那一行）——空串不是任何一家店，写错了这一行不报错，
+    只会让下面每条 staffOnly 断言都以 403 的形态红（看起来像鉴权坏了）。
+    所以顺手断言读回的集合：白名单真的落在这一家店上。
+  */
   const operator = (await import('ethers')).Wallet.createRandom();
-  const { kvSet } = await import('../src/db.js');
-  kvSet('mk:shop_operators', JSON.stringify([operator.address.toLowerCase()]));
+  const { addShopOperator, getShopOperators } = await import('../src/auth.js');
+  await addShopOperator(shopRef.value, operator.address.toLowerCase());
+  assert.deepEqual(await getShopOperators(shopRef.value), [operator.address.toLowerCase()]);
   const op = await login(ctx, operator);
   operatorToken = op.token;
 });
 
 async function createProduct(payload) {
-  const res = await ctx.request(ctx.app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).send(payload).expect(200);
+  const res = await ctx.request(ctx.app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).send(payload).expect(200);
   assertOk(res);
   return res.body.data;
 }
@@ -39,7 +46,7 @@ async function createProduct(payload) {
 test('图片 URL 仅 http/https：javascript:/data: 拒绝入库，正常 https 通过', async () => {
   const bad = await ctx.request(ctx.app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '坏图商品', media: [{ type: 'image', url: 'javascript:alert(1)' }, { type: 'image', url: 'data:image/png;base64,AAAA' }] }))
     .expect(200);
   assert.notEqual(bad.body.code, 0, '非 http(s) 图片应整体拒绝');
@@ -54,7 +61,7 @@ test('下架商品详情：匿名/第三人 404，店主令牌可预览', async 
   // 操作员（staff）同样可预览（经营面）
   await ctx.request(ctx.app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ active: false })
     .expect(200);
 
@@ -65,7 +72,7 @@ test('下架商品详情：匿名/第三人 404，店主令牌可预览', async 
 
   const ownerView = await ctx.request(ctx.app)
     .get(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(ownerView.body.data.active, false, '店主可预览下架商品');
 });
@@ -74,42 +81,42 @@ test('码池清空：需 confirm + 仅 owner；清空后可改商品类型', asy
   const p = await createProduct(productPayload({ kind: 'digital', title: '清池商品' }));
   await ctx.request(ctx.app)
     .post(`/api/products/${p.slug}/codes`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: ['C1', 'C2', 'C3'] })
     .expect(200);
 
   // 操作员不能清池（ownerOnly 敏感批量作废）
   const opClear = await ctx.request(ctx.app)
     .delete(`/api/products/${p.slug}/codes?confirm=1`)
-    .set('Authorization', `Bearer ${operatorToken}`)
+    .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(403);
   assert.equal(opClear.body.code, 403);
 
   // 无 confirm 拒绝
   const noConfirm = await ctx.request(ctx.app)
     .delete(`/api/products/${p.slug}/codes`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.notEqual(noConfirm.body.code, 0);
 
   // 有池时改型被拒 → 清空后改型成功
   const blockType = await ctx.request(ctx.app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ kind: 'physical', title: '清池后改实物' })
     .expect(200);
   assert.notEqual(blockType.body.code, 0, '已建码池不可直接改型');
 
   const cleared = await ctx.request(ctx.app)
     .delete(`/api/products/${p.slug}/codes?confirm=1`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(cleared);
   assert.equal(cleared.body.data.cleared, 3);
 
   const changed = await ctx.request(ctx.app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     /*
       写接口只认 `specs + skus`（商品级的 `capacity` 是各组合之和的只读汇总，提交它会被
       **带字段名拒绝**——见 products.js 的 PRODUCT_WRITE_KEYS）。本用例只想验"清池后可改型"，
@@ -158,10 +165,15 @@ test('履约画像同源窗口：窗外创建、窗内确认的旧单不再污�
       // 托管证明（画像按它计入单量）+ 锚点兜底（OrderCreated 被挤掉时用）——见 computeReputation 的说明
       paid_tx_hash: '0x' + 'ab'.repeat(32),
       created_at: oldCreated,
-      onchain_events: JSON.stringify([
+      /*
+        ⚠️ **不 stringify**：`onchain_events` 是 JSON 列，驱动读回来已是数组，
+        `parseOnchainEvents` 只收数组（传字符串会回 `[]` ⇒ 这里变成"没有 ReceiptConfirmed"
+        ⇒ 175 行的 `confirmed` 断言响亮失败，而不是静默算错）。
+      */
+      onchain_events: [
         e('OrderCreated', oldCreated),
         e('ReceiptConfirmed', now - 1000), // 窗内才确认（旧实现会把确认计进 d30 分子）
-      ]),
+      ],
     },
   ];
   const r = computeReputation(rows, now);
@@ -179,20 +191,20 @@ test('码池敏感读取入审计（code.read）且 detail 不含码原文', asy
   const p = await createProduct(productPayload({ kind: 'digital', title: '审计读码商品' }));
   await ctx.request(ctx.app)
     .post(`/api/products/${p.slug}/codes`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: ['SECRET-CODE-X'] })
     .expect(200);
   await ctx.request(ctx.app)
     .get(`/api/products/${p.slug}/codes?status=all`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
-  const audit = await ctx.request(ctx.app).get('/api/shop/audit').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const audit = await ctx.request(ctx.app).get('/api/shop/audit').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   const reads = audit.body.data.items.filter((i) => i.action === 'code.read');
   assert.ok(reads.length >= 1, '码池读取应留审计');
   assert.ok(!JSON.stringify(reads).includes('SECRET-CODE-X'), '审计 detail 不得含码原文');
   const opRead = await ctx.request(ctx.app)
     .get(`/api/products/${p.slug}/codes?status=all`)
-    .set('Authorization', `Bearer ${operatorToken}`)
+    .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(opRead, '操作员仍可读码（经营面设计），但读取留痕');
 });

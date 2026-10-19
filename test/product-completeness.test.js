@@ -1,6 +1,6 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 /**
  * 卖家列表的「资料是否齐全」：筛选（`?incomplete=1`）与逐行 `missing` 必须**同源**。
@@ -19,12 +19,12 @@ before(async () => {
 });
 
 const create = async (body) => {
-  const res = await request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).send(body).expect(200);
+  const res = await request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).send(body).expect(200);
   assertOk(res);
   return res.body.data;
 };
 const all = async (query = '') => {
-  const res = await request(app).get(`/api/products/all${query}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const res = await request(app).get(`/api/products/all${query}`).set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assertOk(res);
   return res.body.data.products;
 };

@@ -34,7 +34,6 @@
  * 没有一个判定词，也不提供"是否拉黑"这类结论字段；解读的责任在店主，判断的依据是订单明细。
  */
 import { getDb } from './db.js';
-import config from './config.js';
 import { INCOME_STATUS } from './orderStatus.js';
 import { rowEverDisputed } from './orderFacts.js';
 import { parseOnchainEvents } from './reputation.js';
@@ -49,7 +48,12 @@ export const SIGNAL_MIN_SAMPLES = 3;
 /** 比率：分母 0 → null；4 位小数（与履约画像同款，防浮点尾巴） */
 const ratio = (num, den) => (den > 0 ? Math.round((num / den) * 10000) / 10000 : null);
 
-/** 该单是否退过钱给买家（`refunded_amount_wei != '0'`，含全额与部分/仲裁拆分；链上 getOrder.refundedAmount 的镜像） */
+/**
+ * 该单是否退过钱给买家（`refunded_amount_wei > 0`，含全额与部分/仲裁拆分；链上 getOrder.refundedAmount 的镜像）。
+ * 列是 `DECIMAL(38,0)` ⇒ 驱动给**字符串**（38 位 wei 过不了 JS 数字，见 db.js），所以一律 `BigInt(...)`；
+ * NULL（读模型里没有链上镜像行）按"没有退款"处理——进得了样本的单必然有那一行
+ * （样本判据是 `paid_tx_hash` 非空，而它就住在链上镜像表上）。
+ */
 function hasRefundedToBuyer(row) {
   try {
     return BigInt(row?.refunded_amount_wei || '0') > 0n;
@@ -66,10 +70,12 @@ function hasRefundedToBuyer(row) {
  * 文件头）。刻意**不用** `escrow_order_id`：那一列在**下单草稿**时就已生成（orderId 随草稿落库），
  * 拿它当"成交"会把一堆从未付款的草稿算进分母——"5 张单 0 次履约"就会看起来像履约记录。
  *
- * @param {Array<object>} rows 该买家的 orders 行
- * @param {{address?: string, minSamples?: number, now?: number}} opts
+ * @param {Array<object>} rows 该买家在**本店**的订单行（读模型 `v_orders`）
+ * @param {{address?: string, seller?: string|null, minSamples?: number, now?: number}} opts
+ *        `seller` = 本店店主地址（端点解析出来的那一个）：只用于响应里的 `shopOwner`，
+ *        不参与判据——`seller === null` 表示"该节点全部店铺的合计"（节点级读数）。
  */
-export function computeBuyerSignal(rows, { address, minSamples = SIGNAL_MIN_SAMPLES, now = Date.now() } = {}) {
+export function computeBuyerSignal(rows, { address, seller = null, minSamples = SIGNAL_MIN_SAMPLES, now = Date.now() } = {}) {
   const list = Array.isArray(rows) ? rows : [];
   const addr = String(address || '').toLowerCase();
   const min = Number.isFinite(Number(minSamples)) && Number(minSamples) > 0 ? Math.floor(Number(minSamples)) : SIGNAL_MIN_SAMPLES;
@@ -119,8 +125,11 @@ export function computeBuyerSignal(rows, { address, minSamples = SIGNAL_MIN_SAMP
       ⑥ 提出过退款申请：取**耐久痕迹** `refund_requested_at`（而不是数 RefundRequested 事件）——
       终局迁移会复位 refund_status，却刻意保留这一列时刻（见 escrowWatcher 的两级售后分支），
       所以它比"事件史里还有没有那条事件"更可靠（事件史只保留最近 20 条，会被挤掉）。
+      列是 `DATETIME(3)`（`Date` 或 NULL，见 db.js 的三层时间口径），所以判据是"有没有这个时刻"，
+      不再与 0 比大小——`Number(Date)` 会得到毫秒数而**恰好**能比，但那让"NULL 被当成 0"
+      这一档悄悄溜过去（NULL → `Number(null)` = 0 → 判成"没申请过"）。
     */
-    if (Number(r?.refund_requested_at) > 0 || String(r?.refund_status) === 'requested') refundRequested += 1;
+    if (r?.refund_requested_at != null || String(r?.refund_status) === 'requested') refundRequested += 1;
     // ⑦ 售后案件（本地列状态；案件是叠加在终局之上的第二层，不动 orders.status）
     const as = String(r?.after_sale_status || 'none');
     if (as === 'open') afterSaleOpen += 1;
@@ -177,7 +186,12 @@ export function computeBuyerSignal(rows, { address, minSamples = SIGNAL_MIN_SAMP
         '它们是否曾经争议/超时释放**读不到**，不计入 disputed / expiredReleased，也不当作"没发生过"。',
     },
     scope: 'this_shop_only',
-    shopOwner: (config.shop.owner || '').toLowerCase() || null,
+    /*
+      本店店主地址 = 端点解析出来的**这家店的 seller**（不是 `config.shop.owner`）：
+      多店之下后者是**节点主**（谁提供基础设施），而被查询的这家店可能属于别的店主——
+      拿节点主冒充"本店店主"就是一句关于别人的断言。节点级合计读数（seller=null）如实给 null。
+    */
+    shopOwner: seller ? String(seller).toLowerCase() : null,
     scopeNote:
       '本读数只统计**本店**与该买家的历史：节点不会为任意地址去其他店铺查询（那是别人的数据面，也是隐私面）。' +
       '你看到的就是"该买家在本店的表现"，不代表他在别处如何。',
@@ -195,20 +209,37 @@ export function computeBuyerSignal(rows, { address, minSamples = SIGNAL_MIN_SAMP
   };
 }
 
-/** 端点用入口：读该买家在本店的订单行 → 纯函数（无链上读取、无跨店查询） */
-export function buyerSignal(address, opts = {}) {
+/**
+ * 端点用入口：读该买家在**指定店铺**的订单行 → 纯函数（无链上读取、无跨店查询）。
+ *
+ * **必须按卖家地址限定"本店"**（2026-10-15 修 D6；2026-10 多店改造改为显式传参）：
+ * `orders.seller` 是逐行写入的（= 该单所属店铺的 `shops.seller`），而这个读数的 `scope`
+ * 自称 `this_shop_only` —— 不带这个过滤，多店之下会把**别家店**与该买家的往来算进
+ * "他在本店的表现"（`localOrders`/`sample` 一起被抬高，店主据此误判风险）。
+ *
+ * `seller` 是**必传**（三态，与 reputationSummary 同款）：`undefined` ⇒ 抛错（不给默认值，
+ * 让"忘了传"不可表达）；`null` = 该节点全部在售店铺的合计（**只在节点级读数里用**，
+ * 店铺级端点一律传该店 seller）。
+ * @param {string} address
+ * @param {string|null|undefined} seller
+ * @param {object} [opts]
+ */
+export async function buyerSignal(address, seller, opts = {}) {
+  if (seller === undefined) {
+    throw new Error('buyerSignal 需要显式的 seller（店铺级端点必须传该店 seller）；漏传会静默跨店混算');
+  }
   const addr = String(address || '').toLowerCase();
+  const sel = seller === null ? '' : String(seller).toLowerCase();
   /*
-    **必须按 `seller` 限定"本店"**（2026-10-15 修 D6，与 reputationSummary 同一条判据）：
-    `orders.seller` 是逐行写入的（= 写入时的 `config.shop.owner`），而这个读数的 `scope`
-    自称 `this_shop_only` —— 换过店主地址（店铺转手 / 换绑钱包）之后，不带这个 WHERE
-    会把**上一家店**与该买家的往来算进"他在本店的表现"（`localOrders`/`sample` 一起被抬高）。
-    未配店主（只读展示模式）时不加过滤：那时没有身份可比对，库里的行只可能来自本节点自己
-    （判据与代价见 reputation.js 的 reputationSummary）。
+    整单读走读模型 `v_orders`：这一份读数要同时看订单事实（status/buyer/seller/created_at）、
+    链上镜像（paid_tx_hash / refund_* / after_sale_* / events）与退款金额——三张表里的列，
+    视图一次给全（列名与旧形状一致，只有事件史那一列在这里叫 `onchain_events`）。
+    `seller = ?` 不带 `lower()`：地址列的大小写不敏感排序规则已经在那了（见 db.js 第 8 条），
+    函数包住列只会让索引失效。
   */
-  const seller = String(config.shop?.owner || '').toLowerCase();
-  const rows = getDb()
-    .prepare(`SELECT * FROM orders WHERE buyer = ? ${seller ? 'AND lower(seller) = ?' : ''} ORDER BY created_at DESC`)
-    .all(...(seller ? [addr, seller] : [addr]));
-  return computeBuyerSignal(rows, { address: addr, ...opts });
+  const rows = await getDb().all(
+    `SELECT * FROM v_orders WHERE buyer = ? ${sel ? 'AND seller = ?' : ''} ORDER BY created_at DESC`,
+    ...(sel ? [addr, sel] : [addr])
+  );
+  return computeBuyerSignal(rows, { address: addr, seller: sel || null, ...opts });
 }

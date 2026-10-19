@@ -7,7 +7,7 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -28,7 +28,7 @@ before(async () => {
 async function listProduct(payload) {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(payload)
     .expect(200);
   assertOk(res);
@@ -39,7 +39,7 @@ async function listProduct(payload) {
 async function createDraftWithShipping(slug, shipping, quantity = 1) {
   const res = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, quantity, shipping })
     .expect(200);
   assertOk(res);
@@ -54,13 +54,13 @@ test('实物商品下单携带收货信息：买家本人/店主可见，匿名�
   // 详情按视角返回
   const asBuyer = await request(app)
     .get(`/api/orders/${o.id}`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.deepEqual(asBuyer.body.data.shipping, GOOD_SHIPPING, '买家登录可见收货信息');
 
   const asOwner = await request(app)
     .get(`/api/orders/${o.id}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.deepEqual(asOwner.body.data.shipping, GOOD_SHIPPING, '店主可见收货信息（发货履约用）');
 
@@ -69,25 +69,25 @@ test('实物商品下单携带收货信息：买家本人/店主可见，匿名�
 
   const asStranger = await request(app)
     .get(`/api/orders/${o.id}`)
-    .set('Authorization', `Bearer ${strangerToken}`)
+    .set('Authorization', `Bearer ${strangerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(asStranger.body.data.shipping, null, '第三人不可见收货信息');
 
-  // 买家列表（登录本人）同构携带；匿名列表为 null
+  // 买家列表（登录本人）同构携带；匿名列表连草稿行都不出现
   const list = await request(app)
     .get(`/api/orders?address=${buyer.address}`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.deepEqual(list.body.data.orders.find((x) => x.id === o.id).shipping, GOOD_SHIPPING);
   const listAnon = await request(app)
     .get(`/api/orders?address=${buyer.address}`)
     .expect(200);
-  assert.equal(listAnon.body.data.orders.find((x) => x.id === o.id).shipping, null);
+  assert.equal(listAnon.body.data.orders.find((x) => x.id === o.id), undefined, '匿名列表不出现草稿行');
 
   // 卖家列表（/seller）亦可见
   const sellerList = await request(app)
     .get('/api/orders/seller')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.deepEqual(sellerList.body.data.orders.find((x) => x.id === o.id).shipping, GOOD_SHIPPING);
 });
@@ -98,7 +98,7 @@ test('收货信息为选填：不传/全空不报错且输出空对象；越界�
   // 不传 shipping → 正常下单，输出空收货信息
   const noShip = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: p.slug })
     .expect(200);
   assertOk(noShip);
@@ -107,7 +107,7 @@ test('收货信息为选填：不传/全空不报错且输出空对象；越界�
   // 全空对象 → 同不传
   const empty = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: p.slug, shipping: { name: '  ', phone: '', address: '' } })
     .expect(200);
   assertOk(empty);
@@ -115,7 +115,7 @@ test('收货信息为选填：不传/全空不报错且输出空对象；越界�
   // 超长拒绝
   const bad = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: p.slug, shipping: { name: 'x'.repeat(61), phone: '1', address: 'a' } })
     .expect(200);
   assert.notEqual(bad.body.code, 0);
@@ -123,7 +123,7 @@ test('收货信息为选填：不传/全空不报错且输出空对象；越界�
 
   const badAddr = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: p.slug, shipping: { name: '张三', phone: '1', address: 'x'.repeat(301) } })
     .expect(200);
   assert.notEqual(badAddr.body.code, 0);
@@ -144,7 +144,7 @@ test('订单备注 note：≤200 字、不入快照、当事人可见；越界�
   const p = await listProduct(productPayload({ kind: 'digital', title: '备注商品' }));
   const res = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: p.slug, note: '  请发顺丰 / 发票抬头：测试公司  '.repeat(3).slice(0, 260) })
     .expect(200);
   assertOk(res);
@@ -156,22 +156,22 @@ test('订单备注 note：≤200 字、不入快照、当事人可见；越界�
   const plain = await createDraftWithShipping(p.slug, { name: '', phone: '', address: '' }); // digital 无收货信息
   const plain2 = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: p.slug })
     .expect(200);
   assertOk(plain2);
   assert.equal(o.snapshotHash, plain2.body.data.snapshotHash, '备注不入快照哈希');
 
   // 可见矩阵：买家本人/店主可见；匿名与第三人 null
-  const asBuyer = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).expect(200);
+  const asBuyer = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.equal(asBuyer.body.data.note, o.note);
-  const asOwner = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const asOwner = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.equal(asOwner.body.data.note, o.note, '店主可见买家备注（履约沟通）');
   const anon = await request(app).get(`/api/orders/${o.id}`).expect(200);
   assert.equal(anon.body.data.note, null, '匿名不暴露备注');
   const asStranger = await request(app)
     .get(`/api/orders/${o.id}`)
-    .set('Authorization', `Bearer ${strangerToken}`)
+    .set('Authorization', `Bearer ${strangerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(asStranger.body.data.note, null, '第三人不可见备注');
   void plain;
@@ -181,14 +181,14 @@ test('发货前修改收货信息：escrowed 实物单买家可改；发货后/�
   const p = await listProduct(productPayload({ kind: 'physical', title: '改地址商品', capacity: 5 }));
   const o = await createDraftWithShipping(p.slug, GOOD_SHIPPING);
   // 模拟链上托管（escrowed + 支付凭证）
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run('0x' + 'a'.repeat(64), Date.now(), o.id);
+  await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), o.id);
+  await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', '0x' + 'a'.repeat(64), o.id);
 
   const NEW_SHIP = { name: '王五', phone: '13700137000', address: '广州市天河区新地址 99 号' };
   // 第三人不可改
   const strangerPatch = await request(app)
     .patch(`/api/orders/${o.id}/shipping`)
-    .set('Authorization', `Bearer ${strangerToken}`)
+    .set('Authorization', `Bearer ${strangerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(NEW_SHIP)
     .expect(403);
   assert.equal(strangerPatch.body.code, 403);
@@ -196,7 +196,7 @@ test('发货前修改收货信息：escrowed 实物单买家可改；发货后/�
   // 买家修改成功
   const okRes = await request(app)
     .patch(`/api/orders/${o.id}/shipping`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(NEW_SHIP)
     .expect(200);
   assertOk(okRes);
@@ -206,22 +206,22 @@ test('发货前修改收货信息：escrowed 实物单买家可改；发货后/�
   // 每单仅可修改一次：第二次修改被拒（防反复改址）
   const second = await request(app)
     .patch(`/api/orders/${o.id}/shipping`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ name: '赵六', phone: '13600136000', address: '深圳市南山区又一次改地址' })
     .expect(200);
   assert.notEqual(second.body.code, 0, '第二次修改被拒');
   assert.match(second.body.message || '', /已修改过一次/);
   const afterSecond = await request(app)
     .get(`/api/orders/${o.id}`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.deepEqual(afterSecond.body.data.shipping, NEW_SHIP, '第二次修改未生效');
 
   // 发货后不可改（status shipped）
-  db.prepare("UPDATE orders SET status = 'shipped', tracking_no = 'SF1', updated_at = ? WHERE id = ?").run(Date.now(), o.id);
+  await db.run("UPDATE orders SET status = 'shipped', tracking_no = 'SF1', updated_at = ? WHERE order_no = ?", new Date(), o.id);
   const afterShip = await request(app)
     .patch(`/api/orders/${o.id}/shipping`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(NEW_SHIP)
     .expect(200);
   assert.notEqual(afterShip.body.code, 0, '发货后不可修改');
@@ -230,14 +230,14 @@ test('发货前修改收货信息：escrowed 实物单买家可改；发货后/�
   const dg = await listProduct(productPayload({ kind: 'digital', title: '改址数字商品' }));
   const dgOrder = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: dg.slug })
     .expect(200);
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run('0x' + 'b'.repeat(64), Date.now(), dgOrder.body.data.id);
+  await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), dgOrder.body.data.id);
+  await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', '0x' + 'b'.repeat(64), dgOrder.body.data.id);
   const dgPatch = await request(app)
     .patch(`/api/orders/${dgOrder.body.data.id}/shipping`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(NEW_SHIP)
     .expect(200);
   assert.notEqual(dgPatch.body.code, 0, '非实物单不可改收货信息');

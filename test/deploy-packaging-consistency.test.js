@@ -67,8 +67,6 @@ test('拷贝规则作用于一批文件名时的实际结果（.env 被排掉、
     'docker-entrypoint.sh',
     'src/server.js',
     'scripts/register-node.mjs',
-    'marketplace-node.db',
-    'marketplace-node.db-wal',
     'node_modules/express/package.json',
     'data/x',
     'uploads/x',
@@ -83,9 +81,45 @@ test('拷贝规则作用于一批文件名时的实际结果（.env 被排掉、
   for (const must of ['.env.example', 'Dockerfile', 'src/server.js', 'scripts/register-node.mjs']) {
     assert.ok(kept.includes(must), `${must} 必须留在部署目录里，实际留下的：${kept.join(' ')}`);
   }
-  for (const not of ['.env', '.env.local', 'marketplace-node.db', 'node_modules/express/package.json', '.git/config', '.deploy-state']) {
-    assert.ok(!kept.includes(not), `${not} 不该被搬到部署目录（本机状态/密钥/数据）：${kept.join(' ')}`);
+  for (const not of ['.env', '.env.local', 'node_modules/express/package.json', '.git/config', '.deploy-state']) {
+    assert.ok(!kept.includes(not), `${not} 不该被搬到部署目录（本机状态/密钥）：${kept.join(' ')}`);
   }
+});
+
+/*
+  ── MySQL 之后，"数据库怎么配"整体从**文件**搬到了**环境变量**上 ──
+
+  SQLite 时期这条守卫盯的是"本机那个 .db（含 -wal/-shm）不许被搬到服务器上"：那是**数据**，
+  搬过去要么泄露、要么让新装的节点读到旧库。现在库里没有任何文件，唯一能泄露的是**连接口令**
+  （MK_DB_PASSWORD），而它只存在于 `.env` 里——所以上面"排掉 .env"那条仍然成立，只是主语变了。
+  这一组把新形状钉住，同样是结构性的：
+    · `.env.example`（会被搬到服务器）必须写全 MK_DB_* 键，且口令必须是空的——否则全新安装
+      既不知道要配什么，又可能把一个真口令当模板发出去；
+    · deploy.sh 的 MANAGED_KEYS **不得**包含任何 MK_DB_*：口令是运维自己写进 .env 的，
+      部署脚本既不该生成、也不该覆盖（脚本重跑要原样保留它）。
+*/
+test('.env.example 写全 MK_DB_* 键，且口令位留空（模板会跟着代码发布出去）', () => {
+  const lines = read('.env.example')
+    .split('\n')
+    .map((l) => l.trim());
+  const valueOf = (key) => {
+    const hit = lines.find((l) => l.startsWith(`${key}=`) && !l.startsWith('#'));
+    return hit === undefined ? undefined : hit.slice(key.length + 1);
+  };
+  for (const key of ['MK_DB_HOST', 'MK_DB_PORT', 'MK_DB_USER', 'MK_DB_NAME']) {
+    assert.ok(valueOf(key) !== undefined, `.env.example 缺 ${key}（全新安装无从得知库怎么配）`);
+  }
+  assert.equal(valueOf('MK_DB_PASSWORD'), '', 'MK_DB_PASSWORD 在模板里必须留空（真实口令只写进本机 .env）');
+});
+
+test('deploy.sh 不代管任何 MK_DB_* 键（口令由运维写进 .env，脚本既不生成也不覆盖）', () => {
+  const managed = /MANAGED_KEYS='([^']*)'/.exec(read('deploy.sh'));
+  assert.ok(managed, 'deploy.sh 里找不到 MANAGED_KEYS（重跑时原样保留的键清单）');
+  const keys = managed[1].split(/\s+/);
+  const dbKeys = keys.filter((k) => k.startsWith('MK_DB_'));
+  assert.deepEqual(dbKeys, [], `这些库连接键不该由部署脚本代管：${dbKeys.join(' ')}`);
+  // 反向控制：脚本确实**告知**了运维该在哪里写 MK_DB_*（否则全新安装会卡在"连不上库"而没人知道为什么）
+  assert.match(read('deploy.sh'), /MK_DB_HOST/, 'deploy.sh 必须写明 MK_DB_* 由运维写进 .env（否则连不上库时无从下手）');
 });
 
 test('Dockerfile 里 COPY 的每个源文件，都不会被拷贝规则误杀（否则镜像构建必炸）', () => {

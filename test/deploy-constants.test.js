@@ -18,11 +18,23 @@ const NODE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const CONSTANTS = JSON.parse(fs.readFileSync(path.join(NODE_DIR, 'deploy-constants.json'), 'utf8'));
 const DEPLOY_SH = fs.readFileSync(path.join(NODE_DIR, 'deploy.sh'), 'utf8');
 
-test('deploy-constants.json：合约三项必须有**本批**的形状（地址 + 非 0 起始块）', () => {
-  const { escrow, registry, startBlock } = CONSTANTS.contracts;
+test('deploy-constants.json：合约四项要么全空（本批尚未部署），要么三者形状俱全', () => {
+  /*
+    ⚠️ **"留空"是一个合法状态**（2026-10-16 改判据）：`contracts` 记的是**本批部署产物**，
+    只有真部署过才知道；而此前每一批都已整体作废（缺当前源码里店主分账所需的读法，
+    节点的启动期代次自检会判定代次不符并拒绝工作）。留空时 `deploy.sh` 的结构门禁会当场
+    拒绝部署（见那里的 `[deploy.sh] 拒绝执行` 分支）——**空值响亮地停下，旧值静默地接错**，
+    所以"空"必须被允许，而不是被这条测试逼着填一个已作废的地址进去。
+    真正不许出现的是**半填**：有地址却没哈希（那样"接的是哪一代"无法机械核验）。
+    `escrowCodeHash` 与本地编译产物的一致性由 `deploy-plan.test.js` 守。
+  */
+  const { escrow, registry, startBlock, escrowCodeHash } = CONSTANTS.contracts;
+  const allEmpty = !escrow && !registry && !escrowCodeHash && Number(startBlock) === 0;
+  if (allEmpty) return;
   assert.match(escrow, /^0x[0-9a-fA-F]{40}$/, 'Escrow 必须是合法地址');
   assert.match(registry, /^0x[0-9a-fA-F]{40}$/, 'Registry 必须是合法地址');
   assert.ok(Number.isInteger(startBlock) && startBlock > 0, 'startBlock 必须是正整数：0 表示从最新块开始 ⇒ 漏扫历史事件且不报错');
+  assert.match(String(escrowCodeHash), /^0x[0-9a-fA-F]{64}$/, '填了地址就必须给出该批 Escrow 的运行时字节码哈希（否则无法机械核验代次）');
 });
 
 test('deploy-constants.json：网络与前端来源在，且 chainId 与 RPC 是主网口径', () => {
@@ -32,7 +44,15 @@ test('deploy-constants.json：网络与前端来源在，且 chainId 与 RPC 是
 });
 
 test('deploy.sh 从 JSON 读合约三项 —— 不允许自己留一份字面量', () => {
-  // 判据：脚本里有 `ESCROW="$(const escrow)"` 这类取值，且**没有**硬编码的 0x… 地址
+  /*
+    判据：脚本里有 `ESCROW="$(const escrow)"` 这类取值。
+    **`escrowCodeHash` 不在此列，而且是刻意的**：`deploy.sh` 装出来的节点**不需要**它——
+    链上那两个 immutable 锚（`Registry.CANONICAL_ESCROW_CODE_HASH`、
+    `Staking.CANONICAL_ESCROW_CODE_HASH`）已经把这个哈希钉死了，节点自己的启动期代次自检
+    逐条探读法（`ESCROW_GENERATION_PROBES`）也足够回答"接的是不是这一代"。
+    它的消费方是**仓库自己**：`deploy-plan.test.js` 拿它与本地编译产物比对，
+    让"改了合约却没换批"当场变红。给脚本加一条读了不用的赋值，正好是本仓反对的那种形状。
+  */
   for (const [key, field] of [['ESCROW', 'escrow'], ['REGISTRY', 'registry'], ['START_BLOCK', 'startBlock']]) {
     assert.match(
       DEPLOY_SH,
@@ -40,12 +60,21 @@ test('deploy.sh 从 JSON 读合约三项 —— 不允许自己留一份字面�
       `${key} 应从 deploy-constants.json 读（const ${field}）`
     );
   }
-  const addr = CONSTANTS.contracts.escrow.toLowerCase();
-  const occurrences = DEPLOY_SH.toLowerCase().split(addr).length - 1;
-  assert.equal(
-    occurrences,
-    0,
-    'deploy.sh 里不该再出现合约地址字面量（连注释里的示例地址也算：注释会漂移，且换批时没人会去改它）'
+  /*
+    脚本里不许出现**任何** 40 位十六进制地址字面量（连注释里的示例也算：注释会漂移，
+    换批时没人会去改它）。判据从"不含某一个具体地址"升级成"不含任何一个地址"——
+    前者在常量留空时退化成恒真（`''.split(…)` 命中 53286 次，本会话实测），等于没守。
+    唯一的例外是**全零地址**：它不是"某个合约的地址"，而是"没有地址"的写法
+    （owner 校验里用它挡占位值），留着一个具体地址才会漂移。
+  */
+  const ZERO = '0x0000000000000000000000000000000000000000';
+  const addrLiterals = [...DEPLOY_SH.matchAll(/0x[0-9a-fA-F]{40}\b/g)]
+    .map((m) => m[0])
+    .filter((a) => a.toLowerCase() !== ZERO);
+  assert.deepEqual(
+    [...new Set(addrLiterals)],
+    [],
+    'deploy.sh 里不该出现合约地址字面量（注释里的示例也算）——它必须从 deploy-constants.json 读'
   );
 });
 

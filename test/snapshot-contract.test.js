@@ -15,7 +15,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx } from './setup.mjs';
+import { makeCtx, shopRef } from './setup.mjs';
 
 // 先建临时库/注入环境，再动态 import 路由模块（它经 config/db 读环境，与其它用例同一套底座）
 await makeCtx();
@@ -44,30 +44,35 @@ const CROSS_LANG_FIXTURE = {
 };
 
 test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 keccak（两侧必须逐字节一致）', () => {
-  // node 输入形状：DB 行（snake_case；media/description_blocks/specs/attributes/terms 是 JSON 字符串列）
+  /*
+    node 输入形状：DB 行（snake_case）。JSON 列（media/description_blocks/specs/attributes/terms）
+    **不 stringify**：驱动读回来就是解析好的数组/对象，快照投影只收这个形状——传字符串会被
+    `assertParsedJsonColumn` 响亮拒绝（那是刻意的，见 setup.mjs 的 rowLikeOf）。
+    `skus` 是子表行（不是 JSON 列），形状与 v_orders 无关。
+  */
   const row = {
     slug: 'p-fix-1',
     title: '测试 "商品" & co', // 含引号与 &：转义差异会立刻改变 JSON
     description: 'desc\nline2', // 含换行：\n 的写法必须一致
-    description_blocks: '[]',
+    description_blocks: [],
     // 主图区：图片 + 视频各一。**元素里的键序也是契约**（type → url → poster）——
     // 写入路径重建对象时就是这个顺序，两端不能各按自己的写法序列化。
-    media: JSON.stringify([
+    media: [
       { type: 'image', url: 'https://a/b.png' },
       {
         type: 'video',
         url: '/api/uploads/00000000-0000-0000-0000-000000000000.mp4',
         poster: '/api/uploads/11111111-1111-1111-1111-111111111111.jpg',
       },
-    ]),
+    ],
     kind: 'physical',
     shipping_fee_usdt_micro: 5_000_000, // 运费必须进快照（否则店主可在下单前事后加价）
     age_restricted: 1, // 年龄限制必须进快照
     // skus 故意乱序传入：实现必须按 sku_key 升序排（顺序影响哈希）
-    specs: JSON.stringify([
+    specs: [
       { name: '颜色', options: ['黑', '白'] },
       { name: '尺寸', options: ['M'] },
-    ]),
+    ],
     /*
       三个新键（2026-10-15）都在这里**带真实内容**参与 fixture：
       · attributes 顺序 = 店主书写顺序（不重排）；
@@ -79,16 +84,16 @@ test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 
       { sku_key: '尺寸=M|颜色=白', price_usdt_micro: 12_000_000, image_url: '' },
       { sku_key: '尺寸=M|颜色=黑', price_usdt_micro: 10_000_000, image_url: 'https://a/black.png' },
     ],
-    attributes: JSON.stringify([
+    attributes: [
       { name: '成色', value: '全新未拆封' },
       { name: '材质', value: '304 不锈钢' },
-    ]),
-    terms: JSON.stringify({
+    ],
+    terms: {
       handling_days: 2,
       return_policy: 'no-reason',
       return_window_days: 7,
       return_freight: 'seller',
-    }),
+    },
   };
 
   const snap = snapshotObject(row);
@@ -101,15 +106,15 @@ test('snapshot 契约：NFT 单的两键追加在 sku_images 之后（与前端�
     slug: 'p-fix-nft',
     title: 'NFT 商品',
     description: '',
-    description_blocks: '[]',
-    media: '[]',
+    description_blocks: [],
+    media: [],
     kind: 'nft',
     shipping_fee_usdt_micro: 0,
     age_restricted: 0,
-    specs: '[]',
+    specs: [],
     skus: [{ sku_key: '', price_usdt_micro: 3_000_000 }],
-    attributes: '[]',
-    terms: '{}', // 未声明任何承诺：三态里的"空承诺"必须是这个形状（不是缺键）
+    attributes: [],
+    terms: {}, // 未声明任何承诺：三态里的"空承诺"必须是这个形状（不是缺键）
     // 故意大写：实现必须归一成小写（否则同一件商品会得到两个哈希）
     nft_contract: '0xAbC0000000000000000000000000000000000001',
     nft_standard: 'erc1155',

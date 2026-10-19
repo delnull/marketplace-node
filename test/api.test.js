@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertOk, login, makeCtx, productPayload, rowLikeOf } from './setup.mjs';
+import { assertOk, login, makeCtx, productPayload, rowLikeOf, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -30,14 +30,23 @@ test('店铺信息与健康检查公开可读', async () => {
 
 // ── SIWE 认证 ──
 
-test('SIWE：店主登录 isOwner=true，买家登录 isOwner=false，令牌可鉴权', async () => {
+test('SIWE：节点主登录 isHost=true、店主身份按 shops[] 给出；买家两者都不是，令牌可鉴权', async () => {
   const ownerLogin = await login(ctx, owner);
-  assert.equal(ownerLogin.isOwner, true);
+  assert.equal(ownerLogin.isHost, true);
+  /*
+    登录是**节点级**的：回执回答"这个地址是谁"（`isHost`）与"他在这台机器上能经营哪些店、
+    各自什么角色"（`shops[]`），而不是"这次登录针对哪家店"——所以"我是不是店主"这件事
+    没有节点级答案，只有**逐店**答案（见 src/routes/auth.js）。旧形状的 `role`/`isOwner`/
+    `isStaff` 正是那个已删掉的"针对哪家店"的结论，回执里不再有它们。
+  */
+  assert.equal(ownerLogin.shops.find((s) => s.code === shopRef.value)?.role, 'owner', '店主身份由 shops[] 里那家店的 role 回答');
   assert.equal(ownerLogin.address.toLowerCase(), owner.address.toLowerCase());
   assert.ok(ownerLogin.token.includes('.'));
 
+  // 买家：登录照样成功（一次登录即可买本节点任何一家店的东西），只是没有可经营的店
   const buyerLogin = await login(ctx, buyer);
-  assert.equal(buyerLogin.isOwner, false);
+  assert.equal(buyerLogin.isHost, false);
+  assert.deepEqual(buyerLogin.shops, [], '买家在这台机器上没有可经营的店铺');
 });
 
 test('SIWE：地址参数非法被拒', async () => {
@@ -89,7 +98,7 @@ test('上架鉴权：未登录 401，普通买家 403', async () => {
   const buyerLogin = await login(ctx, buyer);
   await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload())
     .expect(403);
 });
@@ -98,7 +107,7 @@ test('店主上架成功：返回快照哈希（keccak256 0x 前缀）', async (
   const ownerLogin = await login(ctx, owner);
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload())
     .expect(200);
   assertOk(res);
@@ -114,13 +123,13 @@ test('上架参数校验：非法 kind / 非正价格被拒', async () => {
   const ownerLogin = await login(ctx, owner);
   const badKind = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ kind: 'ghost' }))
     .expect(200);
   assert.notEqual(badKind.body.code, 0);
   const badPrice = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ priceUsdtMicro: -1 }))
     .expect(200);
   assert.notEqual(badPrice.body.code, 0);
@@ -149,7 +158,7 @@ test('改价后快照哈希变化；下架后不出现在公开列表', async ()
   const ownerLogin = await login(ctx, owner);
   const repriced = await request(app)
     .patch(`/api/products/${productSlug}`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '', priceUsdtMicro: 99_000_000, capacity: null }] })
     .expect(200);
   assertOk(repriced);
@@ -157,7 +166,7 @@ test('改价后快照哈希变化；下架后不出现在公开列表', async ()
 
   const off = await request(app)
     .patch(`/api/products/${productSlug}`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ active: false })
     .expect(200);
   assertOk(off);
@@ -166,7 +175,7 @@ test('改价后快照哈希变化；下架后不出现在公开列表', async ()
   // 恢复上架供后续下单测试
   await request(app)
     .patch(`/api/products/${productSlug}`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ active: true, skus: [{ key: '', priceUsdtMicro: 88_000_000, capacity: null }] })
     .expect(200);
 });
@@ -180,7 +189,7 @@ test('买家创建订单草稿：锁定快照、汇率与应付金额（BTY wei 
   const buyerLogin = await login(ctx, buyer);
   const res = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug })
     .expect(200);
   assertOk(res);
@@ -208,7 +217,7 @@ test('订单草稿未托管时店主不可发货', async () => {
   const ownerLogin = await login(ctx, owner);
   const res = await request(app)
     .post(`/api/orders/${orderId}/ship`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({})
     .expect(200);
   assert.notEqual(res.body.code, 0);
@@ -219,7 +228,7 @@ test('支付确认鉴权：未登录 401，非买家 403', async () => {
   const ownerLogin = await login(ctx, owner);
   const res = await request(app)
     .post(`/api/orders/${orderId}/paid`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ txHash: '0x' + 'a'.repeat(64) })
     .expect(403); // 非买家
 });
@@ -228,22 +237,30 @@ test('支付确认：txHash 格式非法被拒', async () => {
   const buyerLogin = await login(ctx, buyer);
   const res = await request(app)
     .post(`/api/orders/${orderId}/paid`)
-    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ txHash: 'not-a-hash' })
     .expect(200);
   assert.notEqual(res.body.code, 0);
 });
 
 test('买家订单列表 / 店主 seller 列表可见该订单', async () => {
-  const list = await request(app).get(`/api/orders?address=${buyer.address}`).expect(200);
+  const buyerLogin = await login(ctx, buyer);
+  const list = await request(app)
+    .get(`/api/orders?address=${buyer.address}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .expect(200);
   assertOk(list);
   assert.equal(list.body.data.total, 1);
   assert.equal(list.body.data.orders[0].id, orderId);
 
+  // 匿名列表不再出现草稿行（否则 order_no → 匿名详情 → 草稿 escrowOrderId）
+  const anonList = await request(app).get(`/api/orders?address=${buyer.address}`).expect(200);
+  assert.equal(anonList.body.data.total, 0);
+
   const ownerLogin = await login(ctx, owner);
   const sellerView = await request(app)
     .get('/api/orders/seller?status=draft')
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(sellerView);
   assert.equal(sellerView.body.data.total, 1);
@@ -256,14 +273,14 @@ test('买家订单列表 / 店主 seller 列表可见该订单', async () => {
 
 test('托管成功（模拟 watcher 回写）后店主可发货，买家可见 shipped', async () => {
   // 模拟 escrowWatcher 收到 OrderCreated 事件后的 DB 状态（回写同步落链上规范哈希作支付凭证）
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run('0x' + 'f'.repeat(64), Date.now(), orderId);
+  await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), orderId);
+  await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', '0x' + 'f'.repeat(64), orderId);
 
   const ownerLogin = await login(ctx, owner);
   // 数字商品：trackingNo 字段兼容为"手动交付内容"（写入 deliveryCode，码池外的直发模式）
   const ship = await request(app)
     .post(`/api/orders/${orderId}/ship`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .send({ trackingNo: 'SF1234567890' })
     .expect(200);
   assertOk(ship);
@@ -276,7 +293,7 @@ test('托管成功（模拟 watcher 回写）后店主可发货，买家可见 s
   const buyerLogin = await login(ctx, buyer);
   const mine = await request(app)
     .get(`/api/orders?address=${buyer.address}&status=shipped`)
-    .set('Authorization', `Bearer ${buyerLogin.token}`)
+    .set('Authorization', `Bearer ${buyerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(mine);
   assert.equal(mine.body.data.total, 1);
@@ -291,7 +308,7 @@ test('托管成功（模拟 watcher 回写）后店主可发货，买家可见 s
   assert.deepEqual(detailAnon.body.data.deliveries, []);
   const detailOwner = await request(app)
     .get(`/api/orders/${orderId}`)
-    .set('Authorization', `Bearer ${ownerLogin.token}`)
+    .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(detailOwner.body.data.deliveries[0].value, 'SF1234567890', '店主详情应始终可见交付码');
 });

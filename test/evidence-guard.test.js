@@ -22,7 +22,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { makeCtx, login, assertOk } from './setup.mjs';
+import { makeCtx, login, assertOk, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
 
 // 附件目录（擦除用例要验证"磁盘真的动过"；独立临时目录避免与他人共享）
 process.env.MK_ATTACH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mk-evguard-'));
@@ -41,110 +41,108 @@ const ARB_CAP = 20;
 let buyerToken;
 let ownerToken;
 before(async () => {
+  ({ withTransaction } = await import('../src/db.js'));
   buyerToken = (await login(ctx, buyer)).token;
   ownerToken = (await login(ctx, owner)).token;
 });
+/** 事务入口（批量插历史数据用；见"详情陈述行有展示上限"那条用例） */
+let withTransaction;
 
 let seq = 0;
 /**
  * 直接插本地订单行（状态/售后镜像/收货信息全由用例指定——本文件关心的是门控，
  * 不是下单流程；这样才构造得出"异常态 + 镜像残留"这种真实但少见的组合）。
+ *
+ * 行形状交给 setup.mjs 的 `insertOrder`：`refund_status`/`paid_tx_hash` 住在 `order_chain`，
+ * 收货信息（这里只用到姓名）住在 `order_shipping`——**擦除就是删掉那一行**，
+ * 所以"擦干净了"的新真相是姓名读回 NULL，而不是旧形状里的空串。
  */
-function insertOrder({ status = 'escrowed', refundStatus = 'none', paid = false, shipping = '' } = {}) {
+async function insertOrder({ status = 'escrowed', refundStatus = 'none', paid = false, shippingName = '' } = {}) {
   seq += 1;
-  const id = `ev-${seq}`;
-  const now = Date.now();
-  db.prepare(
-    `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash,
-       refund_status, shipping_name, created_at, updated_at)
-     VALUES (?, 'p-ev', '{}', '0x00', '', ?, ?, '1000', 1000000, '0.1', ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    buyer.address.toLowerCase(),
-    owner.address.toLowerCase(),
+  return await insertOrderRow(db, {
+    buyer: buyer.address.toLowerCase(),
+    seller: owner.address.toLowerCase(),
     status,
-    `0x${String(seq).padStart(64, '0')}`,
-    paid ? `0x${String(seq).padStart(64, 'f')}` : null,
+    productSlug: 'p-ev',
+    amountWei: '1000',
+    usdtMicro: 1000000,
+    btyUsdtRate: '0.1',
+    escrowOrderId: `0x${String(seq).padStart(64, '0')}`,
+    paidTxHash: paid ? `0x${String(seq).padStart(64, 'f')}` : null,
     refundStatus,
-    shipping,
-    now,
-    now
-  );
-  return { id, escrowOrderId: `0x${String(seq).padStart(64, '0')}` };
+    shippingName,
+  });
 }
 
 /** 造一条已有的陈述行（角色 buyer / 阶段 refund_request），供附件上传走到门控 */
-function insertEvidence(orderId, { role = 'buyer', phase = 'refund_request', content = '既有陈述' } = {}) {
-  const r = db
-    .prepare('INSERT INTO dispute_evidence (order_id, role, phase, content, created_at) VALUES (?, ?, ?, ?, ?)')
-    .run(orderId, role, phase, content, Date.now());
-  return Number(r.lastInsertRowid);
+async function insertEvidence(orderId, { role = 'buyer', phase = 'refund_request', content = '既有陈述' } = {}) {
+  const r = await db.run('INSERT INTO dispute_evidence (order_id, role, phase, content) VALUES (?, ?, ?, ?)', orderId, role, phase, content);
+  return Number(r.insertId);
 }
 
-const rowOf = (id) => db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
-const evidenceCount = (id) => db.prepare('SELECT COUNT(*) AS c FROM dispute_evidence WHERE order_id = ?').get(id).c;
+const rowOf = async (orderId) => await db.get('SELECT * FROM v_orders WHERE order_id = ?', orderId);
+const evidenceCount = async (id) => (await db.get('SELECT COUNT(*) AS c FROM dispute_evidence WHERE order_id = ?', id)).c;
 
 const postEvidence = (orderId, body, token = buyerToken) =>
-  request(app).post(`/api/orders/${orderId}/evidence`).set('Authorization', `Bearer ${token}`).send(body);
+  request(app).post(`/api/orders/${orderId}/evidence`).set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value).send(body);
 
 const pngB64 = () => Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.alloc(8, 1)]).toString('base64');
 const uploadFile = (orderId, evidenceId, token = buyerToken) =>
   request(app)
     .post(`/api/orders/${orderId}/evidence/${evidenceId}/files`)
-    .set('Authorization', `Bearer ${token}`)
+    .set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value)
     .send({ files: [{ name: 'proof.png', mime: 'image/png', dataB64: pngB64() }] });
 
 const cancelOrder = (orderId, token = buyerToken) =>
-  request(app).post(`/api/orders/${orderId}/cancel`).set('Authorization', `Bearer ${token}`).send({});
+  request(app).post(`/api/orders/${orderId}/cancel`).set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value).send({});
 const erasePii = (orderId) =>
-  request(app).post(`/api/shop/orders/${orderId}/erase-pii`).set('Authorization', `Bearer ${ownerToken}`).send({});
+  request(app).post(`/api/shop/orders/${orderId}/erase-pii`).set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).send({});
 
 test('cancelled 单（售后镜像残留在 requested）不再受理售后陈述与附件', async () => {
   // 这笔单正是缺陷场景：异常态被取消，但 refund_status 仍停在 requested
-  const o = insertOrder({ status: 'cancelled', refundStatus: 'requested', shipping: '张三 13800000000' });
-  const evId = insertEvidence(o.id);
-  assert.equal(rowOf(o.id).refund_status, 'requested', '前置：镜像残留 requested（旧实现据此放行）');
+  const o = await insertOrder({ status: 'cancelled', refundStatus: 'requested', shippingName: '张三 13800000000' });
+  const evId = await insertEvidence(o.orderId);
+  assert.equal((await rowOf(o.orderId)).refund_status, 'requested', '前置：镜像残留 requested（旧实现据此放行）');
 
-  const stmt = await postEvidence(o.id, { phase: 'refund_request', content: '取消了我还要补充陈述' });
+  const stmt = await postEvidence(o.orderNo, { phase: 'refund_request', content: '取消了我还要补充陈述' });
   assert.notEqual(stmt.body.code, 0, '陈述必须被拒');
   assert.match(stmt.body.message, /不接受新的售后陈述/);
   assert.match(stmt.body.message, /cancelled/, '拒绝原因要说明当前状态，可行动');
 
-  const up = await uploadFile(o.id, evId);
+  const up = await uploadFile(o.orderNo, evId);
   assert.notEqual(up.body.code, 0, '附件上传必须被拒（它是个人数据的主要载体）');
   assert.match(up.body.message, /不接受新的售后陈述/);
-  assert.equal(evidenceCount(o.id), 1, '没有新增陈述行（写入侧真的被挡住了）');
-  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM evidence_files WHERE order_id = ?').get(o.id).c, 0, '没有落任何附件行');
+  assert.equal(await evidenceCount(o.orderId), 1, '没有新增陈述行（写入侧真的被挡住了）');
+  assert.equal((await db.get('SELECT COUNT(*) AS c FROM evidence_files WHERE order_id = ?', o.orderId)).c, 0, '没有落任何附件行');
 });
 
 test('/cancel 复位售后镜像：状态置 cancelled 的同时 refund_status → none', async () => {
-  const o = insertOrder({ status: 'escrowed', refundStatus: 'requested', paid: false });
-  const res = await cancelOrder(o.id);
+  const o = await insertOrder({ status: 'escrowed', refundStatus: 'requested', paid: false });
+  const res = await cancelOrder(o.orderNo);
   assertOk(res);
-  const row = rowOf(o.id);
+  const row = await rowOf(o.orderId);
   assert.equal(row.status, 'cancelled');
   assert.equal(row.refund_status, 'none', '本地终局不留"退款申请待处理"的残影（与 watcher/sync 终局迁移同口径）');
 
   // 取消后再提交：被**状态门控**拒绝（而不是仅靠 refund_status 恰好已是 none——
   // 门控顺序决定了拒因，这条断言钉住"状态是第一道闸"）
-  const stmt = await postEvidence(o.id, { phase: 'refund_request', content: '取消后补理由' });
+  const stmt = await postEvidence(o.orderNo, { phase: 'refund_request', content: '取消后补理由' });
   assert.notEqual(stmt.body.code, 0);
   assert.match(stmt.body.message, /不接受新的售后陈述/);
 });
 
 test('擦除不 sticky：cancel → erase-pii → 仍然无法在这张单上落下新的个人信息', async () => {
-  const o = insertOrder({ status: 'escrowed', refundStatus: 'requested', paid: false, shipping: '李四 13900000000' });
-  const evId = insertEvidence(o.id, { content: '原陈述：货不对版' });
-  assert.equal((await cancelOrder(o.id)).body.code, 0, '异常单可被取消');
+  const o = await insertOrder({ status: 'escrowed', refundStatus: 'requested', paid: false, shippingName: '李四 13900000000' });
+  const evId = await insertEvidence(o.orderId, { content: '原陈述：货不对版' });
+  assert.equal((await cancelOrder(o.orderNo)).body.code, 0, '异常单可被取消');
 
-  const erased = await erasePii(o.id);
+  const erased = await erasePii(o.orderNo);
   assertOk(erased);
-  assert.equal(rowOf(o.id).shipping_name, '', '擦除已生效（cancelled 在可擦集里）');
-  assert.equal(rowOf(o.id).refund_status, 'none', '取消已复位镜像（配合状态门控，双保险）');
+  assert.equal((await rowOf(o.orderId)).shipping_name, null, '擦除已生效（cancelled 在可擦集里）');
+  assert.equal((await rowOf(o.orderId)).refund_status, 'none', '取消已复位镜像（配合状态门控，双保险）');
 
   // 关键断言：擦除之后，陈述与附件都进不来 —— 否则"已删除"的单上又会长出新的个人数据
-  const stmt = await postEvidence(o.id, { phase: 'refund_request', content: '擦完我再写一段 2000 字的个人信息' });
+  const stmt = await postEvidence(o.orderNo, { phase: 'refund_request', content: '擦完我再写一段 2000 字的个人信息' });
   assert.notEqual(stmt.body.code, 0);
   /*
     拒因现在是**擦除**那一句（2026-10-15 起擦除成了独立的一道门，见 evidenceStatusError）：
@@ -152,11 +150,11 @@ test('擦除不 sticky：cancel → erase-pii → 仍然无法在这张单上落
     "已按删除请求擦除"这条仍然成立，而"状态"那条会随状态变化而失效（判据挂错层的典型）。
   */
   assert.match(stmt.body.message, /已按删除请求擦除|不再受理新的售后陈述/);
-  const up = await uploadFile(o.id, evId);
+  const up = await uploadFile(o.orderNo, evId);
   assert.notEqual(up.body.code, 0);
-  assert.equal(evidenceCount(o.id), 1, '陈述行数不变（只有那条已被墓碑化的历史)');
-  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM evidence_files WHERE order_id = ?').get(o.id).c, 0);
-  assert.equal(rowOf(o.id).shipping_name, '', 'PII 仍然是空的（没有被新提交"喂"回来）');
+  assert.equal(await evidenceCount(o.orderId), 1, '陈述行数不变（只有那条已被墓碑化的历史)');
+  assert.equal((await db.get('SELECT COUNT(*) AS c FROM evidence_files WHERE order_id = ?', o.orderId)).c, 0);
+  assert.equal((await rowOf(o.orderId)).shipping_name, null, 'PII 仍然是空的（没有被新提交"喂"回来）');
 });
 
 test('已擦除的单即使有在途售后案件也不再收新陈述（否则"删了又收"，保留期还为该案让路）', async () => {
@@ -168,22 +166,22 @@ test('已擦除的单即使有在途售后案件也不再收新陈述（否则"�
     ⇒ 新写入的个人信息**可能长期留存**，删除请求形同虚设。
     判据落在唯一的阶段门（evidenceStatusError）：陈述与附件两个端点一起关门。
   */
-  const o = insertOrder({ status: 'confirmed', paid: true });
-  db.prepare("UPDATE orders SET after_sale_status = 'open', after_sale_opened_at = ? WHERE id = ?").run(Date.now(), o.id);
+  const o = await insertOrder({ status: 'confirmed', paid: true });
+  await db.run("UPDATE order_chain SET after_sale_status = 'open', after_sale_opened_at = ? WHERE order_id = ?", new Date(), o.orderId);
   // 前置：案件在途 ⇒ 这条单本来**受理**售后陈述（这正是洞的形状）
-  const before = await postEvidence(o.id, { phase: 'after_sale', content: '开案时的陈述' });
+  const before = await postEvidence(o.orderNo, { phase: 'after_sale', content: '开案时的陈述' });
   assert.equal(before.body.code, 0, '前置：在途售后案件受理陈述');
   const evId = Number(before.body.data.evidenceId);
 
-  assertOk(await erasePii(o.id));
-  assert.ok(rowOf(o.id).pii_erased_at, '擦除已生效（confirmed 在可擦集里）');
+  assertOk(await erasePii(o.orderNo));
+  assert.ok((await rowOf(o.orderId)).pii_erased_at, '擦除已生效（confirmed 在可擦集里）');
 
-  const stmt = await postEvidence(o.id, { phase: 'after_sale', content: '擦完以后再写一段个人信息' });
+  const stmt = await postEvidence(o.orderNo, { phase: 'after_sale', content: '擦完以后再写一段个人信息' });
   assert.notEqual(stmt.body.code, 0, '擦除之后不许再落下新的个人信息');
   assert.match(stmt.body.message, /已按删除请求擦除/);
-  const up = await uploadFile(o.id, evId);
+  const up = await uploadFile(o.orderNo, evId);
   assert.notEqual(up.body.code, 0, '附件端点同门控（同一个 evidenceStatusError）');
-  assert.equal(rowOf(o.id).after_sale_status, 'open', '案件本身不动（擦除不改案件状态，仍由仲裁台处理）');
+  assert.equal((await rowOf(o.orderId)).after_sale_status, 'open', '案件本身不动（擦除不改案件状态，仍由仲裁台处理）');
 });
 
 test('阶段门控只有一份实现：陈述端点与附件端点对同一 (订单, 阶段) 给出**逐字相同**的拒绝', async () => {
@@ -202,23 +200,23 @@ test('阶段门控只有一份实现：陈述端点与附件端点对同一 (订
     { status: 'escrowed', refundStatus: 'none', role: 'buyer', phase: 'arbitration', why: '非争议态不受理仲裁陈述' },
   ];
   for (const c of cases) {
-    const o = insertOrder({ status: c.status, refundStatus: c.refundStatus });
-    const evId = insertEvidence(o.id, { role: c.role, phase: c.phase });
+    const o = await insertOrder({ status: c.status, refundStatus: c.refundStatus });
+    const evId = await insertEvidence(o.orderId, { role: c.role, phase: c.phase });
     const token = c.role === 'seller' ? ownerToken : buyerToken;
-    const before = evidenceCount(o.id); // 前置证据行（附件端点必须有一条既有陈述才能走到阶段门控）
+    const before = await evidenceCount(o.orderId); // 前置证据行（附件端点必须有一条既有陈述才能走到阶段门控）
 
-    const stmt = await postEvidence(o.id, { phase: c.phase, content: '试探门控' }, token);
+    const stmt = await postEvidence(o.orderNo, { phase: c.phase, content: '试探门控' }, token);
     assert.notEqual(stmt.body.code, 0, `[${c.why}] 陈述端点必须拒绝`);
-    const up = await uploadFile(o.id, evId, token);
+    const up = await uploadFile(o.orderNo, evId, token);
     assert.notEqual(up.body.code, 0, `[${c.why}] 附件端点必须拒绝`);
     assert.equal(
       up.body.message,
       stmt.body.message + '（附件同证据阶段门控）',
       `[${c.why}] 附件端点的拒因必须**逐字**来自陈述端点那一份（漂移即变红）：${stmt.body.message}`
     );
-    assert.equal(evidenceCount(o.id), before, `[${c.why}] 被拒的陈述没有落库`);
+    assert.equal(await evidenceCount(o.orderId), before, `[${c.why}] 被拒的陈述没有落库`);
     assert.equal(
-      db.prepare('SELECT COUNT(*) AS c FROM evidence_files WHERE order_id = ?').get(o.id).c,
+      (await db.get('SELECT COUNT(*) AS c FROM evidence_files WHERE order_id = ?', o.orderId)).c,
       0,
       `[${c.why}] 被拒的附件没有落盘`
     );
@@ -226,31 +224,36 @@ test('阶段门控只有一份实现：陈述端点与附件端点对同一 (订
 });
 
 test('阶段门控的身份分支返回 403（业务码与 HTTP 都是 403），不与"阶段不对"混为一谈', async () => {
-  const o = insertOrder({ status: 'escrowed', refundStatus: 'requested' });
+  const o = await insertOrder({ status: 'escrowed', refundStatus: 'requested' });
   // 店主去提交"退款理由"（那是买家的阶段）
-  const asSeller = await postEvidence(o.id, { phase: 'refund_request', content: '我自己回复自己' }, ownerToken);
+  const asSeller = await postEvidence(o.orderNo, { phase: 'refund_request', content: '我自己回复自己' }, ownerToken);
   assert.equal(asSeller.body.code, 403, '身份不符是 403，不是普通业务拒绝');
   assert.match(asSeller.body.message, /仅买家可提交/);
-  assert.equal(evidenceCount(o.id), 0);
+  assert.equal(await evidenceCount(o.orderId), 0);
   // 买家去提交"退款回复"（那是店主的阶段）
-  const asBuyer = await postEvidence(o.id, { phase: 'refund_reply', content: '我自己回复自己' });
+  const asBuyer = await postEvidence(o.orderNo, { phase: 'refund_reply', content: '我自己回复自己' });
   assert.equal(asBuyer.body.code, 403);
   assert.match(asBuyer.body.message, /仅店主可提交/);
-  assert.equal(evidenceCount(o.id), 0);
+  assert.equal(await evidenceCount(o.orderId), 0);
   // 同一个 endpoint 上，同样的身份若换成自己那一侧，就能提交（证明上面的 403 来自身份而不是别的门）
-  assertOk(await postEvidence(o.id, { phase: 'refund_request', content: '这次是对的阶段' }));
-  assert.equal(evidenceCount(o.id), 1);
+  assertOk(await postEvidence(o.orderNo, { phase: 'refund_request', content: '这次是对的阶段' }));
+  assert.equal(await evidenceCount(o.orderId), 1);
 });
 
 test('详情陈述行有展示上限：历史脏数据（>100 条）被截断但总数照报（读取侧的 N+1 防护）', async () => {
-  const o = insertOrder({ status: 'disputed' });
-  // 绕过写入侧的条数上限，直接批量塞 130 条（模拟"老版本无上限时期"的历史数据）
-  const ins = db.prepare('INSERT INTO dispute_evidence (order_id, role, phase, content, created_at) VALUES (?, ?, ?, ?, ?)');
-  db.exec('BEGIN');
-  for (let i = 0; i < 130; i++) ins.run(o.id, i % 2 === 0 ? 'buyer' : 'seller', 'arbitration', `历史陈述 ${i + 1}`, Date.now() + i);
-  db.exec('COMMIT');
+  const o = await insertOrder({ status: 'disputed' });
+  /*
+    绕过写入侧的条数上限，直接批量塞 130 条（模拟"老版本无上限时期"的历史数据）。
+    门面只有 get/all/run，没有 statement 复用这种形状；130 次单行 INSERT 包在**一个事务**里，
+    与旧的"prepare 一次跑 130 次"落库结果逐字一致（旧的 BEGIN/COMMIT 也是这个作用域）。
+  */
+  await withTransaction(async () => {
+    for (let i = 0; i < 130; i++) {
+      await db.run('INSERT INTO dispute_evidence (order_id, role, phase, content, created_at) VALUES (?, ?, ?, ?, ?)', o.orderId, i % 2 === 0 ? 'buyer' : 'seller', 'arbitration', `历史陈述 ${i + 1}`, new Date(Date.now() + i));
+    }
+  });
 
-  const detail = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).expect(200);
+  const detail = await request(app).get(`/api/orders/${o.orderNo}`).set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assertOk(detail);
   const ev = detail.body.data.evidence;
   assert.equal(detail.body.data.evidenceCount, 130, '总数如实上报');
@@ -261,27 +264,27 @@ test('详情陈述行有展示上限：历史脏数据（>100 条）被截断但
 });
 
 test('陈述条数上限：仲裁阶段每角色 20 条，超出拒绝；对方额度互不影响', async () => {
-  const o = insertOrder({ status: 'disputed', refundStatus: 'requested' });
+  const o = await insertOrder({ status: 'disputed', refundStatus: 'requested' });
   // 买家把额度用满
   for (let i = 0; i < ARB_CAP; i++) {
-    const r = await postEvidence(o.id, { phase: 'arbitration', content: `买家陈述 ${i + 1}` });
+    const r = await postEvidence(o.orderNo, { phase: 'arbitration', content: `买家陈述 ${i + 1}` });
     assertOk(r);
   }
-  const over = await postEvidence(o.id, { phase: 'arbitration', content: '第 21 条' });
+  const over = await postEvidence(o.orderNo, { phase: 'arbitration', content: '第 21 条' });
   assert.notEqual(over.body.code, 0, '超过上限必须拒绝');
   assert.match(over.body.message, /上限/);
   assert.match(over.body.message, new RegExp(String(ARB_CAP)));
-  assert.equal(evidenceCount(o.id), ARB_CAP, '超限的那条没有落库');
+  assert.equal(await evidenceCount(o.orderId), ARB_CAP, '超限的那条没有落库');
 
   // 店主不受买家额度影响（额度按 (单, 角色, 阶段) 计）
-  const seller = await postEvidence(o.id, { phase: 'arbitration', content: '卖家陈述：不同意仅退款' }, ownerToken);
+  const seller = await postEvidence(o.orderNo, { phase: 'arbitration', content: '卖家陈述：不同意仅退款' }, ownerToken);
   assertOk(seller);
-  assert.equal(evidenceCount(o.id), ARB_CAP + 1);
+  assert.equal(await evidenceCount(o.orderId), ARB_CAP + 1);
   // 买家仍受自己额度约束
-  assert.notEqual((await postEvidence(o.id, { phase: 'arbitration', content: '再补一条' })).body.code, 0);
+  assert.notEqual((await postEvidence(o.orderNo, { phase: 'arbitration', content: '再补一条' })).body.code, 0);
 
   // 详情读取侧：陈述行按时间线升序返回，并给出总条数（展示上限见 EVIDENCE_DETAIL_LIMIT）
-  const detail = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).expect(200);
+  const detail = await request(app).get(`/api/orders/${o.orderNo}`).set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assertOk(detail);
   assert.equal(detail.body.data.evidenceCount, ARB_CAP + 1, '详情给出陈述总条数');
   assert.equal(detail.body.data.evidenceTruncated, false, `未超过展示上限 ${ARB_CAP + 1} 条`);
@@ -291,8 +294,8 @@ test('陈述条数上限：仲裁阶段每角色 20 条，超出拒绝；对方�
 
   // 附件随陈述上传后，详情用批量查询取回元数据（不是逐行 filesOfEvidence 的 N+1）
   const evId = detail.body.data.evidence[0].id;
-  assertOk(await uploadFile(o.id, evId));
-  const detail2 = await request(app).get(`/api/orders/${o.id}`).set('Authorization', `Bearer ${buyerToken}`).expect(200);
+  assertOk(await uploadFile(o.orderNo, evId));
+  const detail2 = await request(app).get(`/api/orders/${o.orderNo}`).set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   const first = detail2.body.data.evidence.find((e) => e.id === evId);
   assert.equal(first.files.length, 1);
   assert.equal(first.files[0].name, 'proof.png');

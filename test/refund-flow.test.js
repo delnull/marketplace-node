@@ -16,13 +16,17 @@ import { test, before } from 'node:test';
 const FULL_REFUND = '1000000000000000000';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { assertOk, login, makeCtx, productPayload, skuInv } from './setup.mjs';
+import { assertOk, login, makeCtx, productPayload, skuInv, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
 
 // 必须在 makeCtx 之前设置（config 模块求值时读取，见 setup.mjs 头注释）
 const arbiter = Wallet.createRandom();
-process.env.MK_ARBITER_ADDRESS = arbiter.address;
+// 2026-10-18：仲裁人不再是单个环境变量，改为链上当前届名单（测试注入取值）
 
 const ctx = await makeCtx();
+
+// 2026-10-18：仲裁人 = 链上当前届名单（注入取值，避免起假 RPC）
+const { setCommitteeReader } = await import('../src/chain.js');
+setCommitteeReader(async () => ({ arbiters: [arbiter.address.toLowerCase()], threshold: 1, epoch: 1 }));
 const { app, request, db, owner, buyer } = ctx;
 const stranger = Wallet.createRandom();
 
@@ -42,10 +46,12 @@ const { applyEvent } = await import('../src/escrowWatcher.js');
   **镜像滞后于链上**那个窗口由 test/delivery-gate.test.js 专门钉住（那里链上说冻结、镜像说没冻结）。
 */
 const { setChainOrderFetcher } = await import('../src/chainOrder.js');
-setChainOrderFetcher((orderIdHex) => {
-  const row = db
-    .prepare('SELECT buyer, seller, amount_wei, refund_status FROM orders WHERE escrow_order_id = ?')
-    .get(String(orderIdHex || '').toLowerCase());
+setChainOrderFetcher(async (orderIdHex) => {
+  const row = await db.get(
+    `SELECT buyer, seller, amount_wei, refund_status, commission_quoted_to, commission_quoted_bps, timeout_blocks
+       FROM v_orders WHERE escrow_order_id = ?`,
+    String(orderIdHex || '').toLowerCase()
+  );
   if (!row) throw new Error('unit-test 链上桩：链上没有这一单');
   return {
     status: 'Created',
@@ -55,6 +61,11 @@ setChainOrderFetcher((orderIdHex) => {
     buyer: row.buyer,
     seller: row.seller,
     amount: row.amount_wei,
+    timeoutBlocks: Number(row.timeout_blocks),
+    commissionTerms: {
+      commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
+      commissionBps: Number(row.commission_quoted_bps) || 0,
+    },
   };
 });
 
@@ -69,7 +80,7 @@ before(async () => {
 async function listProduct(payload) {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(payload)
     .expect(200);
   assertOk(res);
@@ -80,21 +91,21 @@ async function listProduct(payload) {
 async function createDraft(slug, quantity = 1) {
   const res = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, quantity, buyer: buyer.address })
     .expect(200);
   assertOk(res);
   return res.body.data;
 }
 
-function escrowed(order) {
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run(payHash(), Date.now(), order.id);
+async function escrowed(order) {
+  await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), order.id);
+  await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', payHash(), order.id);
 }
 
 async function getDetail(id, token) {
   const req = request(app).get(`/api/orders/${id}`);
-  if (token) req.set('Authorization', `Bearer ${token}`);
+  if (token) req.set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value);
   const res = await req.expect(200);
   assertOk(res);
   return res.body.data;
@@ -103,7 +114,7 @@ async function getDetail(id, token) {
 async function postEvidence(id, body, token) {
   // 拒绝分支含 HTTP 403（鉴权语义）与 200+code!=0（状态语义）两种，统一由调用方断言 body.code
   const req = request(app).post(`/api/orders/${id}/evidence`);
-  if (token) req.set('Authorization', `Bearer ${token}`);
+  if (token) req.set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value);
   return req.send(body);
 }
 
@@ -118,11 +129,11 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   const p = await listProduct(productPayload({ kind: 'physical', title: '两级售后实物', capacity: 5, priceUsdtMicro: 88_000_000 }));
   const order = await createDraft(p.slug, 2);
   assert.equal(
-    skuInv(db, p.slug).committed,
+    (await skuInv(db, p.slug)).committed,
     2,
     '下单占位 2 件'
   );
-  escrowed(order);
+  await escrowed(order);
   const oid = order.id;
   const eid = order.escrowOrderId;
 
@@ -131,10 +142,11 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   assert.match(blocked(early), /refund_status=requested/);
 
   // 买家链上 requestRefund（watcher 回写）
-  assert.equal(applyEvent('RefundRequested', { orderId: eid }), 1);
+  assert.equal(await applyEvent('RefundRequested', { orderId: eid }), 1);
   const afterReq = await getDetail(oid, buyerToken);
   assert.equal(afterReq.refundStatus, 'requested');
-  assert.ok(afterReq.refundRequestedAt > 0, '详情携带申请时刻');
+  // 时间字段在 DTO 里是 **ISO-8601 字符串**（库里 DATETIME(3) → `Date` → JSON）：比时刻先 parse
+  assert.ok(Number.isFinite(Date.parse(afterReq.refundRequestedAt)), '详情携带申请时刻');
   assert.equal(afterReq.status, 'escrowed', '资金仍冻结在托管，等待卖家决策');
 
   // ── 陈述时间线：买家理由（可追加）→ 店主回复；角色/阶段严格校验 ──
@@ -168,7 +180,7 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   assert.ok(!('evidence' in strangerDetail), '第三人不可见陈述');
 
   // ── 卖家拒绝（链上 rejectRefund）：解锁争议入口；申请阶段的陈述不再受理 ──
-  assert.equal(applyEvent('RefundRejected', { orderId: eid }), 1);
+  assert.equal(await applyEvent('RefundRejected', { orderId: eid }), 1);
   const afterRej = await getDetail(oid, ownerToken);
   assert.equal(afterRej.refundStatus, 'rejected');
   assert.ok(afterRej.refundRejectedAt >= afterReq.refundRequestedAt);
@@ -178,7 +190,7 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   assert.match(blocked(arbEarly), /争议中/);
 
   // ── 买家链上 requestDispute（被拒后获得资格）→ 双方仲裁陈述 ──
-  assert.equal(applyEvent('DisputeRequested', { orderId: eid }), 1);
+  assert.equal(await applyEvent('DisputeRequested', { orderId: eid }), 1);
   const arbB = await postEvidence(oid, { phase: 'arbitration', content: '商品与描述严重不符，诉求全额退款' }, buyerToken);
   assertOk(arbB);
   const arbS = await postEvidence(oid, { phase: 'arbitration', content: '买家未按约定寄回，我不同意仅退款' }, ownerToken);
@@ -187,10 +199,17 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   // 待仲裁摘要携带售后镜像（仲裁人判断两级流程是否走完）
   const pend = await request(app).get('/api/arbitration/pending?pageSize=100').expect(200);
   assertOk(pend);
-  const row = pend.body.data.disputes.find((d) => d.id === oid);
+  /*
+    匿名队列**不下发本地订单号**（节点 2026-10 起：队列摘要匿名可读，但那个句柄只给
+    已确证是链上仲裁人的身份）。所以这里按链上公开事实 `escrowOrderId` 定位，
+    并把"匿名拿到的是 null"本身钉成判据——否则"多给一个可探测的句柄"会静默回来。
+  */
+  const row = pend.body.data.disputes.find((d) => d.escrowOrderId === eid);
   assert.ok(row, '争议单入待仲裁列表');
+  assert.equal(row.orderNo, null, '匿名队列不下发本地订单号');
   assert.equal(row.refundStatus, 'rejected');
-  assert.ok(row.refundRequestedAt > 0 && row.refundRejectedAt > 0);
+  // DTO 上的时间一律 ISO-8601（Date.prototype.toJSON）：能解析成时刻才算真的下发了
+  assert.ok(!Number.isNaN(Date.parse(row.refundRequestedAt)) && !Number.isNaN(Date.parse(row.refundRejectedAt)));
   assert.equal(row.evidenceCount, 5, '2 条买家理由 + 1 条店主回复 + 2 条仲裁陈述');
 
   // 仲裁人详情可见完整时间线（5 条已提交）
@@ -205,12 +224,12 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   assert.equal(arbDetail.evidence[4].phase, 'arbitration');
 
   // 争议中卖家链上 approveRefund 和解（资金退买家）
-  assert.equal(applyEvent('RefundApproved', { orderId: eid, refundWei: order.amountWei }), 1);
+  assert.equal(await applyEvent('RefundApproved', { orderId: eid, refundWei: order.amountWei }), 1);
   const done = await getDetail(oid, buyerToken);
   assert.equal(done.status, 'refunded');
   assert.equal(done.refundStatus, 'none', '终态售后标记复位');
   assert.equal(
-    skuInv(db, p.slug).committed,
+    (await skuInv(db, p.slug)).committed,
     0,
     '退款后占位库存回补（可再售）'
   );
@@ -229,42 +248,42 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
 test('退款申请待决期间拒绝发货（ship 门控）：先链上拒绝申请或同意退款', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '冻结发货门控', capacity: 5 }));
   const order = await createDraft(p.slug);
-  escrowed(order);
+  await escrowed(order);
   const eid = order.escrowOrderId;
 
   // 买家链上申请退款（watcher 回写 requested）→ 卖家发货被拒
-  assert.equal(applyEvent('RefundRequested', { orderId: eid }), 1);
+  assert.equal(await applyEvent('RefundRequested', { orderId: eid }), 1);
   const ship = await request(app)
     .post(`/api/orders/${order.id}/ship`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ trackingNo: 'SF-001' })
     .expect(200);
   assert.notEqual(ship.body.code, 0);
   assert.match(ship.body.message || '', /已申请退款/);
   assert.equal(
-    db.prepare('SELECT status FROM orders WHERE id = ?').get(order.id).status,
+    (await db.get('SELECT status FROM v_orders WHERE order_no = ?', order.id)).status,
     'escrowed',
     '冻结期发货被拒，状态不变'
   );
 
   // 卖家链上拒绝退款（rejectRefund）→ 恢复可发货
-  assert.equal(applyEvent('RefundRejected', { orderId: eid }), 1);
+  assert.equal(await applyEvent('RefundRejected', { orderId: eid }), 1);
   const ok = await request(app)
     .post(`/api/orders/${order.id}/ship`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ trackingNo: 'SF-002' })
     .expect(200);
   assertOk(ok);
-  assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(order.id).status, 'shipped');
+  assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', order.id)).status, 'shipped');
 });
 
 test('已交付（shipped 有物流单号）后退款：不自动回补占位（货在买家侧，需线下回收）', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '交付后退款不释放', capacity: 5 }));
   const order = await createDraft(p.slug);
-  escrowed(order);
+  await escrowed(order);
   const eid = order.escrowOrderId;
   assert.equal(
-    skuInv(db, p.slug).committed,
+    (await skuInv(db, p.slug)).committed,
     1,
     '下单占位 1 件'
   );
@@ -272,20 +291,20 @@ test('已交付（shipped 有物流单号）后退款：不自动回补占位（
   // 卖家发货（物流单号=交付证据）→ 买家申请退款 → 卖家同意退款（链上 RefundApproved）
   const ship = await request(app)
     .post(`/api/orders/${order.id}/ship`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ trackingNo: 'SF-003' })
     .expect(200);
   assertOk(ship);
-  assert.equal(applyEvent('RefundRequested', { orderId: eid }), 1);
-  assert.equal(applyEvent('RefundApproved', { orderId: eid, refundWei: order.amountWei }), 1);
+  assert.equal(await applyEvent('RefundRequested', { orderId: eid }), 1);
+  assert.equal(await applyEvent('RefundApproved', { orderId: eid, refundWei: order.amountWei }), 1);
   assert.equal(
-    db.prepare('SELECT status FROM orders WHERE id = ?').get(order.id).status,
+    (await db.get('SELECT status FROM v_orders WHERE order_no = ?', order.id)).status,
     'refunded'
   );
 
   // 已交付行退款 → 占位不回补（与 shipped→expired 不释放同口径；防同一批实物被再次承诺）
   assert.equal(
-    skuInv(db, p.slug).committed,
+    (await skuInv(db, p.slug)).committed,
     1,
     '已交付后退款不自动回补占位'
   );
@@ -295,69 +314,84 @@ test('已交付（shipped 有物流单号）后退款：不自动回补占位（
 test('applyRefundFlags：sync 反查按链上 getOrder 标记回填/清除 refund_status', async () => {
   const { applyRefundFlags } = await import('../src/routes/orders.js');
   // 手工构造 escrowed 单（escrow_order_id 唯一），模拟 sync case Created 的本地镜像
-  const id = 'rf-1';
   const eid = '0x' + 'ab'.repeat(32);
-  const now = Date.now();
-  db.prepare(
-    `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash, created_at, updated_at)
-     VALUES (?, 'p-x', '{}', '0x00', '', ?, ?, '1000000000000000000', 1000000, '0.1', 'escrowed', ?, ?, ?, ?)`
-  ).run(id, buyer.address.toLowerCase(), owner.address.toLowerCase(), eid, payHash(), now, now);
+  // 两个键都要：`applyRefundFlags` 按**链上单号**找人，而按 `order_no` 回查要的是对外单号
+  // （`orderId` 是内部主键——拿它当 order_no 查只会永远读到 undefined，静默为空）
+  const { orderId: id, orderNo } = await insertOrderRow(db, {
+    status: 'escrowed',
+    productSlug: 'p-x',
+    buyer: buyer.address.toLowerCase(),
+    seller: owner.address.toLowerCase(),
+    amountWei: '1000000000000000000',
+    usdtMicro: 1000000,
+    btyUsdtRate: '0.1',
+    escrowOrderId: eid,
+    paidTxHash: payHash(),
+  });
 
   // 链上 refundRequested=true → 本地 requested（首次时刻保留）
-  assert.equal(applyRefundFlags(eid, { refundRequested: true, refundRejected: false }), 1);
-  let row = db.prepare('SELECT refund_status, refund_requested_at FROM orders WHERE id = ?').get(id);
+  assert.equal(await applyRefundFlags(eid, { refundRequested: true, refundRejected: false }), 1);
+  let row = await db.get('SELECT refund_status, refund_requested_at FROM v_orders WHERE order_no = ?', orderNo);
   assert.equal(row.refund_status, 'requested');
   const firstAt = row.refund_requested_at;
-  assert.ok(firstAt > 0);
+  assert.ok(firstAt instanceof Date, '申请时刻由服务器盖章（DATETIME(3) 读回来是 Date）');
   // 幂等：重复同步不重复迁移
-  assert.equal(applyRefundFlags(eid, { refundRequested: true, refundRejected: false }), 0);
+  assert.equal(await applyRefundFlags(eid, { refundRequested: true, refundRejected: false }), 0);
 
   // 链上翻转（卖家拒绝）→ rejected
-  assert.equal(applyRefundFlags(eid, { refundRequested: false, refundRejected: true }), 1);
-  row = db.prepare('SELECT refund_status, refund_rejected_at FROM orders WHERE id = ?').get(id);
+  assert.equal(await applyRefundFlags(eid, { refundRequested: false, refundRejected: true }), 1);
+  row = await db.get('SELECT refund_status, refund_rejected_at FROM v_orders WHERE order_no = ?', orderNo);
   assert.equal(row.refund_status, 'rejected');
   assert.ok(row.refund_rejected_at >= firstAt);
 
   // 链上两者皆无（从未申请/已重置）→ 本地残留标记清除
-  assert.equal(applyRefundFlags(eid, { refundRequested: false, refundRejected: false }), 1);
-  row = db.prepare('SELECT refund_status FROM orders WHERE id = ?').get(id);
+  assert.equal(await applyRefundFlags(eid, { refundRequested: false, refundRejected: false }), 1);
+  row = await db.get('SELECT refund_status FROM v_orders WHERE order_no = ?', orderNo);
   assert.equal(row.refund_status, 'none');
 
-  // 终态订单（refunded）不触碰
-  db.prepare("UPDATE orders SET status = 'refunded', refund_status = 'requested' WHERE id = ?").run(id);
-  assert.equal(applyRefundFlags(eid, { refundRequested: true, refundRejected: false }), 0);
-  assert.equal(
-    db.prepare('SELECT refund_status FROM orders WHERE id = ?').get(id).refund_status,
+  // 终态订单（refunded）不触碰：把标记摆成与链上读数**相反**的值再调一次，
+  // 只有"一个字都不改"才算不越权（只断言"返回值 0"会让"悄悄改写"也能通过）。
+  // 状态在 `orders`、镜像在 `order_chain`：一条语句写一张表（多表 UPDATE 的 changes 是各表之和）。
+  await db.run("UPDATE orders SET status = 'refunded' WHERE order_no = ?", orderNo);
+  await db.run(
+    'UPDATE order_chain SET refund_status = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)',
     'requested',
-    '终态订单的镜像由 watcher/sync 主状态推进负责，标记函数不越权'
+    orderNo
   );
+  assert.equal(await applyRefundFlags(eid, { refundRequested: false, refundRejected: true }), 0);
+  assert.equal(
+    (await db.get('SELECT refund_status FROM v_orders WHERE order_no = ?', orderNo)).refund_status,
+    'requested',
+    '终态订单的镜像由 watcher/sync 主状态推进负责，标记函数不越权（哪怕链上读数与本地相反）'
+  );
+  void id;
 });
 
 test('自提交付（空物流单号发货）后退款：不回补占位；可开退货单，确认收到后回补（复审 P1 shipped_at）', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '自提交付退款不释放', capacity: 5 }));
   const order = await createDraft(p.slug);
-  escrowed(order);
+  await escrowed(order);
   const eid = order.escrowOrderId;
-  assert.equal(skuInv(db, p.slug).committed, 1, '下单占位 1 件');
+  assert.equal((await skuInv(db, p.slug)).committed, 1, '下单占位 1 件');
 
   // 空物流单号发货（自提/线下交付——前端明确支持留空）：shipped_at 须落发货标记
   const ship = await request(app)
     .post(`/api/orders/${order.id}/ship`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ trackingNo: '' })
     .expect(200);
   assertOk(ship);
-  const shippedRow = db.prepare('SELECT status, shipped_at, tracking_no FROM orders WHERE id = ?').get(order.id);
+  const shippedRow = await db.get('SELECT status, shipped_at, tracking_no FROM v_orders WHERE order_no = ?', order.id);
   assert.equal(shippedRow.status, 'shipped');
-  assert.equal(shippedRow.tracking_no, '');
-  assert.ok(shippedRow.shipped_at > 0, '发货标记 shipped_at 已写入（自提交付的交付证据）');
+  // 空物流单号是**三态里的 NULL**（"这件货走的是自提/线下交付，没有单号可填"），不是空串
+  assert.equal(shippedRow.tracking_no, null);
+  assert.ok(shippedRow.shipped_at instanceof Date, '发货标记 shipped_at 已写入（自提交付的交付证据）');
 
   // 退款终局（链上 RefundApproved）
-  assert.equal(applyEvent('RefundRequested', { orderId: eid }), 1);
-  assert.equal(applyEvent('RefundApproved', { orderId: eid, refundWei: order.amountWei }), 1);
+  assert.equal(await applyEvent('RefundRequested', { orderId: eid }), 1);
+  assert.equal(await applyEvent('RefundApproved', { orderId: eid, refundWei: order.amountWei }), 1);
   assert.equal(
-    skuInv(db, p.slug).committed,
+    (await skuInv(db, p.slug)).committed,
     1,
     '自提交付后退款不自动回补占位（货已当面交付，需先线下回收）——修复前按空单号误判未交付提前释放'
   );
@@ -365,7 +399,7 @@ test('自提交付（空物流单号发货）后退款：不回补占位；可�
   // 已交付（shipped_at）可创建退货单（修复前 hasDelivered 漏判会拒：'尚无交付记录'）
   const ret = await request(app)
     .post(`/api/orders/${order.id}/return`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ address: '回收地址 A', note: '自提商品追回' })
     .expect(200);
   assertOk(ret);
@@ -374,12 +408,12 @@ test('自提交付（空物流单号发货）后退款：不回补占位；可�
   // 店主确认收到退货 → 占位回补（released_at 幂等）
   const rec = await request(app)
     .post(`/api/orders/${order.id}/return/receive`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({})
     .expect(200);
   assertOk(rec);
   assert.equal(
-    skuInv(db, p.slug).committed,
+    (await skuInv(db, p.slug)).committed,
     0,
     '退货确认收到后占位回补，容量可再售'
   );

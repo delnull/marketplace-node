@@ -13,7 +13,7 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -27,14 +27,14 @@ before(async () => {
 const post = async (body) => {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(body)
     .expect(200);
   assertOk(res);
   return res.body.data;
 };
 
-const rowOf = (slug) => db.prepare('SELECT id FROM products WHERE slug = ?').get(slug);
+const rowOf = async (slug) => await db.get('SELECT id FROM products WHERE slug = ?', slug);
 
 let seq = 0;
 /**
@@ -42,36 +42,32 @@ let seq = 0;
  * 关键点：**带上 product_id**（承诺对账按商品归属），并给 paid_tx_hash
  * （没有链上支付凭证的单不进任何统计——与履约画像同一批凭据）。
  */
-function insertOrder({ productId, slug, status, createdAgoMs, shippedAgoMs = null }) {
+async function insertOrder({ productId, slug, status, createdAgoMs, shippedAgoMs = null }) {
   seq += 1;
-  const id = `prom-${seq}`;
   const now = Date.now();
   const created = now - createdAgoMs;
-  db.prepare(
-    `INSERT INTO orders (id, product_id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash, shipped_at,
-       refund_status, onchain_events, hold_qty, released_at, created_at, updated_at)
-     VALUES (?, ?, ?, '{}', '0x00', '', ?, ?, '1000', 1000000, '0.1', ?, ?, ?, ?, 'none', ?, 1, NULL, ?, ?)`
-  ).run(
-    id,
+  const row = await insertOrderRow(db, {
     productId,
-    slug,
-    buyer.address.toLowerCase(),
-    owner.address.toLowerCase(),
+    productSlug: slug,
+    buyer: buyer.address.toLowerCase(),
+    seller: owner.address.toLowerCase(),
+    amountWei: '1000',
+    usdtMicro: 1000000,
+    btyUsdtRate: '0.1',
     status,
-    `0x${String(seq).padStart(64, '0')}`,
-    `0x${String(seq).padStart(64, 'a')}`,
-    shippedAgoMs === null ? null : now - shippedAgoMs,
-    // 托管入账时刻（承诺对账与履约画像共用的锚点）
-    JSON.stringify([{ name: 'OrderCreated', txHash: '0x' + 'f'.repeat(64), block: 1, at: created }]),
-    created,
-    now
-  );
-  return id;
+    escrowOrderId: `0x${String(seq).padStart(64, '0')}`,
+    paidTxHash: `0x${String(seq).padStart(64, 'a')}`,
+    shippedAt: shippedAgoMs === null ? null : new Date(now - shippedAgoMs),
+    holdQty: 1,
+    updatedAt: new Date(created),
+    // 托管入账时刻（承诺对账与履约画像共用的锚点）：事件史里的 at 是**毫秒读数**，不是 DATETIME 列
+    events: [{ name: 'OrderCreated', txHash: '0x' + 'f'.repeat(64), block: 1, at: created }],
+  });
+  return row.orderNo;
 }
 
 const slaOf = async () => {
-  const res = await request(app).get('/api/shop/sla').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const res = await request(app).get('/api/shop/sla').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assertOk(res);
   return res.body.data;
 };
@@ -89,14 +85,14 @@ test('在途超承诺：数字 + 最久等了多久；已终结的单不算"还�
   const p = await post(
     productPayload({ kind: 'physical', title: '承诺对账·在途', terms: { handling_days: 1 }, capacity: 10 })
   );
-  const { id } = rowOf(p.slug);
+  const { id } = await rowOf(p.slug);
   // ① 在途、已等 2 天（承诺 1 天）→ 超期
-  insertOrder({ productId: id, slug: p.slug, status: 'escrowed', createdAgoMs: 2 * DAY });
+  await insertOrder({ productId: id, slug: p.slug, status: 'escrowed', createdAgoMs: 2 * DAY });
   // ② 在途、已等 6 小时 → 未超期
-  insertOrder({ productId: id, slug: p.slug, status: 'escrowed', createdAgoMs: 6 * 3600 * 1000 });
+  await insertOrder({ productId: id, slug: p.slug, status: 'escrowed', createdAgoMs: 6 * 3600 * 1000 });
   // ③ 已取消（等再久也不算"还没发货"）
-  const cancelled = insertOrder({ productId: id, slug: p.slug, status: 'cancelled', createdAgoMs: 9 * DAY });
-  db.prepare('UPDATE orders SET hold_qty = 0, released_at = ? WHERE id = ?').run(Date.now(), cancelled);
+  const cancelled = await insertOrder({ productId: id, slug: p.slug, status: 'cancelled', createdAgoMs: 9 * DAY });
+  await db.run('UPDATE orders SET hold_qty = 0, released_at = ? WHERE order_no = ?', new Date(), cancelled);
 
   const row = (await slaOf()).promises.find((x) => x.slug === p.slug);
   assert.ok(row, '声明了承诺且已上架 ⇒ 必须出现在清单里');
@@ -111,15 +107,15 @@ test('已交付实况：样本量照给、样本 <5 不下发中位数、超承�
   const p = await post(
     productPayload({ kind: 'physical', title: '承诺对账·实况', terms: { handling_days: 1 }, capacity: 50 })
   );
-  const { id } = rowOf(p.slug);
+  const { id } = await rowOf(p.slug);
   /*
     两条已交付样本（走 shipped_at，与实物单同一条路径）：
       · 甲：下单 → 发货 0.5 天（未超承诺 1 天）
       · 乙：下单 → 发货 3 天（超承诺）
     耗时统计的口径是「托管入账时刻 → 交付时刻」，所以 created_at 就是托管锚点。
   */
-  insertOrder({ productId: id, slug: p.slug, status: 'shipped', createdAgoMs: 4 * DAY, shippedAgoMs: 3.5 * DAY });
-  insertOrder({ productId: id, slug: p.slug, status: 'shipped', createdAgoMs: 5 * DAY, shippedAgoMs: 2 * DAY });
+  await insertOrder({ productId: id, slug: p.slug, status: 'shipped', createdAgoMs: 4 * DAY, shippedAgoMs: 3.5 * DAY });
+  await insertOrder({ productId: id, slug: p.slug, status: 'shipped', createdAgoMs: 5 * DAY, shippedAgoMs: 2 * DAY });
 
   const row = (await slaOf()).promises.find((x) => x.slug === p.slug);
   assert.equal(row.sampleCount, 2, '两条窗口内已交付');

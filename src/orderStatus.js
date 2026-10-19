@@ -1,19 +1,25 @@
 /**
  * 订单状态集合的**唯一出处**（源码评审 2026-09）。
  *
- * 为什么要有这个模块：`orders.status` 的权威定义在 `db.js` 的建表 CHECK 里，但**用**到这个枚举的地方
- * 散在十几个文件：有的写内联字面量（`status IN ('escrowed','shipped','disputed')`）、有的写模板常量
- * （`escrowWatcher.js` 的 `FROM_SET`）、有的导出了自己的数组（`INCOME_STATUS` / `REVIEWABLE_STATUS` /
- * `EVIDENCE_OPEN_STATUS` / `PII_ERASABLE_STATUS`）。同一套语义的集合被抄了多份，改一处漏一处**全是静默的**：
+ * 为什么要有这个模块：`orders.status` 的权威定义在 `db.js` 的建表语句里（MySQL 8 的 `ENUM(...)`），
+ * 但**用**到这个枚举的地方散在十几个文件：有的写内联字面量（`status IN ('escrowed','shipped','disputed')`）、
+ * 有的写模板常量（`escrowWatcher.js` 的 `FROM_SET`）、有的导出了自己的数组（`INCOME_STATUS` /
+ * `REVIEWABLE_STATUS` / `EVIDENCE_OPEN_STATUS` / `PII_ERASABLE_STATUS`）。同一套语义的集合被抄了多份，
+ * 改一处漏一处**全是静默的**：
  *   · 状态名拼错 ⇒ 那条 SQL 永远匹配 0 行（事件照扫、状态照旧、不报错）；
  *   · 新增状态漏进某个集合 ⇒ 某些单永远迁移不到。
  * 现在集合在这里命名一次，业务代码引用常量；`test/status-set-consistency.test.js` 负责确认
- * "每个集合都 ⊆ db.js 的 CHECK 约束"，并继续拦住残留在 SQL 里的字面量拼写错误。
+ * "每个集合都 ⊆ 列定义里的 ENUM 取值"，并继续拦住残留在 SQL 里的字面量拼写错误。
  *
  * 纪律：本模块**只放集合与拼 SQL 的小工具**，不放任何业务判断——判断留在各自的唯一实现里。
+ *
+ * 注意这里**只有 `orders.status`** 这一个维度：链上镜像的两个状态列各有一套自己的取值
+ * （`order_chain.refund_status` = none/requested/rejected、`after_sale_status` = none/open/closed，
+ * 均由 `src/afterSale.js` 与 escrowWatcher 的退款分支负责），把它们混进这里会让"这一单走到哪一步了"
+ * 出现两个答案层。
  */
 
-/** 与 `db.js` 建表语句里 `CHECK (status IN …)` **逐字同源**的权威顺序 */
+/** 与 `db.js` 建表语句里 `status ENUM(…)` **逐字同源**的权威顺序 */
 export const ORDER_STATUS = Object.freeze([
   'draft',
   'escrowed',
@@ -39,7 +45,7 @@ export const PRE_PAID_STATUS = Object.freeze(['draft', 'escrowed', 'shipped']);
  * `Created`——钱仍在托管里，超时窗口一到，**任何人**都能调 `releaseExpired` 把钱判给卖家。
  * 刻意排除另外两个易混状态：
  *  · `draft`    —— 本地草稿，链上根本没有单（无从谈释放）；
- *  · `disputed` —— 合约 `releaseExpired` 明确要求 `status == Created`，争议单只能走 `arbitrate`。
+ *  · `disputed` —— 合约 `releaseExpired` 明确要求 `status == Created`，争议单只能走 `voteSettlement` 票决。
  * 判据的链上真值不是这一列，而是合约 `releaseNotBeforeBlock(orderId)`（见 src/opsMetrics.js）：
  * 这里只用来圈定"要读谁"的候选面。
  */

@@ -2,9 +2,10 @@
  * 店铺履约画像统计（公开只读，链下信誉索引）。
  *
  * 口径（每项标注数据源与可审计性）：
- *  - 事件计数（托管单量/买家确认/超时释放/争议/仲裁判向）取自订单 onchain_events——
- *    watcher 对 Escrow 链上事件的**本地位移镜像**（每事件含 txHash/块号，可链上对账），
- *    节点虚报统计可被第三方重算戳穿；at 为节点轮询落库时刻（近似事件时刻，诚实标注）。
+ *  - 事件计数（托管单量/买家确认/超时释放/争议/仲裁判向）取自订单事件史（`order_chain.events`，
+ *    读模型 `v_orders` 里叫 `onchain_events`）——watcher 对 Escrow 链上事件的**本地位移镜像**
+ *    （每事件含 txHash/块号，可链上对账），节点虚报统计可被第三方重算戳穿；
+ *    `at` 为节点落库时刻（近似事件时刻，诚实标注）。
  *  - 仲裁判向不在事件史字段内（Arbitrated 参数未落库），以订单**终局状态**反推：
  *    refunded = 判买家 / settled = 判卖家（只统计**含 Arbitrated 事件**的行）。
  *    注意 refunded/settled 两态**也可由 `RefundApproved` 产生**（卖家同意退款 / 争议中和解，
@@ -60,15 +61,54 @@ export const DELIVERY_MIN_SAMPLES = 5;
 
 const DAY_MS = 24 * 3600 * 1000;
 
-/** 解析 `orders.onchain_events`（JSON 列；非法/非数组 → []）——**唯一入口**（画像/SLA/买家信号共用） */
+/**
+ * 时间列的**毫秒读数**（唯一实现）——统计侧所有"多久/早晚"的算术都在毫秒域里做。
+ *
+ * 为什么要有它（而不是各处 `Number(x)`）：库里的时间列是 `DATETIME(3)`，读出来是 **`Date`**
+ * （见 db.js 的三层时间口径），而这一层的窗口比较、排序、减法都要毫秒数。写成 `.getTime()`
+ * 是显式的；写成 `Number(date)` 虽然碰巧也对，但它看起来像"把 Date 当数字用"，
+ * 让人分不清哪一处是刻意的换算。
+ *
+ * 读不到/不是时间 ⇒ **null**（调用方按"读不到"处理）：绝不返回 NaN——
+ * NaN 与任何数比较都是假，一条坏数据会静默地被判成"不在任何窗口里"，而那是编出来的结论。
+ * 只接受 `Date` 与毫秒数两种形状（前者来自库、后者来自单测注入），别的形状一律 null。
+ */
+export function timeMs(v) {
+  if (v === null || v === undefined) return null;
+  const t = v instanceof Date ? v.getTime() : typeof v === 'number' ? v : NaN;
+  return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * 解析事件史（`order_chain.events`，读模型 `v_orders` 里叫 `onchain_events`）——**唯一入口**
+ * （画像/SLA/买家信号共用）。
+ *
+ * JSON 列由驱动**解析成 JS 值**返回（见 db.js 的连接选项），所以这里拿到的是数组本身，
+ * 不再 `JSON.parse`；再 parse 一次会抛错并被吞掉，事件史会被静默清空。
+ * 形状不对（不是数组）时给 `[]`：调用方只做计数，多一条少一条都不该让整页读数炸掉。
+ */
 export function parseOnchainEvents(raw) {
-  let parsed = [];
-  try {
-    parsed = JSON.parse(raw || '[]');
-  } catch {
-    parsed = [];
-  }
-  return Array.isArray(parsed) ? parsed : [];
+  return Array.isArray(raw) ? raw : [];
+}
+
+/**
+ * 事件史 → **对外形状**：把 `at` 的毫秒数折成 ISO-8601 字符串。
+ *
+ * 为什么存储保持毫秒、只在出口折一次：
+ *   · 内部读者 `escrowedAtOf` 要做**时长算术**（必须先有毫秒），所以存储不能是字符串；
+ *   · 对外只有**一种**时间表示（见 db.js 的说明），所以出口不能是毫秒。
+ * 两个需求分别在各自那一层满足，而不是让某一层"两种都认"——那正是要消灭的东西。
+ * 折在前端也不行：出口统一之后前端只需要一条规则（所有时间都是 ISO）。
+ *
+ * 形状不对的条目原样透传（与 `parseOnchainEvents` 的宽容口径一致：一份坏数据
+ * 不该让整页读数炸掉，但也不该被悄悄补上一个编出来的时刻）。
+ */
+export function eventsForDto(raw) {
+  return parseOnchainEvents(raw).map((ev) =>
+    ev && typeof ev === 'object' && typeof ev.at === 'number'
+      ? { ...ev, at: new Date(ev.at).toISOString() }
+      : ev
+  );
 }
 
 /**
@@ -76,10 +116,16 @@ export function parseOnchainEvents(raw) {
  *
  * 口径的边界（如实写）：`at` 是节点轮询/`/paid` 落库的时刻，不是链上区块时刻（差一轮轮询间隔），
  * 全仓的"发货耗时"都以它为准（见文件头），所以它是**节点自述**而非链上事实。
+ *
+ * `at` 在这一列里是**毫秒数**（不是 DATETIME）：事件史是应用自己写的 JSON 文档，
+ * 它的形状由"所有写者 + 所有读者"共同决定——写者（watcher 的 recordEvent、routes/orders.js 的
+ * 补写）都是毫秒，而这里的时长算术也必须先有毫秒。
+ * 对外的形状由 `eventsForDto` 折成 ISO（出口只有一种表示）；把库里 DATETIME 的 `Date`
+ * 口径直接套到这一列上（或反过来把 `at` 存成字符串）都会让时长算术静默变成 NaN。
  */
 export function escrowedAtOf(events) {
   for (const ev of events || []) {
-    const at = Number(ev && ev.at) || 0;
+    const at = timeMs(ev && ev.at);
     if (ev?.name === 'OrderCreated' && at) return at;
   }
   return null;
@@ -89,10 +135,12 @@ export function escrowedAtOf(events) {
  * 发货耗时样本（毫秒）= 交付时刻 − 托管入账近似时刻；任一缺失返回 null（读不到就不报数）。
  * **唯一判据**：履约画像与卖家 SLA 读数共用同一个减法——两处各写一遍必然漂移，
  * 而"这家店发货要多久"出现两个数就是两个真相。
+ *
+ * 入参是**毫秒数**（调用方用 `timeMs(列)` / `escrowedAtOf(事件史)` 先折算好）。
  */
 export function shipLatencySpan({ deliveredAt, escrowedAt }) {
-  const d = Number(deliveredAt || 0) || null;
-  const e = Number(escrowedAt || 0) || null;
+  const d = timeMs(deliveredAt) || null;
+  const e = timeMs(escrowedAt) || null;
   if (!d || !e) return null;
   return d - e;
 }
@@ -111,7 +159,7 @@ export function percentile(list, q) {
 /** 交易对的稳定键（buyer↔seller；卖家在本仓是一家店，但键里带上它才是"交易对"的诚实口径） */
 const pairKeyOf = (row) => `${String(row.buyer || '').toLowerCase()}|${String(row.seller || '').toLowerCase()}`;
 
-/** 纯统计函数（行：orders 表 status/onchain_events/delivered_at/buyer/seller 列；nowMs 供测试注入） */
+/** 纯统计函数（行：读模型 `v_orders` 的 status/onchain_events/delivered_at/buyer/seller 列；nowMs 供测试注入） */
 export function computeReputation(rows, nowMs = Date.now()) {
   // 每窗聚合桶（事件计数 + 发货耗时样本 + 交易对计数）
   const win = {};
@@ -124,12 +172,26 @@ export function computeReputation(rows, nowMs = Date.now()) {
     };
   }
   let firstOrderAt = null;
+  /*
+    **事件史读不出来的行数**（2026-10-16 补，三态纪律）：`order_chain.events` 是 JSON 列，
+    驱动会解析成 JS 值——但配置/列类型/读模型任何一处变化都可能让它以**字符串**回来。
+    宽容地把非数组折成 `[]` 是对的（一份坏数据不该让整页读数炸掉），但**折成 0 事件就不对了**：
+    画像里的单量、确认率、超时率、争议率全部按事件计数算，于是一次格式漂移会让整个节点的
+    公开画像静默变成"这家店什么历史都没有"，而 `/api/shop/reputation` 仍然 200。
+    这是买家用来判断"这家店靠不靠谱"的主要信号，答案必须是**能不能读**而不是一个默认值。
+    所以这里把"读不出来的行数"作为**独立结论**带回出口（调用方据此显示"画像不完整"，
+    而不是显示一个看起来正常的零）。与 `poolAlert` 为"快照读不到 ≠ 没有池"做三态同款。
+  */
+  let eventsUnreadable = 0;
 
   /** 事件 at 落入窗口？all 恒含；有界窗按落库时刻过滤 */
   const inWindow = (w, at) => w.days === 0 || at >= nowMs - w.days * DAY_MS;
 
   for (const row of rows) {
     // 事件史解析与"托管入账近似时刻"都走本模块的唯一实现（画像/SLA/买家信号同源）
+    if (row.onchain_events !== null && row.onchain_events !== undefined && !Array.isArray(row.onchain_events)) {
+      eventsUnreadable += 1;
+    }
     const events = parseOnchainEvents(row.onchain_events);
     /*
       ⚠️ **不按"有没有事件史"跳过整单**（2026-10-15 修 D3 的最后一段）：
@@ -139,8 +201,8 @@ export function computeReputation(rows, nowMs = Date.now()) {
       没有事件时下面各计数自然是 0（分子不受影响），单量与非空凭证同源。
     */
 
-    // 交付时刻（本地账：卖家发货写入）
-    const deliveredAt = Number(row.delivered_at || 0) || null;
+    // 交付时刻（本地账：卖家发货写入）——列是 DATETIME(3)（Date）或 NULL，算术在毫秒域做
+    const deliveredAt = timeMs(row.delivered_at);
     // OrderCreated 落库时刻（托管入账近似）——唯一判据见 escrowedAtOf
     const escrowedAt = escrowedAtOf(events);
 
@@ -166,7 +228,7 @@ export function computeReputation(rows, nowMs = Date.now()) {
     */
     const proven = !!String(row.paid_tx_hash || '').trim();
     if (!proven) continue;
-    const anchorAt = escrowedAt || Number(row.created_at || 0) || 0;
+    const anchorAt = escrowedAt || timeMs(row.created_at) || 0;
     if (!anchorAt) continue; // 连本地起始时刻都没有：无法归属窗口
     const orderWindows = WINDOWS.filter((w) => inWindow(w, anchorAt));
     /*
@@ -195,7 +257,7 @@ export function computeReputation(rows, nowMs = Date.now()) {
     if (rowEverDisputed(row, events)) for (const w of orderWindows) win[w.key].disputes += 1;
 
     for (const ev of events) {
-      const at = Number(ev && ev.at) || 0;
+      const at = timeMs(ev && ev.at);
       if (!at) continue;
       if (ev.name === 'ReceiptConfirmed') {
         for (const w of orderWindows) win[w.key].confirmed += 1;
@@ -283,7 +345,19 @@ export function computeReputation(rows, nowMs = Date.now()) {
   return {
     windows,
     delivery,
-    firstOrderAt,
+    /*
+      ⚠️ 出口折 ISO：这是**对外契约里的时刻**，全仓只有这一种表示（见 db.js）。
+      内部一路用毫秒算（`anchorAt` 来自 `timeMs`，方便比较与相减），只在出口折一次；
+      直接把毫秒下发会让前端的 `fmtTime(iso)` 静默印 "-"（读不到），而数据显示是空的、
+      也不报错——这类"两种时间表示"的错配正是把它统一成 ISO 要消灭的东西。
+    */
+    firstOrderAt: firstOrderAt === null ? null : new Date(firstOrderAt).toISOString(),
+    /*
+      **画像完整性的独立结论**（不是"零事件"）：`eventsUnreadable > 0` 表示有若干行的事件史
+      读不出来（列形状不对），它们的事件计数在本轮里是缺的。调用方遇到非零应当**如实标注
+      "画像不完整"**，而不是把它当成"这家店没有历史"。为 0 才是"全部都读到了"。
+    */
+    eventsUnreadable,
     note: '事件计数源自节点对 Escrow 链上事件的镜像（txHash/块号可重算对账）；发货耗时为本地账（节点自述）。',
     /*
       给调用方的一句话边界（同一条也写在 windows[].sybil 的注释里）：
@@ -305,31 +379,38 @@ export function computeReputation(rows, nowMs = Date.now()) {
  * buyer/seller 两列是**重复交易对信号**的分组键（见文件头；两者都是 OrderCreated 事件的
  * indexed 字段 ⇒ 口径可由第三方扫链复算）。
  *
- * **必须按 `seller` 过滤**（2026-10-15 修 D6）：`orders.seller` 是**逐行**写入的
- * （= 写入时的 `config.shop.owner`），而本函数此前不带任何 WHERE —— 于是换过店主地址
- * （店铺转手 / 换绑钱包）或复用别人库启动的节点，会把**上一家店**的订单算进新店的公开画像
- * （单量、确认率、发货耗时全被稀释/抬高），而这份画像是买家用来判断"这家店靠不靠谱"的。
- * 判据只有一个来源：`config.shop.owner`（本店身份锚点）；未配置时**不猜**——返回空画像，
- * 由路由按"未接店铺身份"处理（宁可没有画像，也不把别人的记录说成自己的）。
+ * **必须按卖家地址过滤**（2026-10-15 修 D6，2026-10 多店改造改为显式传参）：
+ * `orders.seller` 是**逐行**写入的（= 该单所属店铺的 `shops.seller`），而本函数此前不带任何
+ * WHERE —— 于是换过店主地址（店铺转手 / 换绑钱包）、或一台节点上有多家店时，会把**别家店**
+ * 的订单算进这一家的公开画像（单量、确认率、发货耗时全被稀释/抬高），而这份画像是买家
+ * 用来判断"这家店靠不靠谱"的。
+ *
+ * 参数是**三态**（沿用本仓的三态纪律，目的是让"忘了传"不可表达）：
+ *   · `undefined`（漏传）⇒ 抛错。**不给默认值**：默认成"全部"就是一次静默的跨店混算，
+ *     而它的表现是"画像数字看起来正常、只是不对"——最难查的一类；
+ *   · `null` ⇒ 显式表示"该节点全部在售店铺的合计"（公开目录页要的就是这个）；
+ *   · 地址字符串 ⇒ 只算这一家。
+ * @param {string|null|undefined} seller
  */
-export function reputationSummary() {
-  const seller = String(config.shop?.owner || '').toLowerCase();
+export async function reputationSummary(seller) {
+  if (seller === undefined) {
+    throw new Error('reputationSummary 需要显式的 seller（null = 全部在售店铺）；漏传会静默跨店混算');
+  }
+  const sel = seller === null ? '' : String(seller).toLowerCase();
   /*
-    店主地址配了 ⇒ 只算本店的单（判据见上面的说明）；**没配**（`MK_SHOP_OWNER` 空，节点处于
-    "只读展示"模式）⇒ 不加过滤：此时没有任何身份可比对，而这份库只可能装本节点自己镜像的东西
-    （写入者只有本节点的订单路由与 watcher），把它们全排除只会得到一份空画像——
-    "读不到店铺身份"与"这家店没有记录"是两件事，这里只有前者，不该顺手说成后者。
+    整单读走读模型 `v_orders`：事件史（`order_chain.events`，视图里叫 `onchain_events`）、
+    支付凭证（`order_chain.paid_tx_hash`）与订单事实一次读全；交付时刻取交付子表的最晚一行、
+    实物单兜底 `shipped_at`（口径见函数说明）。
+    `WHERE o.seller = ?` 不带 `lower()`：函数包住列只会让索引失效；写入侧一律小写落库是
+    **唯一的不变量**（地址列是 `utf8mb4_0900_as_cs` 大小写敏感，2026-10 更正：此前这里写的是
+    "排序规则本是 ai_ci"——那是假话，as_cs 下大小写不同的行是两条互不可见的键）。
   */
-  const rows = getDb()
-    .prepare(
-      `SELECT o.status, o.onchain_events, o.buyer, o.seller, o.paid_tx_hash, o.created_at,
+  const rows = await getDb().all(`SELECT o.status, o.onchain_events, o.buyer, o.seller, o.paid_tx_hash, o.created_at,
               COALESCE(
-                (SELECT MAX(created_at) FROM order_delivery_items WHERE order_id = o.id),
+                (SELECT MAX(created_at) FROM order_delivery_items WHERE order_id = o.order_id),
                 o.shipped_at
               ) AS delivered_at
-       FROM orders o
-       ${seller ? 'WHERE lower(o.seller) = ?' : ''}`
-    )
-    .all(...(seller ? [seller] : []));
+       FROM v_orders o
+       ${sel ? 'WHERE o.seller = ?' : ''}`, ...(sel ? [sel] : []));
   return computeReputation(rows, Date.now());
 }

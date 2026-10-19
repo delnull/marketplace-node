@@ -88,7 +88,7 @@ export const MEDIA = {
     window: [[0, 64, 'webm']],
   },
   // PDF 只服务证据附件（商品媒体不收）：放进同一张表的理由是"字节 → 类型"这件事只有一处实现，
-  // 谁允许收是各路自己 policiy（见 node/src/evidenceFiles.js）。
+  // 谁允许收是各路自己的 policy（见 node/src/evidenceFiles.js）。
   'application/pdf': { kind: 'document', ext: 'pdf', maxBytes: null, at: [[0, '%PDF']] },
 };
 

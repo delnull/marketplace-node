@@ -14,7 +14,7 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login } from './setup.mjs';
+import { makeCtx, login, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, owner } = ctx;
@@ -68,14 +68,18 @@ test('公开重端点限流：/api/arbitration/pending 与 /api/shop/reputation 
 
 test('重导出限流：四路 CSV 共用一把窗口，达到阈值后 429（且不吃掉其它端点）', async () => {
   // 前几次导出必须正常（含 BOM 头的 CSV 正文；CSV 不走 {code,message} 信封，故断言正文）
-  const first = await request(app).get('/api/shop/export/orders.csv').set('Authorization', `Bearer ${ownerToken}`);
+  const first = await request(app).get('/api/shop/export/orders.csv').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value);
   assert.equal(first.status, 200);
-  assert.match(first.text, /^\uFEFFid,product_slug/);
-  const ledger = await request(app).get('/api/shop/export/ledger.csv').set('Authorization', `Bearer ${ownerToken}`);
+  /*
+    首列是**对外单号**（`order_no`），不是内部自增键：内部键在换库/重建之后会变，而 CSV 是拿去对账的
+    （判据见 routes/export.js 的文件头）。旧列名 `id` 随"内部键不出本节点"这条口径一起作废。
+  */
+  assert.match(first.text, /^\uFEFForder_no,product_slug/);
+  const ledger = await request(app).get('/api/shop/export/ledger.csv').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value);
   assert.equal(ledger.status, 200);
 
   const { hit } = await hammer(
-    () => request(app).get('/api/shop/export/products.csv').set('Authorization', `Bearer ${ownerToken}`),
+    () => request(app).get('/api/shop/export/products.csv').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value),
     { maxTries: 40, warmup: 3 }
   );
   assert.ok(hit, '导出（全表 SELECT）必须有节点内限流');
@@ -88,7 +92,7 @@ test('重导出限流：四路 CSV 共用一把窗口，达到阈值后 429（�
 test('个人信息擦除端点限流：retention/run 与 erase-pii 各自有窗口（重同步操作）', async () => {
   // retention/run 的阈值给得较宽（一次最多擦 200 单，且另有单飞）：这里只验证"存在限流"
   const { hit } = await hammer(
-    () => request(app).post('/api/shop/retention/run').set('Authorization', `Bearer ${ownerToken}`).send({ days: 400 + Math.floor(Date.now() % 1000) }),
+    () => request(app).post('/api/shop/retention/run').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).send({ days: 400 + Math.floor(Date.now() % 1000) }),
     { maxTries: 40, warmup: 3 }
   );
   assert.ok(hit, '保留期运行端点必须有节点内限流（每次同步擦最多 200 单）');

@@ -7,7 +7,7 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { assertOk, login, makeCtx, rowLikeOf } from './setup.mjs';
+import { assertOk, login, makeCtx, rowLikeOf, shopRef, orderIdOf } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -50,21 +50,21 @@ before(async () => {
 test('上架 NFT：无/非法合约地址被拒', async () => {
   const noAddr = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(nftPayload({ nftContract: '' }))
     .expect(200);
   assert.notEqual(noAddr.body.code, 0);
 
   const badAddr = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(nftPayload({ nftContract: '0x123' }))
     .expect(200);
   assert.notEqual(badAddr.body.code, 0);
 
   const zeroAddr = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(nftPayload({ nftContract: '0x0000000000000000000000000000000000000000' }))
     .expect(200);
   assert.notEqual(zeroAddr.body.code, 0);
@@ -73,7 +73,7 @@ test('上架 NFT：无/非法合约地址被拒', async () => {
 test('上架 NFT 成功：快照含 nft_contract 键，哈希可复算；合约地址小写归一', async () => {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(nftPayload())
     .expect(200);
   assert.ok(res);
@@ -97,12 +97,17 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
     slug: 'p-abc',
     title: '旧商品',
     description: 'd',
-    media: '[]',
+    /*
+      JSON 列一律传**已解析的值**（数组/对象）：驱动读回来就是这个形状，
+      快照投影只收它（传字符串会被 assertParsedJsonColumn 响亮拒绝——静默当"没有内容"
+      会让哈希算错而看不出是谁的错）。
+    */
+    media: [],
     kind: 'digital',
-    description_blocks: '[]',
-    specs: '[]',
+    description_blocks: [],
+    specs: [],
     skus: [{ sku_key: '', price_usdt_micro: 100 }],
-    nft_contract: '', // 非 NFT 商品 DB 中该列恒为空串
+    nft_contract: null, // 非 NFT 商品的该列是 **NULL**（三态：'没有'不等于空串）
   };
   const snap = snapshotObject(rowLike);
   assert.ok(!('nft_contract' in snap), '数字商品快照不得含 nft_contract 键（否则哈希全部失效）');
@@ -139,7 +144,7 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
 test('nftStandard 校验：非法值被拒；erc1155 上架成功且快照锁定该标准', async () => {
   const bad = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(nftPayload({ nftStandard: 'erc20' }))
     .expect(200);
   assert.notEqual(bad.body.code, 0);
@@ -147,7 +152,7 @@ test('nftStandard 校验：非法值被拒；erc1155 上架成功且快照锁定
 
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(nftPayload({ title: 'ERC1155 批量藏品', nftStandard: 'erc1155' }))
     .expect(200);
   assertOk(res);
@@ -162,7 +167,7 @@ test('nftStandard 校验：非法值被拒；erc1155 上架成功且快照锁定
 test('NFT 标准不可在已建交付池后变更（核验语义绑定池内库存）；清池后可改', async () => {
   const up = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(nftPayload({ title: '标准守卫商品' }))
     .expect(200);
   assertOk(up);
@@ -170,7 +175,7 @@ test('NFT 标准不可在已建交付池后变更（核验语义绑定池内库�
   // 建池前可改标准（快照哈希随 nft_standard 键变化而重算）
   const patch1 = await request(app)
     .patch(`/api/products/${slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ nftStandard: 'erc1155' })
     .expect(200);
   assertOk(patch1);
@@ -178,13 +183,13 @@ test('NFT 标准不可在已建交付池后变更（核验语义绑定池内库�
   // 建池后不可改（避免已导入库存与未来核验语义错配）
   const imp = await request(app)
     .post(`/api/products/${slug}/tokens`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokens: ['1'] })
     .expect(200);
   assertOk(imp);
   const patch2 = await request(app)
     .patch(`/api/products/${slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ nftStandard: 'erc721' })
     .expect(200);
   assert.notEqual(patch2.body.code, 0);
@@ -192,17 +197,17 @@ test('NFT 标准不可在已建交付池后变更（核验语义绑定池内库�
   // 删除池内全部 tokenId 后恢复可改
   const list = await request(app)
     .get(`/api/products/${slug}/tokens`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(list);
   const del = await request(app)
     .delete(`/api/products/${slug}/tokens/${list.body.data.tokens[0].id}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(del);
   const patch3 = await request(app)
     .patch(`/api/products/${slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ nftStandard: 'erc721' })
     .expect(200);
   assertOk(patch3);
@@ -237,13 +242,13 @@ test('交付池导入：非 NFT 商品被拒', async () => {
   const { productPayload } = await import('./setup.mjs');
   const digital = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '非 NFT 对照商品' }))
     .expect(200);
   const slug = digital.body.data.slug;
   const res = await request(app)
     .post(`/api/products/${slug}/tokens`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokens: ['1'] })
     .expect(200);
   assert.notEqual(res.body.code, 0, '数字商品不可导入 tokenId 池');
@@ -252,7 +257,7 @@ test('交付池导入：非 NFT 商品被拒', async () => {
 test('交付池导入：展开 + 去重 + 重复跳过；超限被拒', async () => {
   const res = await request(app)
     .post(`/api/products/${nftSlug}/tokens`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokens: ['0x01', '2', '3', '4-6', '4-6', '0x5'] })
     .expect(200);
   assertOk(res);
@@ -262,23 +267,23 @@ test('交付池导入：展开 + 去重 + 重复跳过；超限被拒', async ()
   // 非法行 → 整批拒绝（不产生部分导入）
   const bad = await request(app)
     .post(`/api/products/${nftSlug}/tokens`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokens: ['7', 'oops'] })
     .expect(200);
   assert.notEqual(bad.body.code, 0);
-  const stats = db.prepare('SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = (SELECT id FROM products WHERE slug = ?)').get(nftSlug);
+  const stats = await db.get('SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = (SELECT id FROM products WHERE slug = ?)', nftSlug);
   assert.equal(stats.c, 6, '非法批不应产生部分导入');
   // 展开超限
   const tooMany = await request(app)
     .post(`/api/products/${nftSlug}/tokens`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokens: ['100-1000'] })
     .expect(200);
   assert.notEqual(tooMany.body.code, 0);
   // 库内已存在的 tokenId 再导入 → 整条跳过（INSERT OR IGNORE 生效，池不重复）
   const dup = await request(app)
     .post(`/api/products/${nftSlug}/tokens`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokens: ['1'] })
     .expect(200);
   assertOk(dup);
@@ -290,21 +295,21 @@ test('交付池导入：展开 + 去重 + 重复跳过；超限被拒', async ()
 test('交付池查询与删除：状态过滤、仅未用可删', async () => {
   const list = await request(app)
     .get(`/api/products/${nftSlug}/tokens?status=unused`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(list);
   assert.equal(list.body.data.total, 6);
   assert.equal(list.body.data.tokens[0].tokenId, '6');
   const del = await request(app)
     .delete(`/api/products/${nftSlug}/tokens/${list.body.data.tokens[0].id}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(del);
   assert.equal(del.body.data.stats.unused, 5);
   // 再次删除同一 id：服务端返回 HTTP 404 + body.code 404
   const again = await request(app)
     .delete(`/api/products/${nftSlug}/tokens/${list.body.data.tokens[0].id}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(404);
   assert.equal(again.body.code, 404);
 });
@@ -313,7 +318,7 @@ test('交付池查询与删除：状态过滤、仅未用可删', async () => {
 async function createDraft(slug, who = buyer.address) {
   const res = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, buyer: who })
     .expect(200);
   assertOk(res);
@@ -335,21 +340,26 @@ test('NFT 商品下单：池内有未用 tokenId 时成功，订单快照含 nft
 });
 
 test('NFT 商品售罄拦截：池内全部交付后新订单被拒', async () => {
-  // 手工模拟全部 tokenId 已交付（used）——池还有 5 个，先全置 used
-  db.prepare(
-    'UPDATE product_nft_tokens SET status = ?, order_id = ?, used_at = ? WHERE product_id = (SELECT id FROM products WHERE slug = ?)'
-  ).run('used', '00000000-0000-0000-0000-000000000000', Date.now(), nftSlug);
+  /*
+    手工模拟全部 tokenId 已交付（used）——池还有 5 个，先全置 used。
+
+    `order_id` 刻意**不写**（留 NULL）：这一条要验的是"池里没有可用 token ⇒ 新订单被拒"，
+    与"这些 token 被哪一单拿走"无关；写一个 `o.id` 既需要先有订单、又会把断言绑到无关的东西上
+    （而且原样里的 `o` 根本没定义，ReferenceError 只在跑到这行时才现形）。
+  */
+  await db.run(
+    "UPDATE product_nft_tokens SET status = 'used', used_at = ? WHERE product_id = (SELECT id FROM products WHERE slug = ?)",
+    new Date(), nftSlug
+  );
   const res = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: nftSlug, buyer: buyer.address })
     .expect(200);
   assert.notEqual(res.body.code, 0);
   assert.match(res.body.message, /库存不足/);
   // 复原一个未用供后续发货测试
-  db.prepare(
-    "UPDATE product_nft_tokens SET status = 'unused', order_id = NULL, used_at = NULL WHERE product_id = (SELECT id FROM products WHERE slug = ?) AND status = 'used'"
-  ).run(nftSlug);
+  await db.run("UPDATE product_nft_tokens SET status = 'unused', order_id = NULL, used_at = NULL WHERE product_id = (SELECT id FROM products WHERE slug = ?) AND status = 'used'", nftSlug);
 });
 
 // ── 发货参数边界（链上核验前的可测部分）──
@@ -358,50 +368,50 @@ test('NFT 交付登记：tokenId/txHash 缺失或非法、tokenId 不在池内 �
   const created = await createDraft(nftSlug, buyer2.address);
   const id = created.id;
   // 直接置 escrowed（模拟托管成功并落支付凭证——链上校验非本文件范围）
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run(payHash(), Date.now(), id);
+  await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), id);
+  await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', payHash(), id);
   const txHash = '0x' + 'a'.repeat(64);
 
   const noToken = await request(app)
     .post(`/api/orders/${id}/nft-deliveries`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokenId: '', txHash })
     .expect(200);
   assert.notEqual(noToken.body.code, 0);
 
   const badHash = await request(app)
     .post(`/api/orders/${id}/nft-deliveries`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokenId: '1', txHash: 'abc' })
     .expect(200);
   assert.notEqual(badHash.body.code, 0);
 
   const notInPool = await request(app)
     .post(`/api/orders/${id}/nft-deliveries`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokenId: '99999', txHash })
     .expect(200);
   assert.notEqual(notInPool.body.code, 0);
   assert.match(notInPool.body.message, /不在商品交付池/);
   // 池外 tokenId 应保持 escrowed 不动
-  assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(id).status, 'escrowed');
+  assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', id)).status, 'escrowed');
 });
 
 test('NFT 交付登记：池内 tokenId 但收据无法核验 → 明确失败且状态不动', async () => {
   const created = await createDraft(nftSlug, buyer3.address);
   const id = created.id;
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run(payHash(), Date.now(), id);
+  await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), id);
+  await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', payHash(), id);
   // 该单的买家 != 链上 from 校验会失败，但 txHash 本身无法在单测查询（provider 指向假 RPC）
   // —— verifyNftTransferTx 会因网络不可用返回「链上查询失败」，同样视为核验不通过
   const res = await request(app)
     .post(`/api/orders/${id}/nft-deliveries`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokenId: '1', txHash: '0x' + 'b'.repeat(64) })
     .expect(200);
   assert.notEqual(res.body.code, 0);
   assert.match(res.body.message, /核验未通过/);
-  assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(id).status, 'escrowed');
+  assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', id)).status, 'escrowed');
 });
 
 // ── matchNftTransfers 纯函数（集合核验）──

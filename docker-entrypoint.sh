@@ -3,8 +3,8 @@
 # 容器入口脚本：把数据卷的属主交给 node，再降权执行。
 #
 # 为什么需要它（而不是直接 `CMD node src/server.js`）：节点要以**非 root** 运行，但 `/data`
-# 这个卷（named volume 或 bind mount）刚被 Docker 建出来时属主通常是 root，SQLite 一写就
-# `SQLITE_READONLY`/`EACCES`。所以：以 root 启动时先把数据目录交给镜像里的 `node` 用户（uid 1000），
+# 这个卷（named volume 或 bind mount）刚被 Docker 建出来时属主通常是 root，附件与商品媒体一写就
+# `EACCES`。所以：以 root 启动时先把数据目录交给镜像里的 `node` 用户（uid 1000），
 # 再用 setpriv 降权执行真正的命令；以非 root 启动（例如 `--user 1000:1000`）就直接执行。
 #
 # 为什么用 setpriv 而不是 su-exec / gosu：那两个都要额外装包，而**装包就得连镜像源的 CDN**——

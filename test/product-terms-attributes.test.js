@@ -13,7 +13,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, owner } = ctx;
@@ -23,7 +23,7 @@ const ownerToken = (await login(ctx, owner)).token;
 const create = async (body) => {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(body)
     .expect(200);
   if (res.body.code !== 0) throw new Error(res.body.message);
@@ -34,7 +34,7 @@ const create = async (body) => {
 const patch = async (slug, body) => {
   const res = await request(app)
     .patch(`/api/products/${slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(body)
     .expect(200);
   if (res.body.code !== 0) throw new Error(res.body.message);
@@ -55,7 +55,7 @@ test('承诺：未声明是"未声明"，不是"不支持退换"；恒为完整�
 test('承诺：声明可退换就必须给窗口；不可退换时窗口与运费承担方都不许填', async () => {
   const missing = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '缺窗口', terms: { return_policy: 'no-reason' } }))
     .expect(200);
   assert.equal(missing.body.code, 1);
@@ -63,7 +63,7 @@ test('承诺：声明可退换就必须给窗口；不可退换时窗口与运�
 
   const contradictory = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '自相矛盾', terms: { return_policy: 'none', return_window_days: 7, return_freight: 'seller' } }))
     .expect(200);
   assert.equal(contradictory.body.code, 1);
@@ -71,14 +71,14 @@ test('承诺：声明可退换就必须给窗口；不可退换时窗口与运�
 
   const bad = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '天数越界', terms: { handling_days: 0 } }))
     .expect(200);
   assert.equal(bad.body.code, 1, '0 天不是承诺（没有可核对的边界）');
 
   const unknown = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '未知键', terms: { warranty_days: 90 } }))
     .expect(200);
   assert.equal(unknown.body.code, 1, '不认识的承诺字段也要点名拒绝');
@@ -146,7 +146,7 @@ test('参数：去重按大小写不敏感的键；只写一半报错；超长�
 
   const half = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '只写一半', attributes: [{ name: '成色', value: '' }] }))
     .expect(200);
   assert.equal(half.body.code, 1, '只填名称不填值 = 这条参数不存在，必须说出来');
@@ -154,7 +154,7 @@ test('参数：去重按大小写不敏感的键；只写一半报错；超长�
 
   const long = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '超长', attributes: [{ name: '说明', value: 'x'.repeat(61) }] }))
     .expect(200);
   assert.equal(long.body.code, 1);
@@ -162,7 +162,7 @@ test('参数：去重按大小写不敏感的键；只写一半报错；超长�
 
   const many = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(
       productPayload({
         title: '太多',
@@ -175,7 +175,7 @@ test('参数：去重按大小写不敏感的键；只写一半报错；超长�
 
   const extraKey = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '多键', attributes: [{ name: '成色', value: '全新', extra: 1 }] }))
     .expect(200);
   assert.equal(extraKey.body.code, 1, '每一行只认 name/value，多一个键就是"提交了不生效"');
@@ -209,21 +209,21 @@ test('规格图：逐组合可选；进快照只收有图的组合；批量改�
   // 快照里的 sku_images 只含有图的组合（空图与"没传过图"对买家同形）
   const { snapshotObject } = await import('../src/routes/products.js');
   const { loadSkus } = await import('../src/routes/products.js');
-  const row = ctx.db.prepare('SELECT * FROM products WHERE slug = ?').get(p.slug);
-  const snap = snapshotObject({ ...row, skus: loadSkus(row.id) });
+  const row = await ctx.db.get('SELECT * FROM products WHERE slug = ?', p.slug);
+  const snap = snapshotObject({ ...row, skus: await loadSkus(row.id) });
   assert.deepEqual(snap.sku_images, [['黑', 'https://example.com/black.png']]);
   assert.deepEqual(snap.skus, [['白', 12_000_000], ['黑', 10_000_000]], '价格仍在二元组里（形状不变）');
 
   // 批量改价：整行重算快照，**不许把 image_url 丢掉**（丢了 = 改一次价，所有规格图从快照里消失）
   const batch = await request(app)
     .patch('/api/products/batch')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ slugs: [p.slug], patch: { priceUsdtMicro: 9_000_000 } })
     .expect(200);
   assertOk(batch);
   const after = await request(app)
     .get(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(after);
   assert.equal(
@@ -231,8 +231,8 @@ test('规格图：逐组合可选；进快照只收有图的组合；批量改�
     'https://example.com/black.png',
     '批量改价后规格图必须还在'
   );
-  const row2 = ctx.db.prepare('SELECT * FROM products WHERE slug = ?').get(p.slug);
-  const snap2 = snapshotObject({ ...row2, skus: loadSkus(row2.id) });
+  const row2 = await ctx.db.get('SELECT * FROM products WHERE slug = ?', p.slug);
+  const snap2 = snapshotObject({ ...row2, skus: await loadSkus(row2.id) });
   assert.deepEqual(snap2.sku_images, [['黑', 'https://example.com/black.png']], '快照里的规格图也必须还在');
   assert.equal(after.body.data.snapshotHash, row2.snapshot_hash, '公开字段可复算（DTO 与快照同源）');
 });
@@ -240,7 +240,7 @@ test('规格图：逐组合可选；进快照只收有图的组合；批量改�
 test('规格图：非法 URL 被拒（与主图同一套判据）；非法 SKU 字段点名拒绝', async () => {
   const bad = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '坏图', skus: [{ key: '', priceUsdtMicro: 1_000_000, imageUrl: 'javascript:alert(1)' }] }))
     .expect(200);
   assert.equal(bad.body.code, 1);
@@ -248,7 +248,7 @@ test('规格图：非法 URL 被拒（与主图同一套判据）；非法 SKU �
 
   const extra = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '多键 sku', skus: [{ key: '', priceUsdtMicro: 1_000_000, img: 'x' }] }))
     .expect(200);
   assert.equal(extra.body.code, 1, '组合条目多一个键 = 提交了不生效，同样要点名');
@@ -269,7 +269,7 @@ test('订单快照锁定承诺/参数/规格图（下单时冻结，事后改商
   );
   const created = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: p.slug })
     .expect(200);
   assertOk(created);
@@ -283,7 +283,7 @@ test('订单快照锁定承诺/参数/规格图（下单时冻结，事后改商
   assert.equal(after.terms.handling_days, 9);
   const reread = await request(app)
     .get(`/api/orders/${created.body.data.id}`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(reread);
   assert.equal(reread.body.data.productSnapshot.terms.handling_days, 2, '在途单的承诺按快照执行');
@@ -309,7 +309,7 @@ test('开票声明：三态（true / false / 未声明），且只认布尔', as
   for (const bad of ['true', 1, 'yes']) {
     const res = await request(app)
       .post('/api/products')
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
       .send(productPayload({ kind: 'physical', terms: { invoice_supported: bad }, capacity: 5 }))
       .expect(200);
     assert.notEqual(res.body.code, 0, `invoice_supported=${JSON.stringify(bad)} 必须被拒`);
@@ -319,7 +319,7 @@ test('开票声明：三态（true / false / 未声明），且只认布尔', as
   // 改开票声明会改变快照哈希（它是进快照的店主陈述）
   const patched = await request(app)
     .patch(`/api/products/${unset.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ terms: { handling_days: 1, invoice_supported: true } })
     .expect(200);
   assert.equal(patched.body.data.terms.invoice_supported, true);

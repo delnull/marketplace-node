@@ -9,29 +9,39 @@
  * 所以"换址"从来不是无害操作：它意味着旧实例里的在途单只能靠双方在旧合约上自行了结。
  *
  * 本模块把这件事变成**启动期可见的判定**：
- *   · 首次启动：把地址记进 kv（不用迁移框架，见 DECISIONS「不留兼容垫片」）；
+ *   · 首次启动：把地址记进 `node.escrow_address`（单例行，由 db.js 的 initDb() 在启动时建立）；
  *   · 地址没变：什么都不做（正常路径）；
  *   · 地址变了且**本地没有在途链上单**：记新地址 + 大声告警（可以继续启动）；
  *   · 地址变了且**本地还有在途链上单**：默认**拒绝启动**，除非显式 `MK_ESCROW_CHANGE_ACK=1`
  *     （处置步骤写在报错里：先在旧合约上了结这些单，再重建库/换地址）。
  *
- * 判据本体是纯函数 `anchorVerdict`（有单测）；读库/写 kv 的接线很薄。
+ * 判据本体是纯函数 `anchorVerdict`（有单测）；读库/写 `node` 那一行的接线很薄。
  * 本项目为 greenfield（数据可弃、库可重建），所以"拒绝启动"的代价是几分钟，
  * 而它拦住的是"以为换了个地址就完事、其实一批在途单再也没人管"。
+ *
+ * ⚠️ 地址锚的**家变了**（2026-10 MySQL 重设计）：旧形状存在 kv（`mk:escrow_address`），
+ * 现在是 `node` 单例行的 `escrow_address` 列——节点自身的几个已知单例（合约地址锚、两个轮询
+ * 游标、隔离事件清单）各有带类型的列，不再塞进一张键值表。行的**建立**只有一处
+ * （`db.js` 的 `initDb()` → `ensureNodeRow()`）；本模块只读它、只写这一列，
+ * 行不存在时**如实返回"拒绝"**而不是假装记下了地址（"记不下"与"记下了"在链上后果完全不同）。
  */
-import { getDb, kvGet, kvSet } from './db.js';
+import { getDb } from './db.js';
+// node 单例行的唯一读入口（行由 db.js 的 initDb() 在启动期建立）
+import { nodeRow } from './shops.js';
 import { ACTIVE_IN } from './orderStatus.js';
 
-/** kv 键：上次启动时用的托管合约地址（小写） */
-const KEY = 'mk:escrow_address';
-
 /** 本地还有多少**链上已有单**的在途订单（这些单的托管资金在当时的那个合约实例上） */
-export function inflightChainOrders() {
-  return getDb()
-    .prepare(
-      `SELECT COUNT(*) AS c FROM orders WHERE escrow_order_id IS NOT NULL AND status IN ${ACTIVE_IN}`
-    )
-    .get().c;
+export async function inflightChainOrders() {
+  /*
+    链上单号住在 `order_chain`（1:1 子表），`orders` 表里已经没有这一列——
+    所以"这一单有没有上链"只能靠 JOIN 子表来问。INNER JOIN 即"有链上镜像行"，
+    而 `order_chain.escrow_order_id` 是 NOT NULL 的（草稿期就生成，见 routes/orders.js），
+    所以这里不需要再叠一个 `IS NOT NULL` 谓词。
+  */
+  const row = await getDb().get(
+    `SELECT COUNT(*) AS c FROM orders o JOIN order_chain c ON c.order_id = o.id WHERE o.status IN ${ACTIVE_IN}`
+  );
+  return Number(row?.c) || 0;
 }
 
 /**
@@ -61,7 +71,7 @@ export function anchorVerdict({ envAddress = '', storedAddress = '', inflightCou
         '  这些单的托管资金在**旧合约实例**上：换个地址后它们查不到、也对不了账，店主会一直看到"待发货"。\n' +
         '  处置（任选其一）：\n' +
         '   ① 先把旧实例上的这些单了结（确认收货 / 退款 / 争议裁决 / 超时释放），再改地址；\n' +
-        '   ② 本项目为 greenfield：确认这批数据可弃 ⇒ **重建节点库**（删掉 db 文件后重启，节点会重新记录新地址）；\n' +
+        '   ② 本项目为 greenfield：确认这批数据可弃 ⇒ **重建节点库**（DROP DATABASE 后重启，节点会重新记录新地址）；\n' +
         '   ③ 确实知道后果仍要继续 ⇒ 显式设 MK_ESCROW_CHANGE_ACK=1 再启动（本次会记下新地址）。',
     };
   }
@@ -84,17 +94,54 @@ export function anchorVerdict({ envAddress = '', storedAddress = '', inflightCou
 /** 最近一次锚定判定的结果（供 /healthz 与排查；进程内状态） */
 let lastAnchor = { at: null, level: null, reason: null, address: null, previous: null, inflight: 0 };
 
-/** 启动期执行锚定：读 kv → 判定 → 必要时写回。返回判定结果（不自己退出，由调用方决定） */
-export function applyEscrowAnchor({ envAddress, ack = false } = {}) {
-  const stored = kvGet(KEY, '') || '';
-  const inflight = envAddress ? inflightChainOrders() : 0;
+/**
+ * 启动期执行锚定：读 `node.escrow_address` → 判定 → 必要时写回。返回判定结果（不自己退出，由调用方决定）
+ *
+ * ⚠️ **必须 await**（2026-10 MySQL 迁移）：读库与在途单计数都是异步调用。旧实现下
+ * （SQLite 同步执行）这三步是同步的，照抄下来会得到 `stored = Promise`、`inflight = Promise`：
+ *   · `String(promise)` 恒为 `"[object Promise]"` ⇒ 每次启动都判定成"**换址**"（warn），
+ *     于是首次启动记不进锚点、也没人能拿它比对；
+ *   · `inflightCount` 是 Promise，`Number(Promise)` = NaN ⇒ `n > 0` 恒 false ⇒
+ *     **有在途单时的"拒绝启动"这道闸整段失效**，真正的换址会被静默接受。
+ * 调用方（server.js）同样必须 await，否则 `anchor.ok` 读的是 Promise（恒真），
+ * `process.exit(1)` 那条分支永远走不到。
+ */
+export async function applyEscrowAnchor({ envAddress, ack = false } = {}) {
+  const row = await nodeRow();
+  /*
+    `node` 单例行不存在 ⇒ **拒绝**（不是"当作首次记录"）：这一行的 `owner` 是 NOT NULL，
+    db.js 的 `initDb()` 本该已经建立它（`ensureNodeRow()`，`MK_SHOP_OWNER` 缺失时直接拒绝启动）。
+    少了它，下面那条 `UPDATE … WHERE id = 1` 会命中 0 行——而"命中 0 行"与"记下了"在返回值上同形，
+    现象是每次启动都判成"首次记录"、地址锚永远没有值（换址门禁随之整段失效）。
+    所以这里把"行不存在"当成判定结果说出来，由 server.js 拒绝启动。
+  */
+  if (!row) {
+    const reason =
+      'node 单例行（id=1）不存在：合约地址锚没有地方记账（链上事件游标也一样）。' +
+      '处置：确认 MK_SHOP_OWNER 已配置（db.js 的 initDb() 会据此建立这一行），再重启。';
+    lastAnchor = { at: Date.now(), level: 'refuse', reason, address: null, previous: null, inflight: 0 };
+    return { level: 'refuse', ok: false, action: 'none', reason, previous: null, inflight: 0 };
+  }
+  const stored = row.escrow_address ? String(row.escrow_address).trim().toLowerCase() : '';
+  const env = String(envAddress || '').trim().toLowerCase();
+  const inflight = env ? await inflightChainOrders() : 0;
   const verdict = anchorVerdict({ envAddress, storedAddress: stored, inflightCount: inflight, ack });
-  if (verdict.action === 'record') kvSet(KEY, String(envAddress).trim().toLowerCase());
+  if (verdict.action === 'record') {
+    // `updated_at` 由**服务器**盖章（不接应用端时钟，见 db.js 的时间口径）
+    const r = await getDb().run(
+      'UPDATE node SET escrow_address = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = 1',
+      env
+    );
+    if (r.changes !== 1) {
+      // 行在上面读过、这里却写不到：只可能是并发删库/清表。响亮失败，不留"以为记下了"的假象。
+      throw new Error('写入 node.escrow_address 未命中任何行（node 单例行在读与写之间消失了）');
+    }
+  }
   lastAnchor = {
     at: Date.now(),
     level: verdict.level,
     reason: verdict.reason,
-    address: verdict.action === 'record' ? String(envAddress).trim().toLowerCase() : stored || null,
+    address: verdict.action === 'record' ? env : stored || null,
     previous: stored || null,
     inflight,
   };

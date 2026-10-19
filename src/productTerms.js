@@ -10,7 +10,7 @@
  *
  * `terms` 把这几条承诺变成**结构化、下单时锁进快照、仲裁台读得到**的字段：
  * 买家签的那笔交易的 `orderId` 由快照哈希派生 ⇒ 事后改承诺会改变 orderId（防篡改锁定）。
- * 这不是"上链存证"，是"可被买家独立核验的锁定"——与年龄限制同一条论证（见 COMPLIANCE.md）。
+ * 这不是"上链存证"，是"可被买家独立核验的锁定"——与年龄限制同一条论证（见 docs/OPERATOR_COMPLIANCE.md）。
  *
  * ── 三条设计纪律（都不是可选的）─────────────────────────────────────────
  *  1. **只有受控枚举与数字，没有自由文本**。自由文本会退化成"换个地方写文案"，
@@ -29,7 +29,12 @@
  *    两者共同回答"这一单要等多久、要花多少"，但一个是金额一个不是。
  *  · `specs` / `product_skus` = 卖什么规格、什么价（决定 `sku_key` 与成交价）；
  *    `attributes`（`src/attributes.js`）= 这东西是什么（不影响价格）。
+ *
+ * 落库是 MySQL 的真 JSON 列（`products.terms`）：写进去的键序**不是**读回来的键序
+ * （JSON 类型会按键长/字节重排，见 `src/db.js` 的说明），所以**下发与快照都以读回值为准**，
+ * 并且由 {@link parseTermsColumn} 这一处把形状重新钉成固定键序——那是快照哈希的输入。
  */
+import { assertParsedJsonColumn } from './tags.js';
 
 /** 承诺发货时效的上限（自然日）。下限 = 1：0 天不是承诺，"今天发"没有可核对的边界 */
 export const MAX_HANDLING_DAYS = 30;
@@ -52,7 +57,11 @@ export const RETURN_POLICIES = ['unspecified', 'none', 'defective', 'no-reason']
  */
 export const RETURN_FREIGHTS = ['seller', 'buyer', 'split'];
 
-/** 归一后的空承诺（未声明任何一条）：DTO、快照、DB 列三处**同一个形状** */
+/**
+ * 归一后的空承诺（未声明任何一条）：DTO、快照、DB 列三处**同一个形状**。
+ * ⚠️ **键序有意义**：它就是快照哈希里 `terms` 的键序（前端 `utils/snapshot.ts` 的 `termsOf`
+ * 按同一顺序重建），改动这里的顺序等于改快照契约。
+ */
 export const EMPTY_TERMS = Object.freeze({
   handling_days: null,
   return_policy: 'unspecified',
@@ -159,22 +168,20 @@ export function normalizeTerms(input) {
 }
 
 /**
- * 解析 `products.terms` 列（JSON 对象）→ 归一后的承诺。
+ * 解析 `products.terms` 列的**读回值**（JSON 对象）→ 归一后的承诺（**固定键序**，见 {@link EMPTY_TERMS}）。
  *
- * 口径与 `parseTagsColumn` 一致：**读不出来就是空承诺**（"未声明"与"读不出"对展示与仲裁的影响相同，
+ * 口径与 `parseTagsColumn` 一致：**形状不对就是空承诺**（"未声明"与"读不出来"对展示与仲裁的影响相同，
  * 都不是"店主声明了什么"），但**刻意不在这里做二次校验**——写入路径已经归一过，
  * 这里再判一次就会出现第二个判据（而它一旦与写入侧不同口径，"展示的承诺"与"锁进快照的承诺"就会不一致）。
  *
- * @param {unknown} raw DB 列原文（JSON 字符串）
+ * 为什么这个投影非有不可：DB 里的键序是 MySQL 排的（按键长/字节重排），而**快照哈希算的是这一份**，
+ * 前端 `utils/snapshot.ts` 的 `termsOf` 也按 {@link EMPTY_TERMS} 的顺序重建——三处必须逐字同序。
+ *
+ * @param {unknown} raw DB 读回的列值（⚠️ 不是列原文，见 `assertParsedJsonColumn`）
  * @returns {{handling_days: number|null, return_policy: string, return_window_days: number|null, return_freight: string|null, invoice_supported: boolean|null}}
  */
 export function parseTermsColumn(raw) {
-  let v;
-  try {
-    v = JSON.parse(raw ?? '{}');
-  } catch {
-    return { ...EMPTY_TERMS };
-  }
+  const v = assertParsedJsonColumn(raw, 'products.terms');
   if (!v || typeof v !== 'object' || Array.isArray(v)) return { ...EMPTY_TERMS };
   return {
     handling_days: Number.isInteger(v.handling_days) && v.handling_days > 0 ? v.handling_days : null,

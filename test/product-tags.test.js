@@ -1,13 +1,13 @@
 /**
- * 商品标签（类目）与店内检索：`src/tags.js`（唯一判据）+ `products.tags`（展示形）/
- * `product_tags`（键 + 展示形镜像）+ `GET /api/products?tag=` / `GET /api/products/tags`。
+ * 商品标签（类目）与店内检索：`src/tags.js`（唯一判据）+ `products.tags`（JSON 列：`[{key, display}]`）
+ * + `GET /api/products?tag=` / `GET /api/products/tags`。
  *
  * 覆盖五组：
  *  ① **纯归一化**：键（`tagKeyOf`：控制字符→空格、零宽→删除、空白折叠、trim、ASCII 折小写）
  *     与展示形（`normalizeTags`：同一套清洗但**不折大小写**）的关系；按**键**去重；
  *     单标签 ≤24 字 / 最多 8 个，超限与非法**报可读中文错**（绝不静默截断）；列解析恒为数组；
- *  ② **两个写入入口同批维护**：上架 POST 与编辑 PATCH 都必须让 `products.tags`（展示形 JSON 列）
- *     与 `product_tags`（键+展示形镜像行）**在同一次写入里对齐**——不给"只更新了一处"留位置；
+ *  ② **两个写入入口**：上架 POST 与编辑 PATCH 都写 `products.tags` 那一列（键与展示形同批写入，
+ *     所以"只更新了一处"在形状上不可表达）；
  *  ③ **店内检索**：`?tag=` 把**任意写法**（展示形、手输小写、多打空格）归一成同一个键再精确匹配，
  *     与既有 `?q=` 关键词搜索（标题+描述 ASCII 大小写不敏感包含）及 kind/分页正交；
  *     非法/超长标签按"查不到"处理**并说明**；
@@ -18,7 +18,7 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, owner, db } = ctx;
@@ -48,7 +48,7 @@ before(async () => {
   pD = await createProduct(productPayload({ title: '标签测试 下架 D', kind: 'digital', tags: ['gpu'] }));
   await request(app)
     .patch(`/api/products/${pD.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ active: false })
     .expect(200);
 });
@@ -56,7 +56,7 @@ before(async () => {
 async function createProduct(payload) {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(payload)
     .expect(200);
   assertOk(res);
@@ -64,7 +64,7 @@ async function createProduct(payload) {
 }
 
 async function patchProduct(slug, body) {
-  return request(app).patch(`/api/products/${slug}`).set('Authorization', `Bearer ${ownerToken}`).send(body);
+  return request(app).patch(`/api/products/${slug}`).set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).send(body);
 }
 
 async function list(query = '') {
@@ -73,12 +73,18 @@ async function list(query = '') {
   return res.body.data;
 }
 
-/** 库里两份镜像的读数：products.tags 列（展示形）+ product_tags 行（键 + 展示形） */
-function mirrorOf(slug) {
-  const row = db.prepare('SELECT id, tags FROM products WHERE slug = ?').get(slug);
-  const rows = db.prepare('SELECT tag_key, tag_display FROM product_tags WHERE product_id = ? ORDER BY tag_key').all(row.id);
-  return { column: JSON.parse(row.tags), rows: rows.map((r) => [r.tag_key, r.tag_display]) };
-}
+/**
+   * 库里的标签读数（**只有一处**：`products.tags` JSON 列，形如 `[{key, display}]`）。
+   *
+   * 旧形状是"列 + 一张 `product_tags` 镜像表"，本助手当时读两份并逐个比对；
+   * 新 schema 把镜像表删了——key 与 display **在同一列里同批写入**，
+   * 于是"两处漂移"这件事在形状上不可表达（旧形状要靠"记得同批写"来维持）。
+   * 这份读数因此只剩一份，但它比原来更硬：任何漏写/写歪都只能出现在这一列上。
+   */
+  async function tagsOf(slug) {
+    const row = await db.get('SELECT tags FROM products WHERE slug = ?', slug);
+    return row ? row.tags : null;
+  }
 
 /** 本店在用标签清单（公开只读） */
 async function tagList(query = '') {
@@ -92,10 +98,15 @@ async function tagList(query = '') {
 test('键与展示形：同一套清洗（控制/零宽/空白折叠/trim），只有键折 ASCII 小写', () => {
   // 展示形保留店主写的原样（大小写不丢），键折 ASCII 小写
   assert.equal(tagKeyOf(' RTX 5090 '), 'rtx 5090');
-  assert.deepEqual(normalizeTags([' RTX 5090 ']), ['RTX 5090']);
+  /*
+    `normalizeTags` 返回的是**落库形状** `[{key, display}]`（products.tags 那一列的内容），
+    不再是展示形字符串数组——键与展示形必须在同一列里同批写入，"两处漂移"才是不可表达的
+    （旧形状：展示形一列 + product_tags 镜像表，靠"记得同批写"维持）。所以下面全部按对象断言。
+  */
+  assert.deepEqual(normalizeTags([' RTX 5090 ']), [{ key: 'rtx 5090', display: 'RTX 5090' }]);
   // 空白多少是输入噪声：多打的空格折成一个（键相同），但大小写是书写风格（展示形保留）
   assert.equal(tagKeyOf('RTX  5090'), 'rtx 5090');
-  assert.deepEqual(normalizeTags(['RTX  5090']), ['RTX 5090']);
+  assert.deepEqual(normalizeTags(['RTX  5090']), [{ key: 'rtx 5090', display: 'RTX 5090' }]);
   // 控制字符（含制表/换行）折成空格；零宽字符直接删（前端 utils/productTags 的 normTag 同口径）
   assert.equal(tagKeyOf('RTX\t5090'), 'rtx 5090');
   assert.equal(tagKeyOf('RTX\u200b5090'), 'rtx5090');
@@ -106,13 +117,13 @@ test('键与展示形：同一套清洗（控制/零宽/空白折叠/trim），�
 });
 
 test('按**键**去重：同商品里 GPU/gpu/Gpu 只留首次出现的写法；空串项丢弃', () => {
-  assert.deepEqual(normalizeTags(['GPU', 'gpu', 'Gpu']), ['GPU'], '去重保留首次出现的展示形');
+  assert.deepEqual(normalizeTags(['GPU', 'gpu', 'Gpu']), [{ key: 'gpu', display: 'GPU' }], '去重保留首次出现的展示形');
   assert.deepEqual(normalizeTags([' GPU ', 'gpu', 'GPU\u0000', '二手', '   ', '\u0001\u0002', '中文标签']), [
-    'GPU',
-    '二手',
-    '中文标签',
+    { key: 'gpu', display: 'GPU' },
+    { key: '二手', display: '二手' },
+    { key: '中文标签', display: '中文标签' },
   ]);
-  assert.deepEqual(normalizeTags(['gp\u200bu', '\ufeffgpu', 'g\u200dpu']), ['gpu'], '零宽字符清洗后同键');
+  assert.deepEqual(normalizeTags(['gp\u200bu', '\ufeffgpu', 'g\u200dpu']), [{ key: 'gpu', display: 'gpu' }], '零宽字符清洗后同键');
   // 未提交 = 无标签（不是错误）
   assert.deepEqual(normalizeTags(undefined), []);
   assert.deepEqual(normalizeTags(null), []);
@@ -122,7 +133,7 @@ test('按**键**去重：同商品里 GPU/gpu/Gpu 只留首次出现的写法；
 test(`上限与非法：单标签 ≤${TAG_MAX_LEN} 字、最多 ${TAGS_MAX} 个，超限/非法报可读中文错（不静默截断）`, () => {
   // 恰好到上限：合法
   const max = 'a'.repeat(TAG_MAX_LEN);
-  assert.deepEqual(normalizeTags([max]), [max]);
+  assert.deepEqual(normalizeTags([max]), [{ key: max, display: max }]);
   // 超一个字：报错（按**码点**计数，中文一个字就是 1 字）
   const long = '标'.repeat(TAG_MAX_LEN + 1);
   assert.throws(() => normalizeTags([long]), (e) => {
@@ -140,84 +151,93 @@ test(`上限与非法：单标签 ≤${TAG_MAX_LEN} 字、最多 ${TAGS_MAX} 个
   assert.throws(() => normalizeTags([123]), /每一项都必须是字符串/);
 });
 
-test('列解析恒为数组（空数组 = 无标签，不是 null）：损坏/缺失/非数组一律 []', () => {
-  assert.deepEqual(parseTagsColumn('["GPU","二手"]'), ['GPU', '二手'], '下发的是展示形（原样大小写）');
-  assert.deepEqual(parseTagsColumn(''), []);
-  assert.deepEqual(parseTagsColumn(null), []);
-  assert.deepEqual(parseTagsColumn('{不是 JSON'), []);
-  assert.deepEqual(parseTagsColumn('{"a":1}'), []);
-  assert.deepEqual(parseTagsColumn('[1,"gpu",null]'), ['gpu'], '非字符串项被剔除（不下发脏值）');
+test('列解析（收的是驱动读回的值）：空数组 = 无标签，不是 null；形状不对一律 []；列原文必须响亮拒绝', () => {
+  assert.deepEqual(
+    parseTagsColumn([{ key: 'gpu', display: 'GPU' }, { key: '二手', display: '二手' }]),
+    ['GPU', '二手'],
+    '下发的是展示形（原样大小写）'
+  );
+  assert.deepEqual(parseTagsColumn(null), [], 'NULL 行（LEFT JOIN 没命中）⇒ 无标签');
+  assert.deepEqual(parseTagsColumn([]), []);
+  assert.deepEqual(parseTagsColumn({ a: 1 }), [], '不是数组 ⇒ 无标签');
+  /*
+    缺键的元素**丢掉**：那种元素只能显示、不能被筛选，正是本设计要消灭的"显示得出但搜不到"；
+    非字符串 display 同理（不下发脏值）。上半段的 `{不是 JSON` / `'{"a":1}'` 两条旧断言随
+    TEXT 列一起消失——JSON 列由驱动解析，"列原文"这个形状在读取路径上不再存在。
+    但**传进来**仍然可能（调用方手里拿着别处的原文），那种情况必须响亮失败而不是静默当空：
+    静默当空 = 快照里少一份标签，两端哈希不一致而没人知道是谁漏的。
+  */
+  assert.deepEqual(parseTagsColumn([{ key: 'gpu', display: 'GPU' }, { key: '', display: 'x' }, null, { display: '无键' }]), ['GPU']);
+  assert.throws(() => parseTagsColumn('["GPU","二手"]'), /JSON 列由驱动解析/);
 });
 
-// ── ② 两个写入入口（上架 / 编辑）同批维护两份镜像 ──
+// ── ② 两个写入入口（上架 / 编辑）都写同一列 ──
 
-test('上架 POST：DTO 下发**原样大小写**的展示形，两份镜像同批一致（列=展示形、行=键+展示形）', async () => {
+test('上架 POST：DTO 下发**原样大小写**的展示形，键与展示形同列落库', async () => {
   assert.deepEqual(pA.tags, ['GPU', '二手'], '提交 ["GPU"," 二手 "] → 展示形保留原样');
   assert.deepEqual(
-    mirrorOf(pA.slug),
-    {
-      column: ['GPU', '二手'],
-      rows: [
-        ['gpu', 'GPU'],
-        ['二手', '二手'],
-      ],
-    },
-    '列存展示形、行存键+展示形（键 ASCII 小写、中文原样）'
+    await tagsOf(pA.slug),
+    [
+      { key: 'gpu', display: 'GPU' },
+      { key: '二手', display: '二手' },
+    ],
+    '同一列里存键与展示形（键 ASCII 小写、中文原样）——没有第二处可漂移'
   );
-  // 按键去重：提交 ['gpu','GPU'] 只落一条镜像行，展示形是首次出现的 'gpu'
+  // 按键去重：提交 ['gpu','GPU'] 只落一条，展示形是首次出现的 'gpu'
   assert.deepEqual(pB.tags, ['gpu']);
-  assert.deepEqual(mirrorOf(pB.slug), { column: ['gpu'], rows: [['gpu', 'gpu']] });
+  assert.deepEqual(await tagsOf(pB.slug), [{ key: 'gpu', display: 'gpu' }]);
 });
 
-test('无标签商品：tags 恒为空数组（不是 null），且不产生镜像行', async () => {
+test('无标签商品：tags 恒为空数组（不是 null），库里也不留任何标签项', async () => {
   const p = await createProduct(productPayload({ title: '标签测试 无标签 E' }));
   assert.ok(Array.isArray(p.tags), 'tags 必须是数组');
   assert.deepEqual(p.tags, [], '空数组 = 无标签（不是 null——标签本来就是可选项）');
-  assert.deepEqual(mirrorOf(p.slug), { column: [], rows: [] });
+  assert.deepEqual(await tagsOf(p.slug), []);
   // 详情端点同样恒为数组（DTO 只有一处实现，故两个入口自动一致）
   const detail = await request(app).get(`/api/products/${p.slug}`).expect(200);
   assertOk(detail);
   assert.deepEqual(detail.body.data.tags, []);
 });
 
-test('编辑 PATCH：标签变更时两份镜像**同批**替换（旧标签行必须消失）', async () => {
+test('编辑 PATCH：标签变更时整列**同批**替换（旧标签项必须消失）', async () => {
   const p = await createProduct(productPayload({ title: '标签测试 改标签 F', tags: ['旧标签'] }));
   const res = await patchProduct(p.slug, { tags: ['新标签', 'GPU'] });
   assertOk(res);
   assert.deepEqual(res.body.data.tags, ['新标签', 'GPU'], '改标签同样保留展示形');
-  assert.deepEqual(mirrorOf(p.slug), {
-    column: ['新标签', 'GPU'],
-    rows: [
-      ['gpu', 'GPU'],
-      ['新标签', '新标签'],
-    ],
-  });
-  // 清空：提交 [] = 显式清空（与 media 同款三态：未提交=不动）→ 两处都空
+  /*
+    整列同批替换，顺序 = **本次提交的顺序**（`normalizeTags` 的输出就是列的内容，不再按 key 重排）：
+    列里只有一份数据，所以"顺序"这件事只有提交这一个出处，读取侧不再替它排序。
+  */
+  assert.deepEqual(await tagsOf(p.slug), [
+    { key: '新标签', display: '新标签' },
+    { key: 'gpu', display: 'GPU' },
+  ]);
+  // 清空：提交 [] = 显式清空（与 media 同款三态：未提交=不动）→ 整列为空
   const cleared = await patchProduct(p.slug, { tags: [] });
   assertOk(cleared);
   assert.deepEqual(cleared.body.data.tags, []);
-  assert.deepEqual(mirrorOf(p.slug), { column: [], rows: [] });
+  assert.deepEqual(await tagsOf(p.slug), []);
 });
 
-test('编辑 PATCH：未提交 tags → 两份镜像都保持原值（不被清空、也不被重算）', async () => {
-  const before = mirrorOf(pC.slug);
+test('编辑 PATCH：未提交 tags → 列保持原值（不被清空、也不被重算）', async () => {
+  const before = await tagsOf(pC.slug);
   const res = await patchProduct(pC.slug, { title: '标签测试 键盘 C（改名）' });
   assertOk(res);
   assert.deepEqual(res.body.data.tags, ['二手']);
-  assert.deepEqual(mirrorOf(pC.slug), before, '只改标题不该动标签');
+  assert.deepEqual(await tagsOf(pC.slug), before, '只改标题不该动标签');
 });
 
-test('编辑 PATCH：非法标签整体拒绝，两份镜像都不留半写状态', async () => {
-  const before = mirrorOf(pC.slug);
+test('编辑 PATCH：非法标签整体拒绝，列里不留半写状态', async () => {
+  const before = await tagsOf(pC.slug);
   const res = await patchProduct(pC.slug, { tags: ['ok', 'x'.repeat(TAG_MAX_LEN + 1)] });
   assert.notEqual(res.body.code, 0, '超长标签必须整体拒绝');
   assert.match(res.body.message, new RegExp(`超过 ${TAG_MAX_LEN} 字上限`));
-  assert.deepEqual(mirrorOf(pC.slug), before, '拒绝之后镜像必须与拒绝前逐字相同');
+  assert.deepEqual(await tagsOf(pC.slug), before, '拒绝之后列必须与拒绝前逐字相同');
 
   const tooMany = await patchProduct(pC.slug, { tags: Array.from({ length: 9 }, (_, i) => `t${i}`) });
   assert.notEqual(tooMany.body.code, 0);
   assert.match(tooMany.body.message, /最多 8 个标签/);
-  assert.deepEqual(mirrorOf(pC.slug), before);
+  assert.deepEqual(await tagsOf(pC.slug), before);
 });
 
 // ── ③ 店内检索：?tag= 任意写法归一成键；?q= 复用既有实现 ──
@@ -302,7 +322,7 @@ test('?tag= 与既有 ?q= 关键词搜索、kind 分面、光标分页**正交**
 test('店主全量列表（/all）同样带 tags（DTO 只有一处实现）', async () => {
   const res = await request(app)
     .get('/api/products/all?pageSize=100')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(res);
   const off = res.body.data.products.find((p) => p.slug === pD.slug);
@@ -361,12 +381,14 @@ test('同一个键只产生一项；展示形取"次数最多者，并列取字�
   assert.equal(row2.tag, 'iphone 15', '出现 2 次的小写写法压过 1 次的大写写法');
   assert.equal(row2.count, 3);
 
-  // 同键的不同展示形是允许并存的（每个商品一行）；但**同一商品内**按键去重只落一行
-  const rows = db.prepare("SELECT tag_key, tag_display FROM product_tags WHERE tag_key = 'iphone 15'").all();
-  assert.equal(rows.length, 3, '三个商品各一行（唯一索引是 (product_id, tag_key)，不是 tag_display）');
+  // 同键的不同展示形允许并存（每个商品各写自己那份）；**同一商品内**按键去重只落一项。
+  // 这里用多值索引的谓词（`? MEMBER OF (tags->'$[*].key')`）数——它正是库里用来筛标签的那条路，
+  // 而不是另写一条 LIKE 去找（那会变成第二套判据）。
+  const rows = await db.all("SELECT slug FROM products WHERE ? MEMBER OF (tags->'$[*].key')", 'iphone 15');
+  assert.equal(rows.length, 3, '三个商品各一项（同一商品内按键去重）');
   p4 = await createProduct(productPayload({ title: '展示形测试 手机 X4', tags: ['iPhone 15', 'iphone 15', 'IPHONE 15'] }));
   assert.deepEqual(p4.tags, ['iPhone 15'], '同一商品内按键去重，只留首次出现的写法');
-  assert.deepEqual(mirrorOf(p4.slug), { column: ['iPhone 15'], rows: [['iphone 15', 'iPhone 15']] });
+  assert.deepEqual(await tagsOf(p4.slug), [{ key: 'iphone 15', display: 'iPhone 15' }]);
   // 清理：把这四条下架，避免影响后面的清单计数用例
   for (const s of [p1.slug, p2.slug, p3.slug, p4.slug]) {
     const res = await patchProduct(s, { active: false });
@@ -395,7 +417,7 @@ test('标签清单：只统计上架商品；count 降序、同 count 按键升�
 test('标签清单：count 随上下架真实变化（下架商品不再贡献计数，展示形随之转移）', async () => {
   const res = await request(app)
     .patch(`/api/products/${pB.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ active: false })
     .expect(200);
   assertOk(res);

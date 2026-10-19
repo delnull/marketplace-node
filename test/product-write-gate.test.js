@@ -20,7 +20,7 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, owner, buyer } = ctx;
@@ -37,7 +37,7 @@ before(async () => {
 const create = async (body) => {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(body)
     .expect(200);
   assertOk(res);
@@ -53,7 +53,7 @@ const publicSlugs = async () => {
 const allProducts = async (q = '') => {
   const res = await request(app)
     .get(`/api/products/all${q ? `?q=${encodeURIComponent(q)}` : ''}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(res);
   return res.body.data.products;
@@ -63,7 +63,7 @@ const allProducts = async (q = '') => {
 const patch = async (slug, body) => {
   const res = await request(app)
     .patch(`/api/products/${slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(body)
     .expect(200);
   if (res.body.code !== 0) throw new Error(res.body.message);
@@ -78,7 +78,7 @@ test('草稿：POST 采纳 active=false；买家看不到、店主看得到；�
   await request(app).get(`/api/products/${draft.slug}`).expect(404); // 匿名：下架/草稿一律 404
   const staffView = await request(app)
     .get(`/api/products/${draft.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(staffView);
   assert.equal(staffView.body.data.active, false, '店主看得到自己的草稿');
@@ -88,7 +88,7 @@ test('草稿：POST 采纳 active=false；买家看不到、店主看得到；�
 
   const up = await request(app)
     .patch(`/api/products/${draft.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ active: true })
     .expect(200);
   assertOk(up);
@@ -99,7 +99,7 @@ test('编辑不带 active 时不改变发布状态（下架中的商品不会被
   const p = await create(productPayload({ title: '下架中商品', active: false }));
   const edited = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ title: '下架中商品（改过标题）' })
     .expect(200);
   assertOk(edited);
@@ -110,13 +110,17 @@ test('编辑不带 active 时不改变发布状态（下架中的商品不会被
  * 「首次上架时刻」（`published_at`）是**事实**不是状态：可见性只看 `active`，
  * 这一列只回答"这件商品有没有发布过"。判据是"写一次、此后永不清空"——
  * 它一旦被下架改写，列表就会把卖过的商品说成"从未发布"（那是关于这家店的假话）。
+ *
+ * 形状：库列是 `DATETIME(3)` → DTO 出参是 **ISO-8601 字符串**（`Date.prototype.toJSON`），
+ * 所以"有没有值"与"是不是同一时刻"都要先 `Date.parse`——`Number.isInteger` 在字符串上恒 false，
+ * 那会让"第一次上架写入时刻"这条断言永远红（而不是永远绿，这是它还算诚实的地方）。
  */
 test('首次上架时刻：草稿中没有；第一次上架写入；下架保留；再上架不改写', async () => {
   const draft = await create(productPayload({ title: '发布时刻·草稿', active: false }));
   assert.equal(draft.publishedAt, null, '草稿 = 从未发布（NULL，不是 0）');
 
   const live = await patch(draft.slug, { active: true });
-  assert.ok(Number.isInteger(live.publishedAt), '第一次上架写入时刻');
+  assert.ok(Number.isFinite(Date.parse(live.publishedAt)), '第一次上架写入时刻');
   const firstAt = live.publishedAt;
 
   const down = await patch(draft.slug, { active: false });
@@ -129,26 +133,26 @@ test('首次上架时刻：草稿中没有；第一次上架写入；下架保�
 
   // 直接建成在售的商品：创建即发布，时刻非空
   const direct = await create(productPayload({ title: '发布时刻·直接上架' }));
-  assert.ok(Number.isInteger(direct.publishedAt), '建单即上架 ⇒ 首次上架时刻就是创建时刻');
+  assert.ok(Number.isFinite(Date.parse(direct.publishedAt)), '建单即上架 ⇒ 首次上架时刻就是创建时刻');
 
   // 批量上架同样走同一条规则（三处写入口套的是同一个表达式）
   const draft2 = await create(productPayload({ title: '发布时刻·批量上架', active: false }));
   assert.equal(draft2.publishedAt, null);
   const batch = await request(app)
     .patch('/api/products/batch')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ slugs: [draft2.slug], patch: { active: true } })
     .expect(200);
   assertOk(batch);
   const after = await allProducts('发布时刻·批量上架');
-  assert.ok(Number.isInteger(after[0].publishedAt), '批量上架也要写首次上架时刻（漏一处就是列表里的假话）');
+  assert.ok(Number.isFinite(Date.parse(after[0].publishedAt)), '批量上架也要写首次上架时刻（漏一处就是列表里的假话）');
 });
 
 test('未知字段被拒绝：上架 / 编辑 / 批量三个入口，错误里带字段名与接受集', async () => {
   // ① 上架：多一个服务端不处理的键（`capacity` 就是曾经的实例）
   const badCreate = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ ...productPayload({ title: '带未知字段的商品' }), capacity: 5 })
     .expect(200);
   assert.equal(badCreate.body.code, 1, '不认识的字段必须拒绝，而不是 200 + 静默忽略');
@@ -162,7 +166,7 @@ test('未知字段被拒绝：上架 / 编辑 / 批量三个入口，错误里�
   // ② 编辑：商品级 priceUsdtMicro 是只读汇总（各组合最低价），不是可写字段
   const badPatch = await request(app)
     .patch(`/api/products/${okCreate.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ priceUsdtMicro: 1_000_000 })
     .expect(200);
   assert.equal(badPatch.body.code, 1);
@@ -171,7 +175,7 @@ test('未知字段被拒绝：上架 / 编辑 / 批量三个入口，错误里�
   // ③ 批量：patch 的键集更小（批量不展开规格）
   const badBatch = await request(app)
     .patch('/api/products/batch')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ slugs: [okCreate.slug], patch: { tags: ['春茶'] } })
     .expect(200);
   assert.equal(badBatch.body.code, 1);
@@ -210,7 +214,7 @@ test('卖家列表搜索 q：标题/标识/描述/参数/承诺都命中；% 按
 
   // 鉴权两档各自说清：匿名 401（没令牌）、买家 403（有令牌但不是 staff）
   await request(app).get('/api/products/all?q=x').expect(401);
-  await request(app).get('/api/products/all?q=x').set('Authorization', `Bearer ${buyerToken}`).expect(403);
+  await request(app).get('/api/products/all?q=x').set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(403);
 });
 
 test('在途承诺读数：下单占位后出现，取消后消失（改规格前提示的判据）', async () => {
@@ -220,7 +224,7 @@ test('在途承诺读数：下单占位后出现，取消后消失（改规格�
 
   const draft = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: p.slug })
     .expect(200);
   assertOk(draft);
@@ -234,7 +238,7 @@ test('在途承诺读数：下单占位后出现，取消后消失（改规格�
 
   const cancelled = await request(app)
     .post(`/api/orders/${draft.body.data.id}/cancel`)
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(cancelled);
   const released = (await allProducts('限量一件')).find((x) => x.slug === p.slug);

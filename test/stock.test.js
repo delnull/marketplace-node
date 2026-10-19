@@ -13,7 +13,7 @@ import { test, before } from 'node:test';
 const FULL_REFUND = '1000000000000000000';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { ageDrafts, assertOk, login, makeCtx, productPayload, skuInv } from './setup.mjs';
+import { ageDrafts, assertOk, login, makeCtx, orderIdOf, productPayload, skuInv, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -40,22 +40,22 @@ function nftPayload(overrides = {}) {
   };
 }
 
-const invRow = (slug) => skuInv(db, slug);
+const invRow = async (slug) => await skuInv(db, slug);
 /** 可售余量（DB 列：总量 capacity − 销量 committed；null=不限量） */
-const availOf = (slug) => {
-  const r = invRow(slug);
+const availOf = async (slug) => {
+  const r = await invRow(slug);
   return r.capacity === null ? null : Math.max(0, r.capacity - (r.committed || 0));
 };
 /** 总量（capacity 列，卖家编辑口径） */
-const capOf = (slug) => invRow(slug).capacity;
+const capOf = async (slug) => (await invRow(slug)).capacity;
 /** 销量/已占位（committed 列，订单驱动） */
-const commOf = (slug) => invRow(slug).committed || 0;
+const commOf = async (slug) => (await invRow(slug)).committed || 0;
 
 /** 上架商品（owner），返回产物 */
 async function listProduct(payload) {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(payload)
     .expect(200);
   assertOk(res);
@@ -70,15 +70,15 @@ async function listProduct(payload) {
 async function createDraft(slug, who = buyer.address, extra = {}) {
   return request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, buyer: who, ...extra })
     .expect(200);
 }
 
 /** 直接置为 escrowed 并落支付凭证（模拟 watcher/paid 已回写，跳过链上） */
-function escrowed(order) {
-  db.prepare("UPDATE orders SET status = 'escrowed', paid_tx_hash = ?, updated_at = ? WHERE id = ?")
-    .run(payHash(), Date.now(), order.id);
+async function escrowed(order) {
+  await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), order.id);
+  await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', payHash(), order.id);
 }
 
 /**
@@ -101,25 +101,25 @@ const { sweepExpiredDrafts } = await import('../src/orderSweeper.js');
 
 test('限量商品下单原子占位，余量耗尽后拒单', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '限量占位商品', capacity: 3 }));
-  assert.equal(availOf(p.slug), 3);
+  assert.equal(await availOf(p.slug), 3);
 
   // 同商品连续多单（各买家独立下单）
   for (let i = 0; i < 3; i++) {
     const res = await createDraft(p.slug, buyers[i].address);
     assertOk(res);
-    assert.equal(availOf(p.slug), 2 - i, `第 ${i + 1} 单应扣减 1`);
+    assert.equal(await availOf(p.slug), 2 - i, `第 ${i + 1} 单应扣减 1`);
   }
   const fourth = await createDraft(p.slug, buyers[3].address);
   assert.notEqual(fourth.body.code, 0, '余量耗尽第 4 单应被拒');
   assert.match(fourth.body.message || '', /售罄/);
-  assert.equal(availOf(p.slug), 0, '拒单不得再扣减');
+  assert.equal(await availOf(p.slug), 0, '拒单不得再扣减');
 });
 
 test('不限量商品（capacity NULL）下单不占位', async () => {
   const p = await listProduct(productPayload({ title: '无限量商品' }));
   const res = await createDraft(p.slug);
   assertOk(res);
-  assert.equal(availOf(p.slug), null, '不限量商品 capacity 保持 NULL');
+  assert.equal(await availOf(p.slug), null, '不限量商品 capacity 保持 NULL');
 });
 
 // ── 释放：草稿超时取消 ──
@@ -128,13 +128,13 @@ test('草稿超时取消回补占位库存', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '取消回补商品', capacity: 2 }));
   const d1 = (await createDraft(p.slug)).body.data;
   const d2 = (await createDraft(p.slug, buyers[1].address)).body.data;
-  assert.equal(availOf(p.slug), 0, '两单占满');
-  ageDrafts(db, [d1.id, d2.id], 2 * 3600_000); // 做旧（含单调锚点：判据只看它）
+  assert.equal(await availOf(p.slug), 0, '两单占满');
+  await ageDrafts(db, [d1.id, d2.id], 2 * 3600_000); // 做旧（含单调锚点：判据只看它）
 
-  assert.equal(sweepExpiredDrafts(), 2, '两单同时超时关闭');
-  assert.equal(availOf(p.slug), 2, '取消后额度全部回补');
-  assert.equal(sweepExpiredDrafts(), 0, '清扫幂等不再回补');
-  assert.equal(availOf(p.slug), 2, '幂等清扫不得重复回补');
+  assert.equal(await sweepExpiredDrafts(), 2, '两单同时超时关闭');
+  assert.equal(await availOf(p.slug), 2, '取消后额度全部回补');
+  assert.equal(await sweepExpiredDrafts(), 0, '清扫幂等不再回补');
+  assert.equal(await availOf(p.slug), 2, '幂等清扫不得重复回补');
 });
 
 // ── 释放：仲裁退款 / 超时释放；成交不释放 ──
@@ -143,21 +143,21 @@ test('仲裁退款（disputed→refunded）回补；仲裁判付（settled）不
   const p = await listProduct(productPayload({ kind: 'physical', title: '仲裁退款商品', capacity: 2 }));
   const d1 = (await createDraft(p.slug)).body.data;
   const d2 = (await createDraft(p.slug, buyers[1].address)).body.data;
-  escrowed(d1);
-  escrowed(d2);
+  await escrowed(d1);
+  await escrowed(d2);
 
   // d1 争议 → 仲裁判退款：应回补 1
-  assert.equal(applyEvent('DisputeRequested', { orderId: d1.escrowOrderId }), 1);
-  assert.equal(applyEvent('Arbitrated', { orderId: d1.escrowOrderId, refundWei: d1.amountWei }), 1);
-  assert.equal(availOf(p.slug), 1, '退款单回补 1');
+  assert.equal(await applyEvent('DisputeRequested', { orderId: d1.escrowOrderId }), 1);
+  assert.equal(await applyEvent('Arbitrated', { orderId: d1.escrowOrderId, refundWei: d1.amountWei }), 1);
+  assert.equal(await availOf(p.slug), 1, '退款单回补 1');
 
   // d2 争议 → 仲裁判付卖家：钱货两清，不释放
-  assert.equal(applyEvent('DisputeRequested', { orderId: d2.escrowOrderId }), 1);
-  assert.equal(applyEvent('Arbitrated', { orderId: d2.escrowOrderId, refundWei: 0n }), 1);
-  assert.equal(availOf(p.slug), 1, '判付单不释放');
+  assert.equal(await applyEvent('DisputeRequested', { orderId: d2.escrowOrderId }), 1);
+  assert.equal(await applyEvent('Arbitrated', { orderId: d2.escrowOrderId, refundWei: 0n }), 1);
+  assert.equal(await availOf(p.slug), 1, '判付单不释放');
 
   const st = Object.fromEntries(
-    db.prepare('SELECT id, status FROM orders WHERE id IN (?, ?)').all(d1.id, d2.id).map((r) => [r.id, r.status])
+    (await db.all('SELECT order_no AS id, status FROM v_orders WHERE order_no IN (?, ?)', d1.id, d2.id)).map((r) => [r.id, r.status])
   );
   assert.equal(st[d1.id], 'refunded');
   assert.equal(st[d2.id], 'settled');
@@ -167,16 +167,16 @@ test('超时释放（escrowed→expired）回补；确认收货（→confirmed�
   const p = await listProduct(productPayload({ kind: 'physical', title: '超时/确认商品', capacity: 2 }));
   const e1 = (await createDraft(p.slug)).body.data;
   const e2 = (await createDraft(p.slug, buyers[1].address)).body.data;
-  escrowed(e1);
-  escrowed(e2);
+  await escrowed(e1);
+  await escrowed(e2);
 
   // escrowed → expired（超时释放给卖家，货物从未交付）：回补
-  assert.equal(applyEvent('OrderExpiredReleased', { orderId: e1.escrowOrderId }), 1);
-  assert.equal(availOf(p.slug), 1, '超时释放单回补 1');
+  assert.equal(await applyEvent('OrderExpiredReleased', { orderId: e1.escrowOrderId }), 1);
+  assert.equal(await availOf(p.slug), 1, '超时释放单回补 1');
 
   // escrowed → confirmed（买家确认收货）：不释放
-  assert.equal(applyEvent('ReceiptConfirmed', { orderId: e2.escrowOrderId }), 1);
-  assert.equal(availOf(p.slug), 1, '确认收货不释放');
+  assert.equal(await applyEvent('ReceiptConfirmed', { orderId: e2.escrowOrderId }), 1);
+  assert.equal(await availOf(p.slug), 1, '确认收货不释放');
 });
 
 // ── 释放不越界 ──
@@ -184,10 +184,10 @@ test('超时释放（escrowed→expired）回补；确认收货（→confirmed�
 test('草稿转正（escrowed）不回补（占位随订单存活）', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '转正保留商品', capacity: 1 }));
   const d = (await createDraft(p.slug)).body.data;
-  escrowed(d);
-  assert.equal(availOf(p.slug), 0, 'escrowed 保持扣减');
-  applyEvent('ReceiptConfirmed', { orderId: d.escrowOrderId });
-  assert.equal(availOf(p.slug), 0, 'confirmed 不释放');
+  await escrowed(d);
+  assert.equal(await availOf(p.slug), 0, 'escrowed 保持扣减');
+  await applyEvent('ReceiptConfirmed', { orderId: d.escrowOrderId });
+  assert.equal(await availOf(p.slug), 0, 'confirmed 不释放');
 });
 
 // ── poolEmpty 提示 ──
@@ -197,11 +197,11 @@ test('卖家列表 poolEmpty：数字码池空为 true，导入后 false；实�
   // 补货自动补发行为见 auto-deliver.test.js「码池补货自动补发」用例）
   const p = await listProduct(productPayload({ title: '码池提示商品', autoDeliver: 0 }));
   const d = (await createDraft(p.slug)).body.data;
-  escrowed(d);
+  await escrowed(d);
 
   const listEmpty = await request(app)
     .get('/api/orders/seller?status=escrowed')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(listEmpty);
   const found1 = listEmpty.body.data.orders.find((o) => o.id === d.id);
@@ -210,14 +210,14 @@ test('卖家列表 poolEmpty：数字码池空为 true，导入后 false；实�
 
   const importRes = await request(app)
     .post(`/api/products/${p.slug}/codes`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: ['CARD-001'] })
     .expect(200);
   assertOk(importRes);
 
   const listFull = await request(app)
     .get('/api/orders/seller?status=escrowed')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   const found2 = listFull.body.data.orders.find((o) => o.id === d.id);
   assert.equal(found2.poolEmpty, false, '码池有未用码后不再提示');
@@ -225,10 +225,10 @@ test('卖家列表 poolEmpty：数字码池空为 true，导入后 false；实�
   // 实物商品恒不提示（非池式商品）
   const ph = await listProduct(productPayload({ kind: 'physical', title: '实物提示对照', capacity: 5 }));
   const dp = (await createDraft(ph.slug)).body.data;
-  escrowed(dp);
+  await escrowed(dp);
   const list3 = await request(app)
     .get('/api/orders/seller?status=escrowed')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   const found3 = list3.body.data.orders.find((o) => o.id === dp.id);
   assert.equal(found3.poolEmpty, false, '实物无池概念，恒 false');
@@ -237,25 +237,25 @@ test('卖家列表 poolEmpty：数字码池空为 true，导入后 false；实�
 test('卖家列表 poolEmpty：NFT 交付池空为 true，导入 tokenId 后 false', async () => {
   const p = await listProduct(nftPayload());
   const d = (await createDraft(p.slug)).body.data;
-  escrowed(d);
+  await escrowed(d);
 
   const empty = await request(app)
     .get('/api/orders/seller?status=escrowed')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   const f1 = empty.body.data.orders.find((o) => o.id === d.id);
   assert.equal(f1.poolEmpty, true, '未建 NFT 交付池提示缺货');
 
   const imp = await request(app)
     .post(`/api/products/${p.slug}/tokens`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ tokens: ['42'] })
     .expect(200);
   assertOk(imp);
 
   const full = await request(app)
     .get('/api/orders/seller?status=escrowed')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   const f2 = full.body.data.orders.find((o) => o.id === d.id);
   assert.equal(f2.poolEmpty, false, '池内有未用 tokenId 后不再提示');
@@ -264,7 +264,7 @@ test('卖家列表 poolEmpty：NFT 交付池空为 true，导入 tokenId 后 fal
 test('订单详情附带 poolEmpty（买家可感知待补货）', async () => {
   const p = await listProduct(productPayload({ title: '详情提示商品' }));
   const d = (await createDraft(p.slug)).body.data;
-  escrowed(d);
+  await escrowed(d);
   const res = await request(app).get(`/api/orders/${d.id}`).expect(200);
   assertOk(res);
   assert.equal(res.body.data.poolEmpty, true, '数字无池订单详情应提示');
@@ -277,46 +277,46 @@ test('编辑填的是总量不是余量：占位列不被触碰；总量下限 =
   assert.equal(p.capacity, 5, '商品输出携带总库存字段');
   const d1 = (await createDraft(p.slug)).body.data;
   const d2 = (await createDraft(p.slug, buyers[1].address)).body.data;
-  assert.equal(commOf(p.slug), 2, '两单锁定占位');
-  assert.equal(availOf(p.slug), 3);
+  assert.equal(await commOf(p.slug), 2, '两单锁定占位');
+  assert.equal(await availOf(p.slug), 3);
 
   // 只改标题（不传 capacity）：总量/占位/余量全部不变——编辑绝不触发任何释放/回补
   const rename = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ title: '编辑总量商品-改' })
     .expect(200);
   assertOk(rename);
-  assert.equal(capOf(p.slug), 5, '编辑不改总量');
-  assert.equal(commOf(p.slug), 2, '编辑不改占位');
-  assert.equal(availOf(p.slug), 3, '编辑不改余量');
+  assert.equal(await capOf(p.slug), 5, '编辑不改总量');
+  assert.equal(await commOf(p.slug), 2, '编辑不改占位');
+  assert.equal(await availOf(p.slug), 3, '编辑不改余量');
 
   // 总量改小到低于已占位 → 拒绝（防止「总量 < 销量」的矛盾账目）
   const tooSmall = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '', capacity: 1 }] })
     .expect(200);
   assert.notEqual(tooSmall.body.code, 0);
   assert.match(tooSmall.body.message || '', /总量|已占位|已售/);
-  assert.equal(capOf(p.slug), 5, '被拒后总量不变');
+  assert.equal(await capOf(p.slug), 5, '被拒后总量不变');
 
   // 总量调到 4（≥ 已占 2）→ 成功：余量 = 4 − 2 = 2，占位不动
   const shrink = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '', capacity: 4 }] })
     .expect(200);
   assertOk(shrink);
-  assert.equal(capOf(p.slug), 4);
-  assert.equal(commOf(p.slug), 2, '编辑不释放占位');
-  assert.equal(availOf(p.slug), 2, '余量随总量收缩');
+  assert.equal(await capOf(p.slug), 4);
+  assert.equal(await commOf(p.slug), 2, '编辑不释放占位');
+  assert.equal(await availOf(p.slug), 2, '余量随总量收缩');
 
   // 取消一单释放占位 → committed 减 1、余量回到 3——回补只作用于销量列，永不超过总量
-  ageDrafts(db, d1.id, 2 * 3600_000); // 做旧（含单调锚点：判据只看它）
-  assert.equal(sweepExpiredDrafts(), 1);
-  assert.equal(commOf(p.slug), 1, '取消释放占位');
-  assert.equal(availOf(p.slug), 3);
+  await ageDrafts(db, d1.id, 2 * 3600_000); // 做旧（含单调锚点：判据只看它）
+  assert.equal(await sweepExpiredDrafts(), 1);
+  assert.equal(await commOf(p.slug), 1, '取消释放占位');
+  assert.equal(await availOf(p.slug), 3);
 });
 
 // ── 释放单点：共享 escrow_order_id 多行同批迁出聚合回补 ──
@@ -333,7 +333,7 @@ test('卖家列表（/all）附池口径统计；公开列表不带；池用尽�
   const sellerRow = async () => {
     const res = await request(app)
       .get('/api/products/all')
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
       .expect(200);
     return res.body.data.products.find((x) => x.slug === p.slug);
   };
@@ -344,7 +344,7 @@ test('卖家列表（/all）附池口径统计；公开列表不带；池用尽�
 
   const imp = await request(app)
     .post(`/api/products/${p.slug}/codes`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ codes: ['B-1', 'B-2', 'B-3'] })
     .expect(200);
   assertOk(imp);
@@ -354,10 +354,10 @@ test('卖家列表（/all）附池口径统计；公开列表不带；池用尽�
 
   // 交付 1 单消耗 1 码：池未用 2 < 可售余量 9 → 前端据此提示「总量承诺超出池交付能力」
   const d = (await createDraft(p.slug)).body.data;
-  escrowed(d);
+  await escrowed(d);
   const ship = await request(app)
     .post(`/api/orders/${d.id}/ship`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({})
     .expect(200);
   assertOk(ship);
@@ -373,15 +373,15 @@ test('卖家列表（/all）附池口径统计；公开列表不带；池用尽�
 test('sweeper 关单后链上托管落定：watcher 自动恢复为 escrowed 并回补占位', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '自动恢复商品', capacity: 3 }));
   const d = (await createDraft(p.slug)).body.data;
-  assert.equal(commOf(p.slug), 1);
+  assert.equal(await commOf(p.slug), 1);
   // sweeper 超时关单（取消并释放占位）
-  ageDrafts(db, d.id, 2 * 3600_000); // 做旧（含单调锚点：判据只看它）
-  assert.equal(sweepExpiredDrafts(), 1);
-  assert.equal(commOf(p.slug), 0, '关单释放占位');
-  assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(d.id).status, 'cancelled');
+  await ageDrafts(db, d.id, 2 * 3600_000); // 做旧（含单调锚点：判据只看它）
+  assert.equal(await sweepExpiredDrafts(), 1);
+  assert.equal(await commOf(p.slug), 0, '关单释放占位');
+  assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', d.id)).status, 'cancelled');
 
   // 链上托管事件落定（金额/卖家/买家全匹配）→ watcher 自动恢复：restock 回补 + 置 escrowed + 落凭证
-  const changed = applyEvent(
+  const changed = await applyEvent(
     'OrderCreated',
     {
       orderId: d.escrowOrderId,
@@ -392,99 +392,107 @@ test('sweeper 关单后链上托管落定：watcher 自动恢复为 escrowed 并
     { txHash: payHash(), block: 120 }
   );
   assert.equal(changed, 1, '已取消行收到匹配托管事件应自动恢复');
-  const row = db.prepare('SELECT status, paid_tx_hash FROM orders WHERE id = ?').get(d.id);
+  const row = await db.get('SELECT status, paid_tx_hash FROM v_orders WHERE order_no = ?', d.id);
   assert.equal(row.status, 'escrowed');
   assert.ok(row.paid_tx_hash, '恢复时落支付凭证');
-  assert.equal(commOf(p.slug), 1, '恢复时按 hold_qty 回补占位');
-  assert.equal(availOf(p.slug), 2);
+  assert.equal(await commOf(p.slug), 1, '恢复时按 hold_qty 回补占位');
+  assert.equal(await availOf(p.slug), 2);
 });
 
 test('不限量期下单 → 切回限量：在途未占位单纳入占位；容量不足拒绝切换', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '切换限量商品', capacity: null }));
   // 不限量期下单：不占位（hold_qty=0）
   const d = (await createDraft(p.slug)).body.data;
-  assert.equal(db.prepare('SELECT hold_qty FROM orders WHERE id = ?').get(d.id).hold_qty, 0);
+  assert.equal((await db.get('SELECT hold_qty FROM v_orders WHERE order_no = ?', d.id)).hold_qty, 0);
 
   // 切回限量但容量不足覆盖在途（在途 1 件 > 容量 0）→ 拒绝（提示在途件数）
   const tooSmall = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '', capacity: 0 }] })
     .expect(200);
   assert.notEqual(tooSmall.body.code, 0);
   assert.match(tooSmall.body.message || '', /在途/);
-  assert.equal(commOf(p.slug), 0, '被拒后占位不变');
+  assert.equal(await commOf(p.slug), 0, '被拒后占位不变');
 
   // 容量足以覆盖在途 → 成功：在途单补记占位（hold_qty=quantity），committed 纳入
   const ok = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '', capacity: 2 }] })
     .expect(200);
   assertOk(ok);
-  assert.equal(commOf(p.slug), 1, '在途未占位单切限量后纳入 committed');
-  assert.equal(availOf(p.slug), 1);
-  assert.equal(db.prepare('SELECT hold_qty FROM orders WHERE id = ?').get(d.id).hold_qty, 1, '行补记 hold_qty');
+  assert.equal(await commOf(p.slug), 1, '在途未占位单切限量后纳入 committed');
+  assert.equal(await availOf(p.slug), 1);
+  assert.equal((await db.get('SELECT hold_qty FROM v_orders WHERE order_no = ?', d.id)).hold_qty, 1, '行补记 hold_qty');
 
   // 该单随后取消 → 正常释放（不会出现「从未占位却被扣减」的账目漂移）
   const cancel = await request(app)
     .post(`/api/orders/${d.id}/cancel`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(cancel);
-  assert.equal(commOf(p.slug), 0);
-  assert.equal(availOf(p.slug), 2);
+  assert.equal(await commOf(p.slug), 0);
+  assert.equal(await availOf(p.slug), 2);
 });
 
 test('限量下单 → 改不限量 → 取消：hold 记账照常回补，无幻影占额滞留', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '放开限量商品', capacity: 2 }));
   const d = (await createDraft(p.slug)).body.data;
-  assert.equal(commOf(p.slug), 1);
-  assert.equal(db.prepare('SELECT hold_qty FROM orders WHERE id = ?').get(d.id).hold_qty, 1);
+  assert.equal(await commOf(p.slug), 1);
+  assert.equal((await db.get('SELECT hold_qty FROM v_orders WHERE order_no = ?', d.id)).hold_qty, 1);
 
   // 卖家改不限量（编辑不触碰 committed/hold_qty——放开的是承诺上限，不是已占位）
   const open = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '', capacity: null }] })
     .expect(200);
   assertOk(open);
-  assert.equal(commOf(p.slug), 1);
+  assert.equal(await commOf(p.slug), 1);
 
   // 不限量窗口内取消 → 按行 hold_qty 回补（不再因「当前不限量」跳过 → 无幻影）
   const cancel = await request(app)
     .post(`/api/orders/${d.id}/cancel`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(cancel);
-  assert.equal(commOf(p.slug), 0, '取消回补不依赖当前是否限量');
+  assert.equal(await commOf(p.slug), 0, '取消回补不依赖当前是否限量');
 
   // 再切回限量：无在途 → 直接可用，占位未被幻影占用
   const back = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ skus: [{ key: '', capacity: 2 }] })
     .expect(200);
   assertOk(back);
-  assert.equal(commOf(p.slug), 0);
-  assert.equal(availOf(p.slug), 2, '切回限量后余量全量可用（无幻影滞留）');
+  assert.equal(await commOf(p.slug), 0);
+  assert.equal(await availOf(p.slug), 2, '切回限量后余量全量可用（无幻影滞留）');
 });
 
 test('部分交付（escrowed 已有交付行）超时释放：不回补占位（与退款/成交口径一致）', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '部分交付超时商品', capacity: 5 }));
   const d = (await createDraft(p.slug)).body.data;
-  escrowed(d);
-  assert.equal(commOf(p.slug), 1, '下单占位 1 件');
-  // 卖家已部分交付（NFT 形态的部分交付行；此处直接落一条交付行模拟 escrowed + 有交付记录）
-  db.prepare(
-    "INSERT INTO order_delivery_items (order_id, kind, value, created_at) VALUES (?, 'code', 'PARTIAL-1', ?)"
-  ).run(d.id, Date.now());
+  await escrowed(d);
+  assert.equal(await commOf(p.slug), 1, '下单占位 1 件');
+  /*
+    卖家已部分交付（NFT 形态的部分交付行；此处直接落一条交付行模拟 escrowed + 有交付记录）。
+
+    ⚠️ 两个都容易写错的地方：
+      · `order_delivery_items.order_id` 是**内部数值主键**（外键指向 orders.id），
+        而接口下发的是**对外单号** ⇒ 必须显式转一次（`orderIdOf`，找不到就抛错，不会静默挂错单）；
+      · `created_at` 是 `DATETIME(3)`，传毫秒整数会被当数字字面量写进一个荒谬的时间且**不报错** ⇒ 传 Date。
+  */
+  await db.run(
+    "INSERT INTO order_delivery_items (order_id, kind, value, created_at) VALUES (?, 'code', 'PARTIAL-1', ?)",
+    await orderIdOf(db, d.id), new Date()
+  );
 
   // 链上超时释放事件：escrowed（有交付记录）→ expired——已交付部分不可回补再售，占位保留
-  assert.equal(applyEvent('OrderExpiredReleased', { orderId: d.escrowOrderId }, { txHash: payHash(), block: 130 }), 1);
-  assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(d.id).status, 'expired');
-  assert.equal(commOf(p.slug), 1, '有交付记录的 escrowed 行超时不回补（防已交付资源再售）');
-  assert.equal(availOf(p.slug), 4);
+  assert.equal(await applyEvent('OrderExpiredReleased', { orderId: d.escrowOrderId }, { txHash: payHash(), block: 130 }), 1);
+  assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', d.id)).status, 'expired');
+  assert.equal(await commOf(p.slug), 1, '有交付记录的 escrowed 行超时不回补（防已交付资源再售）');
+  assert.equal(await availOf(p.slug), 4);
 });
 
 test('confirmed 残镜像 + 自提交付（shipped_at 非空、无单号、无交付行）超时释放：**不得**回补占位（源码审计 2026-09 修复）', async () => {
@@ -499,30 +507,30 @@ test('confirmed 残镜像 + 自提交付（shipped_at 非空、无单号、无�
   */
   const p = await listProduct(productPayload({ kind: 'physical', title: '自提残镜像超时商品', capacity: 5 }));
   const d = (await createDraft(p.slug)).body.data;
-  escrowed(d);
+  await escrowed(d);
   // 空物流单号发货（自提 / 线下交付——前端明确支持留空）⇒ 落 shipped_at，无 tracking_no、无交付行
   const ship = await request(app)
     .post(`/api/orders/${d.id}/ship`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ trackingNo: '' })
     .expect(200);
   assertOk(ship);
-  const shipped = db.prepare('SELECT status, shipped_at, tracking_no FROM orders WHERE id = ?').get(d.id);
+  const shipped = await db.get('SELECT status, shipped_at, tracking_no FROM v_orders WHERE order_no = ?', d.id);
   assert.equal(shipped.status, 'shipped');
-  assert.ok(shipped.shipped_at > 0, '自提交付的交付证据是 shipped_at');
+  assert.ok(shipped.shipped_at instanceof Date, '自提交付的交付证据是 shipped_at（DATETIME(3) 读回来是 Date）');
   assert.ok(!shipped.tracking_no, '空单号');
   // 模拟历史残镜像：旧版 /sync 把链上 Settled 一律焊成 confirmed（状态离开了 shipped，但货已交付）
-  db.prepare("UPDATE orders SET status = 'confirmed' WHERE id = ?").run(d.id);
-  assert.equal(commOf(p.slug), 1, '前置：占位仍在');
+  await db.run("UPDATE orders SET status = 'confirmed' WHERE order_no = ?", d.id);
+  assert.equal(await commOf(p.slug), 1, '前置：占位仍在');
 
-  assert.equal(applyEvent('OrderExpiredReleased', { orderId: d.escrowOrderId }, { txHash: payHash(), block: 132 }), 1);
-  assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(d.id).status, 'expired');
+  assert.equal(await applyEvent('OrderExpiredReleased', { orderId: d.escrowOrderId }, { txHash: payHash(), block: 132 }), 1);
+  assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', d.id)).status, 'expired');
   assert.equal(
-    commOf(p.slug),
+    await commOf(p.slug),
     1,
     'shipped_at 必须计入「已交付事实」——否则已交到买家手里的货被回补成可售库存（超卖）'
   );
-  assert.equal(availOf(p.slug), 4, '余量不得虚高');
+  assert.equal(await availOf(p.slug), 4, '余量不得虚高');
 });
 
 /*
@@ -554,37 +562,38 @@ test('规格改名守卫：已交付后退款（货未回收）的占位不得�
     （`invRow` 只查默认行 ⇒ 对多规格商品会返回 undefined，不能拿它取 product_id）。
     所以这里直接查商品行再聚合所有组合——被测的是"这件货还占着没有"，与它在哪个组合无关。
   */
-  const productId = db.prepare('SELECT id FROM products WHERE slug = ?').get(p.slug).id;
-  const totalCommitted = () =>
-    db.prepare('SELECT COALESCE(SUM(committed), 0) AS c FROM product_skus WHERE product_id = ?').get(productId).c;
+  const productId = (await db.get('SELECT id FROM products WHERE slug = ?', p.slug)).id;
+  // `SUM()` 回的是 DECIMAL ⇒ 字符串（连接 decimalNumbers:false，见 db.js），比数字必须显式转
+  const totalCommitted = async () =>
+    Number((await db.get('SELECT COALESCE(SUM(committed), 0) AS c FROM product_skus WHERE product_id = ?', productId)).c);
 
   const draftRes = await createDraft(p.slug, buyer.address, { skuKey: '红' });
   assertOk(draftRes);
   const d = draftRes.body.data;
-  assert.equal(totalCommitted(), 1, '下单占位 1 件');
+  assert.equal(await totalCommitted(), 1, '下单占位 1 件');
 
-  escrowed(d);
+  await escrowed(d);
   const ship = await request(app)
     .post(`/api/orders/${d.id}/ship`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ carrier: '顺丰', trackingNo: 'SF123' })
     .expect(200);
   assertOk(ship);
 
   // 全额退款（已交付）：占位**刻意保留**（货在买家手里）
   // 金额取本单真实的托管额——"全额"由 amount == refundWei 判定（写死一个常量会在改价时假红）
-  const fullWei = db.prepare('SELECT amount_wei FROM orders WHERE id = ?').get(d.id).amount_wei;
-  assert.equal(applyEvent('Arbitrated', { orderId: d.escrowOrderId, refundWei: fullWei }, { txHash: payHash(), block: 140 }), 1);
-  const row = db.prepare('SELECT status, hold_qty, released_at FROM orders WHERE id = ?').get(d.id);
+  const fullWei = (await db.get('SELECT amount_wei FROM v_orders WHERE order_no = ?', d.id)).amount_wei;
+  assert.equal(await applyEvent('Arbitrated', { orderId: d.escrowOrderId, refundWei: fullWei }, { txHash: payHash(), block: 140 }), 1);
+  const row = await db.get('SELECT status, hold_qty, released_at FROM v_orders WHERE order_no = ?', d.id);
   assert.equal(row.status, 'refunded');
   assert.equal(row.hold_qty, 1, '占位仍在（这是「货未回收」的表达）');
   assert.equal(row.released_at, null, '占位未释放');
-  assert.equal(totalCommitted(), 1, 'committed 仍记着这 1 件');
+  assert.equal(await totalCommitted(), 1, 'committed 仍记着这 1 件');
 
   // 改名（capacity 不变）：必须被拒，否则 committed 归零、同一件货可再卖一次
   const rename = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({
       specs: [{ name: '颜色', options: ['深红', '蓝'] }],
       skus: [
@@ -595,26 +604,26 @@ test('规格改名守卫：已交付后退款（货未回收）的占位不得�
     .expect(200);
   assert.notEqual(rename.body.code, 0, '改名必须被拒（否则占位静默归零 ⇒ 超卖）');
   assert.match(rename.body.message || '', /占位|超卖|在途/);
-  assert.equal(totalCommitted(), 1, '被拒后 committed 不变');
+  assert.equal(await totalCommitted(), 1, '被拒后 committed 不变');
 
   // 退货确认收到（货回到店主手里）⇒ 占位释放，此后改名照常放行
   const ret = await request(app)
     .post(`/api/orders/${d.id}/return`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ reason: '退款后回收' })
     .expect(200);
   assertOk(ret);
   const recv = await request(app)
     .post(`/api/orders/${d.id}/return/receive`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({})
     .expect(200);
   assertOk(recv);
-  assert.equal(totalCommitted(), 0, '货已回收 ⇒ 占位释放');
+  assert.equal(await totalCommitted(), 0, '货已回收 ⇒ 占位释放');
 
   const rename2 = await request(app)
     .patch(`/api/products/${p.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({
       specs: [{ name: '颜色', options: ['深红', '蓝'] }],
       skus: [

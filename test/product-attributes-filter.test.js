@@ -1,12 +1,13 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 /**
  * 商品参数的**筛选与分面**（`?attr=名:值` 与 `GET /api/products/attributes`）。
  *
  * 这一组判据要钉住的是"参数能被用来找东西"这件事的四个面：
- *  1. 写入即有镜像：`products.attributes` 与 `product_attributes` **同批**落库（改一次参数不影响另一件商品）；
+ *  1. 写入即完整：`products.attributes` 是被筛选的那一份，`pair`（名键 + \u0000 + 值键）就在同一列里——
+ *     同一列里落库，所以"只更新了一处"这种漂移在形状上不可表达（改一次参数不影响另一件商品）；
  *  2. 键匹配：两侧都归一成键，`成色`/`成色 `、`USB-C`/`usb-c` 命中同一批（写法不影响命中）；
  *  3. 三态：没按参数筛（attr=null）／筛了但查不到（结果空、attr 有值）／形状写错（attrError 说清原因），
  *     三者不能混成一句话，且**非法输入不静默**（不返回全量、也不 500）；
@@ -21,7 +22,7 @@ before(async () => {
 });
 
 const create = async (body) => {
-  const res = await request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).send(body).expect(200);
+  const res = await request(app).post('/api/products').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).send(body).expect(200);
   assertOk(res);
   return res.body.data;
 };

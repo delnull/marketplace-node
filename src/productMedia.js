@@ -6,12 +6,13 @@
  * 买家看到的商品与下单时锁定的快照就脱钩了（快照哈希只覆盖 URL 字符串，覆盖不到内容）。
  * 落盘到本节点后，URL 与内容是同一份事实，节点在则媒体在。
  *
- * 存储布局：<库文件所在目录>/uploads/<uuid>.<ext>
- *  - 与证据附件同款（见 evidenceFiles.js）：按库目录定位，删库即清干净、不会散落在 cwd
+ * 存储布局：`<MK_ATTACH_DIR 的父目录>/uploads/<uuid>.<ext>`（默认 `<cwd>/uploads/`）
+ *  - 与证据附件**同根**（都由 evidenceFiles.attachmentsRoot 派生）：一个旋钮决定两条数据目录，
+ *    容器里两者一起落在挂载卷内，不会出现"附件进了卷、商品图留在临时层"
  *  - 文件名用随机 UUID，不用原始名：防路径穿越、防覆盖、防原始名泄露店主本地信息
  *
  * 安全约定：
- *  - **类型由字节判定**（`shared/media.js` 的 `sniffMediaMime`）：白名单是
+ *  - **类型由字节判定**（`mediaKinds.js` 的 `sniffMediaMime`）：白名单是
  *    png/jpeg/webp/gif 图片与 mp4/webm 视频；不收 svg（可内嵌脚本）、不收 pdf/任意二进制、
  *    不收 mkv（EBML 同头但 DocType 是 matroska，浏览器放不了）。
  *  - 单文件上限按类型（图片 2MB / 视频 50MB）；**传输上限**是表内最大者，
@@ -24,6 +25,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import config from './config.js';
+// 附件根目录的**唯一实现**（本目录 = 它的兄弟目录；见 uploadsDir 的说明）
+import { attachmentsRoot } from './evidenceFiles.js';
 import {
   MEDIA,
   PRODUCT_MEDIA_MIMES,
@@ -53,11 +56,21 @@ const MB = (n) => Math.round(n / 1024 / 1024);
  */
 const SNIFF_BYTES = 64;
 
-/** 上传目录（跟随库文件位置；内存库（测试）落到 cwd 下的 .uploads） */
+/**
+ * 上传目录 = **附件根目录的兄弟目录**（`path.dirname(attachmentsRoot())/uploads`）。
+ *
+ * 为什么不再跟随"数据库文件位置"：MySQL 没有库文件（`config.db.file` 已删除），旧写法
+ * `!dbFile → process.cwd()` 只会静默回落到 `process.cwd()/uploads`——容器里 cwd = `/app`，
+ * 落在**挂载卷之外**：店主上传的每个图片/视频都会被下一次镜像更新抹掉，而部署文档承诺的
+ * 是"上传落在数据卷里"。同一件事原本有两份推导（见 evidenceFiles.attachmentsRoot），
+ * 证据附件那边直接抛、这边静默丢数据——现在只有一处推导，两个目录同生同死。
+ *
+ * 为什么不是第二个环境变量：`MK_ATTACH_DIR=/data/attachments` ⇒ 本目录 `/data/uploads`；
+ * 不配置 ⇒ `<cwd>/uploads`（与 `<cwd>/attachments` 同级）。一个旋钮决定两条数据目录，
+ * 运维不可能只把其中一个挂进卷里、把另一个留在临时层——那种半挂载是静默数据丢失。
+ */
 export function uploadsDir() {
-  const dbFile = config.db.file;
-  const base = !dbFile || dbFile === ':memory:' ? process.cwd() : path.dirname(path.resolve(dbFile));
-  return path.join(base, dbFile === ':memory:' ? '.uploads' : 'uploads');
+  return path.join(path.dirname(attachmentsRoot()), 'uploads');
 }
 
 /** 读文件头（判定用），文件比 SNIFF_BYTES 短就按实际长度读 */
@@ -121,7 +134,7 @@ function discard(disk) {
  *
  * 为什么不用 base64 JSON（旧实现）：base64 再膨胀 33%，50MB 的视频要变成 ~67MB 的字符串，
  * 而且整份内容要在内存里待两遍。流式写入的内存占用是常量，代价是"类型要等字节到了才知道"
- * ⇒ 传输上限只能取表内最大者（见 shared/media.js 的 MAX_UPLOAD_BYTES 注释）。
+ * ⇒ 传输上限只能取表内最大者（见 mediaKinds.js 的 MAX_UPLOAD_BYTES 注释）。
  *
  * @param {import('node:stream').Readable} stream 请求体（req）
  * @returns {Promise<{url:string,kind:string,mime:string,size:number,sha256:string}>}

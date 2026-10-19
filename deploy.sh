@@ -11,7 +11,8 @@
 #  还可能把别人依赖的运行时顺手升掉。改成容器后：
 #      · 不再往宿主机装任何运行时（Node 只在镜像里）；
 #      · 不依赖 init 系统（开机自启用 Docker 的 `--restart unless-stopped`）；
-#      · 数据在**命名卷**里 —— 容器可以随时删掉重建（升级就是换镜像），搬家就是导出/导入卷。
+#      · 数据在**命名卷**里（附件与商品媒体；库在 MySQL 里）—— 容器可以随时删掉重建（升级就是换镜像），
+#        搬家就是导出/导入卷与 MySQL 库。
 #  宿主上只多三样东西：Docker（若原本没有）、一个数据卷、（可选）一个反向代理容器。
 #
 #  ── 证书放哪、HTTPS 在哪终止（**这是两个拓扑，不是一个开关**）─────────────
@@ -61,23 +62,33 @@
 set -Eeuo pipefail
 
 # 本联邦的共享合约（店主不需要填、也不该改）。
-# ⚠️ 这三个值现在住在 `deploy-constants.json`（与 Windows 原生路径 `deploy.ps1` **共用同一份**）。
+# ⚠️ 这些值现在住在 `deploy-constants.json`（与 Windows 原生路径 `deploy.ps1` **共用同一份**）。
 # 为什么必须共用：两条部署路径要装出同一个节点，而"接错托管合约"的表现是**静默的**
 # ——节点照常启动、商品照常展示，只有买家付款路径指向别处。各写一份常量，换批时必然分叉。
 # 为什么是 JSON 而不是这里的 shell 常量：PowerShell 读 JSON 是一等公民（ConvertFrom-Json），
 # 读 shell 变量则要自己解析；反过来 bash 用一行 sed 就能从固定结构里取值。
 #
-# ⚠️ 换批时：改 `deploy-constants.json` 的 contracts 三项（Escrow / Registry / startBlock），
-# 两边脚本**同时**生效，不需要改脚本本体。
+# ⚠️ 换批时：改 `deploy-constants.json` 的 contracts 五项（Escrow / Registry / Blocklist /
+# startBlock / escrowCodeHash），两边脚本**同时**生效，不需要改脚本本体。
 #   · Registry 把 Escrow 的**地址与运行时字节码哈希**钉成 immutable（canonical 双锚定），
 #     只换其中一个 ⇒ 节点登记会被链上以 EscrowNotCanonical 拒绝；
+#   · Blocklist 同样是 Registry 构造函数里的 immutable（先发 Escrow，再发 Blocklist(owner, escrow)，
+#     再把它的地址传给 Registry）：换 Registry 就必须同批换名单，空值会被下面的结构门禁当场拒绝
+#     ——它没有"以后再加"这条路；
 #   · Staking 自 2026-10-14 起也把事实源钉成 immutable 双锚定（**换源能力已整条删除**），
 #     所以换 Escrow 必须连带重部署 Staking——这条在合约层是硬约束，不是运维建议；
-#   · startBlock 错成旧高度只会空扫一轮（不报错），但错成**更高**的高度会**漏扫历史事件**。
-# 更早两代（2026-09-23 的 Escrow 0x820d7ae8…、2026-10-13 的 Escrow 0x462f9044…319e48）都已停用：
-# 它们的字节码与仓库当前代码不一致（缺 sellerOpenExposure / totalOpenExposure / sellerNetAtSettle
-# 与 immutable 双锚定），实际后果是店主**提不出质押**而节点 `/healthz` 一切正常。
-# 两批链上均无任何业务数据（弃用前实测余额为 0），无迁移成本。
+#   · startBlock 错成旧高度只会空扫一轮（不报错），但错成**更高**的高度会**漏扫历史事件**；
+#   · escrowCodeHash 是**本批部署产物**的 keccak256（`cast keccak $(cast code <ESCROW>)`），
+#     `node/test/deploy-plan.test.js` 拿它与本地编译产物比对——它是"仓库记的地址与本批源码
+#     是不是同一代"的唯一机械判据。
+#
+# **为什么 contracts 五项现在是空的**（2026-10-16）：主网此前部署过的每一批都已**整体作废**
+# （全部缺当前源码里店主分账所需的 `commissionTermsAtCreate` / `commissionAtSettle`，
+# 本节点的启动期代次自检会直接判定代次不符并拒绝工作），下一批由部署方按当批结果填。
+# 这里**刻意不放任何地址**：内置一个已作废的地址，症状是"节点照常启动、商品照常展示，
+# 只有买家付款路径指向一个没人维护的合约"，而 deploy.sh 的形状门禁当场拒绝空值 ——
+# **空值会响亮地停下，旧值只会静默地接错**。两代历史（2026-09-23、2026-10-13）都属这一类，
+# 弃用前实测均无业务数据、余额为 0，因此没有迁移成本。
 # 取源码用（只在"宿主机没有源码也没有 git"时启用；见 ② 取代码）
 SRC_REPO='https://github.com/delnull/marketplace-node.git'
 SRC_TARBALL='https://codeload.github.com/delnull/marketplace-node/tar.gz/refs/heads/main'
@@ -116,31 +127,42 @@ RPC_URL="$(const rpcUrl)"
 CHAIN_ID="$(const chainId)"
 ESCROW="$(const escrow)"
 REGISTRY="$(const registry)"
+BLOCKLIST="$(const blocklist)"
 START_BLOCK="$(const startBlock)"
 CONTAINER_PORT="$(const containerPort)"
+# 容器停机宽限期（秒）⇒ `docker run --stop-timeout`。它必须**大于** .env 里的
+# MK_SHUTDOWN_DRAIN_MS（节点自己等在途请求的上限）：相等或更短时，宽限期一到 SIGKILL 就把
+# 优雅关闭截断，而节点已经打了"已关闭"那一行（看起来一切正常）。这条不等式由
+# test/deploy-plan.test.js 对 deploy-constants.json 守着，脚本不重复判。
+STOP_GRACE="$(constN stopGraceSeconds)"
 CADDY_IMAGE='caddy:2-alpine'
 
 # ── 构建期硬门禁：共享合约地址必须是**本批**的（fail-closed，不静默） ───────────────
-# 为什么是一条门禁而不是靠注释提醒（2026-10-14）：这三个值决定"买家把钱锁到哪个合约"，
-# 而错了之后的表现是**静默的**——节点照常启动、商品照常展示，只有买家付款路径指向别处。
+# 为什么是一条门禁而不是靠注释提醒（2026-10-14）：这些值决定"买家把钱锁到哪个合约、
+# 节点按哪份名单过滤"，而错了之后的表现是**静默的**——节点照常启动、商品照常展示，
+# 只有买家付款路径指向别处（或名单过滤整体不生效、界面上什么都不挡）。
 # 历史已经踩过一次：那批链上字节码与仓库代码不一致（缺 sellerOpenExposure 等读法），
 # 后果是店主提不出质押而 `/healthz` 一切正常。"常量填错"必须当场停下。
 # 判据只做**结构性**校验（地址形状 + 起始块非 0）：「是不是上一批已弃用的那个合法地址」
 # 脚本无法判断，只能由部署者按发布检查表逐项核对。
 if ! printf '%s' "$ESCROW" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
    || ! printf '%s' "$REGISTRY" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+   || ! printf '%s' "$BLOCKLIST" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
    || ! printf '%s' "$START_BLOCK" | grep -Eq '^[0-9]+$' \
    || [ "$START_BLOCK" = '0' ]; then
   cat >&2 <<EOF
 [deploy.sh] 拒绝执行：deploy-constants.json 里的合约常量不合法。
 
-  取到的值：escrow=$ESCROW  registry=$REGISTRY  startBlock=$START_BLOCK
+  取到的值：escrow=$ESCROW  registry=$REGISTRY  blocklist=$BLOCKLIST  startBlock=$START_BLOCK
 
-  本脚本把这三个值编进镜像（店主不需要、也不该自己填），它们必须由部署方按当批部署结果填：
+  本脚本把这些值编进镜像（店主不需要、也不该自己填），它们必须由部署方按当批部署结果填：
     1) 部署当批合约：node scripts/deploy-mainnet.cjs
-    2) 把输出的 Escrow / Registry / 起始扫描块填进 deploy-constants.json 的 contracts
+    2) 把输出的 Escrow / Registry / Blocklist / 起始扫描块填进 deploy-constants.json 的 contracts
        （**不要改脚本**：Windows 原生路径 deploy.ps1 读的是同一份文件）
     3) 起始块不能是 0（0 = 从最新块开始 ⇒ 漏扫历史事件且不报错）
+    4) Blocklist 是 Registry 构造函数的 immutable：先发 Escrow，再发 Blocklist(owner, escrow)，再发 Registry；
+       必须与 Registry 同批，空值/无代码地址会让 Registry 构造直接 revert（BlocklistNotConfigured），
+       而节点侧会静默丢掉两道名单闸
 EOF
   exit 1
 fi
@@ -410,7 +432,7 @@ fi
 if [ "$MODE" = uninstall ] || [ "$MODE" = purge ]; then
   step "卸载"
   if [ "$MODE" = purge ]; then
-    warn "==--purge：会**删除数据卷 $VOLUME**（商品/订单/附件全没）—— 不可逆 =="
+    warn "==--purge：会**删除数据卷 $VOLUME**（附件与商品媒体全没；库在 MySQL 里，不在本卷内）—— 不可逆 =="
     if [ "$ASSUME_YES" != 1 ]; then
       log "  确认请输入卷名：$VOLUME"
       CONFIRM="$(ask '  > ' '' '删除数据卷的确认（非交互请加 --yes）')"
@@ -444,8 +466,8 @@ step "② 取代码"
 copy_code_from_here() {
   info "把当前代码复制到 $DIR"
   ( cd "$HERE" && tar -cf - \
-      --exclude=node_modules --exclude=.env --exclude='.env.*' --exclude='*.db' --exclude='*.db-wal' \
-      --exclude='*.db-shm' --exclude=data --exclude=uploads --exclude=.uploads --exclude=.git \
+      --exclude=node_modules --exclude=.env --exclude='.env.*' \
+      --exclude=data --exclude=uploads --exclude=.uploads --exclude=.git \
       --exclude=.test-build --exclude=.deploy-state . ) | ( cd "$DIR" && tar -xf - ) || die "复制代码到 $DIR 失败"
   # 上面排掉了 .env / .env.*（本机开发用的 .env 里可能有私钥、令牌，不该被搬到服务器上），
   # 但 .env.example 是**样例配置、没有秘密**，而 Dockerfile 里有 `COPY .env.example` ——
@@ -656,7 +678,7 @@ info "店主地址：$OWNER"
 info "对外域名：${ENDPOINT:-（未指定，节点不会被买家发现）}"
 info "HTTPS   ：$TLS_MODE"
 info "链上登记：$([ "$DO_REGISTER" = 1 ] && echo '本次脚本完成' || echo '稍后（前端开店向导）')"
-info "合约：Escrow=$ESCROW  Registry=$REGISTRY（已内置）"
+info "合约：Escrow=$ESCROW  Registry=$REGISTRY  Blocklist=$BLOCKLIST（已内置）"
 # 域名给了但本机不申请证书时，在这里把"这不等于不能上 https"说清楚（拓扑 A 的定位说明）
 if [ -n "$ENDPOINT" ] && [ "$TLS_MODE" = none ]; then
   info "证书    ：本机不申请（TLS 在哪终止、证书就在哪申请 —— 见上面第 ⑧ 步）"
@@ -689,7 +711,7 @@ step "③ 写配置（$ENV_FILE）"
 umask 077
 DATA_MOUNT='/data'
 KEEP_EXTRA=''
-MANAGED_KEYS='MK_PORT MK_SHOP_OWNER MK_RPC_URL MK_CHAIN_ID MK_ESCROW_ADDRESS MK_REGISTRY_ADDRESS MK_ESCROW_START_BLOCK MK_ESCROW_TIMEOUT_BLOCKS MK_ESCROW_FINALITY_BLOCKS MK_ESCROW_POLL_MS MK_CHAIN_RECONCILE_MS MK_CORS_ORIGIN MK_CORS_ALLOW_ALL MK_DB_FILE MK_ATTACH_DIR MK_AUTO_DELIVER MK_PII_RETENTION_DAYS MK_BTY_TTL_MS MK_DRAFT_TTL_MINUTES MK_REVIEW_TTL_DAYS MK_TOKEN_TTL MK_SIWE_TTL MK_TOKEN_SECRET MK_SIWE_DOMAIN'
+MANAGED_KEYS='MK_PORT MK_SHOP_OWNER MK_RPC_URL MK_CHAIN_ID MK_ESCROW_ADDRESS MK_REGISTRY_ADDRESS MK_BLOCKLIST_ADDRESS MK_ESCROW_START_BLOCK MK_ESCROW_TIMEOUT_BLOCKS MK_ESCROW_FINALITY_BLOCKS MK_ESCROW_POLL_MS MK_CHAIN_RECONCILE_MS MK_CORS_ORIGIN MK_CORS_ALLOW_ALL MK_ATTACH_DIR MK_AUTO_DELIVER MK_PII_RETENTION_DAYS MK_BTY_TTL_MS MK_DRAFT_TTL_MINUTES MK_REVIEW_TTL_DAYS MK_TOKEN_TTL MK_SIWE_TTL MK_TOKEN_SECRET MK_SIWE_DOMAIN'
 if [ -f "$ENV_FILE" ]; then
   KEEP_SECRET="$(env_val MK_TOKEN_SECRET)"
   cp -a "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
@@ -734,6 +756,7 @@ MK_RPC_URL=$RPC_URL
 MK_CHAIN_ID=$CHAIN_ID
 MK_ESCROW_ADDRESS=$ESCROW
 MK_REGISTRY_ADDRESS=$REGISTRY
+MK_BLOCKLIST_ADDRESS=$BLOCKLIST
 MK_ESCROW_START_BLOCK=$START_BLOCK
 MK_ESCROW_TIMEOUT_BLOCKS=$(constN MK_ESCROW_TIMEOUT_BLOCKS)
 MK_ESCROW_FINALITY_BLOCKS=$(constN MK_ESCROW_FINALITY_BLOCKS)
@@ -742,11 +765,17 @@ MK_CHAIN_RECONCILE_MS=$(constN MK_CHAIN_RECONCILE_MS)
 # 谁可以跨域读你的节点：联邦前端（买家聚合） + 你自己的域名
 MK_CORS_ORIGIN=$CORS
 MK_CORS_ALLOW_ALL=$(constN MK_CORS_ALLOW_ALL)
-# 数据在**卷**里：容器删了重建数据也在，这是升级与搬家都不丢数据的前提
-MK_DB_FILE=$DATA_MOUNT/marketplace-node.db
+# 附件与商品媒体在**卷**里：容器删了重建数据也在，这是升级与搬家都不丢附件的前提
 MK_ATTACH_DIR=$DATA_MOUNT/attachments
+# 库在 MySQL 里、不在本卷内：MK_DB_* 由你自己写进 <安装目录>/.env（本脚本不管它们，重跑原样保留）。
+# 注意容器里的 127.0.0.1 指的是**容器自己** —— MK_DB_HOST 必须指向那台 MySQL 服务器。
 MK_AUTO_DELIVER=$(constN MK_AUTO_DELIVER)
 MK_PII_RETENTION_DAYS=$(constN MK_PII_RETENTION_DAYS)
+# 优雅关闭：收到 SIGTERM 后节点自己"停止收新连接 → 等在途响应 → 关库 → 退出"的**上限**（毫秒）。
+# ⚠️ 它与上面 `docker run --stop-timeout $STOP_GRACE` 是一对：宽限期必须**大于**这个值，
+# 否则宽限期一到 SIGKILL 就把优雅关闭截断，而日志里已经打了"已关闭"。
+# 这条不等式由 node/test/deploy-plan.test.js 对 deploy-constants.json 守着，脚本不重复判。
+MK_SHUTDOWN_DRAIN_MS=$(constN MK_SHUTDOWN_DRAIN_MS)
 # 行情缓存（毫秒）：官方 BTY-USDT 行情直接决定"买家要付多少 BTY"，所以跟得紧（标价单位就是 USDT）
 MK_BTY_TTL_MS=$KEEP_BTY_TTL
 MK_DRAFT_TTL_MINUTES=$(constN MK_DRAFT_TTL_MINUTES)
@@ -794,8 +823,9 @@ if [ "$MODE" != register ]; then
     dk volume create "$VOLUME" >/dev/null
     ok "已创建数据卷：$VOLUME"
   fi
-  info "备份：docker run --rm -v $VOLUME:/data -v \"\$PWD\":/backup --entrypoint tar $IMAGE czf /backup/node-data-\$(date +%F).tar.gz -C /data ."
-  info "恢复：docker run --rm -v $VOLUME:/data -v \"\$PWD\":/backup --entrypoint tar $IMAGE xzf /backup/node-data-YYYY-MM-DD.tar.gz -C /data"
+  info "备份（卷内附件与商品媒体）：docker run --rm -v $VOLUME:/data -v \"\$PWD\":/backup --entrypoint tar $IMAGE czf /backup/node-data-\$(date +%F).tar.gz -C /data ."
+  info "恢复（卷内附件与商品媒体）：docker run --rm -v $VOLUME:/data -v \"\$PWD\":/backup --entrypoint tar $IMAGE xzf /backup/node-data-YYYY-MM-DD.tar.gz -C /data"
+  info "库在 MySQL 里、不在卷内：备份/恢复用 mysqldump / mysql（见 docs/OPERATIONS.md §2、§3）"
 
   # 起容器（正常路径与回滚路径共用；回滚要用旧镜像 + 同一套网络/端口/卷/配置）
   run_container() {
@@ -808,21 +838,32 @@ if [ "$MODE" != register ]; then
     # 所以失败信息与善后一律在**调用方**处理（见下面的 ⑥ 段）。
     dk run -d --name "$CONTAINER" \
       --restart unless-stopped \
+      --stop-timeout "$STOP_GRACE" \
       --network "$NETWORK" --network-alias "$SERVICE" \
       -p "$BIND:$PORT:$CONTAINER_PORT" \
       --env-file "$ENV_FILE" \
       -v "$VOLUME:$DATA_MOUNT" \
       "$img" >/dev/null
   }
-  # 探活：返回 0/1，同时把最后一次的 HTTP 码放进 PROBE_CODE
+  # 探活：返回 0/1，同时把最后一次的 HTTP 码放进 PROBE_CODE。
+  # ⚠️ 判据是 **HTTP 200 + 正文 `"code":0`**（2026-10-16）：`/healthz` 现在在"进程在监听
+  # 但后台任务不健康"（watcher 停滞 / 有隔离事件）时返回 **503 + code=1** —— 只看 HTTP 码
+  # 或只 grep code 都会漏掉一半，而漏掉的后果是"发布成功"打印在一个根本没在处理链上
+  # 事件的节点上（旧实现无条件 200/code=0，三处探活都只证明进程在监听）。
   probe() {
-    local i
+    local i body
     PROBE_CODE=''
+    PROBE_BODY=''
     for i in $(seq 1 30); do
-      PROBE_CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$PORT/healthz" 2>/dev/null || true)"
-      [ "$PROBE_CODE" = "200" ] && return 0
+      body="$(curl -s -m 5 -w '\n%{http_code}' "http://127.0.0.1:$PORT/healthz" 2>/dev/null || true)"
+      PROBE_CODE="$(printf '%s' "$body" | tail -n1)"
+      if [ "$PROBE_CODE" = "200" ] && printf '%s' "$body" | grep -q '"code":0'; then
+        PROBE_BODY="$(printf '%s' "$body" | sed '$d')"
+        return 0
+      fi
       sleep 1
     done
+    PROBE_BODY="$(printf '%s' "${body:-}" | sed '$d')"
     return 1
   }
 
@@ -884,7 +925,7 @@ if [ "$MODE" != register ]; then
       fi
       warn "回滚也没起来（HTTP ${PROBE_CODE:-000}）：看上面的日志，手工介入"
     fi
-    die "节点没起来：看上面的日志（常见：配置里的合约地址被改坏 / 数据卷权限 / 端口被占）"
+    die "节点没起来：看上面的日志（常见：连不上 MySQL（MK_DB_*）/ 配置里的合约地址被改坏 / 数据卷权限 / 端口被占）"
   fi
   BODY="$(curl -s -m 8 "http://127.0.0.1:$PORT/healthz" || true)"
   ok "探活通过：$BODY"
@@ -1166,10 +1207,10 @@ log "    bash deploy.sh --register            # 补登记（或换域名后重�
 log "    docker restart $CONTAINER            # 重启节点"
 log "    bash deploy.sh --uninstall           # 停掉并移除容器（数据卷保留）"
 log ""
-log "  数据（数据库与附件）都在卷 $VOLUME 里 —— 备份就是导出这个卷（命令见上面 ⑤ 的提示）"
+log "  附件与商品媒体都在卷 $VOLUME 里（备份命令见上面 ⑤ 的提示）；库在 MySQL 里，备份用 mysqldump"
 log "  店铺资料（店名/公告/店员/通知）登录 $FRONTEND 的卖家面板网页维护，即改即生效"
 log ""
-log "  建议接着读三份（都在本目录的 docs/ 里）："
-log "    docs/COMPLIANCE.md  合规与责任手册（开店前必读：经营者的法律义务、个人信息、被投诉怎么办）"
-log "    docs/OPERATIONS.md  运维手册（备份/恢复/升级/轮换密钥/故障速查）"
-log "    docs/MECHANICS.md   钱、订单与边界（钱怎么被保护、售后怎么走、明确不做什么）"
+log "  建议接着读（都在本目录的 docs/ 里）："
+log "    docs/OPERATIONS.md  运维手册（备份/恢复/升级/轮换密钥/故障速查/个人信息保留期）"
+log "  另有面向运营方的合规与责任说明（docs/OPERATOR_COMPLIANCE.md）与公开裁决规则（docs/DISPUTE_RULES.md），"
+log "  它们随完整仓库发布、不在本安装目录里 —— 开店前请读前者。"

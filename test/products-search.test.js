@@ -10,7 +10,7 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, owner } = ctx;
@@ -38,7 +38,7 @@ before(async () => {
   pOff = await listProduct(productPayload({ title: '下架显卡测试' }));
   await request(app)
     .patch(`/api/products/${pOff.slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ active: false })
     .expect(200);
 });
@@ -46,7 +46,7 @@ before(async () => {
 async function listProduct(payload) {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(payload)
     .expect(200);
   assertOk(res);
@@ -154,10 +154,26 @@ test('kind 过滤：服务端真过滤，且与光标分页正交', async () => 
   );
   assert.ok(multi.products.length >= physical.products.length, '并集不小于子集');
 
-  // 非法值静默忽略（不得 500，也不得把 kind 当空串条件返回空集）
+  /*
+    ⚠️ **非法 kind 不静默**（2026-10-16 改判据）：旧实现 `.filter(PRODUCT_KINDS.has)` 把认不出的值
+    直接丢掉，于是 `?kind=digial`（拼错）退化成"不加过滤"，调用方拿到**全站在售商品**却分不清
+    "没有这种商品"与"参数写错了"。现在与 `tag`/`attr` 同一套口径：进 `kindError`、结果为空、
+    响应里带 `kind` 与 `kindError` 两个字段（三态：`kind=null` = 没按类型过滤；
+    `kindError` 非空 = 参数写错了）。
+    这一条断言的就是那个区别——**"返回全部"与"返回空 + 说明原因"是两件事**。
+  */
   const bogus = await search('', 0, 30, { kind: 'not-a-kind' });
   const all = await search('', 0, 30);
-  assert.equal(bogus.products.length, all.products.length, '非法 kind 静默忽略 = 不过滤');
+  assert.equal(bogus.products.length, 0, '非法 kind ⇒ 空结果（不是"不过滤"）');
+  assert.ok(bogus.kindError, '必须下发 kindError 说明取值非法');
+  assert.match(String(bogus.kindError), /not-a-kind/, '错误里要点出是哪个值不合法');
+  assert.match(String(bogus.kindError), /physical|digital|nft/, '错误里要列出可用取值');
+  assert.ok(all.products.length > 0 && all.kindError === null, '合法请求（不带 kind）仍然返回全部且无错误');
+
+  // 合法与非法混在一起：合法部分照旧生效，但整条请求按"参数写错了"处理（结果为空 + 有说明）
+  const mixed = await search('', 0, 30, { kind: 'physical,not-a-kind' });
+  assert.equal(mixed.products.length, 0, '混入非法值时结果为空（不静默丢弃那一段）');
+  assert.ok(mixed.kindError, '并且要说清是哪一段不合法');
 
   // 与搜索组合
   const combo = await search('显卡', 0, 30, { kind: 'physical' });

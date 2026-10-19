@@ -42,10 +42,11 @@ export function usdtOf(micro) {
  * 此时它就等于总额（旧语义），所以这个兜底对老数据同样成立。
  *
  * **这里保持"永远返回 number"**（不引入 `null`）：两个入参在节点侧都是**自己库里的
- * SQLite INTEGER 列**，畸形值到不了这里——为一条不可达的路径把返回值改成 `number | null`，
- * 会让这个 DTO 字段的形状在**链路上**多出一态，而下游（前端 `types.ts` 与各渲染点）
- * 得跟着改一遍。trust boundary 在**消费端**：畸形载荷由 `utils/orderVault` 的
- * `toFiniteNumber` 判成"读不到"（不写这个键），不在这里造一个假数字。
+ * `BIGINT UNSIGNED` 列**（`orders.usdt_micro` / `shipping_fee_usdt_micro`，微 USDT；
+ * 不是 wei 那种 38 位 `DECIMAL`，所以驱动给的是 number），畸形值到不了这里——为一条不可达
+ * 的路径把返回值改成 `number | null`，会让这个 DTO 字段的形状在**链路上**多出一态，而下游
+ * （前端 `types.ts` 与各渲染点）得跟着改一遍。trust boundary 在**消费端**：畸形载荷由
+ * `utils/orderVault` 的 `toFiniteNumber` 判成"读不到"（不写这个键），不在这里造一个假数字。
  * 因此这里只做有限的形状防御（数组/对象等非数值 → 夹成 0，与从前逐字节一致），
  * 不承担"读不到"的语义。
  */

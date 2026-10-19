@@ -4,35 +4,74 @@
  *  - GET /api/shop/export/products.csv（商品 + 池口径）
  *  - GET /api/shop/export/codes.csv?slug=&status=（码池含码原文——仅 owner，资源敏感）
  * 行列白名单化；UTF-8 BOM + CRLF（src/csv.js）。
+ *
+ * ## 时间与读模型（2026-10 重设计）
+ *
+ *  - 过滤参数 `from`/`to` 收 **ISO-8601 字符串**（如 `2026-10-01T00:00:00Z`），非法即拒绝——
+ *    旧形状收毫秒整数，而"这个数到底是秒还是毫秒"猜错的症状是一次**静默的全量导出**；
+ *  - 单元格里的时刻写成 ISO-8601（`Date.toISOString()`）：Excel 里是文本时间，
+ *    但它是**没有歧义**的那一种（旧形状给毫秒整数，任何人拿去手算都要先猜单位）；
+ *  - 列的来源是**读模型视图 `v_orders`**（订单事实 + 收货信息 + 链上镜像三表各一份）：
+ *    导出是"把一张订单读全"的典型场景，"写哪张表"在这里不存在。
+ *    视图里内部主键叫 `order_id`、对外标识叫 `order_no`——CSV 下发**对外单号**
+ *    （内部自增键不出本节点：它在换库/重建之后会变，而 CSV 是拿去对账的）。
  */
 import { Router } from 'express';
 import { getDb } from '../db.js';
 import { verifyToken, roleOf } from '../auth.js';
-import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
+import { fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
 import { sendCsv } from '../csv.js';
 import { logAudit } from '../audit.js';
-import { refreshFeeCollector, feeOfRow, feeSnapshotReadOf, feeChargeableForOrder, feeBasisOf } from '../fees.js';
-// 入账口径与订单状态集合的唯一出处（与流水页/看板/可评价同源，见 src/orderStatus.js）；
-// 状态全集此前在本文件手抄了一份内联数组，不在 status-set-consistency 守卫的射程内
+import {
+  refreshFeeCollector,
+  commissionTermsReadOf,
+  feeSnapshotReadOf,
+  feeChargeableForOrder,
+  feeBasisOf,
+  settlementReadOf,
+} from '../fees.js';
+// 入账口径与订单状态集合的唯一出处（与流水页/看板/可评价同源，见 src/orderStatus.js）
 import { INCOME_STATUS as ORDER_INCOME_STATUS, ORDER_STATUS } from '../orderStatus.js';
 
 const router = Router();
 const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true });
 
+/** 时间单元格：`Date` → ISO-8601；空值 → 空串（"没有这个时刻"） */
+const isoCell = (v) => (v instanceof Date ? v.toISOString() : '');
+
+/**
+ * JSON 列的单元格：驱动把 `JSON` 列解成对象（db.js 没开 jsonStrings），
+ * 所以按**规范文本形**写回（`JSON.stringify`）。这一列的价值就是"与库里那一份一致"，
+ * 而在库那一份就是 MySQL 规范化之后的文本——stringify 出来的正是它。
+ */
+const jsonCell = (v) => (v === null || v === undefined ? '' : JSON.stringify(v));
+
+/**
+ * 时间过滤参数：只收 ISO-8601 字符串。
+ * 非法/`from > to` 一律显式拒绝（旧实现静默忽略非法值 ⇒ 用户以为筛过了，实际导出全量）。
+ */
+function timeParamOf(raw, name) {
+  if (raw === undefined || raw === '') return { value: null };
+  const d = new Date(String(raw));
+  if (Number.isNaN(d.getTime())) {
+    return { error: `${name} 需为 ISO-8601 时间字符串（如 2026-10-01T00:00:00Z；本接口不再接受毫秒整数）` };
+  }
+  return { value: d };
+}
+
 /**
  * 一行的「平台费口径三件套」——**唯一实现**（ledger.csv 与 orders.csv 共用，两处必须逐字同源）。
  *
- * 为什么要把判据本身也导出来（源码审计 2026-09 续）：此前两个 CSV 只给 `fee_wei` / `net_wei`，
- * 店主拿它对账时**无法自证**这个费是怎么来的——按本单快照扣的？还是因为快照缺失、
- * 按全局保守口径折算的？两者在同一个文件里长得一模一样，而后者**可能**与链上实际扣费相反
- * （见 src/fees.js 文件头的两个方向）。所以把 `fee_bps`（费率快照）、
+ * 为什么要把判据本身也导出来：只给 `fee_wei` / `net_wei` 时，店主拿它对账**无法自证**这个费是怎么来的
+ * ——按本单快照扣的？还是因为快照缺失、按全局保守口径折算的？两者在同一个文件里长得一模一样，
+ * 而后者**可能**与链上实际扣费相反（见 src/fees.js 文件头的两个方向）。所以把 `fee_bps`（费率快照）、
  * `fee_chargeable`（这一单判不判扣费）、`fee_basis`（判据来源：snapshot / fallback）
- * 一并落盘：任何一行都能在 Excel 里手算复核 net = amount − refunded − fee。
+ * 一并落盘：任何一行都能在 Excel 里手算复核 net = amount − refunded − fee − commission。
  *
- * **三态（2026-10-14 收口）**：`fee_bps` 那一列是 `INTEGER NOT NULL DEFAULT 0`，"没补录过"与
- * "快照就是 0"分不开（判据见 src/fees.js 的 feeSnapshotReadOf）。快照未回填时这一行的
- * 费与净额**算不出来** —— 三个金额单元格一律留**空**（Excel 里是"没有值"），`fee_basis` 那列
- * 写 `fallback` 说明原因。此前这里写 0，等于在月结文件里替链上宣布"这单不扣费"。
+ * **三态**：`fee_bps` 那一列是 `NOT NULL DEFAULT 0`，"没补录过"与"快照就是 0"分不开
+ * （判据见 src/fees.js 的 feeSnapshotReadOf）。快照未回填时这一行的费与净额**算不出来**
+ * ——三个金额单元格一律留**空**（Excel 里是"没有值"），`fee_basis` 那列写 `fallback` 说明原因。
+ * 写 0 等于在月结文件里替链上宣布"这单不扣费"。
  * @returns {{bps:number|'', chargeable:0|1, basis:'snapshot'|'fallback'}}
  */
 function feeCellsOf(o) {
@@ -45,7 +84,7 @@ function feeCellsOf(o) {
 }
 
 /**
- * 导出限流（四路 CSV 共用一把窗口；此前**无任何限流**）：
+ * 导出限流（四路 CSV 共用一把窗口）：
  * 导出是最重的读路径——orders/ledger/products 都是**全表** SELECT（不带分页）并在 JS 侧
  * 逐行折算，codes.csv 还会把码原文整体吐出；`await refreshFeeCollector()` 另有一次链上读。
  * 数值依据：真实用法是月结/盘点时点几下（一次会话 1~4 个文件），20 次/分已远超需要；
@@ -57,179 +96,199 @@ const exportLimiter = simpleRateLimit({ windowMs: 60_000, max: 20, message: '导
 /** 已入账状态（与 orders.js ledger 同口径：买家确认/仲裁判付/超时释放） */
 const INCOME_STATUS = ORDER_INCOME_STATUS; // 唯一出处：src/orderStatus.js（与流水页同源）
 
-/** 敏感导出审计（ownerOnly 端点均记录：谁在何时导出了什么） */
-const auditExport = (req, action, targetId, detail) =>
-  logAudit({ req, actor: req.auth?.address, actorRole: roleOf(req.auth?.address || ''), action, targetType: 'export', targetId, detail });
+/** 敏感导出审计（ownerOnly 端点均记录：谁在何时导出了什么）——async：角色判定要读库，
+ *  且审计必须在响应之前落库（导出动作的证据力就在这里） */
+const auditExport = async (req, action, targetId, detail) =>
+  logAudit({
+    req,
+    actor: req.auth?.address,
+    // 角色按**本店**算：漏传店铺编号会得到 'user'，而 logAudit 对 'user' 直接返回——导出审计静默消失
+    actorRole: await roleOf(req.auth?.address || '', req.shop.code),
+    // 四条 CSV 全是 ownerOnly + 本店作用域（查询里 `WHERE shop_code = ?`，见下方说明）：归属恒为本店
+    shopCode: req.shop.code,
+    action,
+    targetType: 'export',
+    targetId,
+    detail,
+  });
 
 /**
  * 订单全量导出列。
- * 金额块（源码审计 2026-09 续）：原先只有 `amount_wei` + `amount_net_wei`，中间的
- * **已退买家**与**平台费**两笔都没有——店主拿到一行 `amount_net_wei` 却算不回它，
- * 只能回去翻页面。补齐 refunded/fee/费率/判据来源后，一行即可自证
- * `amount_net_wei = amount_wei − refunded_wei − fee_wei`（且可知 fee 是按快照还是兜底算的）。
+ * 金额块：只给 `amount_net_wei` 时店主算不回它（只能回去翻页面）。补齐
+ * refunded/fee/commission/费率/判据来源后，一行即可自证
+ * `amount_net_wei = amount_wei − refunded_wei − fee_wei − commission_wei`
+ * （且可知每条腿是按快照还是兜底算的）。
  * `accepted_partial_refund_wei` 同 ledger.csv 的理由：分辨"部分退款是仲裁拆分还是买家授权"。
  */
 const ORDER_COLUMNS = [
-  'id', 'product_slug', 'status', 'quantity', 'amount_wei', 'refunded_wei', 'fee_wei', 'amount_net_wei',
-  'fee_bps', 'fee_chargeable', 'fee_basis', 'accepted_partial_refund_wei',
+  'order_no', 'product_slug', 'status', 'quantity', 'amount_wei', 'refunded_wei', 'fee_wei', 'commission_wei',
+  'amount_net_wei',
+  'fee_bps', 'fee_chargeable', 'fee_basis', 'commission_bps', 'commission_basis',
+  'accepted_partial_refund_wei',
   'usdt_micro', 'shipping_fee_usdt_micro', 'invoice_needed',
   'buyer', 'shipping_name', 'shipping_phone', 'shipping_address', 'shipping_edited', 'note', 'escrow_order_id',
   'paid_tx_hash', 'refund_status', 'tracking_no', 'carrier', 'created_at', 'updated_at',
 ];
 
+/**
+ * 抽成判据三件套（与 `feeCellsOf` 对称）：`basis` 说明这一行的抽成是**按本单成交条款快照**
+ * 算的还是**根本没补录**（`missing`）。三态与 `src/fees.js` 的 `commissionTermsReadOf` 同款：
+ * 空串 = 从未补录 = 未知（那时抽成与净额两列留空，**不写 0**）。
+ */
+function commissionCellsOf(o) {
+  const snap = commissionTermsReadOf(o);
+  return { bps: snap.known ? snap.bps : '', basis: snap.known ? 'snapshot' : 'missing' };
+}
+
 /** 收款流水导出（ownerOnly；入账口径与流水页一致 = 订单 updated_at 末次迁移时刻；
- *  列含 **毛额 / 已退买家 / 平台费 / 净额** 四列（净额 = 毛额 − 已退 − 平台费）——月结对账免逐页人工加总；
- *  另有**按单的平台费口径三件套**（fee_bps / fee_chargeable / fee_basis）与
- *  **买家已授权的部分退款额**（accepted_partial_refund_wei）——见下方 headers 处说明；
- *  ?from=&to= 毫秒过滤） */
+ *  列含 **毛额 / 已退买家 / 平台费 / 节点抽成 / 净额** 五列——月结对账免逐页人工加总；
+ *  另有**按单的判据三件套**与**买家已授权的部分退款额**；`?from=&to=` 为 ISO-8601） */
 router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const db = getDb();
   // 平台费**按单**判定（创建时收费方快照，见 src/fees.js）；这里刷新全局口径只为
   // "本单没有快照"的兜底行与披露字段（feeCollectorKnown），保持与流水页同源。
-  await refreshFeeCollector(); // 平台费口径见 src/fees.js
+  await refreshFeeCollector();
   const marks = INCOME_STATUS.map(() => '?').join(',');
-  const params = [...INCOME_STATUS];
-  const range = [];
-  // 非法/from>to 显式拒绝（此前静默忽略可能导出全量）
-  const rawFrom = req.query.from;
-  const rawTo = req.query.to;
-  const fromV = rawFrom === undefined || rawFrom === '' ? null : Number(rawFrom);
-  const toV = rawTo === undefined || rawTo === '' ? null : Number(rawTo);
-  if (fromV !== null && (!Number.isFinite(fromV) || fromV <= 0)) return fail(res, 'from 需为毫秒时间戳');
-  if (toV !== null && (!Number.isFinite(toV) || toV <= 0)) return fail(res, 'to 需为毫秒时间戳');
-  if (fromV !== null && toV !== null && fromV > toV) return fail(res, 'from 不得晚于 to');
-  if (fromV !== null) {
-    range.push('updated_at >= ?');
-    params.push(fromV);
-  }
-  if (toV !== null) {
-    range.push('updated_at <= ?');
-    params.push(toV);
-  }
-  const rows = db
-    .prepare(
-      `SELECT * FROM orders WHERE status IN (${marks})${range.length ? ` AND ${range.join(' AND ')}` : ''} ORDER BY updated_at DESC`
-    )
-    .all(...params);
   /*
-    列口径（源码审计 2026-09 续）：
-      · 钱流四列（amount/refunded/fee/net）必须在**同一行内自洽**，月结时能在 Excel 里手算复核；
-      · `fee_bps` / `fee_chargeable` / `fee_basis` = 平台费判据三件套，缺一列店主就无法自证
-        fee_wei 是按本单快照扣的还是按全局兜底折算的（两者可能相反，见 src/fees.js 文件头）；
-      · `accepted_partial_refund_wei` = 买家在链上**授权过**的部分退款额（0 = 未授权）。
-        为什么放进流水：契约层 2026-09 起 `approveRefund` 只接受「全额」或「买家精确授权过的
-        那个数」，于是「这单退给买家 X」这件事在链上有两个来源——仲裁拆分（无需同意）与
-        双方谈拢（买家授权）。只导 refunded_wei 时，店主对着一笔部分退款无法分辨是哪一种，
-        也就无从复核"这笔结算有没有买家点头"。授权额正是那个可查的凭据。
+    ⚠️ **店铺维度是这条查询的安全边界**（四条 CSV 同批）：`ownerOnly` 只回答
+    "你是不是请求头那家店的店主"，而查询不带店铺条件 ⇒ 任一店店主能导出
+    **整个节点**的订单（含买家姓名/电话/地址）、全部商品、以及**任意数字商品的兑换码原文**。
+    这不是"多看了一眼"，是把别店的买家 PII 与卡密交出去。
+  */
+  const params = [String(req.shop.code), ...INCOME_STATUS];
+  const range = [];
+  const fromP = timeParamOf(req.query.from, 'from');
+  if (fromP.error) return fail(res, fromP.error);
+  const toP = timeParamOf(req.query.to, 'to');
+  if (toP.error) return fail(res, toP.error);
+  if (fromP.value && toP.value && fromP.value.getTime() > toP.value.getTime()) return fail(res, 'from 不得晚于 to');
+  if (fromP.value) {
+    range.push('updated_at >= ?');
+    params.push(fromP.value);
+  }
+  if (toP.value) {
+    range.push('updated_at <= ?');
+    params.push(toP.value);
+  }
+  const rows = await db.all(`SELECT * FROM v_orders WHERE shop_code = ? AND status IN (${marks})${range.length ? ` AND ${range.join(' AND ')}` : ''} ORDER BY updated_at DESC`, ...params);
+  /*
+    列口径：
+      · 钱流五列（amount/refunded/fee/commission/net）必须在**同一行内自洽**，月结时能在 Excel 里手算复核；
+      · `fee_*` / `commission_*` = 各腿的判据三件套，缺一列店主就无法自证那些钱是按本单快照算的
+        还是按全局兜底折算的（两者可能相反，见 src/fees.js 文件头）；
+      · `accepted_partial_refund_wei` = 买家在链上**授权过**的部分退款额。
+        契约起 `approveRefund` 只接受「全额」或「买家精确授权过的那个数」，于是「这单退给买家 X」
+        在链上有两个来源——仲裁拆分（无需同意）与双方谈拢（买家授权）。只导 refunded_wei 时，
+        店主对着一笔部分退款无法分辨是哪一种，也就无从复核"这笔结算有没有买家点头"。
   */
   const headers = [
-    'order_id', 'product_slug', 'income_status', 'quantity', 'amount_wei', 'refunded_wei', 'fee_wei', 'net_wei',
-    'fee_bps', 'fee_chargeable', 'fee_basis', 'accepted_partial_refund_wei',
-    'usdt_micro', 'income_at_ms', 'buyer', 'escrow_order_id', 'paid_tx_hash',
+    'order_no', 'product_slug', 'income_status', 'quantity', 'amount_wei', 'refunded_wei', 'fee_wei',
+    'commission_wei', 'net_wei',
+    'fee_bps', 'fee_chargeable', 'fee_basis', 'commission_bps', 'commission_basis',
+    'accepted_partial_refund_wei',
+    'usdt_micro', 'income_at', 'buyer', 'escrow_order_id', 'paid_tx_hash',
   ];
   const csvRows = rows.map((o) => {
-    // 已退金额参与净额：净额 = amount − refunded − fee（部分退款后只对未退部分计费）
-    // 平台费按**该单**的创建时收取方快照判定（合约只读快照；全局 feeCollector() 事后可改，
-    // 用它会让导出与链上在途单的口径相反——见 src/fees.js 文件头）。
-    // 费率快照未回填 ⇒ fee 为 null ⇒ fee_wei / net_wei 留空（`fee_basis=fallback` 说明原因），
-    // 绝不写 0：那会让月结对账把"算不出来"当成"没扣费"。
-    const refunded = BigInt(o.refunded_amount_wei || '0');
-    const base = BigInt(o.amount_wei || '0') - refunded;
-    const fee = feeOfRow(base > 0n ? base : 0n, o);
+    /*
+      四腿口径（与 `Escrow._settle` 逐字同源，算术只有 `src/fees.js` 一处实现）：
+        净额 = 毛额 − 已退买家 − 平台费 − **节点抽成**
+      平台费按**该单的创建时收取方快照**判定（合约只读快照；全局 feeCollector() 事后可改，
+      用它会让导出与链上在途单的口径相反）；抽成按**该单的成交条款快照**。
+      任一条腿的快照未回填 ⇒ 该腿与净额三列一律留空（判据列 `*_basis` 说明原因），
+      **绝不写 0**：那会让月结对账把"算不出来"当成"没扣/没抽"。
+    */
+    const rd = settlementReadOf(o);
     const fc = feeCellsOf(o);
+    const cc = commissionCellsOf(o);
     return [
-      o.id, o.product_slug, o.status, o.quantity || 1, o.amount_wei, refunded.toString(),
-      fee === null ? '' : fee.toString(),
-      fee === null ? '' : (base - fee).toString(),
-      fc.bps, fc.chargeable, fc.basis, String(o.accepted_partial_refund_wei || '0'),
-      o.usdt_micro, o.updated_at, o.buyer, o.escrow_order_id || '', o.paid_tx_hash || '',
+      o.order_no, o.product_slug, o.status, o.quantity || 1, o.amount_wei,
+      // 链上镜像列来自 LEFT JOIN：NULL = **这一单还没有链上镜像行**（尚未托管），
+      // 而 '0' = 确证没退过款。两者在月结里必须长得不一样，所以 NULL 留空、不折成 0。
+      o.refunded_amount_wei ?? '',
+      !rd.ok || rd.feeWei === null ? '' : rd.feeWei,
+      !rd.ok || rd.commissionWei === null ? '' : rd.commissionWei,
+      !rd.ok || rd.netWei === null ? '' : rd.netWei,
+      fc.bps, fc.chargeable, fc.basis, cc.bps, cc.basis, o.accepted_partial_refund_wei ?? '',
+      o.usdt_micro, isoCell(o.updated_at), o.buyer, o.escrow_order_id || '', o.paid_tx_hash || '',
     ];
   });
-  auditExport(req, 'export.ledger', '-', { rows: rows.length, from: req.query.from || 'all', to: req.query.to || 'all' });
+  await auditExport(req, 'export.ledger', '-', { rows: rows.length, from: req.query.from || 'all', to: req.query.to || 'all' });
   sendCsv(res, 'ledger.csv', headers, csvRows);
 }));
 
 router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const db = getDb();
   /*
-    平台费口径必须与 ledger.csv **逐字同源**（源码审计 2026-09 修复）：
-    `fees.js` 的**全局** feeCollector 缓存是进程级的、只由请求触发，而这里原先没有
-    `refreshFeeCollector()`。于是节点刚起来、**先**导 orders.csv 时 `cache.known === false`
-    ⇒ 兜底口径判为"会扣费" ⇒ 按订单级 feeBps 扣费；随后导 ledger.csv（它 await 了刷新）
-    才读到全局 `feeCollector == 0` ⇒ 兜底不扣。同一单在两个 CSV 里的 `amount_net_wei` /
-    `net_wei` 相差一个费额，店主的月结对账对不上——而 fees.js 文件头那条「面板说扣了、
-    钱包没少」正是要消灭的现象。
-    注：契约层 2026-09 起扣费判据是**每单**的创建时快照（orders.fee_collector_at_create），
-    全局值只对"没有快照的行"兜底；刷新仍要保留——否则兜底口径又会在两个 CSV 间漂移。
+    平台费口径必须与 ledger.csv **逐字同源**：`fees.js` 的**全局** feeCollector 缓存是进程级的、
+    只由请求触发，而这里原先没有 `refreshFeeCollector()`。于是节点刚起来、**先**导 orders.csv 时
+    `cache.known === false` ⇒ 兜底口径判为"会扣费" ⇒ 按订单级 feeBps 扣费；随后导 ledger.csv
+    （它 await 了刷新）才读到全局 `feeCollector == 0` ⇒ 兜底不扣。同一单在两个 CSV 里的
+    `amount_net_wei` / `net_wei` 相差一个费额，店主的月结对账对不上。
   */
   await refreshFeeCollector();
+  /*
+    店铺维度**直接写进语句**（而不是塞进下面那个动态拼接的 `where` 数组）：
+    动态数组里的第一个条件很容易在某次重构中被改掉/挪走，而这条过滤是**安全边界**不是筛选条件。
+    写死在 SQL 文本里，`shop_code = ?` 就不可能"顺手"丢。
+  */
   const where = [];
-  const params = [];
+  const params = [String(req.shop.code)];
   if (req.query.status) {
     const st = String(req.query.status);
-    // 状态全集取 src/orderStatus.js（唯一出处；与 db.js 的 CHECK 逐字同源）
+    // 状态全集取 src/orderStatus.js（唯一出处；与 db.js 的 ENUM 取值同源）
     const valid = ORDER_STATUS;
     if (!valid.includes(st)) return fail(res, `status 无效（可选：${valid.join('/')}）`);
     where.push('status = ?');
     params.push(st);
   }
   // from/to 校验同 ledger.csv（防静默忽略/from>to 空集误导）
-  const rawFrom = req.query.from;
-  const rawTo = req.query.to;
-  const fromV = rawFrom === undefined || rawFrom === '' ? null : Number(rawFrom);
-  const toV = rawTo === undefined || rawTo === '' ? null : Number(rawTo);
-  if (fromV !== null && (!Number.isFinite(fromV) || fromV <= 0)) return fail(res, 'from 需为毫秒时间戳');
-  if (toV !== null && (!Number.isFinite(toV) || toV <= 0)) return fail(res, 'to 需为毫秒时间戳');
-  if (fromV !== null && toV !== null && fromV > toV) return fail(res, 'from 不得晚于 to');
-  if (fromV !== null) {
+  const fromP = timeParamOf(req.query.from, 'from');
+  if (fromP.error) return fail(res, fromP.error);
+  const toP = timeParamOf(req.query.to, 'to');
+  if (toP.error) return fail(res, toP.error);
+  if (fromP.value && toP.value && fromP.value.getTime() > toP.value.getTime()) return fail(res, 'from 不得晚于 to');
+  if (fromP.value) {
     where.push('created_at >= ?');
-    params.push(fromV);
+    params.push(fromP.value);
   }
-  if (toV !== null) {
+  if (toP.value) {
     where.push('created_at <= ?');
-    params.push(toV);
+    params.push(toP.value);
   }
-  const rows = db
-    .prepare(`SELECT * FROM orders${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY created_at ASC`)
-    .all(...params);
+  const rows = await db.all(`SELECT * FROM v_orders WHERE shop_code = ?${where.length ? ' AND ' + where.join(' AND ') : ''} ORDER BY created_at ASC`, ...params);
   const csvRows = rows.map((o) => {
-    const refunded = BigInt(o.refunded_amount_wei || '0');
-    const base = BigInt(o.amount_wei || '0') - refunded;
-    // 与 ledger.csv 同一口径（按单快照判定；两处必须逐字同源，见上方 orders.csv 的说明）。
-    // 费率快照未回填 ⇒ 费/净额留空（`fee_basis=fallback`），不写 0（同 ledger.csv）。
-    const fee = feeOfRow(base > 0n ? base : 0n, o);
+    /* 与 ledger.csv 同一口径（五腿、按单快照判定；两处必须逐字同源） */
+    const rd = settlementReadOf(o);
     const fc = feeCellsOf(o);
+    const cc = commissionCellsOf(o);
     return [
-      o.id, o.product_slug, o.status, o.quantity || 1, o.amount_wei,
-      refunded.toString(),
-      fee === null ? '' : fee.toString(),
-      fee === null ? '' : (base - fee).toString(),
-      fc.bps, fc.chargeable, fc.basis, String(o.accepted_partial_refund_wei || '0'),
+      o.order_no, o.product_slug, o.status, o.quantity || 1, o.amount_wei,
+      o.refunded_amount_wei ?? '',
+      !rd.ok || rd.feeWei === null ? '' : rd.feeWei,
+      !rd.ok || rd.commissionWei === null ? '' : rd.commissionWei,
+      !rd.ok || rd.netWei === null ? '' : rd.netWei,
+      fc.bps, fc.chargeable, fc.basis, cc.bps, cc.basis, o.accepted_partial_refund_wei ?? '',
       o.usdt_micro, o.shipping_fee_usdt_micro ?? 0, o.invoice_needed ? 1 : 0,
       o.buyer, o.shipping_name, o.shipping_phone, o.shipping_address, o.shipping_edit_count ? '1' : '0', o.note || '',
       o.escrow_order_id || '', o.paid_tx_hash || '', o.refund_status || 'none',
-      o.tracking_no || '', o.carrier || '', o.created_at, o.updated_at,
+      o.tracking_no || '', o.carrier || '', isoCell(o.created_at), isoCell(o.updated_at),
     ];
   });
-  auditExport(req, 'export.orders', '-', { rows: rows.length, status: req.query.status || 'all' });
+  await auditExport(req, 'export.orders', '-', { rows: rows.length, status: req.query.status || 'all' });
   sendCsv(res, 'orders.csv', ORDER_COLUMNS, csvRows);
 }));
 
 router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const db = getDb();
-  const rows = db
-    .prepare(
-      `SELECT p.*,
+  const rows = await db.all(`SELECT p.*,
          (SELECT COUNT(*) FROM product_codes c WHERE c.product_id = p.id) AS codes_built,
          (SELECT COUNT(*) FROM product_codes c WHERE c.product_id = p.id AND c.status = 'unused') AS codes_unused,
          (SELECT COUNT(*) FROM product_nft_tokens t WHERE t.product_id = p.id) AS tokens_built,
          (SELECT COUNT(*) FROM product_nft_tokens t WHERE t.product_id = p.id AND t.status = 'unused') AS tokens_unused
-       FROM products p ORDER BY p.id ASC`
-    )
-    .all();
+       FROM products p WHERE p.shop_code = ? ORDER BY p.id ASC`, String(req.shop.code));
   // 商品 CSV 按「商品 × SKU」展开：一行一个规格组合 —— 价格与库存本来就逐组合不同，
   // 压成一行会让「哪个组合还剩几件」在导出里彻底丢失。无规格商品即 sku_key 为空的那一行。
-  const skuRows = getDb().prepare('SELECT * FROM product_skus ORDER BY product_id, sku_key').all();
+  const skuRows = await getDb().all('SELECT s.* FROM product_skus s JOIN products p ON p.id = s.product_id WHERE p.shop_code = ? ORDER BY s.product_id, s.sku_key', String(req.shop.code));
   const skuByProduct = new Map();
   for (const s of skuRows) {
     if (!skuByProduct.has(s.product_id)) skuByProduct.set(s.product_id, []);
@@ -237,58 +296,62 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   }
   /*
     列清单 = 商品模型的可导出部分（**含快照里的每一项**：迁移/对账时要能凭它复算出 snapshot_hash）。
-    2026-10-15 补齐：`attributes`/`terms`/`sku_image_url`（三个进快照的新字段）与 `published_at`
-    （首次上架时刻：NULL = 从未发布，用于分辨"草稿"与"已下架"）。
-    逐字保持 JSON 原文（不解析后重排键序）：这一列的价值就是"与库里那一份一致"。
+    `specs`/`attributes`/`terms` 是 **JSON 列**（驱动解成对象）→ 用 `jsonCell` 按规范文本形写出；
+    逐字保持 JSON 原文（不解析后重排键序）：这一列的价值就是"与库里那一份一致"，
+    而库里那一份是 MySQL 规范化之后的文本，`JSON.stringify(读回的对象)` 给出的正是它。
   */
   const headers = ['slug', 'title', 'kind', 'shipping_fee_usdt_micro', 'age_restricted', 'specs', 'attributes', 'terms', 'sku_key', 'sku_specs', 'price_usdt_micro', 'sku_image_url', 'capacity', 'committed', 'available', 'sku_active', 'active', 'published_at', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused'];
   const csvRows = [];
   for (const r of rows) {
     const skus = skuByProduct.get(r.id) || [];
-    let specs = '[]';
-    try {
-      specs = JSON.stringify(JSON.parse(r.specs || '[]'));
-    } catch {
-      specs = '[]';
-    }
     // 商品没有任何 SKU 行（异常数据）：仍导出一行、sku 列留空，便于排查
     const list = skus.length ? skus : [null];
     for (const s of list) {
       csvRows.push([
-        r.slug, r.title, r.kind, r.shipping_fee_usdt_micro ?? 0, r.age_restricted ? 1 : 0, specs,
-        r.attributes || '[]', r.terms || '{}',
-        s ? s.sku_key : '', s ? s.specs_json : '',
+        r.slug, r.title, r.kind, r.shipping_fee_usdt_micro ?? 0, r.age_restricted ? 1 : 0, jsonCell(r.specs),
+        jsonCell(r.attributes), jsonCell(r.terms),
+        s ? s.sku_key : '', s ? jsonCell(s.specs_json) : '',
         s ? s.price_usdt_micro : '', s ? (s.image_url || '') : '',
         s ? (s.capacity ?? '') : '', s ? s.committed || 0 : '',
         s ? (s.capacity === null ? '' : Math.max(0, s.capacity - (s.committed || 0))) : '',
         s ? (s.active ? 1 : 0) : '',
-        r.active ? 1 : 0, r.published_at ?? '', r.auto_deliver, r.stock_alert_at ?? '', r.snapshot_hash,
-        r.created_at, r.updated_at, r.codes_built, r.codes_unused, r.tokens_built, r.tokens_unused,
+        r.active ? 1 : 0, isoCell(r.published_at), r.auto_deliver, r.stock_alert_at ?? '', r.snapshot_hash,
+        isoCell(r.created_at), isoCell(r.updated_at), r.codes_built, r.codes_unused, r.tokens_built, r.tokens_unused,
       ]);
     }
   }
-  auditExport(req, 'export.products', '-', { rows: rows.length });
+  await auditExport(req, 'export.products', '-', { rows: rows.length });
   sendCsv(res, 'products.csv', headers, csvRows);
 }));
 
-router.get('/codes.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {  const db = getDb();
+router.get('/codes.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
+  const db = getDb();
   const slug = String(req.query.slug || '');
-  const product = db.prepare('SELECT id FROM products WHERE slug = ? AND kind = ?').get(slug, 'digital');
+  const product = await db.get('SELECT id FROM products WHERE slug = ? AND kind = ? AND shop_code = ?', slug, 'digital', String(req.shop.code));
   if (!product) return fail(res, '数字商品不存在', 404, 404);
-  const where = ['product_id = ?'];
+  const where = ['c.product_id = ?'];
   const params = [product.id];
   if (req.query.status) {
     if (!['unused', 'used', 'all'].includes(String(req.query.status))) return fail(res, 'status 需为 unused/used/all');
     if (req.query.status !== 'all') {
-      where.push('status = ?');
+      where.push('c.status = ?');
       params.push(String(req.query.status));
     }
   }
-  const rows = db.prepare(`SELECT code, status, order_id, created_at, used_at FROM product_codes WHERE ${where.join(' AND ')} ORDER BY id ASC`).all(...params);
-  auditExport(req, 'export.codes', slug, { rows: rows.length, status: req.query.status || 'all' });
+  /*
+    `product_codes.order_id` 是**内部订单键**（外键指向 `orders.id`），而导出要的是人能核对的标识：
+    这里 JOIN 出 `order_no`（对外单号）。内部自增键在换库/重建之后会变，拿它去对账等于对不上。
+  */
+  const rows = await db.all(
+    `SELECT c.code, c.status, o.order_no, c.created_at, c.used_at
+       FROM product_codes c LEFT JOIN orders o ON o.id = c.order_id
+      WHERE ${where.join(' AND ')} ORDER BY c.id ASC`,
+    ...params
+  );
+  await auditExport(req, 'export.codes', slug, { rows: rows.length, status: req.query.status || 'all' });
   // 码为店主持有资源：关闭公式前缀（码值原样导出，值完整性优先；来源非买家可控）
-  sendCsv(res, `${slug}-codes.csv`, ['code', 'status', 'order_id', 'created_at', 'used_at'],
-    rows.map((r) => [r.code, r.status, r.order_id || '', r.created_at, r.used_at || '']), { formulaGuard: false });
+  sendCsv(res, `${slug}-codes.csv`, ['code', 'status', 'order_no', 'created_at', 'used_at'],
+    rows.map((r) => [r.code, r.status, r.order_no || '', isoCell(r.created_at), isoCell(r.used_at)]), { formulaGuard: false });
 }));
 
 export default router;

@@ -9,7 +9,7 @@
  * 判据本身（三个来源的并集，任一条成立即"发生过争议"）：
  *   ① 当前镜像 `status === 'disputed'` —— 争议**还在进行**的单；
  *   ② 事件史里有 `DisputeRequested` —— 争议发生过、但可能已经终局（镜像已推进到 settled/refunded）；
- *   ③ 事件史里有 `Arbitrated` —— 链上 `arbitrate` 的前置就是 `Disputed`，所以它同样证明争议发生过。
+ *   ③ 事件史里有 `Arbitrated` —— 链上 `voteSettlement` 票决的前置就是 `Disputed`，所以它同样证明争议发生过。
  * ②③ 是针对**镜像会推进**这件事：`status` 只说"此刻还在争议"，而画像要回答的是"这一单争过没有"。
  *
  * ⚠️ 事件史只有最近 20 条（`onchain_events` 的 `slice(-20)`），可重复事件（如

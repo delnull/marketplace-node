@@ -10,9 +10,25 @@
  * 自动交付不覆盖的场景保持 escrowed 等卖家手动交付：
  *  - 实物商品（无码池语义，需物流单号）；
  *  - 数字商品但码池为空 / 未建池（MK_AUTO_DELIVER='0' 时全局关闭）。
+ *
+ * ## 键与表（本模块最容易写错的两处）
+ *
+ *  - **整单读**一律走读模型 `v_orders`：它把 orders / order_shipping / order_chain 三张表
+ *    合成一张可读的订单。**写**一律直接命中具体那张表——视图带 JOIN，MySQL 里本来就不可更新，
+ *    写错表会在 SQL 层当场报错。本模块只写 `orders`（状态与发货时刻）、`product_codes`（码的归属）、
+ *    `order_delivery_items`（交付行）。
+ *  - 行里**没有 `id`**：读模型的内部键叫 `order_id`（子表外键指向的就是它），对外标识叫
+ *    `order_no`（CHAR(21)，URL 与通知里用的那个）。本模块两者都用：子表写入与 orders 自身的
+ *    `WHERE id = ?` 用 `order_id`，日志与通知用 `order_no`。
+ *
+ * ## 时间：DATETIME(3)，由服务器盖章
+ *
+ * `shipped_at` / `used_at` / `updated_at` 一律写 `CURRENT_TIMESTAMP(3)`（会话 time_zone 已在
+ * db.js 钉成 '+00:00'），不传 `Date.now()`——毫秒整数会被 MySQL 当成数字字面量解析成一个荒谬的
+ * 时刻，而且不报错。`shipped_at` 用 `COALESCE(shipped_at, CURRENT_TIMESTAMP(3))` 保留首次交付时刻。
  */
 import config from './config.js';
-import { getDb, txBegin, txCommit, txRollback } from './db.js';
+import { getDb, withTransaction, abortTx } from './db.js';
 import { notify } from './webhook.js';
 import { deliveryGate } from './chainOrder.js';
 
@@ -21,64 +37,52 @@ import { deliveryGate } from './chainOrder.js';
  * 交付行写入 order_delivery_items 子表）。
  * 返回 { codes: [..] } 或 { error: 'pool_empty' | 'conflict' | 'not_escrowed' }。
  * 整批分配：池未用不足 quantity 直接失败（不半交付）。
+ *
+ * @param {object} order 读模型行（`v_orders`）：需要 order_id / order_no / product_id / quantity
  */
-export function deliverDigitalFromPool(order) {
+export async function deliverDigitalFromPool(order) {
   const db = getDb();
   const qty = order.quantity || 1;
-  const codes = db
-    .prepare("SELECT id, code FROM product_codes WHERE product_id = ? AND status = 'unused' ORDER BY id ASC LIMIT ?")
-    .all(order.product_id, qty);
-  if (codes.length < qty) return { error: 'pool_empty' };
-  const now = Date.now();
-  txBegin();
-  try {
-    const claimed = db
-      .prepare("UPDATE product_codes SET status = 'used', order_id = ?, used_at = ? WHERE id = ? AND status = 'unused'")
-      .run(order.id, now, codes[0].id).changes;
-    if (claimed !== 1) {
-      txRollback();
-      return { error: 'conflict' };
-    }
-    // 条件占用其余码：任一冲突（并发）整批回滚
-    for (const c of codes.slice(1)) {
-      const ch = db
-        .prepare("UPDATE product_codes SET status = 'used', order_id = ?, used_at = ? WHERE id = ? AND status = 'unused'")
-        .run(order.id, now, c.id).changes;
-      if (ch !== 1) {
-        txRollback();
-        return { error: 'conflict' };
-      }
-    }
-    const moved = db
-      .prepare("UPDATE orders SET status = 'shipped', shipped_at = COALESCE(shipped_at, ?), updated_at = ? WHERE id = ? AND status = 'escrowed'")
-      .run(now, now, order.id);
-    if (moved.changes !== 1) {
-      txRollback();
-      return { error: 'not_escrowed' };
-    }
-    const ins = db.prepare('INSERT INTO order_delivery_items (order_id, kind, value, created_at) VALUES (?, ?, ?, ?)');
-    for (const c of codes) ins.run(order.id, 'code', c.code, now);
-    txCommit();
-  } catch (e) {
-    txRollback();
-    throw e;
-  }
   /*
-    通知放在**事务 try 之外**（源码审计 2026-09 复审，P3 —— 本条注释此前就写在这里，
-    但 `notify` 一直在 try 内，直到 2026-10-14 才真的搬出来）：`notify` 是 fire-and-forget，
-    但它的**同步段**会碰库（webhook.js 的 kvGet + `SELECT * FROM orders`，见 buildPayload），
-    抛错时若还在 try 内，就会落到上面那个 catch 执行 `txRollback()` —— 而事务**已经 COMMIT 了**：
-    真错被替换成"无活动事务"（db.js 的 txRollback 在深度 0 抛错），交付已生效却返回 500；
-    更糟的是，若将来有调用方在本函数外层还开着事务，这次 `txRollback` 会回滚**调用方**的事务。
-    提交后的副作用一律不许再碰事务，这是本仓反复强调的 `afterCommit` 纪律。
+    候选码在**事务之前**读：读走连接池（真并发），写才需要串行（见 db.js 文件头）。
+    读到的这一批可能已被别人抢走——那由下面每条条件 UPDATE 的 `changes` 判定，
+    它才是"这个码现在归谁"的唯一判据（先读后写在这里是安全的，因为写的守卫是条件式的）。
   */
-  notify('order.shipped', order.id); // 卖家通知（P0-3）：自动交付完成
-  return { codes: codes.map((c) => c.code) };
+  const codes = await db.all("SELECT id, code FROM product_codes WHERE product_id = ? AND status = 'unused' ORDER BY id ASC LIMIT ?", order.product_id, qty);
+  if (codes.length < qty) return { error: 'pool_empty' };
+  /*
+    整批要么全成、要么全不成：`withTransaction` 的回调就是事务的作用域，中途 `return`
+    不会留下半批。`abortTx` 把这个语义写明确：已经算出返回值（一个拒因），但本次写入必须丢弃。
+  */
+  const result = await withTransaction(async () => {
+    // 条件占用：任一码被并发抢走（changes = 0）整批作废
+    for (const c of codes) {
+      const ch = (await db.run("UPDATE product_codes SET status = 'used', order_id = ?, used_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status = 'unused'", order.order_id, c.id)).changes;
+      if (ch !== 1) return abortTx({ error: 'conflict' });
+    }
+    const moved = await db.run("UPDATE orders SET status = 'shipped', shipped_at = COALESCE(shipped_at, CURRENT_TIMESTAMP(3)), updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status = 'escrowed'", order.order_id);
+    if (moved.changes !== 1) return abortTx({ error: 'not_escrowed' });
+    for (const c of codes) {
+      await db.run("INSERT INTO order_delivery_items (order_id, kind, value) VALUES (?, 'code', ?)", order.order_id, c.code);
+    }
+    return { codes: codes.map((c) => c.code) };
+  });
+  if (result.error) return result;
+  /*
+    通知放在**事务回调之外**（提交后的副作用纪律，本条注释此前就在，2026-10-14 才真的搬出来）：
+    `notify` 是 fire-and-forget，但它的同步段会碰库（webhook.js 读 shop_webhook 那一行 + 按单号读
+    订单，见 buildPayload）。放进事务回调里有两笔代价：① 让这次事务多背一次库读（并把行锁多握一会儿），
+    别人的写虽然不再被全局串行化，但仍会被这些行锁挡住；② 它一旦抛错，会把一次**已经全部写完**的交付整个回滚（码重新回到池里、
+    订单退回 escrowed），而调用方只看到 500。提交之后再通知，失败最多是"少一条 webhook"。
+    参数是**对外单号** order_no（webhook 的接收方按它去查/对账），不是内部键。
+  */
+  notify('order.shipped', order.order_no); // 卖家通知（P0-3）：自动交付完成
+  return result;
 }
 
 /** 商品级自动交付开关（P1-③）：-1=跟随全局 MK_AUTO_DELIVER / 0=关 / 1=开 */
-export function autoDeliverEnabledForProduct(productId) {
-  const row = getDb().prepare('SELECT auto_deliver FROM products WHERE id = ?').get(Number(productId) || 0);
+export async function autoDeliverEnabledForProduct(productId) {
+  const row = await getDb().get('SELECT auto_deliver FROM products WHERE id = ?', productId);
   if (!row) return config.autoDeliver; // 商品不存在（订单残留）：跟随全局
   if (row.auto_deliver === 0) return false;
   if (row.auto_deliver === 1) return true;
@@ -87,6 +91,10 @@ export function autoDeliverEnabledForProduct(productId) {
 
 /**
  * 单订单自动交付尝试（幂等；结果只影响本地订单，不抛错）。
+ *
+ * **两个 await 都是承重的**（本函数是 async 的原因）：商品级开关与码池分配都读库，
+ * 漏掉 await 时 `!Promise` 恒为 false（"没开自动交付"会静默放行）而 `r.codes` 恒为
+ * undefined（交付永远不发生，且没有任何日志）——两处都静默，方向还相反。
  *
  * **本函数不再自带"该不该发"的判据**（2026-10-15 删掉了一处镜像判断）：
  * 唯一调用方 `tryAutoDeliverByEscrowOrder` 已经在调它之前过了 `chainOrder.deliveryGate`
@@ -97,7 +105,7 @@ export function autoDeliverEnabledForProduct(productId) {
  * 于是同一时刻"自动交付拒绝、手动 /ship 放行"，同一个问题又有了两个答案层。
  * 行筛选（escrowed + 有凭证）仍在调用方，与本模块的分工不变。
  */
-export function tryAutoDeliverOrder(order) {
+export async function tryAutoDeliverOrder(order) {
   if (!order || order.status !== 'escrowed') return false;
   let snap = {};
   try {
@@ -106,14 +114,14 @@ export function tryAutoDeliverOrder(order) {
     snap = {};
   }
   if (snap.kind !== 'digital') return false;
-  if (!autoDeliverEnabledForProduct(order.product_id)) return false;
-  const r = deliverDigitalFromPool(order);
+  if (!(await autoDeliverEnabledForProduct(order.product_id))) return false;
+  const r = await deliverDigitalFromPool(order);
   if (r.codes) {
-    console.log(`[autoDeliver] 订单 ${order.id.slice(0, 8)}… ${r.codes.length} 个卡密已自动交付给买家`);
+    console.log(`[autoDeliver] 订单 ${String(order.order_no).slice(0, 8)}… ${r.codes.length} 个卡密已自动交付给买家`);
     return true;
   }
   if (r.error === 'pool_empty') {
-    console.log(`[autoDeliver] 订单 ${order.id.slice(0, 8)}… 码池无未用码（需 ${order.quantity || 1} 个），等待卖家手动交付`);
+    console.log(`[autoDeliver] 订单 ${String(order.order_no).slice(0, 8)}… 码池无未用码（需 ${order.quantity || 1} 个），等待卖家手动交付`);
   }
   return false;
 }
@@ -152,18 +160,15 @@ export async function tryAutoDeliverByEscrowOrder(orderIdHex) {
   const id = String(orderIdHex || '').toLowerCase();
   if (!id) return false;
   /*
-    先取本地行，再走**交付闸**（`chainOrder.deliveryGate`）——判据只有那一处：
-    链上 `status == Created` 且 `refundRequested == false`，读不到则不放行。
+    先取本地行（整单读走读模型 v_orders），再走**交付闸**（`chainOrder.deliveryGate`）——
+    判据只有那一处：链上 `status == Created` 且 `refundRequested == false`，读不到则不放行。
     这里不再内联一份"链上 Created 且未申请退款"的判断：三个手动交付入口（/ship、
-    /seller/batch-ship、/:id/nft-deliveries）与自动交付必须回答同一个问题、给出同一个答案
-    （2026-10-14：此前自动交付读链、手动交付读本地镜像，同一问题两个答案层）。
-    顺序也顺带改为"先看有没有可交付的本地行"：没有就不打这次 RPC。
+    /seller/batch-ship、/:id/nft-deliveries）与自动交付必须回答同一个问题、给出同一个答案。
+    顺序也顺带是"先看有没有可交付的本地行"：没有就不打这次 RPC。
+    `paid_tx_hash IS NOT NULL` 就是"有支付凭证"：链上单号在**草稿期**就已生成
+    （见 buyerSignal 的说明），所以只按单号筛会把未付款的草稿也送进交付闸。
   */
-  const order = getDb()
-    .prepare(
-      "SELECT * FROM orders WHERE escrow_order_id = ? AND status = 'escrowed' AND paid_tx_hash IS NOT NULL"
-    )
-    .get(id);
+  const order = await getDb().get("SELECT * FROM v_orders WHERE escrow_order_id = ? AND status = 'escrowed' AND paid_tx_hash IS NOT NULL", id);
   if (!order) return false;
   const gate = await deliveryGate(order);
   if (!gate.ok) {
@@ -172,7 +177,7 @@ export async function tryAutoDeliverByEscrowOrder(orderIdHex) {
     }
     return false;
   }
-  return tryAutoDeliverOrder(order);
+  return await tryAutoDeliverOrder(order);
 }
 
 /**
@@ -190,11 +195,7 @@ export async function tryAutoDeliverByEscrowOrder(orderIdHex) {
  * 也不要在看不清链上状态时把码发出去。
  */
 export async function tryAutoDeliverPendingForProduct(productId) {
-  const rows = getDb()
-    .prepare(
-      "SELECT * FROM orders WHERE product_id = ? AND status = 'escrowed' AND paid_tx_hash IS NOT NULL ORDER BY created_at ASC LIMIT 50"
-    )
-    .all(Number(productId) || 0);
+  const rows = await getDb().all("SELECT * FROM v_orders WHERE product_id = ? AND status = 'escrowed' AND paid_tx_hash IS NOT NULL ORDER BY created_at ASC LIMIT 50", productId);
   let delivered = 0;
   for (const o of rows) {
     /*
@@ -218,11 +219,12 @@ export async function tryAutoDeliverPendingForProduct(productId) {
  * 返回本次补交付的订单数（幂等：行守卫由 tryAutoDeliverOrder/deliverDigitalFromPool 承担）。
  */
 export async function flushAutoDeliverPending() {
-  const rows = getDb()
-    .prepare(
-      "SELECT o.* FROM orders o JOIN products p ON p.id = o.product_id WHERE o.status = 'escrowed' AND o.paid_tx_hash IS NOT NULL AND p.kind = 'digital' AND o.escrow_order_id IS NOT NULL"
-    )
-    .all();
+  /*
+    这里的 `p.kind = 'digital'` 只用来**收窄候选面**（不然要把全部 escrowed 单都拿去打一次链上读）；
+    真正"这一单该不该发码"的 kind 判据在 `tryAutoDeliverOrder` 里，它读的是**下单时冻结的快照**
+    （`product_snapshot.kind`）——快照才是买家当初买的那个商品。
+  */
+  const rows = await getDb().all("SELECT v.* FROM v_orders v JOIN products p ON p.id = v.product_id WHERE v.status = 'escrowed' AND v.paid_tx_hash IS NOT NULL AND p.kind = 'digital' AND v.escrow_order_id IS NOT NULL");
   let delivered = 0;
   let checked = 0;
   for (const o of rows) {

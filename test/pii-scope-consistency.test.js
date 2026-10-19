@@ -1,17 +1,23 @@
 /**
- * 擦除范围（"什么会被擦、什么**刻意保留**"）—— 多份文档与实现之间的**漂移守卫**。
+ * 擦除范围（"什么会被擦、什么**刻意保留**"）—— 文档与实现之间的**漂移守卫**。
  *
  * ── 为什么值得单独一条测试 ────────────────────────────────────────────────
- * 这是一份**对用户的承诺**，而且同时印在三份文档里：
- *   · `docs/DEPLOY_NODE.md`（部署方口径）、`docs/OPS_RUNBOOK.md`（运维口径）、
- *   · `node/docs/COMPLIANCE.md` §4（**店主/买家看得见的那一份**，随公开仓发布）。
- * 加上实现处的文件头（`node/src/piiErase.js`），同一份清单有四个落点。
+ * 这是一份**对用户的承诺**，印在多个落点上：
+ *   · `docs/DEPLOY_NODE.md`（部署方口径）、`node/docs/OPERATIONS.md`（运维口径）、
+ *   · `docs/OPERATOR_COMPLIANCE.md` §5.4（**店主/买家看得见的那一份**，对外的承诺文本）。
+ * 加上实现处的文件头（`node/src/piiErase.js`），同一份清单有多处落点。
  * 谁少一项、谁多说一项，都不会有任何东西报错——而后果是当事人按错误的预期行事：
  * 买家以为"删了个人信息等于这单没了"，或店主以为"评价正文也会被擦掉"而向买家作了虚假承诺。
  *
+ * ⚠️ **2026-10-16 换过正主**：原先那三份"讲全"的文档里有 `node/docs/COMPLIANCE.md`，
+ * 它与 `docs/OPERATOR_COMPLIANCE.md` 逐节重复（同一事实两份，必然漂移）——按本仓"同一事实
+ * 只留一处"的约定，重复的那一份**整份删除**，它独有的正确口径并进了 OPERATOR_COMPLIANCE。
+ * 于是这份守卫的"正主"同批换成 `docs/OPERATOR_COMPLIANCE.md`（判据没变，只是落点变了）——
+ * 这也是 `read()` 会 assert 文件存在的原因：文档被搬走时本测试必须当场说话，而不是静默少守一处。
+ *
  * ── 这条测试查什么、不查什么 ──────────────────────────────────────────────
  * 查：**保留清单**必须逐项出现在上述每一处；**在途状态集合**（不可擦）必须在文档与
- *     `orderStatus.js` 的唯一集合里对得上；"不等于这一单从系统里消失"这句结论必须在店主档里。
+ *     `orderStatus.js` 的唯一集合里对得上；"不等于这一单从系统里消失"这句结论必须在对外承诺文本里。
  * 不查：文档的排版与措辞（各读者面本来就不同），也不查每份文档包含**全部**细节——
  *     给不同读者的文档允许只讲对他重要的部分，但**不许把保留清单讲少**。
  */
@@ -34,18 +40,19 @@ function repoRoot() {
 const ROOT = repoRoot();
 const read = (rel) => {
   const p = path.join(ROOT, rel);
-  assert.ok(fs.existsSync(p), `文档不在预期位置：${rel}（若它被改名/移动，本测试与文档索引要同批改）`);
+  assert.ok(fs.existsSync(p), `文档不在预期位置：${rel}（若它被改名/移动/合并，本测试与文档索引要同批改）`);
   return fs.readFileSync(p, 'utf8');
 };
 
 /** 归一：统一空白（文档里同一句可能跨行、或带 markdown 的强调标记） */
 const norm = (s) => s.replace(/\*\*/g, '').replace(/[ \t\u00a0]+/g, ' ').replace(/\s*\n\s*/g, '\n');
 
-/** 三份对外文档 + 实现处（每一处都必须把"刻意保留"的清单讲全） */
+/** 对外文档（每一处都必须把"刻意保留"的清单讲全）+ 实现处 */
+const SHOP_FACING = 'docs/OPERATOR_COMPLIANCE.md';
 const DOCS = {
   'docs/DEPLOY_NODE.md': norm(read('docs/DEPLOY_NODE.md')),
-  'docs/OPS_RUNBOOK.md': norm(read('docs/OPS_RUNBOOK.md')),
-  'node/docs/COMPLIANCE.md': norm(read('node/docs/COMPLIANCE.md')),
+  'node/docs/OPERATIONS.md': norm(read('node/docs/OPERATIONS.md')),
+  [SHOP_FACING]: norm(read(SHOP_FACING)),
   'node/src/piiErase.js（实现处文件头）': norm(read('node/src/piiErase.js')),
 };
 
@@ -73,15 +80,21 @@ const PRESERVED = [
 /** 各文档里"承诺段"的锚词（该段必须逐项讲全保留清单） */
 const ANCHORS = {
   'docs/DEPLOY_NODE.md': /刻意保留/,
-  'docs/OPS_RUNBOOK.md': /刻意不擦/,
-  'node/docs/COMPLIANCE.md': /刻意保留/,
+  'node/docs/OPERATIONS.md': /刻意不擦/,
+  /*
+    ⚠️ 锚词取的是**小节标题本身**（`刻意不擦除的内容`），不是"刻意不擦"这四个字：
+    后者在 §5.4 的父标题（"什么会被擦、什么刻意不擦"）里也出现，而那是**整节**的开头——
+    按它切会切出一大段（擦除清单 + 两条通道 + 运维细节），于是"承诺表里少一项"未必落在窗口里。
+    这是本文件早先踩过的同一个坑（"整篇包含检查挡不住变异测试"）在**锚词层面**的重现。
+  */
+  [SHOP_FACING]: /刻意不擦除的内容/,
   'node/src/piiErase.js（实现处文件头）': /一律不动/,
 };
 
 /**
  * 把"承诺所在的那一小节"切出来：锚词**所在**的 markdown 小节（上一个标题行 → 下一个标题行）。
  *
- * 为什么不取"锚词之后 N 字"：清单经常写在锚词**之前**——COMPLIANCE §4 的表头是"刻意保留的内容"、
+ * 为什么不取"锚词之后 N 字"：清单经常写在锚词**之前**——对外承诺文本那一节的小标题是"刻意不擦除的内容"、
  * 逐项在下面的表格行里；`piiErase.js` 的清单在"一律不动"这句话的**前半句**。
  * 按小节切的前提是"这一节讲的就是这件事"，于是"删掉清单里的一项"必然落在窗口内 ⇒ 测试会红；
  * 而整篇包含检查会把别处的同名词也算进来（第一版的教训，变异测试当场证明它挡不住）。
@@ -124,7 +137,7 @@ function promiseSpan(text, anchor, file) {
 test('"刻意保留"清单必须完整存在于**正主**处（实现文件头与两份讲全的文档）', () => {
   const BEARERS = [
     'node/src/piiErase.js（实现处文件头）',
-    'node/docs/COMPLIANCE.md',
+    SHOP_FACING,
     'docs/DEPLOY_NODE.md',
   ];
   const missing = [];
@@ -138,7 +151,8 @@ test('"刻意保留"清单必须完整存在于**正主**处（实现文件头�
 });
 
 /*
-  "委托指针"是合法的：`OPS_RUNBOOK.md` 只列了四项，并写明"完整擦除范围…见 node/src/piiErase.js 文件头"。
+  "委托指针"是合法的：
+ode/docs/OPERATIONS.md 只列了四项，并写明"完整擦除范围…见 node/src/piiErase.js 文件头"。
   但**声明"完整在这里"的文档不许讲漏**——那是另一种谎：读者以为按它列的做就够，实际少了几类数据。
   所以这一条查：凡是自称"完整/刻意保留"的地方，要么列全，要么明确指向正主（且正主真的讲全，见上一条）。
 */
@@ -172,7 +186,7 @@ test('"在途不可擦"的状态集合：文档说法必须与 orderStatus.js �
     '可擦 ∪ 受保护 必须等于全部订单状态'
   );
 
-  const shopDoc = DOCS['node/docs/COMPLIANCE.md'];
+  const shopDoc = DOCS[SHOP_FACING];
   for (const st of PII_PROTECTED_STATUS) {
     assert.ok(shopDoc.includes(protectedZh[st]), `店主档必须点明在途状态「${protectedZh[st]}」不能擦（否则店主会以为可以）`);
   }
@@ -184,7 +198,7 @@ test('"在途不可擦"的状态集合：文档说法必须与 orderStatus.js �
 });
 
 test('结论句必须在店主档里：「删除个人信息」不等于这一单从系统里消失', () => {
-  const shopDoc = DOCS['node/docs/COMPLIANCE.md'];
+  const shopDoc = DOCS[SHOP_FACING];
   assert.match(shopDoc, /不等于"?这一单从系统里消失|不等于这一单从系统里消失/, '这句是买家最容易误解的地方，店主档必须原样写着');
   // 且要告诉店主：这个口径必须对买家讲明（否则他读了也不知道要转达）
   assert.match(shopDoc, /对买家讲明|告知买家/, '要知道这句是要**转达给买家**的，不是店主自己知道就行');

@@ -2,22 +2,42 @@
  * SIWE 认证路由：nonce 签发 + 验签（EIP-4361 流程）。
  *
  *  GET  /api/auth/nonce?address=0x... -> {message, address, expiresIn}
- *    —— 生成签名原文（含一次性 nonce，落 SQLite，TTL 内有效）
+ *    —— 生成签名原文（含一次性 nonce，落库，TTL 内有效）
  *  POST /api/auth/login {address, message, signature}
- *    —— 验签通过后签发 HMAC Bearer 令牌；恢复地址 == 店主 → isOwner=true
+ *    —— 验签通过后签发 HMAC Bearer 令牌（**节点级会话**：令牌不带任何店铺声明）
+ *
+ * ## 登录与店铺无关（旧形状的 `shop` 参数已删除，也不留"可选 shop"这一档）
+ *
+ * 挑战的键是地址（`siwe` 表没有 shop_code 列），令牌里也没有店铺——"你是谁"与
+ * "你能动哪几家店"本就是两件事：后者由 `shops.seller` / `shop_operators` 回答，
+ * 每次请求实时判定（见 http.js 的 makeAuthMiddleware 与 auth.roleOf）。
+ * 旧形状要求带 `shop` 且它必须是一家**真实存在**的店：零店铺的新节点连登录都发不出去；
+ * 前端还必须按店各登一次、各存一份令牌，而"拿 A 店的令牌去动 B 店"成了服务端要挡的事。
+ * 把 `shop` 改成"可选"只会让"登录是否绑店"继续有两种形状，所以整条参数删掉。
+ *
+ * 登录回执给出 `shops`：这个地址在本节点能经营的店与**各自**的角色（前端据此画店铺切换器，
+ * 也据此回答"我在这家店是不是店主"）。回执里**没有** node 级的 `code`/`role`/`isOwner`/`isStaff`：
+ * 那四个字段是"这次登录针对的那家店"的结论，而那个维度已经不存在——留着它们只能填一个
+ * 与任何店铺都对不上的值（那正是本次要删掉的那类假话）。
  */
 import { Router } from 'express';
-import { issueSiwe, verifySiwe, issueToken, roleOf } from '../auth.js';
+import { issueSiwe, verifySiwe, issueToken, roleOf, isHost, operatedShopCodes } from '../auth.js';
+import { isNodeStaffOf } from '../chain.js';
 import { isAddress } from '../chain.js';
+import { shopDto, shopRowByCode, nodeOwner } from '../shops.js';
 import config from '../config.js';
-import { ok, fail, wrap } from '../http.js';
+// clientIp：来源 IP 的唯一实现（trust proxy 只解析一次，见 http.js）
+import { ok, fail, wrap, clientIp } from '../http.js';
 import { notifyRaw } from '../webhook.js';
+
+/** "节点主没开店 ⇒ 没有告警收件人"只报一次（见登录告警那段） */
+let ownerLoginAlertNoRecipientWarned = false;
 
 const router = Router();
 
 /**
- * Origin 协议健全性校验（2026-09 修复）：联邦下任意合规前端都可能调用节点接口（CORS 保持
- * 开放），但登录接口的调用方若来自非 http(s) 环境（Origin 为 null/file/data：沙箱 iframe、
+ * Origin 协议健全性校验：联邦下任意合规前端都可能调用节点接口（CORS 保持开放），
+ * 但登录接口的调用方若来自非 http(s) 环境（Origin 为 null/file/data：沙箱 iframe、
  * 本地文件页等）一律拒绝——这类页面不属于任何正规前端，只可能用于钓鱼中继/脚本探测。
  * 无 Origin 头（curl/服务端脚本等非浏览器调用）放行。
  */
@@ -32,6 +52,7 @@ function originProtocolGuard(req, res, next) {
 
 // ── 轻量内存限流（认证接口匿名可达；防 nonce 表膨胀/验签滥用）。单进程滑动窗口： ──
 //   每个 IP 独立窗口，超限返回 429 提示稍后再试；进程重启即清零（演示级够用，生产可换网关/Redis）
+//   窗口长度与次数是**时长/计数**，不是时间戳——它们不进任何 SQL 列（见 auth.js 的令牌 TTL 说明）
 const RATE_LIMIT = {
   '/nonce': { windowMs: 60_000, max: 120 }, // 取 nonce 是廉价但可无限刷表/占地址
   '/login': { windowMs: 60_000, max: 60 },
@@ -42,8 +63,7 @@ function rateLimit(path) {
   const rule = RATE_LIMIT[path];
   return (req, res, next) => {
     if (!rule) return next();
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
-    const key = `${path}|${ip}`;
+    const key = `${path}|${clientIp(req)}`;
     const now = Date.now();
     const list = (hits.get(key) || []).filter((t) => now - t < rule.windowMs);
     if (list.length >= rule.max) {
@@ -52,7 +72,7 @@ function rateLimit(path) {
     }
     list.push(now);
     hits.set(key, list);
-    // 内存护栏（）：条目数超阈值时惰性清扫整窗已过期条目——防 IPv6 轮换/
+    // 内存护栏：条目数超阈值时惰性清扫整窗已过期条目——防 IPv6 轮换/
     // 代理池长期运行下 Map 无界增长（与 http.js simpleRateLimit 同款策略）
     if (hits.size > 5000) {
       const cutoff = now - Math.max(...Object.values(RATE_LIMIT).map((r) => r.windowMs));
@@ -68,42 +88,81 @@ function rateLimit(path) {
 router.get('/nonce', rateLimit('/nonce'), originProtocolGuard, wrap(async (req, res) => {
   const address = String(req.query.address || '').trim().toLowerCase();
   if (!isAddress(address)) return fail(res, 'address 参数无效（需 0x 开头的以太坊地址）');
-  const message = issueSiwe(address);
+  const message = await issueSiwe(address);
   ok(res, { message, address, expiresIn: config.siwe.ttlSeconds });
 }));
 
-/** 验证签名并登录，签发 HMAC 令牌（P1-⑤：payload.role=owner|operator|user） */
+/** 验证签名并登录，签发 HMAC 令牌（**节点级会话**：回执给出这个地址能经营的店与各自角色） */
 router.post('/login', rateLimit('/login'), originProtocolGuard, wrap(async (req, res) => {
   const { address, message, signature } = req.body || {};
   if (!isAddress(address)) return fail(res, 'address 参数无效');
   if (!message || !signature) return fail(res, '缺少 message 或 signature');
   /*
-    `verifySiwe` 用**抛异常**表达业务失败（nonce 过期/不匹配、签名地址不一致），
+    `verifySiwe` 用**抛异常**表达业务失败（nonce 过期/不匹配、签名地址不一致、挑战已被消费），
     而 `wrap` 会把未捕获异常折叠成"服务内部错误"（类生产环境不回原文）——
     于是用户看到的是一条内部错误，既不知道该"重新获取签名原文"，还会把正常事件刷进
-    `[http] 未捕获异常` 的日志噪音里（源码审计 2026-09 复审，P2）。
+    `[http] 未捕获异常` 的日志噪音里。
     这里把它收敛成 401 + 原文：这是**可自行修复**的输入问题，不是服务端故障。
   */
   let recovered;
   try {
-    recovered = verifySiwe(address, message, signature);
+    recovered = await verifySiwe(address, message, signature);
   } catch (e) {
     return fail(res, String(e?.message || '签名校验失败，请重新获取签名原文后再登录'), 1, 401);
   }
-  const role = roleOf(recovered);
-  // 店主登录告警（2026-09 修复，可选开：MK_OWNER_LOGIN_ALERT=1）：owner 令牌 = 全店写权限，
-  // 若因钓鱼中继/令牌失窃被冒领，店主经自有 webhook 通道第一时间知情（轮换/撤销先行）
-  if (role === 'owner' && config.webhook.ownerLoginAlert) {
-    notifyRaw('auth.owner_login', { address: recovered, ip: String(req.ip || req.socket?.remoteAddress || '') });
+  const hostNow = await isHost(recovered, { force: true });
+  // 节点主登录告警（可选开：MK_OWNER_LOGIN_ALERT=1）：host 令牌 = 节点级写权限，
+  // 若因钓鱼中继/令牌失窃被冒领，节点主经自有 webhook 通道第一时间知情（轮换/撤销先行）
+  if (hostNow && config.webhook.ownerLoginAlert) {
+    /*
+      ⚠️ 节点级事件**也必须带 `shopCode`**：`webhook.deliver()` 按 `payload.shopCode` 去查
+      `shop_webhook`（一行一店）。缺了它 `webhookConfig(undefined)` 把键折成 `''` ⇒ url 为空
+      ⇒ **一次尝试都不发**就 resolve(false)，而返回的 false 正是"没配地址"的意思
+      —— 这条通知此前因此**结构性发不出去**，且看不出任何异常。
+
+      收件人取"这个地址能经营的店"里的第一家：这是**通知**不是**授权**，同一个人名下的哪家店
+      落到的是同一个人。一家店都没有（节点主自己没开店）时不是"地址没配"而是"**没有收件人**"
+      —— 那种情况只报一次，且不假装发过。
+    */
+    const hostShops = await operatedShopCodes(recovered);
+    if (hostShops.length) {
+      // fire-and-forget 也必须接住异常：未处理的 rejection 会让进程按未捕获错误退出
+      notifyRaw('auth.owner_login', {
+        shopCode: hostShops[0],
+        address: recovered,
+        ip: clientIp(req),
+      }).catch((e) => console.error('[auth] 节点主登录告警投递异常：', e?.message || e));
+    } else if (!ownerLoginAlertNoRecipientWarned) {
+      ownerLoginAlertNoRecipientWarned = true;
+      console.warn(
+        '[auth] MK_OWNER_LOGIN_ALERT 已开启，但节点主在本节点没有任何店铺 ⇒ 没有可投递的 webhook，该告警不会发出'
+      );
+    }
   }
-  const token = issueToken(recovered, role);
-  ok(res, {
-    token,
-    address: recovered,
-    role,
-    isOwner: role === 'owner',
-    isOperator: role === 'operator',
-  });
+  const token = issueToken(recovered);
+  /*
+    `shops` 是"这个地址在这台机器上能经营哪些店"的清单（带各自角色）——前端的店铺切换器
+    据此一次画出来，不必再为每家店试一次登录。判据与 http.js 中间件解析默认店铺用的是
+    **同一个** `operatedShopCodes`（seller ∪ 店员白名单 ∪ 节点员工的本节点自营店），
+    两处不会给出不同的清单。它只含**这个地址自己有份**的店，不是租户列表（租户列表在公开的 GET /api/shops）。
+    节点员工的自营店已经在那份清单里（见 auth.operatedShopCodes），这里**不再单独补一次**：
+    补一次就是第二份判据，两处迟早漂移（例如员工被解除后登录回执仍列出那家店）。
+  */
+  const addr = recovered.toLowerCase();
+  const nodeAddr = await nodeOwner();
+  const nodeStaff = nodeAddr ? await isNodeStaffOf(addr, nodeAddr) : false;
+  const shops = [];
+  for (const code of await operatedShopCodes(addr)) {
+    const row = await shopRowByCode(code);
+    if (!row) continue; // 清单与这一行同源，读不到只可能是并发删店；不猜、跳过
+    /*
+      角色一律走 `roleOf`（唯一判据）：不要在这里用 `row.seller === addr` 自己推——
+      "owner 还是 staff"是授权判据，抄一份在这里就多一处会漂移的第二真相。
+    */
+    const role = await roleOf(addr, code);
+    if (role === 'owner' || role === 'staff') shops.push({ ...shopDto(row, nodeAddr), role });
+  }
+  ok(res, { token, address: recovered, isHost: hostNow, isNodeStaff: nodeStaff, shops });
 }));
 
 export default router;

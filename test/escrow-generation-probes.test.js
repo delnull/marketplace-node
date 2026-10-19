@@ -80,6 +80,33 @@ test('代次探针：必须覆盖合约伙伴会调、而旧一代没有的那�
   for (const required of ['sellerOpenExposure', 'sellerNetAtSettle', 'totalOpenExposure']) {
     assert.ok(names.has(required), `代次探针清单必须包含 ${required}（否则那种"自检通过但出金死掉"的状态又能进来）`);
   }
+  /*
+    委员会读法同理（2026-10-18：多仲裁人 + 订单级届次快照）：
+    缺 `arbiters/arbiterThreshold/committeeEpoch` ⇒ 当前届读不到（仲裁人视角整体关闭）；
+    缺 `orderEpoch/orderArbiters/orderThreshold` ⇒ 换届后**这一单是谁的**读不到，
+    旧届成员与在途争议一起被切断。见 chain.committeeForOrder 的说明。
+  */
+  for (const required of ['arbiters', 'arbiterThreshold', 'committeeEpoch', 'orderEpoch', 'orderArbiters', 'orderThreshold']) {
+    assert.ok(names.has(required), `代次探针清单必须包含委员会读法 ${required}`);
+  }
+});
+
+test('代次探针：运行时 getCommittee / committeeForOrder 用到的选择器必须在清单里（源码对拍）', () => {
+  /*
+    只钉一份"必须包含"的名单还不够：新增一个裁决委员会读法（例如换掉 orderThreshold）时，
+    清单与运行时代码会各走各的。这里从 chain.js 的**委员会区段**里抽出所有 `escrow.<name>(`
+    调用，再要求它们逐个出现在探针清单里——"清单写着 A、代码调 B"在文本层面就红。
+  */
+  const start = CHAIN_SRC.indexOf('// ── 委员会');
+  const end = CHAIN_SRC.indexOf('// ── 节点员工');
+  assert.ok(start > 0 && end > start, 'chain.js 的委员会区段标记变了——本守卫需要同步更新');
+  const used = new Set(
+    [...CHAIN_SRC.slice(start, end).matchAll(/\bescrow\.(\w+)\s*\(/g)].map((m) => m[1])
+  );
+  assert.ok(used.size >= 6, `委员会区段至少要读到 6 个选择器（实际 ${[...used].join(', ') || '无'}）`);
+  const probed = new Set(ESCROW_GENERATION_PROBES.map((p) => p.shape.split('(')[0]));
+  const missing = [...used].filter((name) => !probed.has(name));
+  assert.deepEqual(missing, [], `运行时调用的委员会读法不在代次探针清单里：${missing.join(', ')}`);
 });
 
 test('代次探针：zeroArg 种类合法，且每个形状的参数个数与零值种类一致', () => {

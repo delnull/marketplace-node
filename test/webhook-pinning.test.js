@@ -18,35 +18,39 @@ import dns from 'node:dns';
 // 重试退避调小（运维参数，config 顶层求值时读取——必须在本文件任何业务模块 import 之前设置）
 process.env.MK_WEBHOOK_RETRY_MS = '20';
 
-import { makeCtx } from './setup.mjs';
+import { makeCtx, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { db } = ctx;
-const { kvSet } = await import('../src/db.js');
-const { setWebhookSender, notify, notifyRaw, webhookStatus, resetWebhookStatus, pinnedSender } = await import('../src/webhook.js');
+const { setWebhookSender, notify, notifyRaw, webhookStatus, resetWebhookStatus, pinnedSender, setWebhookConfig } =
+  await import('../src/webhook.js');
 const { setLookupAll } = await import('../src/netguard.js');
 
 /** netguard 的默认解析器（注入后必须还原，避免污染同文件后续用例） */
 const defaultLookup = (h) => dns.promises.lookup(h, { all: true, verbatim: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 直接插一张草稿单（notify 只按 id 组装 payload，草稿足够——与 webhook.test.js 同款装配） */
+/**
+ * 直接插一张草稿单（notify 只按**对外订单号**组装 payload，草稿足够——与 webhook.test.js 同款装配）。
+ * 行形状交给 setup.mjs 的 insertOrder；链上单号给上（草稿期就已生成，见 routes/orders.js）。
+ */
 let seq = 0;
-function insertOrder() {
+async function insertOrder() {
   seq += 1;
-  const id = `wp-${seq}`;
-  const now = Date.now();
-  db.prepare(
-    `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, created_at, updated_at)
-     VALUES (?, 'p-x', '{}', '0x00', '', '0x00000000000000000000000000000000000000aa', '0x00000000000000000000000000000000000000bb',
-       '1000000000000000000', 1000000, '0.1', 'draft', ?, ?, ?)`
-  ).run(id, `0x${String(seq).padStart(64, '0')}`, now, now);
-  return { id };
+  return await insertOrderRow(db, {
+    status: 'draft',
+    productSlug: 'p-x',
+    buyer: '0x00000000000000000000000000000000000000aa',
+    seller: '0x00000000000000000000000000000000000000bb',
+    amountWei: '1000000000000000000',
+    usdtMicro: 1000000,
+    btyUsdtRate: '0.1',
+    escrowOrderId: `0x${String(seq).padStart(64, '0')}`,
+  });
 }
 
 test('地址钉死：整个投递只解析一次，交给发送器的是校验时那批地址（DNS 换答案进不来）', async () => {
-  kvSet('mk:webhook_url', 'https://rebind.example.com/hook');
+  await setWebhookConfig(shopRef.value, { url: 'https://rebind.example.com/hook' });
   const calls = [];
   setWebhookSender(async (url, init) => {
     calls.push({ url, init });
@@ -60,8 +64,8 @@ test('地址钉死：整个投递只解析一次，交给发送器的是校验�
   });
   try {
     // 夹具构造放在 try 内：写坏了要**快速失败**，不能把注入的解析器/发送器留在原地
-    const o = insertOrder();
-    assert.equal(await notify('order.escrowed', o.id), true, '投递成功');
+    const o = await insertOrder();
+    assert.equal(await notify('order.escrowed', o.orderNo), true, '投递成功');
     assert.equal(lookups, 1, '一次投递只解析一次（校验那次），连接阶段不再问 DNS');
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].init.addresses, ['93.184.216.34'], '发送器/钉住实现只拿到校验通过的那批地址');
@@ -90,10 +94,10 @@ test('解析到内网地址时一个连接都不许发出（服务器侧零连�
       URL 主机名用 `localhost`：它**真的**解析到 127.0.0.1（不依赖任何注入点），若校验被绕过或
       被挪到连接之后，这里就会实打实地连上服务器——"零连接"才是内容为真的断言。
     */
-    const o = insertOrder(); // 夹具在 try 内：写坏了要快速失败，不能让监听中的 socket 泄漏
-    kvSet('mk:webhook_url', `http://localhost:${port}/hook`);
+    const o = await insertOrder(); // 夹具在 try 内：写坏了要快速失败，不能让监听中的 socket 泄漏
+    await setWebhookConfig(shopRef.value, { url: `http://localhost:${port}/hook` });
     setWebhookSender(null); // 默认路径：真实 socket
-    notify('order.escrowed', o.id); // fire-and-forget（忽略返回的 Promise）
+    notify('order.escrowed', o.orderNo); // fire-and-forget（忽略返回的 Promise）
     await sleep(250); // 覆盖 2 次重试窗口（retryBase=20ms）
     assert.equal(connections, 0, '目标解析到回环：一个 TCP 连接都不许建立');
     assert.equal(hits, 0, '服务器侧零请求');
@@ -104,8 +108,8 @@ test('解析到内网地址时一个连接都不许发出（服务器侧零连�
       called.push(url);
       return { ok: true, status: 200 };
     });
-    kvSet('mk:webhook_url', 'http://169.254.169.254/latest/meta-data/');
-    notify('order.escrowed', o.id);
+    await setWebhookConfig(shopRef.value, { url: 'http://169.254.169.254/latest/meta-data/' });
+    notify('order.escrowed', o.orderNo);
     await sleep(250);
     assert.equal(called.length, 0, '云元数据地址：注入的发送器零调用（校验先于发送）');
   } finally {
@@ -146,12 +150,12 @@ test('默认发送器就是钉住实现：不可解析主机名 + 钉住地址�
 });
 
 test('deliver 的最终结算：成功 true、重试耗尽 false、未配置 URL false（3xx 直接算失败）', async () => {
-  const o = insertOrder();
+  const o = await insertOrder();
   resetWebhookStatus();
-  kvSet('mk:webhook_url', 'https://93.184.216.34/hook');
+  await setWebhookConfig(shopRef.value, { url: 'https://93.184.216.34/hook' });
 
   setWebhookSender(async () => ({ ok: true, status: 200 }));
-  assert.equal(await notify('order.escrowed', o.id), true, '送达 ⇒ true（调用方才写幂等标记）');
+  assert.equal(await notify('order.escrowed', o.orderNo), true, '送达 ⇒ true（调用方才写幂等标记）');
 
   // 重试耗尽：3 次尝试（首次 + 2 次重试）后结算 false —— alertAck 据此"不写标记、下次再投"
   let attempts = 0;
@@ -159,28 +163,32 @@ test('deliver 的最终结算：成功 true、重试耗尽 false、未配置 URL
     attempts += 1;
     throw new Error('connect ECONNREFUSED');
   });
-  assert.equal(await notify('order.escrowed', o.id), false, '重试耗尽 ⇒ false');
+  assert.equal(await notify('order.escrowed', o.orderNo), false, '重试耗尽 ⇒ false');
   assert.equal(attempts, 3, '共 3 次尝试（首次 + 2 次重试）');
 
   // 3xx：语义与原来一致（redirect:manual + 显式拒绝），错误文案要能指导店主改成直达地址
   setWebhookSender(async () => ({ ok: false, status: 302 }));
-  assert.equal(await notify('order.escrowed', o.id), false, '3xx ⇒ 失败（不跟随重定向）');
-  assert.match(String(webhookStatus().last.error), /重定向已禁用/);
+  assert.equal(await notify('order.escrowed', o.orderNo), false, '3xx ⇒ 失败（不跟随重定向）');
+  /*
+    投递日志**按店铺过滤**（见 webhook.js 的 webhookStatus）：不传店铺编号只会拿到空列表，
+    而"最近一次投递失败的原因"正是店主面板要显示的那一条。旧形状只有一个全局日志，故不必传。
+  */
+  assert.match(String((await webhookStatus(shopRef.value)).last.error), /重定向已禁用/);
 
   // 未配置 URL：false（**不是** true）——标记不写，店主以后配好 webhook 还能收到这条历史告警
-  kvSet('mk:webhook_url', '');
+  await setWebhookConfig(shopRef.value, { url: '' });
   let called = 0;
   setWebhookSender(async () => {
     called += 1;
     return { ok: true, status: 200 };
   });
-  assert.equal(await notify('order.escrowed', o.id), false);
-  assert.equal(await notifyRaw('order.hold_missing', { orderId: o.id }), false);
+  assert.equal(await notify('order.escrowed', o.orderNo), false);
+  assert.equal(await notifyRaw('order.hold_missing', { orderId: o.orderNo }), false);
   assert.equal(called, 0, '未配置 URL：零调用');
 
   // 本地查不到订单（payload 组装不出来）：同样视同未投递，不产生外呼
   assert.equal(await notify('order.escrowed', 'no-such-order'), false);
   assert.equal(called, 0);
   setWebhookSender(null);
-  kvSet('mk:webhook_url', '');
+  await setWebhookConfig(shopRef.value, { url: '' });
 });

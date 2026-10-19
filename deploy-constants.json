@@ -3,9 +3,21 @@
     "部署期常量：**唯一真相**。deploy.sh（Linux/macOS，容器路径）与 deploy.ps1（Windows，原生路径）都从这里读。",
     "为什么要有这个文件：两条部署路径必须装出**同一个**节点——接错托管合约的表现是静默的（节点照常启动、",
     "商品照常展示，只有买家付款路径指向别处），而两边各写一份常量迟早会在换批时分叉。",
-    "改这里的规矩与 deploy.sh 文件头写的一致：Escrow / Registry / startBlock 三个值必须**同批**换。",
+    "contracts 的五个值必须**同批**换：escrow / registry / blocklist / startBlock / escrowCodeHash。",
+    "blocklist 是 Registry 构造函数的 immutable（先发 Escrow，再发 Blocklist(owner, escrow)，再把它的地址传给 Registry），空值或",
+    "无代码地址会让 Registry 构造直接 revert BlocklistNotConfigured ⇒ 它没有\"以后再加\"这条路径；",
+    "节点读它做地址类拒单与商品类过滤，留空的代价是这两道闸整体不生效且不报错。",
+    "escrowCodeHash = `cast keccak $(cast code <ESCROW>)`，与 Registry 和 Staking 各自锚定的那个哈希是同一个值；",
+    "它同时被 node/test/deploy-plan.test.js 拿来与本地编译产物比对——那是「仓库记的地址与本批源码是不是同一代」",
+    "的**唯一机械判据**（改合约而忘了换批时，那条测试会当场变红，而不是等部署上线后由节点自检发现）。",
     "appDefaults 是两条路径都必须写进 .env 的运行参数：写偏了不会报错，只会让某个后台任务悄悄不跑、",
-    "或者让同一家店在两种宿主上行为不同——所以它也算常量，不算'各自的本机状态'。"
+    "或者让同一家店在两种宿主上行为不同——所以它也算常量，不算'各自的本机状态'。",
+    "runtime.stopGraceSeconds 是**容器**的停机宽限期（docker run --stop-timeout），它必须**大于**",
+    "appDefaults.MK_SHUTDOWN_DRAIN_MS（节点自己等在途请求的上限）：两者相等或更短时，优雅关闭正好被",
+    "SIGKILL 截断——而日志里已经打了'已关闭'，于是没人会去查。node/test/deploy-plan.test.js 守这条不等式。",
+    "contracts 五项必须与主网当批部署结果一致：escrow / registry / blocklist / startBlock / escrowCodeHash。",
+    "2026-10-19 批次：Escrow 0x3926…、Registry 0x85a5…、Blocklist 0x534b…、startBlock 47931055、",
+    "escrowCodeHash 0x8bb01a…（由 scripts/deploy-mainnet.cjs 部署并在链上复核）。"
   ],
   "network": {
     "rpcUrl": "https://mainnet.bityuan.com/eth",
@@ -13,14 +25,17 @@
     "frontendOrigin": "https://fedmall.bityuan.com"
   },
   "contracts": {
-    "escrow": "0x9c2cdf4079b499b8537da47ed9488966efa2531c",
-    "registry": "0xd660917e82101609ee686699266b17faca6cdfc2",
-    "startBlock": 47845799
+    "escrow": "0x3926a983b9d3a514ddb6fbbef2d944a4d9d26f85",
+    "registry": "0x85a545ac2039bc312e1e7fe0b3dcbf2dea58cc87",
+    "blocklist": "0x534b8f46d7940ce0ad6a2ca932cba77111e20054",
+    "startBlock": 47931055,
+    "escrowCodeHash": "0x8bb01aaea40ea662de68f481e72403bf36bfa93d78375dcaa29049d1f778f198"
   },
   "runtime": {
     "containerPort": 8090,
     "serviceName": "marketplace-node",
-    "image": "marketplace-node:latest"
+    "image": "marketplace-node:latest",
+    "stopGraceSeconds": 30
   },
   "appDefaults": {
     "MK_ESCROW_TIMEOUT_BLOCKS": 120960,
@@ -34,6 +49,7 @@
     "MK_DRAFT_TTL_MINUTES": 30,
     "MK_REVIEW_TTL_DAYS": 30,
     "MK_TOKEN_TTL": 86400,
-    "MK_SIWE_TTL": 600
+    "MK_SIWE_TTL": 600,
+    "MK_SHUTDOWN_DRAIN_MS": 10000
   }
 }

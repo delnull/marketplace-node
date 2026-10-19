@@ -9,7 +9,7 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const stranger = Wallet.createRandom();
 
@@ -32,7 +32,7 @@ before(async () => {
   const mk = async (title) => {
     const res = await request(app)
       .post('/api/products')
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
       .send(productPayload({ kind: 'physical', title, priceUsdtMicro: 88_000_000 }))
       .expect(200);
     assertOk(res);
@@ -44,7 +44,7 @@ before(async () => {
 
   const oa = await request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slugA })
     .expect(200);
   assertOk(oa);
@@ -52,7 +52,7 @@ before(async () => {
   for (const s of [slugB, slugC]) {
     const r = await request(app)
       .post('/api/orders')
-      .set('Authorization', `Bearer ${strangerToken}`)
+      .set('Authorization', `Bearer ${strangerToken}`).set('X-Mk-Shop', shopRef.value)
       .send({ productSlug: s })
       .expect(200);
     assertOk(r);
@@ -62,7 +62,7 @@ before(async () => {
 async function search(q, token = ownerToken) {
   const res = await request(app)
     .get(`/api/orders/seller?q=${encodeURIComponent(q)}`)
-    .set('Authorization', `Bearer ${token}`)
+    .set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(res);
   return res.body.data;
@@ -85,7 +85,7 @@ test('q：买家地址精确命中；商品标题子串命中；无词 0 命中'
 });
 
 test('q：% 通配符按字面量处理——仅命中标题含字面 % 的丙单（修复前命中全部 3 单）', async () => {
-  const all = await request(app).get('/api/orders/seller').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const all = await request(app).get('/api/orders/seller').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.ok(all.body.data.total >= 3, '本文件至少存在 3 张草稿单');
 
   const pct = await search('%');
@@ -107,12 +107,12 @@ test('q：% 通配符按字面量处理——仅命中标题含字面 % 的丙�
 });
 
 test('q：空白拒绝、超 200 字符拒绝（业务错误 code=1）；买家调用 HTTP 403', async () => {
-  const blank = await request(app).get('/api/orders/seller?q=%20%20').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const blank = await request(app).get('/api/orders/seller?q=%20%20').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.equal(blank.body.code, 1, '空白 q 业务拒绝');
   const long = await request(app)
     .get('/api/orders/seller?q=' + encodeURIComponent('长'.repeat(201)))
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.equal(long.body.code, 1, '超长 q 业务拒绝');
-  await request(app).get('/api/orders/seller?q=usb').set('Authorization', `Bearer ${buyerToken}`).expect(403);
+  await request(app).get('/api/orders/seller?q=usb').set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(403);
 });

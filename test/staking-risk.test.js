@@ -14,7 +14,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { Interface } from 'ethers';
-import { makeCtx, assertOk } from './setup.mjs';
+import { makeCtx, assertOk, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request } = ctx;
@@ -80,7 +80,8 @@ test('未配置 MK_REGISTRY_ADDRESS：available=false + reason，且不下发任
 const REGISTRY_ABI = new Interface([
   'function minStakeToRegister() view returns (uint256)',
   'function stakingContract() view returns (address)',
-  'function getActiveNodeOperators() view returns (address[])',
+  // 只声明被测模块会读的那一个（模块侧同款纪律）：`getActiveNodes()` 取 operator 字段
+  'function getActiveNodes() view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code)[])',
 ]);
 const STAKING_ABI = new Interface(['function poolOf(address operator) view returns (uint256)']);
 
@@ -105,8 +106,19 @@ function handleRpc(j) {
     if (selector === REGISTRY_ABI.getFunction('stakingContract').selector) {
       return { result: REGISTRY_ABI.encodeFunctionResult('stakingContract', [chain.staking]) };
     }
-    if (selector === REGISTRY_ABI.getFunction('getActiveNodeOperators').selector) {
-      return { result: REGISTRY_ABI.encodeFunctionResult('getActiveNodeOperators', [chain.operators]) };
+    if (selector === REGISTRY_ABI.getFunction('getActiveNodes').selector) {
+      // 本读数的判据是"谁在册"，所以只有 operator 字段需要有值；其余按空串/零填
+      const rows = chain.operators.map((op) => [
+        op,
+        '',
+        '0x0000000000000000000000000000000000000000',
+        1n,
+        1n,
+        true,
+        false,
+        '',
+      ]);
+      return { result: REGISTRY_ABI.encodeFunctionResult('getActiveNodes', [rows]) };
     }
   }
   if (to === STAKING.toLowerCase() && selector === STAKING_ABI.getFunction('poolOf').selector) {

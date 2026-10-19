@@ -16,7 +16,7 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { makeCtx, login, assertOk } from './setup.mjs';
+import { makeCtx, login, assertOk, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -37,10 +37,12 @@ let seq = 0;
 const ev = (name, at) => ({ name, txHash: '0x' + 'f'.repeat(64), block: 1, at });
 
 /**
- * 直接插订单行（本文件关心**读数的口径**，不是下单流程）。
- * `paid: true` = 有链上支付凭证（**样本判据**）；`events: null` = 事件史从未落过。
+ * 直接插订单行（本文件关心**读数的口径**，不是下单流程）。行形状交给 setup.mjs 的 `insertOrder`
+ * （`paid_tx_hash` / `refund_*` / `after_sale_*` / 事件史住在 `order_chain`）。
+ * `paid: true` = 有链上支付凭证（**样本判据**）；不给 `events` = 事件史那一列停在默认的空数组
+ * （它现在是 `NOT NULL DEFAULT ('[]')`，"没有事件"就是空数组）。
  */
-function insertOrder({
+async function insertOrder({
   buyerAddr = buyer.address.toLowerCase(),
   status = 'confirmed',
   paid = true,
@@ -52,35 +54,28 @@ function insertOrder({
   afterSaleOpenedAt = null,
 } = {}) {
   seq += 1;
-  const id = `bs-${seq}`;
-  const now = Date.now();
-  db.prepare(
-    `INSERT INTO orders (id, product_slug, product_snapshot, snapshot_hash, sku_key, buyer, seller,
-       amount_wei, usdt_micro, bty_usdt_rate, status, escrow_order_id, paid_tx_hash,
-       refund_status, refund_requested_at, refunded_amount_wei,
-       after_sale_status, after_sale_opened_at, onchain_events, created_at, updated_at)
-     VALUES (?, 'p-bs', '{}', '0x00', '', ?, ?, '1000', 1000000, '0.1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    buyerAddr,
-    SELLER,
+  return await insertOrderRow(db, {
+    buyer: buyerAddr,
+    seller: SELLER,
     status,
-    `0x${String(seq).padStart(64, '0')}`, // 草稿期就已生成（不能当"成交"判据）
-    paid ? `0x${String(seq).padStart(64, 'a')}` : null,
+    productSlug: 'p-bs',
+    amountWei: '1000',
+    usdtMicro: 1000000,
+    btyUsdtRate: '0.1',
+    // 草稿期就已生成链上单号（所以它不能当"成交"判据）
+    escrowOrderId: `0x${String(seq).padStart(64, '0')}`,
+    paidTxHash: paid ? `0x${String(seq).padStart(64, 'a')}` : null,
     refundStatus,
     refundRequestedAt,
     refundedAmountWei,
     afterSaleStatus,
     afterSaleOpenedAt,
-    events === null ? null : JSON.stringify(events),
-    now,
-    now
-  );
-  return { id };
+    events,
+  });
 }
 
 const getSignal = (address = buyer.address, token = ownerToken) =>
-  request(app).get(`/api/shop/buyer-signal?address=${address}`).set('Authorization', `Bearer ${token}`);
+  request(app).get(`/api/shop/buyer-signal?address=${address}`).set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value);
 
 test('鉴权：ownerOnly（无令牌 401 / 买家令牌 403），地址非法一律明确拒绝', async () => {
   await request(app).get(`/api/shop/buyer-signal?address=${buyer.address}`).expect(401);
@@ -117,11 +112,11 @@ test('纯函数：空样本 → 计数全 0 + 比率全 null + 样本不足说�
 test('样本判据是"真实发生过托管"（paid_tx_hash），草稿/取消单只进 localOrders 不进分母', async () => {
   const b = Wallet.createRandom().address.toLowerCase();
   const at = Date.now() - 5000;
-  insertOrder({ buyerAddr: b, status: 'confirmed', paid: true, events: [ev('OrderCreated', at), ev('ReceiptConfirmed', at + 1)] });
+  await insertOrder({ buyerAddr: b, status: 'confirmed', paid: true, events: [ev('OrderCreated', at), ev('ReceiptConfirmed', at + 1)] });
   // 三张从未付款的单：草稿期就已生成 escrow_order_id，拿它当"成交"会把它们算进分母
-  insertOrder({ buyerAddr: b, status: 'draft', paid: false });
-  insertOrder({ buyerAddr: b, status: 'cancelled', paid: false });
-  insertOrder({ buyerAddr: b, status: 'escrowed', paid: false });
+  await insertOrder({ buyerAddr: b, status: 'draft', paid: false });
+  await insertOrder({ buyerAddr: b, status: 'cancelled', paid: false });
+  await insertOrder({ buyerAddr: b, status: 'escrowed', paid: false });
   const d = (await getSignal(b)).body.data;
   assert.equal(d.localOrders, 4, '本地订单数如实给（含未付款的）');
   assert.equal(d.sample, 1, '样本 = 真实发生过托管的单（paid_tx_hash 非空）');
@@ -133,14 +128,14 @@ test('三态：已终局但没有事件史的单进 unverified（不计入 dispu
   const b = Wallet.createRandom().address.toLowerCase();
   const at = Date.now() - 9000;
   // 1 张可复算的争议单
-  insertOrder({
+  await insertOrder({
     buyerAddr: b,
     status: 'disputed',
     events: [ev('OrderCreated', at), ev('DisputeRequested', at + 1)],
   });
-  // 2 张读不到的终局单：事件史为 NULL / 事件史存在但没有 OrderCreated/DisputeRequested
-  insertOrder({ buyerAddr: b, status: 'settled', events: null });
-  insertOrder({ buyerAddr: b, status: 'refunded', events: [ev('PartialRefundAccepted', at + 2)] });
+  // 2 张读不到的终局单：事件史为空数组（那一列从未写过）/ 事件史存在但没有 OrderCreated/DisputeRequested
+  await insertOrder({ buyerAddr: b, status: 'settled', events: null });
+  await insertOrder({ buyerAddr: b, status: 'refunded', events: [ev('PartialRefundAccepted', at + 2)] });
   const d = (await getSignal(b)).body.data;
   assert.equal(d.sample, 3);
   assert.equal(d.disputed, 1, '读不到的那两张**不进**分子（也不当作 0 争议）');
@@ -158,7 +153,7 @@ test('unverified 与 disputed 是两件独立的事：丢了 OrderCreated 镜像
     镜像缺失与争议史互相独立：知道"它争过"并不会让"复算链条断了一截"这件事消失
     （这正是本读数自称下界的那个原因）。
   */
-  insertOrder({ buyerAddr: b, status: 'disputed', events: [ev('DisputeRequested', at)] });
+  await insertOrder({ buyerAddr: b, status: 'disputed', events: [ev('DisputeRequested', at)] });
   const d = (await getSignal(b)).body.data;
   assert.equal(d.disputed, 1, '争议计数照给（判据是状态 ∨ 事件）');
   assert.equal(d.unverified.terminalWithoutEventMirror, 1, '同一张单也要出现在"镜像缺失"里');
@@ -168,41 +163,43 @@ test('计数可独立复算：与"按链上事实手算"的结果逐项相同（
   const b = Wallet.createRandom().address.toLowerCase();
   const at = Date.now() - 60_000;
   // ① 买家确认收货；② 退款申请后卖家全额退款（无争议）；③ 仲裁拆分（判卖家，退了一部分）；④ 超时释放；⑤ 在途售后案件
-  insertOrder({ buyerAddr: b, status: 'confirmed', events: [ev('OrderCreated', at), ev('ReceiptConfirmed', at + 1)] });
-  insertOrder({
+  await insertOrder({ buyerAddr: b, status: 'confirmed', events: [ev('OrderCreated', at), ev('ReceiptConfirmed', at + 1)] });
+  await insertOrder({
     buyerAddr: b,
     status: 'refunded',
     refundStatus: 'requested',
-    refundRequestedAt: at + 2,
+    refundRequestedAt: new Date(at + 2),
     refundedAmountWei: '1000',
     events: [ev('OrderCreated', at), ev('RefundRequested', at + 2), ev('RefundApproved', at + 3)],
   });
-  insertOrder({
+  await insertOrder({
     buyerAddr: b,
     status: 'settled',
     refundedAmountWei: '400',
     events: [ev('OrderCreated', at), ev('DisputeRequested', at + 4), ev('Arbitrated', at + 5)],
   });
-  insertOrder({ buyerAddr: b, status: 'expired', events: [ev('OrderCreated', at), ev('OrderExpiredReleased', at + 6)] });
-  insertOrder({
+  await insertOrder({ buyerAddr: b, status: 'expired', events: [ev('OrderCreated', at), ev('OrderExpiredReleased', at + 6)] });
+  await insertOrder({
     buyerAddr: b,
     status: 'confirmed',
     afterSaleStatus: 'open',
-    afterSaleOpenedAt: at + 7,
+    afterSaleOpenedAt: new Date(at + 7),
     events: [ev('OrderCreated', at), ev('ReceiptConfirmed', at + 1)],
   });
 
   const d = (await getSignal(b)).body.data;
   // 手算（独立复算：只用本地行 + 链上事实的定义）
-  const rows = db.prepare('SELECT * FROM orders WHERE buyer = ? AND paid_tx_hash IS NOT NULL').all(b);
+  const rows = await db.all('SELECT * FROM v_orders WHERE buyer = ? AND paid_tx_hash IS NOT NULL', b);
   const manual = {
     sample: rows.length,
     settledToSeller: rows.filter((r) => ['confirmed', 'settled', 'expired'].includes(r.status)).length,
     refundedToBuyer: rows.filter((r) => BigInt(r.refunded_amount_wei || '0') > 0n).length,
     confirmed: rows.filter((r) => r.status === 'confirmed').length,
-    refundRequested: rows.filter((r) => Number(r.refund_requested_at) > 0).length,
-    disputed: rows.filter((r) => r.status === 'disputed' || String(r.onchain_events || '').includes('DisputeRequested')).length,
-    expiredReleased: rows.filter((r) => r.status === 'expired' || String(r.onchain_events || '').includes('OrderExpiredReleased')).length,
+    refundRequested: rows.filter((r) => r.refund_requested_at instanceof Date).length,
+    // 事件史是 JSON 列：驱动读回来**已是数组**（旧形状是 TEXT，得自己 JSON.parse）。
+    // `String(数组)` 只会得到 "[object Object]"，所以判据必须逐条看 name——旧写法会静默恒假。
+    disputed: rows.filter((r) => r.status === 'disputed' || (r.onchain_events || []).some((e) => e?.name === 'DisputeRequested')).length,
+    expiredReleased: rows.filter((r) => r.status === 'expired' || (r.onchain_events || []).some((e) => e?.name === 'OrderExpiredReleased')).length,
     afterSaleOpen: rows.filter((r) => r.after_sale_status === 'open').length,
   };
   assert.equal(d.sample, manual.sample);
@@ -227,8 +224,10 @@ test('计数可独立复算：与"按链上事实手算"的结果逐项相同（
 test('售后案件：afterSaleOpen/Closed 取本地列（案件不动 orders.status）', async () => {
   const b = Wallet.createRandom().address.toLowerCase();
   const at = Date.now() - 3000;
-  insertOrder({ buyerAddr: b, status: 'confirmed', afterSaleStatus: 'open', afterSaleOpenedAt: at, events: [ev('OrderCreated', at)] });
-  insertOrder({ buyerAddr: b, status: 'settled', afterSaleStatus: 'closed', afterSaleOpenedAt: at - 1000, events: [ev('OrderCreated', at - 1000)] });
+  // 两个时刻列都是 DATETIME(3)：传毫秒整数会被 MySQL 当数字字面量解析（写进荒谬时间且不报错）。
+  // `events` 里的 `at` 是 JSON 文档里的毫秒数，不折。
+  await insertOrder({ buyerAddr: b, status: 'confirmed', afterSaleStatus: 'open', afterSaleOpenedAt: new Date(at), events: [ev('OrderCreated', at)] });
+  await insertOrder({ buyerAddr: b, status: 'settled', afterSaleStatus: 'closed', afterSaleOpenedAt: new Date(at - 1000), events: [ev('OrderCreated', at - 1000)] });
   const d = (await getSignal(b)).body.data;
   assert.equal(d.afterSaleOpen, 1);
   assert.equal(d.afterSaleClosed, 1);
@@ -239,9 +238,9 @@ test('只做本店视角：其它买家的单不进读数，且响应自报 scop
   const mine = Wallet.createRandom().address.toLowerCase();
   const other = Wallet.createRandom().address.toLowerCase();
   const at = Date.now() - 3000;
-  insertOrder({ buyerAddr: mine, status: 'disputed', events: [ev('OrderCreated', at), ev('DisputeRequested', at + 1)] });
+  await insertOrder({ buyerAddr: mine, status: 'disputed', events: [ev('OrderCreated', at), ev('DisputeRequested', at + 1)] });
   for (let i = 0; i < 5; i++) {
-    insertOrder({ buyerAddr: other, status: 'disputed', events: [ev('OrderCreated', at), ev('DisputeRequested', at + 1)] });
+    await insertOrder({ buyerAddr: other, status: 'disputed', events: [ev('OrderCreated', at), ev('DisputeRequested', at + 1)] });
   }
   const d = (await getSignal(mine)).body.data;
   assert.equal(d.localOrders, 1, '只数本店与该买家的单');
@@ -255,7 +254,7 @@ test('只做本店视角：其它买家的单不进读数，且响应自报 scop
 test('文案纪律：只有计数与比率，没有任何判定词；并显式声明"可疑信号，不是结论"', async () => {
   const b = Wallet.createRandom().address.toLowerCase();
   const at = Date.now() - 2000;
-  insertOrder({ buyerAddr: b, status: 'refunded', refundStatus: 'requested', refundRequestedAt: at, refundedAmountWei: '1000', events: [ev('OrderCreated', at)] });
+  await insertOrder({ buyerAddr: b, status: 'refunded', refundStatus: 'requested', refundRequestedAt: new Date(at), refundedAmountWei: '1000', events: [ev('OrderCreated', at)] });
   const d = (await getSignal(b)).body.data;
   const text = JSON.stringify(d);
   for (const word of ['骗子', '恶意', '欺诈', '黑名单', '拉黑', '封禁该']) {
@@ -271,7 +270,7 @@ test('读数不触链：RPC 指向必然拒绝的端口时照样给出完整读�
   assert.match(String(cfg.chain.rpcUrl), /127\.0\.0\.1:1/, '本套件的前提是 RPC 不可达（不会真的触网）');
   const b = Wallet.createRandom().address.toLowerCase();
   const at = Date.now() - 5000;
-  insertOrder({ buyerAddr: b, status: 'confirmed', events: [ev('OrderCreated', at), ev('ReceiptConfirmed', at + 1)] });
+  await insertOrder({ buyerAddr: b, status: 'confirmed', events: [ev('OrderCreated', at), ev('ReceiptConfirmed', at + 1)] });
   const res = await getSignal(b);
   assertOk(res);
   assert.equal(res.body.data.sample, 1, '链不可用不影响本读数（它只读本地镜像）');

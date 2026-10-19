@@ -12,10 +12,10 @@
  *    `poolEmpty` **完全一致**（见 poolShortfallOf），否则会出现"面板显示缺货但没告警"或反之；
  *  - 两条触发路径（paid 快路径与 watcher 事件回写）都要告警，只能有一份实现。
  *
- * 告警只发一次（kv 标记，键按本地订单 id，与 escrowWatcher 的 order.hold_missing 同款）：
+ * 告警只发一次（`order_alerts(order_id, kind='pool_empty')` 的主键去重，见 alertAck.js）：
  * 池子空了是持续状态，每轮轮询都推一次会把店主的机器人刷爆。
- * 但标记**只在投递成功后**才写（2026-09 修复，见 alertAck.js）：投递失败/未配置通知地址时
- * 不写标记，下一轮复查自然重试——"已收款却无货可交"这条必须至少送达一次。
+ * 但预占行**只在投递成功后**才留下（2026-09 修复，见 alertAck.js）：投递失败/未配置通知地址时
+ * 预占被释放，下一轮复查自然重试——"已收款却无货可交"这条必须至少送达一次。
  * payload 只含订单号/链上单号/原因——不含收货信息、买家地址（与 webhook.js 的隐私边界一致）。
  *
  * 快照读不到时**不当作"没有池"**（2026-10 修复）：订单快照 `orders.product_snapshot` 解析失败
@@ -23,19 +23,27 @@
  * （买家钱已上链、货交不出，却没有任何人被告知）。现在走"读不到池快照"的分支：
  * console.warn 指明哪张快照/哪一单/什么错，且在 escrowed（钱已锁）时照样**至少告警一次**
  * （reason 如实说"读不到快照、无法确认可交付"，**不编**缺货数量）。见 poolShortfallOf。
- * 代价（如实写）：读不到与缺货共用同一个幂等键（每单至多一次成功投递）——快照后来修好、
+ * 代价（如实写）：读不到与缺货共用同一个去重行（每单至多一次成功投递）——快照后来修好、
  * 这一单确实缺货时不会再补推一条；第一次的告警已经要求店主人工核对本单，故不再区分两条。
+ *
+ * ## 键的形状（2026-10 MySQL 重设计）
+ *
+ * 入参一律是**订单内部键** `orders.id`（调用方手里那一行叫 `v_orders.order_id`，路由传的就是它）：
+ * 去重表 `order_alerts.order_id` 是外键指向 `orders(id)`，它**不是**订单号也不是链上单号。
+ * 旧实现按"本地 id 或链上单号"两种拼写查同一个订单，现在只剩一种——链上单号是
+ * `order_chain.escrow_order_id`，要按它查就得先 JOIN 一次，而两条调用路径（/paid 与 watcher）
+ * 手里都已经握着本地行，没有理由再留第二种拼写。
+ *
+ * 整单读走读模型 `v_orders`（`orders` + `order_shipping` + `order_chain` 三表合一）：
+ * 缺货判据要同时看到订单状态、数量、商品快照与链上单号，视图一次给全。
  */
 import { getDb } from './db.js';
 import { notifyRaw } from './webhook.js';
 import { alertOnceDelivered } from './alertAck.js';
 
-/** 已告警标记的 kv 前缀（键 = 前缀 + 本地订单 id） */
-const ALERT_KEY_PREFIX = 'mk:order_pool_empty:';
-
 /**
  * 池式交付的缺口核算（**唯一实现**；卖家面板 poolEmpty 与主动告警共用）。
- * @param {object} order orders 行
+ * @param {object} order `v_orders` 行（需 order_id / order_no / status / quantity / product_id / product_snapshot）
  * @returns {{poolBacked:boolean|null, kind:'digital'|'nft'|null, need:number, available:number, short:boolean}}
  *  need：digital 一次性需 quantity 个；nft 按剩余需求 = quantity − 已交付行数（支持分批交付）。
  *  available：池内 status='unused' 的资源数（池式商品无限量，池即库存）。
@@ -51,7 +59,7 @@ const ALERT_KEY_PREFIX = 'mk:order_pool_empty:';
  *  short：**本单是否需要店主处置**。确证池式且 available < need ⇒ true；
  *     读不到快照且已 escrowed ⇒ true（无法确认可交付）；其余（确证够货/确证非池式/非 escrowed）⇒ false。
  */
-export function poolShortfallOf(order) {
+export async function poolShortfallOf(order) {
   const none = { poolBacked: false, kind: null, need: 0, available: 0, short: false };
   if (!order) return none;
   let snap = null;
@@ -75,7 +83,7 @@ export function poolShortfallOf(order) {
     */
     const raw = order.product_snapshot;
     console.warn(
-      `[poolAlert] 读不到订单快照 orders.product_snapshot（order=${order.id} status=${order.status} 原文=${
+      `[poolAlert] 读不到订单快照 orders.product_snapshot（order=${order.order_no} status=${order.status} 原文=${
         raw === undefined ? '(列缺失)' : JSON.stringify(String(raw).slice(0, 120))
       }）：${snapError?.message || '不是 JSON 对象'}——不当作"该单没有池"（那会让缺货告警与面板 poolEmpty 一起静默消失）`
     );
@@ -88,16 +96,13 @@ export function poolShortfallOf(order) {
   const qty = order.quantity || 1;
   let need = qty;
   if (snap.kind === 'nft') {
-    const delivered = getDb()
-      .prepare("SELECT COUNT(*) AS c FROM order_delivery_items WHERE order_id = ? AND kind = 'nft'")
-      .get(order.id).c;
+    // 子表外键指向 orders.id（读模型里叫 order_id），不是订单号
+    const delivered = (await getDb().get("SELECT COUNT(*) AS c FROM order_delivery_items WHERE order_id = ? AND kind = 'nft'", order.order_id)).c;
     need = Math.max(0, qty - delivered);
     if (need === 0) return { poolBacked: true, kind: 'nft', need: 0, available: 0, short: false };
   }
   const table = snap.kind === 'digital' ? 'product_codes' : 'product_nft_tokens';
-  const available = getDb()
-    .prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE product_id = ? AND status = 'unused'`)
-    .get(order.product_id).c;
+  const available = (await getDb().get(`SELECT COUNT(*) AS c FROM ${table} WHERE product_id = ? AND status = 'unused'`, order.product_id)).c;
   return { poolBacked: true, kind: snap.kind, need, available, short: available < need };
 }
 
@@ -109,70 +114,77 @@ export function poolShortfallOf(order) {
  * 比真实情况更具体（真相是"读不到快照，无法确认"）。精确原因在下发它的那条 webhook 的
  * reason 与 console.warn 里；要在这张卡片上如实说"读不到"，得给 DTO 与前端加第三态。
  */
-export function isPoolEmpty(order) {
-  return poolShortfallOf(order).short;
+export async function isPoolEmpty(order) {
+  return (await poolShortfallOf(order)).short;
 }
 
 /**
  * 托管落定后的池缺口告警（每个订单至多一次**成功投递**）。
  * 供两条路径调用：POST /:id/paid 快路径（提交后）与 escrowWatcher 的 OrderCreated 分支
  * （COMMIT 之后，见 applyEvent 的 afterCommit 约定——回滚了就不该告警）。
- * 不阻塞调用方：标记在投递结算的后台任务里写（见 alertAck.js），HTTP 响应不等店主服务器。
- * @param {string} idOrEscrowId 本地订单 id 或链上 escrow_order_id
- * @returns {boolean} 本次是否已发起告警（false = 已告警过 / 投递进行中 / 非缺货场景）
+ * 不阻塞调用方：预占与释放都在 alertAck 里结算，HTTP 响应不等店主服务器。
+ * @param {number} orderId 订单**内部键**（`orders.id` / `v_orders.order_id`；见文件头的键形状说明）
+ * @returns {Promise<boolean>} 本次是否已发起告警（false = 已告过 / 投递进行中 / 非缺货场景）
  */
-export function alertPoolEmptyForOrder(idOrEscrowId) {
-  const key = String(idOrEscrowId || '');
-  if (!key) return false;
+export async function alertPoolEmptyForOrder(orderId) {
+  const id = Number(orderId);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new Error(`[poolAlert] 需要订单内部键（orders.id），收到 ${JSON.stringify(orderId)}`);
+  }
   const db = getDb();
-  // 优先按本地 id 命中（paid 路径），其次按链上单号（watcher 路径）
-  const order =
-    db.prepare('SELECT * FROM orders WHERE id = ?').get(key) ||
-    db.prepare('SELECT * FROM orders WHERE escrow_order_id = ?').get(key.toLowerCase());
+  const order = await db.get('SELECT * FROM v_orders WHERE order_id = ?', id);
   if (!order) return false;
-  const s = poolShortfallOf(order);
+  const s = await poolShortfallOf(order);
   if (!s.short) return false; // 池子够（或已交付/已终局）：不是缺货告警场景
   /*
     两种 short 的措辞必须分开（**读不到 ≠ 缺货**）：读不到快照时若照抄"仅剩 X 个、仍需 Y 个"，
     就是拿 0/0 编了一个具体的缺货数字给店主——那正是本模块要消灭的东西。
   */
   const readUnknown = s.poolBacked === null;
-  try {
-    const short = order.id.slice(0, 8);
-    return alertOnceDelivered({
-      ackKey: ALERT_KEY_PREFIX + order.id,
-      label: '[poolAlert]',
-      what: readUnknown
-        ? `（order=${short}…，快照读不到：无法确认可交付资源）`
-        : `（order=${short}…，缺货：可用 ${s.available} / 需 ${s.need}）`,
-      send: () =>
-        notifyRaw('order.pool_empty', {
-          orderId: order.id,
-          escrowOrderId: order.escrow_order_id || null,
-          /*
-            事件类型沿用 order.pool_empty（店主机器人按它订阅"钱已付、可能交不出货"这一类待办），
-            但 reason 必须如实说明是哪一种：读不到快照时**不报**缺货数量（那会是编的）。
-          */
-          reason: readUnknown
-            ? `买家已托管付款，但本单的商品快照读不到（orders.product_snapshot 无法解析）——` +
-              `无法确认这是不是池式交付、也无法核对可交付资源：请人工核对该单（读订单详情/商品来源），` +
-              `确认无货可交就立即补货或与买家协商退款，勿让订单悬置`
-            : `买家已托管付款，但该${s.kind === 'digital' ? '数字兑换码' : 'NFT tokenId'}池仅剩 ${s.available} 个可用资源、` +
-              `本单仍需 ${s.need} 个——请立即补货（导入${s.kind === 'digital' ? '兑换码' : ' tokenId'}）或与买家协商退款，勿让订单悬置`,
-        }),
-    });
-  } catch (e) {
-    // 告警失败不影响订单状态（console 已留痕）；未写标记 ⇒ 下次复查会再试
-    console.error(`[poolAlert] 缺货告警发送失败（order=${order.id.slice(0, 8)}…）:`, e?.message || e);
-    return false;
-  }
+  const short = String(order.order_no).slice(0, 8);
+  /*
+    payload 的 `orderId` 是**对外订单号**（order_no）：接收方（店主机器人/对账脚本）拿它去查单，
+    而内部键 `orders.id` 不是任何人的标识（见 db.js 的 v_orders 说明）。去重行用的是内部键。
+  */
+  return await alertOnceDelivered({
+    orderId: id,
+    kind: 'pool_empty',
+    label: '[poolAlert]',
+    what: readUnknown
+      ? `（order=${short}…，快照读不到：无法确认可交付资源）`
+      : `（order=${short}…，缺货：可用 ${s.available} / 需 ${s.need}）`,
+    send: () =>
+      notifyRaw('order.pool_empty', {
+        // ⚠️ 必填：`webhook.deliver()` 按 `payload.shopCode` 查 `shop_webhook`（一行一店）；
+        // 缺了它投递会一次都不发就 resolve(false)，而日志写"未配置通知地址"（误导）。
+        shopCode: order.shop_code,
+        orderId: order.order_no,
+        escrowOrderId: order.escrow_order_id || null,
+        /*
+          事件类型沿用 order.pool_empty（店主机器人按它订阅"钱已付、可能交不出货"这一类待办），
+          但 reason 必须如实说明是哪一种：读不到快照时**不报**缺货数量（那会是编的）。
+        */
+        reason: readUnknown
+          ? `买家已托管付款，但本单的商品快照读不到（orders.product_snapshot 无法解析）——` +
+            `无法确认这是不是池式交付、也无法核对可交付资源：请人工核对该单（读订单详情/商品来源），` +
+            `确认无货可交就立即补货或与买家协商退款，勿让订单悬置`
+          : `买家已托管付款，但该${s.kind === 'digital' ? '数字兑换码' : 'NFT tokenId'}池仅剩 ${s.available} 个可用资源、` +
+            `本单仍需 ${s.need} 个——请立即补货（导入${s.kind === 'digital' ? '兑换码' : ' tokenId'}）或与买家协商退款，勿让订单悬置`,
+      }),
+  });
 }
 
-/** 仅供测试：清掉某单的已告警标记（不改业务语义，仅让用例可重复验证"只告警一次"） */
-export function resetPoolAlertFlag(orderId) {
-  try {
-    getDb().prepare('DELETE FROM kv WHERE key = ?').run(ALERT_KEY_PREFIX + String(orderId || ''));
-  } catch {
-    /* 无库/无表时忽略 */
+/**
+ * 仅供测试：清掉某单的 `pool_empty` 去重行（不改业务语义，仅让用例可重复验证"只告警一次"）。
+ *
+ * 不做 try/catch：它是 DB 支撑的去重行，读不到库时"清标记"会**静默失效**，
+ * 而用例会因此把"重复告警"读成通过——测试辅助同样要响亮失败。
+ * @param {number} orderId 订单内部键（同 alertPoolEmptyForOrder）
+ */
+export async function resetPoolAlertFlag(orderId) {
+  const id = Number(orderId);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new Error(`[poolAlert] resetPoolAlertFlag 需要订单内部键（orders.id），收到 ${JSON.stringify(orderId)}`);
   }
+  await getDb().run("DELETE FROM order_alerts WHERE order_id = ? AND kind = 'pool_empty'", id);
 }

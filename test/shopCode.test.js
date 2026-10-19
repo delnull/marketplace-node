@@ -8,7 +8,7 @@ import { ethers } from "ethers";
 
   两种目录布局都要能跑（取决于本目录在仓库里的层级）：
     · `../../shared/shopCode.js`：上面还有别的包（contracts/、frontend/）的那种布局；
-    · `../shared/shopCode.js`：仓库里只有节点这一份代码时。
+    · `../shared/shopCode.js`：公开节点仓里只有节点这一份代码时（`node/**` 被摊到仓库根）。
   ethers 按包名解析：它是节点自己的生产依赖，两种布局下都成立。
 */
 const SHARED_URL = [
@@ -20,15 +20,62 @@ const {
   encodeShopCodeFromHash, verifyShopCode, isShopCode, isShopCodeShape, SHOP_CODE_LEN,
 } = await import(SHARED_URL.href);
 
-const REG = "0x3333333333333333333333333333333333333333";
-/** 与合约一致：keccak256(abi.encode(chainId, registry, counter)) */
-const hashOf = (seq, { chainId = 2999, registry = REG } = {}) =>
+/**
+ * **合约 fixture**——逐字来自 `contracts/test/ShopCode.t.sol` 的
+ * `testFixturesMatchJsImplementation()`（链上那一侧的 `_enc(seq) = ShopCode.encode(2999, REG, seq)`，
+ * `REG = 0x3333…3333`）。
+ *
+ * 为什么必须是**字面量**、而不是"用本文件的算法再算一遍"：下面其余用例断言的是**性质**
+ * （长度 9、互不相同、前缀分散、校验位挡敲错），而性质在两侧算法**各改各的**时候依然成立——
+ * 合约改字母表、JS 改加权和、两边各自与自己的副本一致 ⇒ 全绿，而链上铸造的编号与前端解析的
+ * 编号已经分叉，症状是"编号能查到节点、查不到店"。只有把同一组输入的**输出**钉成字符串，
+ * 两侧断言的才是同一个东西。
+ *
+ * 改动这张表的唯一合法理由：合约 fixture 变了（先改 `ShopCode.t.sol`，再同步这里）。
+ */
+const FIXTURES = [
+  // chainId  registry                                      seq   编号（合约 ShopCode.encode 的输出）
+  { chainId: 2999, registry: '0x3333333333333333333333333333333333333333', seq: 1, code: 'RRSFVVB8G' },
+  // 校验位落在扩展符号集（第 9 位是 `~`，不是 Base32 字符）：覆盖"编号第 9 位可以不是字母数字"
+  { chainId: 2999, registry: '0x3333333333333333333333333333333333333333', seq: 2, code: 'HBBG60HF~' },
+  { chainId: 2999, registry: '0x3333333333333333333333333333333333333333', seq: 3, code: 'TDN4J1K26' },
+  { chainId: 2999, registry: '0x3333333333333333333333333333333333333333', seq: 42, code: '2EGBK5NES' },
+  { chainId: 2999, registry: '0x3333333333333333333333333333333333333333', seq: 1000, code: 'ZMDZRWYWZ' },
+];
+/** fixture 的链与合约实例（上下两组用例共用，表是唯一来源） */
+const CHAIN_ID = FIXTURES[0].chainId;
+const REGISTRY = FIXTURES[0].registry;
+
+/**
+ * 序号 → 哈希输入：`keccak256(abi.encode(chainId, registry, seq))`，与合约 `ShopCode._dataOf`
+ * 同一算式（**必须是 abi.encode 补 32 字节，不是 solidityPacked**——两者哈希输入完全不同，
+ * 混用会让同一序号在链上与链下算出不同编号）。
+ *
+ * 为什么这一层留在测试里而不是收进 `shared/shopCode.js`：那份实现刻意零依赖（哈希由各运行时
+ * 用自己手上的 ethers 算好传进去），而"算什么哈希"正是跨语言对拍要对照的**输入**——把它收进
+ * 被测实现就等于让被测方自己出题。所以它是全仓 JS 侧唯一一处，且只服务下面两组用例。
+ */
+const hashOf = (seq, { chainId = CHAIN_ID, registry = REGISTRY } = {}) =>
   ethers.keccak256(
     ethers.AbiCoder.defaultAbiCoder().encode(["uint256", "address", "uint64"], [chainId, registry, seq])
   );
+/** 唯一入口：`shared/shopCode.js` 的 `encodeShopCodeFromHash`（哈希层之上的一切都归它） */
 const codeOf = (seq, env) => encodeShopCodeFromHash(hashOf(seq, env));
 
-test("店铺编号：形状、唯一、不可猜、校验位能挡住敲错", () => {
+test('店铺编号：与合约 fixture 逐字对拍（contracts/test/ShopCode.t.sol 的 5 组输入）', () => {
+  for (const { chainId, registry, seq, code } of FIXTURES) {
+    assert.equal(
+      codeOf(seq, { chainId, registry }),
+      code,
+      `(chainId=${chainId}, registry=${registry}, seq=${seq}) 的编号与合约不一致——` +
+        `两侧算法已经分叉（改算法必须同时改 ShopCode.t.sol 与本表）`
+    );
+    // 反向：合约产出的编号必须过 JS 的校验位（前端 `verifyShopCode` 挡在解析之前）
+    assert.equal(verifyShopCode(code), code, `合约产出的编号 ${code} 过不了 JS 校验位`);
+  }
+});
+
+test('店铺编号：形状、唯一、不可猜、校验位能挡住敲错', () => {
   const codes = [];
   for (let i = 1; i <= 50; i += 1) codes.push(codeOf(i));
   for (const c of codes) {
@@ -58,6 +105,7 @@ test("店铺编号：形状、唯一、不可猜、校验位能挡住敲错", ()
   }
   assert.equal(isShopCode(ok), true, "合法编号仍通过（回归：收口不得误伤正常编号）");
 
+  // 哈希掺入 chainId 与合约地址：同字节码在别的链/别处部署不会产出相同序列（防跨链撞号）
   assert.notEqual(codeOf(1), codeOf(1, { chainId: 1 }), "不同链 → 不同序列");
   assert.notEqual(
     codeOf(1),

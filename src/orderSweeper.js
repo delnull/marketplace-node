@@ -27,7 +27,7 @@
  *   （它可能刚建），因此只告警、不扫——读不到年龄就不判过期，交给人工核对（正常写入路径不产生这种行）。
  */
 import config from './config.js';
-import { getDb, txBegin, txCommit, txRollback } from './db.js';
+import { getDb, withTransaction } from './db.js';
 import { releaseHoldsForOrderIds } from './stockHold.js';
 import { bootId, monotonicNow } from './monotonicClock.js';
 
@@ -46,7 +46,7 @@ const bootStartMono = monotonicNow();
  * @param {string} [opts.boot] 本次运行标识，默认当前进程；单测注入以构造"上一次运行留下的行"
  * @param {number} [opts.bootStart] 本进程启动时的单调读数，默认模块求值那一刻（单测与之同源注入）
  */
-export function sweepExpiredDrafts({ now = monotonicNow, boot = bootId, bootStart = bootStartMono } = {}) {
+export async function sweepExpiredDrafts({ now = monotonicNow, boot = bootId, bootStart = bootStartMono } = {}) {
   const db = getDb();
   const ttlMs = config.draftTtlMinutes * 60_000;
   /*
@@ -65,7 +65,7 @@ export function sweepExpiredDrafts({ now = monotonicNow, boot = bootId, bootStar
   const anchorless = 'status = ? AND created_boot = ? AND created_mono IS NULL';
   // 本轮跳过遗留行时把原因与"什么时候能扫到"写清楚（跳过必须是可解释的，不是静默丢弃）
   if (!leftoverReady) {
-    const skipped = db.prepare(`SELECT COUNT(*) AS c FROM orders WHERE ${leftOver}`).get('draft', boot).c;
+    const skipped = (await db.get(`SELECT COUNT(*) AS c FROM orders WHERE ${leftOver}`, 'draft', boot)).c;
     if (skipped) {
       console.warn(
         `[sweeper] 本轮不扫 ${skipped} 个上一次运行遗留的草稿：它们的单调锚点属于上一次运行（跨进程不可比），` +
@@ -75,7 +75,7 @@ export function sweepExpiredDrafts({ now = monotonicNow, boot = bootId, bootStar
       );
     }
   }
-  const anchorlessCount = db.prepare(`SELECT COUNT(*) AS c FROM orders WHERE ${anchorless}`).get('draft', boot).c;
+  const anchorlessCount = (await db.get(`SELECT COUNT(*) AS c FROM orders WHERE ${anchorless}`, 'draft', boot)).c;
   if (anchorlessCount) {
     console.warn(
       `[sweeper] ${anchorlessCount} 个草稿没有任何可用的年龄下界（created_boot=本次运行而 created_mono 为空）：` +
@@ -83,41 +83,49 @@ export function sweepExpiredDrafts({ now = monotonicNow, boot = bootId, bootStar
         `（正常写入路径不会产生这种行，出现即说明该行被外部改写）`
     );
   }
-  // 先取候选（限量商品占位的草稿）：关闭后整批聚合回补占位（见 stockHold.js 释放单点契约）
-  const rows = [
-    ...db.prepare(`SELECT id FROM orders WHERE ${inBoot}`).all('draft', boot, monoCutoff),
-    ...(leftoverReady ? db.prepare(`SELECT id FROM orders WHERE ${leftOver}`).all('draft', boot) : []),
-  ];
-  if (!rows.length) return 0;
-  // 批量置 cancelled + 整批释放同事务（防进程中断半写：状态已取消而占位未回补 →
-  // 幻影占额永久滞留；释放内部事务经 SAVEPOINT 自动降级嵌套）
-  txBegin();
-  let changes = 0;
-  try {
+  /*
+    候选的读**在事务之内**且带 `FOR UPDATE`（2026-10，MySQL 迁移）。
+
+    为什么不能像旧实现那样"先在事务外读候选、再按候选批量 UPDATE + 释放占位"：候选读与写
+    之间隔着一次网络往返，而**买家可以在这一瞬间付款**——那一行随即变成 escrowed，UPDATE
+    的 `status = 'draft'` 守卫不会命中它（对，它不会被误取消），但"受影响行数 > 0"仍然成立，
+    于是旧写法会把**它的占位也一起回补**（`rows` 是事务外读到的那批 id，不是真正被取消的那批）
+    ⇒ 一笔正在付款的单子被释放了额度 ⇒ 同一件货可以再卖一次（超卖）。
+    旧实现落在 SQLite 上时不会有这个问题：单写者同步执行，读候选与写之间没有任何窗口。
+    现在把读搬进事务并锁住候选行：id 集合就是真正被取消的集合，"读到谁就释放谁"重新成立。
+    代价如实写：候选行在本次事务提交前被排他锁住（它们本来就要被改，不是额外代价）。
+  */
+  const changes = await withTransaction(async () => {
     /*
-      `updated_at` 写**墙上时间**（Date.now()），不写单调读数：它是全库公认的墙上时间列，
-      消费者拿它与"此刻的墙钟"相减（PII 保留期锚点 COALESCE(pii_erased_at, updated_at)、
-      对账 min-age、报表分窗）。写单调值会在墙钟跳变后让这一列与其它行、与消费者的 now 不同源，
-      而 PII 保留期是**不可逆**动作——宁可让它按墙钟看"还没到期"，也不要提前擦掉。
+      候选读的是 `orders` 这一张表（不是读模型 `v_orders`）：清扫只判状态与单调锚点，
+      两列都在 orders 上，而 `id` 正是下面批量 UPDATE 要用的内部键。
+      带 `FOR UPDATE` 锁住候选行——读到的 id 集合必须就是真正被取消的那一批（见上）。
+    */
+    const rows = [
+      ...(await db.all(`SELECT id FROM orders WHERE ${inBoot} FOR UPDATE`, 'draft', boot, monoCutoff)),
+      ...(leftoverReady ? await db.all(`SELECT id FROM orders WHERE ${leftOver} FOR UPDATE`, 'draft', boot) : []),
+    ];
+    if (!rows.length) return 0;
+    const ids = rows.map((r) => r.id);
+    const marks = ids.map(() => '?').join(',');
+    /*
+      `updated_at` 写**墙上时间**，而且由**服务器**盖章（`CURRENT_TIMESTAMP(3)`），不写单调读数、
+      也不接应用端时钟：它是全库公认的墙上时间列，消费者拿它与"此刻的墙钟"相减
+      （PII 保留期锚点 COALESCE(pii_erased_at, updated_at)、对账 min-age、报表分窗）。
+      写单调值会在墙钟跳变后让这一列与其它行、与消费者的 now 不同源，而 PII 保留期是
+      **不可逆**动作——宁可让它按墙钟看"还没到期"，也不要提前擦掉。
       也就是说：**判据**必须免疫跳变（上面两条 cutoff），**记录**必须保持墙钟口径（这里）。
     */
-    const at = Date.now();
-    changes =
-      db
-        .prepare(`UPDATE orders SET status = ?, updated_at = ? WHERE ${inBoot}`)
-        .run('cancelled', at, 'draft', boot, monoCutoff).changes +
-      (leftoverReady
-        ? db.prepare(`UPDATE orders SET status = ?, updated_at = ? WHERE ${leftOver}`).run('cancelled', at, 'draft', boot).changes
-        : 0);
-    if (changes > 0) {
-      // 单写者同步执行：候选即受影响行（同一条件），整批一次调用即完成全部回补
-      releaseHoldsForOrderIds(rows.map((r) => r.id));
-    }
-    txCommit();
-  } catch (e) {
-    txRollback();
-    throw e;
-  }
+    const moved = (await db.run(
+      `UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id IN (${marks})`,
+      'cancelled',
+      ...ids
+    )).changes;
+    // 释放与取消同事务（防进程中断半写：状态已取消而占位未回补 → 幻影占额永久滞留；
+    // 释放内部事务经 SAVEPOINT 自动降级嵌套，见 stockHold.js 的释放单点契约）
+    if (moved > 0) await releaseHoldsForOrderIds(ids);
+    return moved;
+  });
   if (changes > 0) {
     console.log(`[sweeper] 自动关闭 ${changes} 个超时未支付的草稿订单（TTL ${config.draftTtlMinutes} 分钟）`);
   }
@@ -125,11 +133,12 @@ export function sweepExpiredDrafts({ now = monotonicNow, boot = bootId, bootStar
 }
 
 /** 启动周期清扫（server 入口调用；幂等，重复调用仅多一个定时器）。
- *  tick 包 try/catch：清扫异常不得击穿进程（WAL 保证不脏数据，仅可用性防护）。 */
+ *  tick 是 async 且 await：`sweepExpiredDrafts` 现在全是异步库调用，不 await 的话
+ *  这个 try/catch 永远接不到异常（失败会变成 unhandled rejection，而定时器照常继续跑）。 */
 export function startOrderSweeper() {
-  const tick = () => {
+  const tick = async () => {
     try {
-      sweepExpiredDrafts();
+      await sweepExpiredDrafts();
     } catch (e) {
       console.error('[sweeper] 本轮清扫异常（下轮重试）:', e?.message || e);
     }

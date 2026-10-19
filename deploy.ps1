@@ -6,7 +6,7 @@
 #
 #  ── 为什么 Windows 不用容器（与 deploy.sh 是两条路径，不是两个实现）───────────
 #  节点本身**零 POSIX 依赖**（已实测：Windows 上 `node src/server.js` 直接起、/healthz 返回
-#  code:0、SQLite + WAL 正常落盘、三个依赖 express/cors/ethers 全是纯 JS，`node:sqlite` 是内置的）。
+#  code:0、依赖 express/cors/ethers/mysql2 全是纯 JS）。
 #  在 Windows Server 上跑 Linux 容器要额外一层 VM（WSL2/Hyper-V）与 Docker Desktop 的授权，
 #  而"直接在 Windows 上跑 Node"反而少一层、少一个故障面。
 #  代价照实说：这是**第二条部署路径**——容器那条（`deploy.sh`）管镜像与卷，这条管本机服务与目录。
@@ -16,8 +16,8 @@
 #  ── 与 deploy.sh 的差异（都源于平台，不是设计分歧）─────────────────────────
 #    · 自启/守护：Linux 用 `docker run --restart unless-stopped`；Windows 用**计划任务 + 看护进程**
 #      （不引第三方二进制，如 NSSM——那要给店主增加一个下载与信任对象）。
-#    · 数据位置：Linux 在**命名卷**里（容器删了数据还在）；Windows 没有卷这一层，
-#      数据就在安装目录的 `data\` 子目录里。**升级只换代码，不碰 data\**。
+#    · 数据位置：**附件与商品媒体**——Linux 在**命名卷**里（容器删了数据还在）；Windows 没有卷这一层，
+#      就放在安装目录的 `data\` 子目录里。**升级只换代码，不碰 data\**。库在 MySQL 里（两条路径都一样）。
 #    · 权限：Linux 有 `chmod 600`；Windows 用 ACL（把 .env 收紧到当前用户 + SYSTEM）。
 #    · HTTPS：两条路径都用 Caddy（容器 vs 本机进程），拓扑含义一致（见 deploy.sh 文件头 A/B）。
 #
@@ -103,14 +103,15 @@ $RpcUrl         = Get-Const 'network.rpcUrl'         'network.rpcUrl'
 $ChainId        = Get-Const 'network.chainId'        'network.chainId'
 $Escrow         = Get-Const 'contracts.escrow'       'contracts.escrow'
 $Registry       = Get-Const 'contracts.registry'     'contracts.registry'
+$Blocklist      = Get-Const 'contracts.blocklist'    'contracts.blocklist'
 $StartBlock     = Get-Const 'contracts.startBlock'   'contracts.startBlock'
 $ContainerPort  = Get-Const 'runtime.containerPort'  'runtime.containerPort'
 $DefaultService = Get-Const 'runtime.serviceName'    'runtime.serviceName'
 
 # 结构性门禁（与 deploy.sh 同一判据）：「是不是上一批已弃用的那个合法地址」脚本无法判断，
 # 只能由部署者按发布检查表核对；这里挡住的是"形状就不对"。
-if ($Escrow -notmatch '^0x[0-9a-fA-F]{40}$' -or $Registry -notmatch '^0x[0-9a-fA-F]{40}$' -or [int]$StartBlock -le 0) {
-  Die "deploy-constants.json 的合约常量不合法：escrow=$Escrow registry=$Registry startBlock=$StartBlock（起始块不能是 0：0 = 从最新块开始 ⇒ 漏扫历史事件且不报错）"
+if ($Escrow -notmatch '^0x[0-9a-fA-F]{40}$' -or $Registry -notmatch '^0x[0-9a-fA-F]{40}$' -or $Blocklist -notmatch '^0x[0-9a-fA-F]{40}$' -or [int]$StartBlock -le 0) {
+  Die "deploy-constants.json 的合约常量不合法：escrow=$Escrow registry=$Registry blocklist=$Blocklist startBlock=$StartBlock（起始块不能是 0：0 = 从最新块开始 ⇒ 漏扫历史事件且不报错；Blocklist 是 Registry 的 immutable，必须与 Registry 同批）"
 }
 
 # ── 模式 ──
@@ -212,7 +213,7 @@ function Get-PlatformInfo {
 
 function Get-NodeExe {
   <#
-    找可用的 Node（≥ 23.4，节点用到内置 node:sqlite 与 --env-file-if-exists）。
+    找可用的 Node（≥ 23.4，节点用到 --env-file-if-exists）。
     顺序：安装目录自带 → PATH。找不到返回 $null（由调用方决定装还是拒绝）。
   #>
   $bundled = Join-Path $NODE_DIR 'node.exe'
@@ -314,8 +315,8 @@ function Write-EnvFile {
 
   $MANAGED = @(
     'MK_PORT', 'MK_SHOP_OWNER', 'MK_RPC_URL', 'MK_CHAIN_ID', 'MK_ESCROW_ADDRESS', 'MK_REGISTRY_ADDRESS',
-    'MK_ESCROW_START_BLOCK', 'MK_ESCROW_TIMEOUT_BLOCKS', 'MK_ESCROW_FINALITY_BLOCKS', 'MK_ESCROW_POLL_MS',
-    'MK_CHAIN_RECONCILE_MS', 'MK_CORS_ORIGIN', 'MK_CORS_ALLOW_ALL', 'MK_DB_FILE', 'MK_ATTACH_DIR',
+    'MK_BLOCKLIST_ADDRESS', 'MK_ESCROW_START_BLOCK', 'MK_ESCROW_TIMEOUT_BLOCKS', 'MK_ESCROW_FINALITY_BLOCKS', 'MK_ESCROW_POLL_MS',
+    'MK_CHAIN_RECONCILE_MS', 'MK_CORS_ORIGIN', 'MK_CORS_ALLOW_ALL', 'MK_ATTACH_DIR',
     'MK_AUTO_DELIVER', 'MK_PII_RETENTION_DAYS', 'MK_BTY_TTL_MS', 'MK_DRAFT_TTL_MINUTES', 'MK_REVIEW_TTL_DAYS',
     'MK_TOKEN_TTL', 'MK_SIWE_TTL', 'MK_TOKEN_SECRET', 'MK_SIWE_DOMAIN'
   )
@@ -342,13 +343,14 @@ function Write-EnvFile {
 
   $lines = @(
     "# 由 deploy.ps1（Windows 原生版）生成于 $([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
-    "# 与 deploy.sh 共用 deploy-constants.json 的常量；数据在 $DATA_DIR（升级只换代码，不碰 data\）"
+    "# 与 deploy.sh 共用 deploy-constants.json 的常量；附件与商品媒体在 $DATA_DIR（升级只换代码，不碰 data\）"
     "MK_PORT=$ContainerPort"
     "MK_SHOP_OWNER=$OwnerAddr"
     "MK_RPC_URL=$RpcUrl"
     "MK_CHAIN_ID=$ChainId"
     "MK_ESCROW_ADDRESS=$Escrow"
     "MK_REGISTRY_ADDRESS=$Registry"
+    "MK_BLOCKLIST_ADDRESS=$Blocklist"
     "MK_ESCROW_START_BLOCK=$StartBlock"
     "MK_ESCROW_TIMEOUT_BLOCKS=$($C.appDefaults.MK_ESCROW_TIMEOUT_BLOCKS)"
     "MK_ESCROW_FINALITY_BLOCKS=$($C.appDefaults.MK_ESCROW_FINALITY_BLOCKS)"
@@ -357,9 +359,9 @@ function Write-EnvFile {
     "# 谁可以跨域读你的节点：联邦前端（买家聚合） + 你自己的域名"
     "MK_CORS_ORIGIN=$cors"
     "MK_CORS_ALLOW_ALL=$($C.appDefaults.MK_CORS_ALLOW_ALL)"
-    "# 数据在安装目录的 data\ 里（Windows 没有命名卷这一层；升级不碰它）"
-    "MK_DB_FILE=$((Join-Path $DATA_DIR 'marketplace-node.db'))"
+    "# 附件与商品媒体在安装目录的 data\ 里（Windows 没有命名卷这一层；升级不碰它）"
     "MK_ATTACH_DIR=$((Join-Path $DATA_DIR 'attachments'))"
+    "# 库在 MySQL 里、不在 data\ 内：MK_DB_* 由你自己写进这个 .env（本脚本不管它们，重跑原样保留）"
     "MK_AUTO_DELIVER=$($C.appDefaults.MK_AUTO_DELIVER)"
     "MK_PII_RETENTION_DAYS=$($C.appDefaults.MK_PII_RETENTION_DAYS)"
     "# 行情缓存（毫秒）：官方 BTY-USDT 行情直接决定""买家要付多少 BTY""，所以跟得紧（标价单位就是 USDT）"
@@ -511,7 +513,7 @@ if ($MODE -eq 'status') {
 if ($MODE -eq 'uninstall' -or $MODE -eq 'purge') {
   Write-Step '卸载'
   if ($MODE -eq 'purge') {
-    Write-Warn "== -Purge：会**删除数据目录 $DATA_DIR**（商品/订单/附件全没）—— 不可逆 =="
+    Write-Warn "== -Purge：会**删除数据目录 $DATA_DIR**（附件与商品媒体全没；库在 MySQL 里，不在本目录内）—— 不可逆 =="
     if (-not $Yes) {
       $ans = Read-Host "  确认请输入 PURGE"
       if ($ans -ne 'PURGE') { Die '输入不匹配，什么都没删' }
@@ -522,9 +524,9 @@ if ($MODE -eq 'uninstall' -or $MODE -eq 'purge') {
   Write-Ok "计划任务已移除：$TASK_NAME"
   if ($MODE -eq 'purge') {
     Remove-Item -LiteralPath $DATA_DIR -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Ok "数据目录已删除：$DATA_DIR"
+    Write-Ok "数据目录已删除：$DATA_DIR（库在 MySQL 里，不在本目录内，要一起删就 DROP DATABASE）"
   } else {
-    Write-Ok "数据保留在：$DATA_DIR（要连数据一起删：.\deploy.ps1 -Purge）"
+    Write-Ok "附件与商品媒体保留在：$DATA_DIR（要一起删：.\deploy.ps1 -Purge；库在 MySQL 里，得自己删）"
   }
   Write-Info "代码/配置/日志保留在 $Dir（含 .env，里面有令牌密钥；不需要了就自行删除）"
   exit 0
@@ -585,7 +587,7 @@ Write-Log ''
 Write-Info "店主地址：$Owner"
 Write-Info "对外域名：$(if ($Domain) { "https://$Domain" } else { '（未指定，节点不会被买家发现）' })"
 Write-Info "HTTPS   ：$TlsMode"
-Write-Info "合约：Escrow=$Escrow  Registry=$Registry（自 deploy-constants.json）"
+Write-Info "合约：Escrow=$Escrow  Registry=$Registry  Blocklist=$Blocklist（自 deploy-constants.json）"
 
 # =============================================================================
 # ④ 写配置
@@ -718,5 +720,5 @@ Write-Ok '完成。常用命令：'
 Write-Info "    .\deploy.ps1 -Status              # 现状（任务/进程/配置/探活）"
 Write-Info "    .\deploy.ps1 -Health              # 一行探活（不健康退出码 2）"
 Write-Info "    .\deploy.ps1 -Update              # 重新安装依赖并重启（数据不动）"
-Write-Info "    .\deploy.ps1 -Uninstall           # 停掉并注销任务（数据保留）"
-Write-Info "    .\deploy.ps1 -Purge               # 连数据一起删（不可逆）"
+Write-Info "    .\deploy.ps1 -Uninstall           # 停掉并注销任务（附件与商品媒体保留；库在 MySQL 里）"
+Write-Info "    .\deploy.ps1 -Purge               # 连附件与商品媒体一起删（不可逆；库不在其中）"

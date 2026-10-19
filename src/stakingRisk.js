@@ -8,13 +8,13 @@
  * 联邦没有任何一处能自动发现它（合约不主动扫链、节点不主动读别家），所以需要一个只读读数。
  *
  * 事实源与取舍：
- *  - 门槛与"已登记"都从 **Registry** 读：`minStakeToRegister()`、`getActiveNodeOperators()`
+ *  - 门槛与"已登记"都从 **Registry** 读：`minStakeToRegister()`、`getActiveNodes()`
  *    （活跃登记集合）、以及 `stakingContract()`（门槛判定实际用的那个保证金合约地址）。
  *    **刻意不加 `MK_STAKING_ADDRESS` 环境变量**：门槛的判据链上是 `Registry.stakingContract`
  *    （owner 可改，且改门槛前必须先链接它），再配一个环境变量就是**第二个真相源**——
  *    配错/改链上地址后本地仍按旧地址算，读数会静默说谎。链上已经发布了权威地址，就用它。
  *  - 每读一个 operator 的 `Staking.poolOf(operator)`（= 质押 + 冷却中在担额，与注册门槛同口径）。
- *    成本 = 1 次 `getActiveNodeOperators` + N 次 `poolOf`（N = 全网活跃店数）。N 大时逐次调用
+ *    成本 = 1 次 `getActiveNodes` + N 次 `poolOf`（N = 全网活跃店数）。N 大时逐次调用
  *    会明显变慢，所以：单次读数上限 `MAX_OPERATORS`（超出置 `truncated: true`，如实说明
  *    "只核了前 N 家"），结果 `TTL_MS` 内复用（同一个读数被面板/巡检脚本反复拉取时只打一轮 RPC）。
  *  - **降级取舍（如实写明）**：以上都读不到（未配 `MK_REGISTRY_ADDRESS`、RPC 不可达、合约未升级到
@@ -22,7 +22,7 @@
  *    ——"读不到"绝不能显示成"没有跌破门槛的店主"。调用方要自己比对时，`minStakeToRegisterWei`
  *    与每个 operator 的 `poolWei` 都在同一个响应里（两个数同源同刻，不会各说一套）。
  *  - 复算：本读数**完全由链上状态推出**（没有任何本地账参与），第三方可独立复算核对
- *    （`Registry.getActiveNodeOperators()` 逐个 `Staking.poolOf`）。
+ *    （`Registry.getActiveNodes()` 逐个 `Staking.poolOf`）。
  */
 import { ethers } from 'ethers';
 import config from './config.js';
@@ -31,7 +31,15 @@ import { getProvider, weiToDecimal } from './chain.js';
 const REGISTRY_ABI = [
   'function minStakeToRegister() view returns (uint256)',
   'function stakingContract() view returns (address)',
-  'function getActiveNodeOperators() view returns (address[])',
+  /*
+    在册节点行（含 operator/endpoint/编号等）。**只声明本模块会读的那一个**（纪律同
+    `Staking._probeEscrow`：探的/声明的必须是会调用的）。
+    为什么不是 `getActiveNodes()`：那是一个"只返回地址数组"的读法，
+    与 `getActiveNodes()` 的判据完全相同（同一份在册集合、同样剔除治理停用者），
+    两份存在只会漂移；而 `MarketplaceRegistry` 贴着 EIP-170 的 24 576 字节上限，
+    实测删掉它能省 368 字节（见合约里的说明）。这里取 `operator` 字段即可。
+  */
+  'function getActiveNodes() view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code)[])',
 ];
 const STAKING_ABI = ['function poolOf(address operator) view returns (uint256)'];
 
@@ -118,14 +126,17 @@ export async function stakingShortfall({ force = false } = {}) {
   try {
     const provider = getProvider();
     const reg = new ethers.Contract(registry, REGISTRY_ABI, provider);
-    const [minRaw, stakingRaw, operatorsRaw] = await Promise.all([
+    const [minRaw, stakingRaw, nodesRaw] = await Promise.all([
       reg.minStakeToRegister(),
       reg.stakingContract(),
-      reg.getActiveNodeOperators(),
+      reg.getActiveNodes(),
     ]);
     const minStakeWei = BigInt(minRaw).toString();
     const stakingAddress = String(stakingRaw || '').toLowerCase();
-    const operators = (operatorsRaw || []).map((a) => String(a).toLowerCase()).filter(Boolean);
+    // 只取 operator 字段：本读数的判据是"谁在册"，行里其余字段与门槛无关
+    const operators = (nodesRaw || [])
+      .map((n) => String(n?.operator || '').toLowerCase())
+      .filter((a) => /^0x[0-9a-f]{40}$/.test(a));
     const truncated = operators.length > MAX_OPERATORS;
     const checked = operators.slice(0, MAX_OPERATORS);
     // 门槛为 0（默认）时无需再读池子：合约语义下"跌破"不成立
@@ -201,6 +212,6 @@ export async function stakingShortfall({ force = false } = {}) {
   } catch (e) {
     // 读不到（RPC/ABI 不匹配）时**不写缓存**：下一轮请求立刻重试，而不是把失败钉住 30 秒
     console.warn('[stakingRisk] 质押门槛读数失败:', e?.message || e);
-    return unavailable(`链上读取失败（RPC 不可达或合约未升级到含 minStakeToRegister/getActiveNodeOperators 的版本）：${String(e?.message || e).slice(0, 160)}`);
+    return unavailable(`链上读取失败（RPC 不可达或合约未升级到含 minStakeToRegister/getActiveNodes 的版本）：${String(e?.message || e).slice(0, 160)}`);
   }
 }

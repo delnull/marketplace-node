@@ -13,7 +13,8 @@
  *     故移到这里，仲裁路由改为 import。
  *  3. **链上读数不新起真相源**：对账读数取 `chainReconcile.js` 的只读快照（`chainReconcileStatus()`，
  *     由路由取好后传进来，见 reconcileReading 的说明）；收费方地址取 `fees.js` 的唯一实现
- *     （含它自己的 60s 缓存与"读不到沿用上次真值"的语义），不配第二个环境变量。
+ *     （60s 缓存；**读不到就是读不到**——`known=false` / `feeCollector=null`，绝不拿上次成功
+ *     读数冒充当前值），不配第二个环境变量。
  *
  * 三态纪律（本仓硬要求：读不到 ≠ 0 ≠ 缺失）——本模块把三类"读不到"分别表达：
  *  · 链上读不到（RPC 不可达/合约未升级）：`available:false` + `reason`，**数值字段一律 null**，
@@ -28,14 +29,25 @@ import { getEscrow, getProvider, isZeroAddress, weiToDecimal } from './chain.js'
 import { ACTIVE_IN, ESCROW_RELEASABLE_IN, INCOME_IN, ORDER_STATUS } from './orderStatus.js';
 import { AFTER_SALE_OPEN_SQL } from './afterSale.js';
 import { refreshFeeCollector, feeStatus } from './fees.js';
-import { reputationSummary, DELIVERY_MIN_SAMPLES, parseOnchainEvents, escrowedAtOf, percentile, shipLatencySpan } from './reputation.js';
-// 「这一单的货交出去了没有」的唯一判据（发货标记/物流单号/交付行/本地状态四者取并集）
-import { isDelivered, occupyingSql } from './stockHold.js';
+// `timeMs`：时间列的毫秒读数（唯一实现）。库里的 DATETIME(3) 读出来是 `Date`，
+// 而这一层的队列等待、SLA 耗时都在毫秒域里算（见 reputation.js 的说明）。
+import { reputationSummary, DELIVERY_MIN_SAMPLES, parseOnchainEvents, escrowedAtOf, percentile, shipLatencySpan, timeMs } from './reputation.js';
+// 「这一单的货交出去了没有」的唯一判据（发货标记/物流单号/交付行/本地状态四者取并集），
+// 以及它的**唯一列名** `delivered_items`（列名写错会当场抛错——静默判成"未交付"就是超卖）
+import { isDelivered, occupyingSql, deliveredItemsSql } from './stockHold.js';
 // 商品级承诺的解析（唯一实现在 src/productTerms.js）：这里只读 `handling_days` 一个字段
 import { parseTermsColumn } from './productTerms.js';
 
 /* ══════════════════════════════════════════════════════════════════════
    待办谓词（**唯一拼法**）——徽标、列表筛选、运营读数、SLA 清单共用
+
+   ⚠️ 这三条谓词里的 `refund_status` / `after_sale_status` / `paid_tx_hash` 现在住在
+   `order_chain`（链上镜像表），所以**消费方的查询必须把 order_chain 带进来**
+   （`FROM orders o LEFT JOIN order_chain oc ON oc.order_id = o.id`，或直接读模型 `v_orders`：
+   视图已经把三张表合成一行）。谓词本身**不带别名**，两种写法都能用；
+   但**不能**只 `FROM orders`——那会得到 `Unknown column`，而不是静默少几行。
+   为什么不用整单读模型：这几条是列表/徽标的谓词，读它的地方只需要订单事实 + 三个镜像列，
+   没有必要把个人信息表也 JOIN 进来。
    ══════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -50,6 +62,8 @@ export const PENDING_REFUND_SQL = `refund_status = 'requested' AND status IN ${A
  * 可发货 = 待发货 ∧ 有链上支付凭证 ∧ 未被退款申请冻结。
  * 三个条件缺一不可：无凭证的 escrowed 是异常行（要先同步或取消，发出去就是无凭据发货）；
  * 退款申请待决的单 `/ship` 与批量发货都会拒（发货等于把钱货关系搅浑），计入就是徽标虚高。
+ * `paid_tx_hash IS NOT NULL` 就是"有凭证"：链上单号在**草稿期**就已生成（见 buyerSignal 的说明），
+ * 所以只按单号筛会把未付款的草稿也当成可发货单——而 NULL 正是"未支付"在这个列上的唯一形状。
  */
 export const SHIP_READY_SQL = "status = 'escrowed' AND paid_tx_hash IS NOT NULL AND refund_status != 'requested'";
 
@@ -73,28 +87,78 @@ export const DISPUTED_SQL = "status = 'disputed'";
  *
  * ⚠️ where/timeCol 只接受**调用方写死的字面常量/本模块导出的谓词**（不是用户输入）——
  * 全仓 SQL 一律参数化，这里拼的是列名/固定谓词，没有任何外部字符串进来。
+ * `timeCol` 的三个取值（refund_requested_at / after_sale_opened_at / updated_at）在两张表上：
+ * 前两个在 order_chain、updated_at 在 orders——所以查询要把两张表都带上，而列名在这里
+ * 各自唯一（不会歧义）。
  */
-export function queueWait({ where, timeCol }) {
-  const row = getDb().prepare(`SELECT COUNT(*) AS c, MIN(${timeCol}) AS oldest FROM orders WHERE ${where}`).get();
-  const oldestAt = row?.oldest || null;
+export async function queueWait({ where, timeCol, seller }) {
+  const s = shopWhere(seller);
+  const row = await getDb().get(
+    `SELECT COUNT(*) AS c, MIN(${timeCol}) AS oldest
+       FROM orders o LEFT JOIN order_chain oc ON oc.order_id = o.id
+      WHERE ${where}${s.where}`,
+    ...s.params
+  );
+  /*
+    这一格对外是**时刻**，所以与全仓一致地给 ISO-8601 字符串（`MIN(DATETIME(3))` 回来是 Date）。
+    为什么不留毫秒：留着它就会让同一个响应里出现两种时间表示，而两种表示必然让某一处少转一次；
+    前端的毫秒算术在本地由 ISO 现算（`Date.parse`），代价记在调用点上。
+    读不到锚点列时给 `null` 而不是 0 —— 0 会被印成 1970 年，是一句与事实相反的话。
+    等待时长 `oldestWaitingMs` **是时长不是时刻**，所以它仍然是毫秒数字（这一点别一起改错）。
+  */
+  const oldestAtMs = timeMs(row?.oldest);
   return {
-    count: row?.c || 0,
-    oldestAt,
-    oldestWaitingMs: oldestAt ? Math.max(0, Date.now() - Number(oldestAt)) : null,
+    count: Number(row?.c) || 0,
+    oldestAt: oldestAtMs === null ? null : new Date(oldestAtMs).toISOString(),
+    oldestWaitingMs: oldestAtMs === null ? null : Math.max(0, Date.now() - oldestAtMs),
   };
+}
+
+/**
+ * 店铺维度的过滤片段（**唯一实现**）。
+ *
+ * 为什么按 `seller` 而不是本地的 `shop_code`：`orders.seller` 就是链上 `OrderCreated` 的
+ * indexed 字段，口径**可被第三方扫链独立复算**；`shop_code` 只是本节点的本地索引。
+ * 运营读数（"这家店压了多少单没发"）将来要被买家/仲裁人对照时，前者才站得住。
+ *
+ * 参数三态（照本仓三态纪律，让"忘传店铺"不可表达）：
+ *   · `undefined` ⇒ 抛错（**刻意不给默认值**：默认成"全部"就是一次静默跨店混算）；
+ *   · `null` ⇒ 显式表示"该节点全部在售店铺的合计"（只给节点级读数用）；
+ *   · 地址字符串 ⇒ 只算那一家。
+ * @param {string|null|undefined} seller
+ * @param {string} [prefix] 表别名（orders 的别名，默认 'o.'；不带别名的查询传 ''）
+ */
+export function shopWhere(seller, prefix = 'o.') {
+  if (seller === undefined) {
+    throw new Error('运营读数需要显式的 seller（null = 全部在售店铺）；漏传会静默跨店混算');
+  }
+  if (seller === null) return { where: '', params: [] };
+  // 不带 `lower()`：地址列的大小写不敏感排序规则已经在那了（见 db.js 第 8 条），
+  // 函数包住列只会让索引失效（同一取舍见 shops.js 的 shopRowBySeller）。
+  return { where: ` AND ${prefix}seller = ?`, params: [String(seller).toLowerCase()] };
 }
 
 /**
  * 店主待办计数（**唯一实现**：卖家面板徽标 `GET /api/orders/seller/status-counts` 与
  * `GET /api/shop/metrics` 共用）。单表聚合毫秒级。
+ * @param {string|null|undefined} seller 见 shopWhere
  */
-export function sellerTodoCounts() {
+export async function sellerTodoCounts(seller) {
   const db = getDb();
-  const rows = db.prepare('SELECT status, COUNT(*) AS c FROM orders GROUP BY status').all();
+  const s = shopWhere(seller);
+  // 商品表的店铺维度读法是 `products.shop_code → shops.seller`，表别名是 `sh`——
+  // 前缀走 shopWhere 的形参，**不做字符串替换**（`s.where.replace('o.','sh.')` 只命中第一处，
+  // 谓词里出现第二个 `o.` 时会静默拼出错误别名，而 SQL 只会在运行时报"列不存在"）。
+  const shopScope = shopWhere(seller, 'sh.');
+  // 状态直方图只需要 orders 一张表（不涉及链上镜像列），所以不带 JOIN——少一次无谓的连接
+  const rows = await db.all(`SELECT status, COUNT(*) AS c FROM orders o WHERE 1=1${s.where} GROUP BY status`, ...s.params);
   const byStatus = Object.fromEntries(rows.map((r) => [r.status, r.c]));
-  const pendingRefund = db.prepare(`SELECT COUNT(*) AS c FROM orders WHERE ${PENDING_REFUND_SQL}`).get().c;
+  // 下面几条谓词用到链上镜像列（refund_status / paid_tx_hash / after_sale_status）：
+  // 必须 LEFT JOIN order_chain（谓词不带别名，见文件头那一段）
+  const fromJoined = 'FROM orders o LEFT JOIN order_chain oc ON oc.order_id = o.id';
+  const pendingRefund = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${PENDING_REFUND_SQL}${s.where}`, ...s.params)).c;
   // 可发货：谓词见 SHIP_READY_SQL（无凭证异常行不计入、退款冻结行不可发）
-  const shipReady = db.prepare(`SELECT COUNT(*) AS c FROM orders WHERE ${SHIP_READY_SQL}`).get().c;
+  const shipReady = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${SHIP_READY_SQL}${s.where}`, ...s.params)).c;
   const pendingDispute = byStatus.disputed || 0;
   /*
     在途**售后案件**（确认收货后开案）计数：与 disputed 并列进店主徽标。
@@ -102,25 +166,25 @@ export function sellerTodoCounts() {
     而订单状态仍是终局（settled/confirmed/expired）——只按 status 分组的徽标永远看不见它，
     店主会一直以为这单已经了结。判据与仲裁队列/退货门控同一处（afterSale.js）。
   */
-  const pendingAfterSale = db.prepare(`SELECT COUNT(*) AS c FROM orders WHERE ${AFTER_SALE_OPEN_SQL}`).get().c;
+  const pendingAfterSale = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${AFTER_SALE_OPEN_SQL}${s.where}`, ...s.params)).c;
   // P 评审扩展（卖家待办聚合）：退货回收 / 待回复评价 / 低库存
-  const pendingReturns = db.prepare("SELECT COUNT(*) AS c FROM order_returns WHERE status IN ('open','shipped')").get().c;
-  const returnsToConfirm = db.prepare("SELECT COUNT(*) AS c FROM order_returns WHERE status = 'shipped'").get().c;
-  const pendingReviewReply = db
-    .prepare(
-      `SELECT COUNT(*) AS c FROM reviews r JOIN orders o ON o.id = r.order_id WHERE r.reply_content = '' AND o.status IN ${INCOME_IN}`
-    )
-    .get().c;
+  // 退货单与评价都挂在订单上，两处都**必须 join orders 再按店铺限定**——
+  // 少了这一层，A 店店主的徽标会把 B 店待回收的退货算成自己的。
+  const pendingReturns = (await db.get(`SELECT COUNT(*) AS c FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE r.status IN ('open','shipped')${s.where}`, ...s.params)).c;
+  const returnsToConfirm = (await db.get(`SELECT COUNT(*) AS c FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE r.status = 'shipped'${s.where}`, ...s.params)).c;
+  const pendingReviewReply = (await db.get(`SELECT COUNT(*) AS c FROM reviews r JOIN orders o ON o.id = r.order_id WHERE r.reply_content = '' AND o.status IN ${INCOME_IN}${s.where}`, ...s.params)).c;
   // 低库存按「商品」计数：任一组合余量 ≤ 商品级阈值即计入（卖家务必要一并看那些组合）
-  const lowStockProducts = db
-    .prepare(
-      `SELECT COUNT(DISTINCT s.product_id) AS c
+  /*
+    商品表的店铺维度读法是 `products.shop_code`，而本模块的入参是 seller
+    （理由见 shopWhere：seller 是链上可复算的那个键）。两者之间**显式 join shops 换算**，
+    不在这里另立一张"seller → code"的映射表——那会变成第二份真相。
+  */
+  const lowStockProducts = (await db.get(`SELECT COUNT(DISTINCT s.product_id) AS c
          FROM product_skus s
          JOIN products p ON p.id = s.product_id
+         JOIN shops sh ON sh.code = p.shop_code
         WHERE s.capacity IS NOT NULL AND p.stock_alert_at IS NOT NULL
-          AND (s.capacity - s.committed) <= p.stock_alert_at`
-    )
-    .get().c;
+          AND (s.capacity - s.committed) <= p.stock_alert_at${shopScope.where}`, ...shopScope.params)).c;
   return {
     byStatus,
     shipReady,
@@ -219,17 +283,22 @@ const chainErrText = (e) => String(e?.message || e).slice(0, 160);
  *        wantItems = 是否返回超时清单（最久的在前，SLA 用）；limit = 清单条数上限
  * @returns {Promise<object>} 见下方各字段注释；读不到链上时 `overdue` 为 **null**（不是 0）
  */
-export async function escrowOverdueReading({ wantItems = false, limit = 0, now = Date.now() } = {}) {
+export async function escrowOverdueReading({ wantItems = false, limit = 0, now = Date.now(), seller } = {}) {
   const db = getDb();
-  const activeOrders = db.prepare(`SELECT COUNT(*) AS c FROM orders WHERE status IN ${ACTIVE_IN}`).get().c;
-  const rows = db
-    .prepare(
-      `SELECT id, product_slug, escrow_order_id, refund_status, timeout_blocks, onchain_events, created_at
-         FROM orders
-        WHERE status IN ${ESCROW_RELEASABLE_IN} AND escrow_order_id IS NOT NULL AND paid_tx_hash IS NOT NULL
-        ORDER BY created_at ASC`
-    )
-    .all();
+  const s = shopWhere(seller);
+  const activeOrders = (await db.get(`SELECT COUNT(*) AS c FROM orders o WHERE status IN ${ACTIVE_IN}${s.where}`, ...s.params)).c;
+  /*
+    候选读两张表：`escrow_order_id` / `paid_tx_hash` / `refund_status` / `events`（事件史）
+    都住在 `order_chain`（链上镜像，watcher 独占写），状态/商品标识/超时读数在 `orders`。
+    `paid_tx_hash IS NOT NULL` = 有链上支付凭证（NULL = 未支付，见 db.js 的列注释）。
+    事件史在视图里叫 `onchain_events`，这里的 JOIN 也要给同一个列名——下游
+    `parseOnchainEvents` / `escrowedAtOf` 读的就是它。
+  */
+  const rows = await db.all(`SELECT o.id AS order_id, o.order_no, o.product_slug, o.timeout_blocks, o.created_at,
+              c.escrow_order_id, c.refund_status, c.events AS onchain_events
+         FROM orders o JOIN order_chain c ON c.order_id = o.id
+        WHERE o.status IN ${ESCROW_RELEASABLE_IN} AND c.escrow_order_id IS NOT NULL AND c.paid_tx_hash IS NOT NULL${s.where}
+        ORDER BY o.created_at ASC`, ...s.params);
   const blocked = rows.filter((r) => String(r.refund_status) === 'requested');
   const candidates = rows.filter((r) => String(r.refund_status) !== 'requested');
   const base = {
@@ -270,13 +339,13 @@ export async function escrowOverdueReading({ wantItems = false, limit = 0, now =
             `latestBlock > 0 ⇒ 已超时` 的假警报。真单的 `timeoutBlocks` 有合约下限保证，恒 > 0。
             所以 0 按"这次没读到"处理（进 unknown），而不是按"已超时"。
           */
-          if (t > 0) thresholds.set(r.id, t);
+          if (t > 0) thresholds.set(r.order_id, t);
         } catch {
           // 单笔读失败：留在 unknown 里（**不**当成"未超时"——那会把一笔随时可能被释放的单说成没事）
         }
       })
     );
-    const overdueRows = checkedRows.filter((r) => thresholds.has(r.id) && latestBlock > thresholds.get(r.id));
+    const overdueRows = checkedRows.filter((r) => thresholds.has(r.order_id) && latestBlock > thresholds.get(r.order_id));
     const items = wantItems
       ? overdueRows
           .map((r) => {
@@ -284,30 +353,45 @@ export async function escrowOverdueReading({ wantItems = false, limit = 0, now =
             // 读不到就是 null（不拿 created_at 顶替——那是草稿创建时刻，是另一个口径）
             const escrowedAt = escrowedAtOf(parseOnchainEvents(r.onchain_events));
             return {
-              orderId: r.id,
+              // 对外给**订单号**（面板/SLA 清单按它跳转与展示）；内部数字键不是任何人的标识
+              orderId: r.order_no,
               productSlug: r.product_slug,
               escrowOrderId: r.escrow_order_id,
               escrowedAt,
               waitingMs: escrowedAt ? Math.max(0, now - escrowedAt) : null,
               timeoutBlocks: r.timeout_blocks || null,
-              releaseNotBeforeBlock: thresholds.get(r.id),
-              blocksLeft: Math.max(0, thresholds.get(r.id) - latestBlock),
+              releaseNotBeforeBlock: thresholds.get(r.order_id),
+              blocksLeft: Math.max(0, thresholds.get(r.order_id) - latestBlock),
             };
           })
           // 最久的在前；等待时长读不到（null）的排在最后，但**照样列出**（它们确实已超时）
           .sort((a, b) => (b.waitingMs ?? -1) - (a.waitingMs ?? -1))
           .slice(0, Math.max(1, Number(limit) || overdueRows.length))
       : [];
+    /*
+      **"没读到"与"本轮根本没去读"必须分开说**（2026-10-16 修）：候选多于
+      `MAX_THRESHOLD_READS` 时，超出部分每一轮都会被同一个上限截断——它们**不是**
+      "这次没读到、下轮重试"，而是**永远不会被读到**。旧文案把两者混成一句
+      "下轮重试"，运维照着反复重试永远不收敛（而 `truncated` 字段其实早就在返回里）。
+    */
+    const notRead = candidates.length - thresholds.size;
+    const capped = Math.max(0, candidates.length - checkedRows.length);
+    const failedReads = notRead - capped;
+    const reasonParts = [];
+    if (failedReads > 0) reasonParts.push(`${failedReads} 单的释放阈值没读到（读取失败，下轮会重试）`);
+    if (capped > 0) {
+      reasonParts.push(
+        `${capped} 单超出单轮读取上限 ${MAX_THRESHOLD_READS}（**本轮没有尝试读取，且只要候选数不减就每轮都不会读到**）` +
+          '——请减少在途单积压'
+      );
+    }
     return {
       ...base,
       available: true,
-      reason:
-        thresholds.size < candidates.length
-          ? `有 ${candidates.length - thresholds.size} 单的释放阈值没读到（本轮未纳入结论，下轮重试）`
-          : null,
+      reason: reasonParts.length ? reasonParts.join('；') : null,
       latestBlock,
       checked: thresholds.size,
-      unknown: candidates.length - thresholds.size,
+      unknown: notRead,
       overdue: overdueRows.length,
       checkedAt: now,
       items,
@@ -335,22 +419,26 @@ const accruedSlot = (reason = null) => ({ available: false, reason, address: nul
  * 两处**按地址**读，主体各不相同，因此各自独立降级（一项读不到不影响另一项）：
  *  · payouts 读**店主地址**（MK_SHOP_OWNER）：托管金派发给卖家时挂的账；
  *  · fees    读**当前全局 feeCollector**：平台费挂的账。地址走 `fees.js` 的唯一实现
- *    （60s 缓存、读不到沿用上次真值），不另配环境变量（配错就是第二个真相源）。
+ *    （60s 缓存；读不到时 `known=false`、地址为 null，**不沿用上次成功读数**——否则一次 RPC
+ *    抖动就能把"读不到"说成"确证是那个地址"），不另配环境变量（配错就是第二个真相源）。
  *    已知边界（如实写）：合约按**每单创建时快照**的收取方扣费，历史收取方名下的挂账
  *    不在这两个读数里——本读数只回答"现在的收款主体有多少可领"。
  */
-export async function accruedReading() {
+export async function accruedReading(seller) {
+  if (seller === undefined) {
+    throw new Error('accruedReading 需要显式的 seller（null = 全部在售店铺）；漏传会静默读错主体的挂账');
+  }
   const note =
-    '挂账是**按地址**计的余额：这里只读当前店主地址与当前全局 feeCollector 名下的挂账；' +
+    '挂账是**按地址**计的余额：这里只读该店店主地址与当前全局 feeCollector 名下的挂账；' +
     '合约按每单创建时快照的收取方扣费，历史收取方名下的挂账不在本读数内。';
   if (!config.chain.escrowAddress) {
     const reason = '未配置 MK_ESCROW_ADDRESS：读不到链上挂账余额';
     return { payouts: accruedSlot(reason), fees: accruedSlot(reason), note };
   }
-  // 收费方地址：唯一实现在 fees.js（读不到时它给出 known=false / 上次真值，不猜）
+  // 收费方地址：唯一实现在 fees.js（读不到时它给出 known=false / addr=null，不猜、不沿用旧值）
   await refreshFeeCollector();
   const st = feeStatus();
-  const seller = String(config.shop.owner || '').toLowerCase();
+  const sellerAddr = seller === null ? '' : String(seller || '').toLowerCase();
   const collector = String(st.feeCollector || '').toLowerCase();
   const escrow = getEscrow();
   /*
@@ -358,12 +446,12 @@ export async function accruedReading() {
     一个读失败不代表另一个没有挂账（也不代表它是 0）。
   */
   const readPayouts = async () => {
-    if (!/^0x[0-9a-f]{40}$/.test(seller)) {
-      return accruedSlot('本节点未配置店主地址（MK_SHOP_OWNER）：挂账按收款地址计，没有主体就没有读数');
+    if (!/^0x[0-9a-f]{40}$/.test(sellerAddr)) {
+      return accruedSlot('本店的店主地址未知：挂账按收款地址计，没有主体就没有读数');
     }
     try {
-      const wei = BigInt(await escrow.accruedPayouts(seller)).toString();
-      return { available: true, reason: null, address: seller, wei, decimal: weiToDecimal(wei) };
+      const wei = BigInt(await escrow.accruedPayouts(sellerAddr)).toString();
+      return { available: true, reason: null, address: sellerAddr, wei, decimal: weiToDecimal(wei) };
     } catch (e) {
       return accruedSlot(`链上读取失败（RPC 不可达或合约未升级到含 accruedPayouts 的版本）：${chainErrText(e)}`);
     }
@@ -404,18 +492,30 @@ export async function accruedReading() {
  *
  * `refundsOldestWaitingMs` 与另两格**同一口径**：等待起点 = `refund_requested_at`
  * （链上 RefundRequested 的本地镜像时刻，与 SLA 清单的 ageMs 同一列），空队列 = null。
- * ⚠️ 前端 `utils/opsBoard.ts` 的退款那一行目前把"最久等待"写死成"本接口未提供"
- * （`missingField: true`）——本字段下发后，那一行要改成读 `refundsOldestWaitingMs`，
- * 否则界面会与接口说的不一致（接口给了、界面说没有）。
+ * 三格走同一条三态判据（前端 `utils/opsBoard.ts` 的退款那一行也读这个字段，
+ * 没有"接口未提供"这一档）。
  *
- * @param {{now?: number, reconcile: object}} opts reconcile = `chainReconcileStatus()` 的返回值（必填）
+ * @param {{now?: number, reconcile: object, seller: string|null}} opts reconcile = `chainReconcileStatus()` 的返回值（必填）；
+ *        `seller` = 该店店主地址（`null` = 全部在售店铺的合计，见 shopWhere 的三态说明）
  */
-export async function opsMetrics({ now = Date.now(), reconcile } = {}) {
-  const todos = sellerTodoCounts();
-  const [escrow, accrued] = await Promise.all([escrowOverdueReading({ now }), accruedReading()]);
-  const refunds = queueWait({ where: PENDING_REFUND_SQL, timeCol: 'refund_requested_at' });
-  const afterSale = queueWait({ where: AFTER_SALE_OPEN_SQL, timeCol: 'after_sale_opened_at' });
-  const disputes = queueWait({ where: DISPUTED_SQL, timeCol: 'updated_at' });
+export async function opsMetrics({ now = Date.now(), reconcile, seller } = {}) {
+  /*
+    六项读数**一次发出、一次解构**（都只是"读"，彼此无依赖）。
+    形状为什么必须是这样：这些助手全是 async，逐个 `const x = helper(...)` 时漏掉 await——
+    漏掉的那个 x 是一个 Promise，它不在那一行报错，而是十几行之后以"undefined 的属性读不到"
+    的样子炸开（MySQL 迁移时本文件与下面的 slaReading 一共漏了八处，报错行分别指向
+    `ordersByStatus.draft`、`promises.some`、`shipSampleCount`，没有一处指向漏 await 的那一行）。
+    绑成一次 Promise.all 之后，漏 await 会在**解构这一行**当场抛 `... is not iterable`。
+    seller 的三态校验由这六项各自的 shopWhere 负责（同一个判据，不在这里再判一次）。
+  */
+  const [todos, escrow, accrued, refunds, afterSale, disputes] = await Promise.all([
+    sellerTodoCounts(seller),
+    escrowOverdueReading({ now, seller }),
+    accruedReading(seller),
+    queueWait({ where: PENDING_REFUND_SQL, timeCol: 'refund_requested_at', seller }),
+    queueWait({ where: AFTER_SALE_OPEN_SQL, timeCol: 'after_sale_opened_at', seller }),
+    queueWait({ where: DISPUTED_SQL, timeCol: 'updated_at', seller }),
+  ]);
   const rec = reconcileReading(reconcile);
   /*
     订单各状态计数：键集合取 ORDER_STATUS（状态名拼错的唯一防线），**缺的状态补 0**——
@@ -498,29 +598,40 @@ export const SLA_LIMIT_DEFAULT = 20;
  * @param {number} now 当前时刻（毫秒；注入便于测试）
  * @param {number} windowDays 实况窗口（天；与 SLA 面板的 d30 对齐）
  */
-export function promiseSlaReading(now = Date.now(), windowDays = 30) {
+export async function promiseSlaReading(now = Date.now(), windowDays = 30, seller = null) {
   const db = getDb();
+  const s = shopWhere(seller);
+  // 商品查询的表别名是 `sh`：前缀由 shopWhere 的形参给，不做 `o.` → `sh.` 的文本替换
+  // （见 sellerTodoCounts 里的同一条说明：替换只命中第一处，越晚越静默）。
+  const shopScope = shopWhere(seller, 'sh.');
   /*
     只取**已发布**且声明了发货时效的商品：草稿/已下架商品没有"该多久发出"的现实意义
     （还没有买家能看到它），把它们算进来只会让面板出现永远超期的幽灵行。
+    按店铺限定要 **join shops**（商品行上只有 `shop_code`，而本模块的入参是 seller，
+    见 shopWhere 的理由）——不在这里另立"code → seller"映射。
   */
-  const products = db
-    .prepare("SELECT id, slug, title, terms FROM products WHERE active = 1 AND terms IS NOT NULL AND terms != '{}'")
-    .all()
+  const products = (await db.all(`SELECT p.id, p.slug, p.title, p.terms FROM products p
+         JOIN shops sh ON sh.code = p.shop_code
+        WHERE p.active = 1 AND p.terms IS NOT NULL AND p.terms != '{}'${shopScope.where}`, ...shopScope.params))
     .map((p) => ({ ...p, handlingDays: parseTermsColumn(p.terms).handling_days }))
     .filter((p) => p.handlingDays !== null);
   if (!products.length) return [];
 
   const since = now - windowDays * 24 * 3600 * 1000;
-  const rows = db
-    .prepare(
-      `SELECT o.id, o.product_id, o.status, o.onchain_events, o.paid_tx_hash, o.created_at, o.shipped_at, o.tracking_no,
-              (SELECT COUNT(*) FROM order_delivery_items d WHERE d.order_id = o.id) AS delivered_items,
+  /*
+    行里要的列横跨两张表：事件史与支付凭证在 `order_chain`、其余在 `orders`。
+    `deliveredItemsSql('o')` 给出**唯一列名** `delivered_items`（`stockHold.isDelivered` 只认它，
+    列名写错会当场抛错——静默判成"未交付"会把在途单算成超期，把已交付单算成未交付）。
+    别名必须是 `orders` 那张表（子查询用的是 `o.id`），所以这里 LEFT JOIN 镜像表而不是读视图。
+    事件史仍以 `onchain_events` 这个列名交给下游（与读模型一致）。
+  */
+  const rows = await db.all(`SELECT o.id, o.product_id, o.status, o.created_at, o.shipped_at, o.tracking_no,
+              c.paid_tx_hash, c.events AS onchain_events,
+              ${deliveredItemsSql('o')},
               (SELECT MAX(created_at) FROM order_delivery_items d WHERE d.order_id = o.id) AS delivered_at,
               ${occupyingSql('o')} AS occupying
-         FROM orders o`
-    )
-    .all();
+         FROM orders o LEFT JOIN order_chain c ON c.order_id = o.id
+        WHERE 1=1${s.where}`, ...s.params);
 
   return products.map((p) => {
     const mine = rows.filter((r) => r.product_id === p.id);
@@ -532,9 +643,11 @@ export function promiseSlaReading(now = Date.now(), windowDays = 30) {
     for (const r of mine) {
       // 与履约画像同一批凭据：没有链上支付凭证的单不进任何统计（"这单托管过"的证据是它）
       if (!String(r.paid_tx_hash || '').trim()) continue;
-      const escrowedAt = escrowedAtOf(parseOnchainEvents(r.onchain_events)) || Number(r.created_at || 0) || null;
+      // 时间列是 DATETIME(3)（`Date`）或 NULL：一律经 timeMs 折成毫秒（唯一实现），
+      // 读不到就是 null（不拿 0 顶替——0 会被读成 1970 年，谁都比它大）
+      const escrowedAt = escrowedAtOf(parseOnchainEvents(r.onchain_events)) || timeMs(r.created_at);
       if (!escrowedAt) continue;
-      const deliveredAt = Number(r.delivered_at || 0) || Number(r.shipped_at || 0) || null;
+      const deliveredAt = timeMs(r.delivered_at) || timeMs(r.shipped_at);
       if (!isDelivered(r)) {
         /*
           在途且未交付：只统计"这一单还占着库存承诺"的行（occupied）或在途状态的行——
@@ -596,34 +709,39 @@ function slaItem(orderId, ageMs, extra = {}) {
  *
  * 响应形状的另一端（前端）：`frontend/src/types.ts` 的 `ShopSla` 与 `utils/opsBoard.ts`。
  */
-export async function slaReading({ limit = SLA_LIMIT_DEFAULT, now = Date.now() } = {}) {
+export async function slaReading({ limit = SLA_LIMIT_DEFAULT, now = Date.now(), seller } = {}) {
   const n = Math.min(SLA_LIMIT_MAX, Math.max(1, Number(limit) || SLA_LIMIT_DEFAULT));
   const db = getDb();
-  const unshipped = await escrowOverdueReading({ wantItems: true, limit: n, now });
-
-  // 待店主回复的退款申请：谓词与徽标/SLA 计数同源；按申请时刻升序 = 最久的在前
-  const refundRows = db
-    .prepare(
-      `SELECT id, refund_requested_at FROM orders WHERE ${PENDING_REFUND_SQL} ORDER BY refund_requested_at ASC LIMIT ?`
-    )
-    .all(n);
-  // 店主已提交的"退款回复"条数：一次聚合取回，避免逐行 COUNT（详情时间线的老坑：N+1）
-  const replyCounts = new Map(
-    db
-      .prepare("SELECT order_id, COUNT(*) AS c FROM dispute_evidence WHERE role = 'seller' AND phase = 'refund_reply' GROUP BY order_id")
-      .all()
-      .map((r) => [r.order_id, r.c])
-  );
-  const refundWait = queueWait({ where: PENDING_REFUND_SQL, timeCol: 'refund_requested_at' });
-
-  // 在途售后案件：判据 after_sale_status='open'；排序锚点是**开案时刻**（案件不动 updated_at）
-  const caseRows = db
-    .prepare(`SELECT id, after_sale_opened_at FROM orders WHERE ${AFTER_SALE_OPEN_SQL} ORDER BY after_sale_opened_at ASC LIMIT ?`)
-    .all(n);
-  const caseWait = queueWait({ where: AFTER_SALE_OPEN_SQL, timeCol: 'after_sale_opened_at' });
-
-  // 发货时长：唯一实现在 reputation.js（这里只读它的 delivery 桶，并按 SLA 的样本阈值决定发不发数）
-  const delivery = reputationSummary().delivery;
+  const s = shopWhere(seller);
+  /*
+    七项读数同样**一次发出、一次解构**（理由与 opsMetrics 里那段相同）：这里漏 await 的表现
+    分别是"队列计数是 undefined"（两个 queueWait）与"发货样本量恒为 0、分位数恒为 null"
+    （reputationSummary）——三种都不会指到漏掉的那一行，而它们说的是三个不同的产品结论。
+  */
+  const [unshipped, refundRows, replyRows, refundWait, caseRows, caseWait, reputation] = await Promise.all([
+    escrowOverdueReading({ wantItems: true, limit: n, now, seller }),
+    /*
+      待店主回复的退款申请：谓词与徽标/SLA 计数同源；按申请时刻升序 = 最久的在前。
+      `refund_requested_at` 在 order_chain（链上镜像）上，所以要把镜像表带进来；
+      `order_id`（内部键）用来与下面的回复条数对齐，`order_no` 是对外展示/跳转用的单号。
+    */
+    db.all(`SELECT o.id AS order_id, o.order_no, c.refund_requested_at
+         FROM orders o LEFT JOIN order_chain c ON c.order_id = o.id
+        WHERE ${PENDING_REFUND_SQL}${s.where} ORDER BY c.refund_requested_at ASC LIMIT ?`, ...s.params, n),
+    // 店主已提交的"退款回复"条数：一次聚合取回，避免逐行 COUNT（详情时间线的老坑：N+1）。
+    // 键是内部 order_id（子表外键指向它），与上面的 SELECT 对齐。
+    db.all("SELECT order_id, COUNT(*) AS c FROM dispute_evidence WHERE role = 'seller' AND phase = 'refund_reply' GROUP BY order_id"),
+    queueWait({ where: PENDING_REFUND_SQL, timeCol: 'refund_requested_at', seller }),
+    // 在途售后案件：判据 after_sale_status='open'；排序锚点是**开案时刻**（案件不动 updated_at）
+    db.all(`SELECT o.id AS order_id, o.order_no, c.after_sale_opened_at
+         FROM orders o LEFT JOIN order_chain c ON c.order_id = o.id
+        WHERE ${AFTER_SALE_OPEN_SQL}${s.where} ORDER BY c.after_sale_opened_at ASC LIMIT ?`, ...s.params, n),
+    queueWait({ where: AFTER_SALE_OPEN_SQL, timeCol: 'after_sale_opened_at', seller }),
+    // 发货时长：唯一实现在 reputation.js（这里只读它的 delivery 桶，并按 SLA 的样本阈值决定发不发数）
+    reputationSummary(seller),
+  ]);
+  const replyCounts = new Map(replyRows.map((r) => [r.order_id, r.c]));
+  const delivery = reputation.delivery;
   const pick = (key) => {
     const b = delivery?.[key] || { count: 0, medianMs: null, p90Ms: null, sampleTooSmall: true };
     return {
@@ -637,16 +755,20 @@ export async function slaReading({ limit = SLA_LIMIT_DEFAULT, now = Date.now() }
 
   return {
     // ===== 前端契约字段（ShopSla）=====
+    // 清单条目里的 `orderId` 是**对外订单号**（SlaItem 的字段名沿用旧契约，值是可跳转的单号）
     unshippedOverdue: unshipped.items.map((i) => slaItem(i.orderId, i.waitingMs)),
-    refundAwaitingReply: refundRows.map((r) =>
-      slaItem(r.id, r.refund_requested_at ? now - Number(r.refund_requested_at) : undefined, {
+    refundAwaitingReply: refundRows.map((r) => {
+      // 申请时刻是 DATETIME(3)（Date）或 NULL：折成毫秒后才能算等待时长（timeMs，唯一实现）
+      const requestedAt = timeMs(r.refund_requested_at);
+      return slaItem(r.order_no, requestedAt === null ? undefined : Math.max(0, now - requestedAt), {
         // 店主已提交的回复条数：0 = 完全没回（这才是"待回复"里最紧的那批）
-        sellerReplyCount: replyCounts.get(r.id) || 0,
-      })
-    ),
-    afterSaleOpen: caseRows.map((r) =>
-      slaItem(r.id, r.after_sale_opened_at ? now - Number(r.after_sale_opened_at) : undefined)
-    ),
+        sellerReplyCount: replyCounts.get(r.order_id) || 0,
+      });
+    }),
+    afterSaleOpen: caseRows.map((r) => {
+      const openedAt = timeMs(r.after_sale_opened_at);
+      return slaItem(r.order_no, openedAt === null ? undefined : Math.max(0, now - openedAt));
+    }),
     shipMedianMs: ship.medianMs,
     shipP90Ms: ship.p90Ms,
     // ===== 三态与口径（附加字段）=====
@@ -672,8 +794,10 @@ export async function slaReading({ limit = SLA_LIMIT_DEFAULT, now = Date.now() }
       承诺对账（商品级）：把 `terms.handling_days` 与**同一批**发货耗时样本摆到一起。
       判据全部复用（isDelivered / shipLatencySpan / percentile），只新增"按商品归属"这一步。
       **没有声明承诺的商品不进这份清单**（不声明就没有可对账的东西）。
+      `seller` 必须原样传下去：它是 ownerOnly 的本店读数，漏传（该函数缺省 null = 全部在售店铺）
+      会把别家店的商品和它们的承诺一起摆到这位店主的面板上。
     */
-    promises: promiseSlaReading(now, 30),
+    promises: await promiseSlaReading(now, 30, seller),
     promiseWindowDays: 30,
     generatedAt: now,
     limit: n,

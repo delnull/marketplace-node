@@ -10,7 +10,7 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, login, assertOk, productPayload } from './setup.mjs';
+import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
@@ -32,7 +32,7 @@ const blocked = (res) => {
 async function listProduct(payload) {
   const res = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(payload)
     .expect(200);
   assertOk(res);
@@ -42,7 +42,7 @@ async function listProduct(payload) {
 async function patchProduct(slug, body) {
   const res = await request(app)
     .patch(`/api/products/${slug}`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(body)
     .expect(200);
   assertOk(res);
@@ -53,12 +53,12 @@ async function patchProduct(slug, body) {
 async function createDraft(slug, extra = {}) {
   return request(app)
     .post('/api/orders')
-    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ productSlug: slug, ...extra })
     .expect(200);
 }
 
-const rowOf = (id) => db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+const rowOf = async (id) => await db.get('SELECT * FROM v_orders WHERE order_no = ?', id);
 
 /** 期望 wei：与节点同源（rates.usdtMicroToPayWei），避免在测试里手抄一遍汇率算式 */
 async function expectWei(usdtMicro) {
@@ -98,7 +98,7 @@ test('运费校验：负值/非整数/超上限/非实物商品设运费 一律�
   for (const bad of [-1, 1.5, 1_000_000_001, 'abc', {}]) {
     const res = await request(app)
       .post('/api/products')
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
       .send(productPayload({ kind: 'physical', shippingFeeUsdtMicro: bad }))
       .expect(200);
     assert.match(blocked(res), /shippingFeeUsdtMicro（运费）/, `非法运费应被拒：${JSON.stringify(bad)}`);
@@ -110,7 +110,7 @@ test('运费校验：负值/非整数/超上限/非实物商品设运费 一律�
   for (const kind of ['digital', 'nft']) {
     const res = await request(app)
       .post('/api/products')
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
       .send(
         productPayload({
           kind,
@@ -128,11 +128,14 @@ test('运费校验：负值/非整数/超上限/非实物商品设运费 一律�
 /*
   ── 单价上限：不只是"防误填"，它还是**安全整数**的保证（源码评审 2026-10，P0） ──
 
-  `orders.usdt_micro` 用 JS Number 承载，而 node:sqlite 读 > 2^53 的整数会抛 RangeError
-  （一行脏数据 ⇒ 订单详情/列表/流水/CSV/仲裁/通知全 500，且该行已提交、只能人工改库）。
+  `orders.usdt_micro` 用 JS Number 承载，而 > 2^53 的值读回来就不再精确：MySQL 驱动不会抛错，
+  它把超界整数**转成字符串**（src/db.js 的 bigNumberStrings:false：宁可响亮，也不要一个悄悄错了的
+  number），于是 `row.usdt_micro + x` 会静默变成字符串拼接——订单详情/列表/流水/CSV/仲裁/通知
+  全按错数算，而且这一行已经提交，只能人工改库。库里另有 CHECK 上界兜底，但那是第二道网，
+  入口这道闸才是"根本写不进去"。
   上限因此必须是"最坏合计（单价 × 99 件 + 运费上限）仍在 2^53 内"的那个数：
   1e13 微 × 99 + 1e9 = 9.9e14 ≪ 9.007e15。本用例把这个**推导**钉死在测试里——
-  以后谁把上限调大，这里先红，而不是等到某天订单面板整片 500。
+  以后谁把上限调大，这里先红，而不是等到某天订单面板整片出错。
 */
 test('单价上限与"最坏合计必须落在安全整数内"这条推导绑定', async () => {
   const { PRICE_MAX_MICRO, SHIPPING_FEE_MAX_MICRO } = await import('../src/routes/products.js');
@@ -149,7 +152,7 @@ test('单价上限与"最坏合计必须落在安全整数内"这条推导绑定
   assert.equal(edge.priceUsdtMicro, PRICE_MAX_MICRO);
   const over = await request(app)
     .post('/api/products')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ title: '单价越限', priceUsdtMicro: PRICE_MAX_MICRO + 1 }))
     .expect(200);
   assert.match(blocked(over), /价格需为 1\.\./, '越限单价必须明确拒绝而不是截断');
@@ -164,19 +167,23 @@ test('快照：运费/年龄限制同键同位入快照；改其一必变哈希�
   const p = await listProduct(
     productPayload({ kind: 'physical', title: '快照运费商品', priceUsdtMicro: 10_000_000, capacity: 5, shippingFeeUsdtMicro: 8_000_000 })
   );
+  /*
+    复算用的是**DB 行形状**：JSON 列（description_blocks/media/specs/attributes/terms）**不 stringify**
+    ——驱动读回来已是解析好的数组/对象，投影只收这个形状（见 setup.mjs 的 rowLikeOf）。
+  */
   const snap = snapshotObject({
     slug: p.slug,
     title: p.title,
     description: p.description,
-    description_blocks: JSON.stringify(p.descriptionBlocks || []),
-    media: JSON.stringify(p.media),
+    description_blocks: p.descriptionBlocks || [],
+    media: p.media,
     kind: p.kind,
     shipping_fee_usdt_micro: p.shippingFeeUsdtMicro,
     age_restricted: p.ageRestricted ? 1 : 0,
-    specs: JSON.stringify(p.specs || []),
+    specs: p.specs || [],
     skus: (p.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro, image_url: s.imageUrl || '' })),
-    attributes: JSON.stringify(p.attributes || []),
-    terms: JSON.stringify(p.terms || {}),
+    attributes: p.attributes || [],
+    terms: p.terms || {},
   });
   assert.equal(computeSnapshotHash(snap), p.snapshotHash, '公开字段可复算快照哈希');
   // 键序契约：kind 之后是 shipping_fee_usdt_micro、age_restricted，然后 specs/skus/attributes/terms/sku_images
@@ -213,12 +220,12 @@ test('快照：运费/年龄限制同键同位入快照；改其一必变哈希�
     slug: renamed.slug,
     title: renamed.title,
     description: renamed.description,
-    description_blocks: JSON.stringify(renamed.descriptionBlocks || []),
-    media: JSON.stringify(renamed.media),
+    description_blocks: renamed.descriptionBlocks || [],
+    media: renamed.media,
     kind: renamed.kind,
     shipping_fee_usdt_micro: renamed.shippingFeeUsdtMicro,
     age_restricted: renamed.ageRestricted ? 1 : 0,
-    specs: JSON.stringify(renamed.specs || []),
+    specs: renamed.specs || [],
     skus: (renamed.skus || []).map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
   });
   assert.equal(computeSnapshotHash(renamedSnap), renamed.snapshotHash, '改标题后仍可复算（运费/限制未丢）');
@@ -241,7 +248,7 @@ test('实物订单锁定「商品 + 运费（按单一次）」并记录拆分�
   assert.equal(one.goodsUsdt, '88', '展示串去净尾零');
   assert.equal(one.usdt, '100', '展示串去净尾零');
   assert.equal(one.amountWei, await expectWei(100_000_000), 'amountWei 由「商品+运费」折算锁定');
-  const row = rowOf(one.id);
+  const row = await rowOf(one.id);
   assert.equal(row.shipping_fee_usdt_micro, 12_000_000, '订单行记录实际锁定的运费');
   assert.equal(row.usdt_micro, 100_000_000);
 
@@ -259,7 +266,7 @@ test('实物订单锁定「商品 + 运费（按单一次）」并记录拆分�
 
   // 事后改运费：老订单的锁定值不变，新订单按新价
   await patchProduct(p.slug, { shippingFeeUsdtMicro: 20_000_000 });
-  const oldOrder = (await request(app).get(`/api/orders/${one.id}`).set('Authorization', `Bearer ${buyerToken}`).expect(200)).body.data;
+  const oldOrder = (await request(app).get(`/api/orders/${one.id}`).set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(200)).body.data;
   assert.equal(oldOrder.shippingFeeUsdtMicro, 12_000_000, '已下单的老订单运费不变');
   assert.equal(computeSnapshotHash(oldOrder.productSnapshot), oldOrder.snapshotHash, '老订单快照仍可复算（不误报被修改）');
   const fresh = (await createDraft(p.slug, { quantity: 1 })).body.data;

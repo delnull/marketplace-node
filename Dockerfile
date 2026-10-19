@@ -1,4 +1,8 @@
-# BitYuan 联邦商城节点 —— 单店铺 API 服务（容器镜像）
+# BitYuan 联邦商城节点 —— 多店铺 API 服务（容器镜像）
+#
+# 数据模型：**一个节点一个库，节点里的店铺都在这个库里**（店铺是库里的行）。
+# 所以这个容器是"一个节点"；同机跑第二个节点就再起一个容器，并给它一个**不同的 MK_DB_NAME**。
+# MySQL 是外部依赖（不在本镜像里、也不在本容器的卷里），连接参数经 MK_DB_* 注入。
 #
 # 构建（context = node/ 目录）：
 #     docker build -t marketplace-node .
@@ -32,8 +36,7 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 ENV NODE_ENV=production
-# 数据默认落在卷 /data（SQLite 单文件 + WAL，可热备份）
-ENV MK_DB_FILE=/data/marketplace-node.db
+# 数据卷只放**附件与商品媒体**（库在 MySQL 里，不在卷内）；附件目录显式指向挂载卷
 ENV MK_ATTACH_DIR=/data/attachments
 ENV MK_PORT=8090
 

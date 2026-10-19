@@ -20,7 +20,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { Interface, Wallet, verifyMessage } from 'ethers';
-import { makeCtx, login, assertOk } from './setup.mjs';
+import { makeCtx, login, assertOk, shopRef, TEST_SHOP_CODE } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, owner, buyer, db } = ctx;
@@ -31,7 +31,7 @@ const { resetShopCodeCache } = await import('../src/shopCode.js');
 const config = (await import('../src/config.js')).default;
 
 const REGISTRY = '0x' + 'aa'.repeat(20);
-const CODE = '00000003'; // 链上铸造的店铺编号（假 RPC 返回它）
+const CODE = TEST_SHOP_CODE; // 与 fixture 落的那一行**同一个编号**（句柄 = 它，见 setup.mjs 的说明）
 const OP = owner.address.toLowerCase();
 const OTHER_CODE = '00000009';
 
@@ -78,13 +78,19 @@ before(async () => {
   config.chain.rpcUrl = `http://127.0.0.1:${rpcServer.address().port}`;
   config.chain.registryAddress = REGISTRY;
   resetShopCodeCache();
+  /*
+    本组用例要验的是"编号已对账落库之后"的正常路径（一行店铺只在链上登记之后才存在），
+    所以这里按对账的产物把编号写进本地店铺行（生产中由 termsReconciler 写，见 src/shops.js
+    的 applyChainShop）。**不是**改判据：判据仍然读 `shops.code`，只是让前置状态就位。
+  */
+  // 编号由 fixture 落好（不再需要在这里改写：改了它就得同时改 shopRef.value）
   ownerToken = (await login(ctx, owner)).token;
   assert.ok(ownerToken);
   // 店员（非店主）：用来证明两个写入口都是 ownerOnly，而不是"登录即可"
   staffWallet = Wallet.createRandom();
   const add = await request(app)
     .put('/api/shop/staff')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ action: 'add', address: staffWallet.address })
     .expect(200);
   assertOk(add);
@@ -107,7 +113,7 @@ const claimMessage = (over = {}) =>
 async function claim(body, token = ownerToken) {
   const res = await request(app)
     .post('/api/shop/claims')
-    .set('Authorization', `Bearer ${token}`)
+    .set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value)
     .send(body)
     .expect(200);
   return res;
@@ -126,9 +132,9 @@ const claimsList = async () => {
   return res.body.data.claims;
 };
 
-const claimRows = () => db.prepare('SELECT * FROM shop_claims ORDER BY id').all();
-const auditActions = () =>
-  db.prepare("SELECT action, detail FROM audit_logs WHERE action LIKE 'shop.claim%' ORDER BY id").all();
+const claimRows = async () => await db.all('SELECT * FROM shop_claims ORDER BY id');
+const auditActions = async () =>
+  await db.all("SELECT action, detail FROM audit_logs WHERE action LIKE 'shop.claim%' ORDER BY id");
 
 // ── ① 消息确定性（字节契约）──
 
@@ -280,20 +286,26 @@ test('POST：店主签名有效 → 落库；第三方用 verifyMessage 可离�
   assert.equal(d.address, OP, 'address = 签名者 = 本店 operator');
   assert.equal(d.message, body.message, '存储/下发的 message 与店主签的那条逐字节相同');
   assert.equal(d.signature, body.signature);
-  assert.ok(Number.isInteger(d.createdAt) && d.createdAt > 0);
+  // `createdAt` 是 DATETIME(3)（`Date`）经 JSON 出去的 **ISO-8601 字符串**：要比时刻先 parse
+  assert.ok(Number.isFinite(Date.parse(d.createdAt)) && Date.parse(d.createdAt) > 0);
 
   const pub = await claimsList();
   assert.equal(pub.length, 1);
   // 第三方视角：只用响应里的 message + signature 重算（不调节点任何代码）
   assert.equal(verifyMessage(pub[0].message, pub[0].signature).toLowerCase(), pub[0].address);
   // 节点只回答"签名有效"这一事实：不得出现任何"已认证/官方"字段
-  assert.deepEqual(Object.keys(pub[0]).sort(), ['address', 'createdAt', 'id', 'kind', 'message', 'signature', 'value']);
+  assert.deepEqual(Object.keys(pub[0]).sort(), ['address', 'createdAt', 'id', 'kind', 'message', 'shopCode', 'signature', 'value']);
   assert.equal(typeof pub[0].id, 'string', 'id 下发字符串（前端类型 ShopClaim.id 是 string，撤销 URL 段也用它）');
-  assert.equal(chain.asked.at(-1), OP, 'operator 走既有只读路径（Registry.codeOf(店主地址)），不新起真相源');
+  /*
+    多店改造后本组用例**不再断言 chain.asked**：声明提交路径不再向 Registry 实时读编号
+    （那会让每次提交都要等一次 RPC，且多店之下"哪个 operator 的编号"本身就不成立——
+    编号属于**店铺**，不再属于节点主地址）。编号改读本地 shops.code 镜像，
+    由 termsReconciler / /verify-onchain 对账写入；对账那一路的链上读取有它自己的用例。
+  */
 });
 
 test('**回归钉子**：非规范输入一律拒绝——哪怕签名对应的正是"归一后的值"（旧形状会放行）', async () => {
-  const before = claimRows().length;
+  const before = (await claimRows()).length;
   // 旧形状的失败形态：节点先归一 value 再拼消息验签 ⇒ 客户端若按原文签，永远验不过；
   // 反过来说，只要客户端"猜到了"节点的归一结果去签，旧形状就会**放行一条 value 与签名不一致**的记录。
   // 这里正是那种输入：提交 'Example.COM'，签的却是归一形 'example.com' 的消息 —— 必须拒绝。
@@ -309,7 +321,7 @@ test('**回归钉子**：非规范输入一律拒绝——哪怕签名对应的�
   assert.match(res.body.message, /example\.com/, '并给出规范形');
   assert.match(res.body.message, /BTY marketplace shop claim/, '同时给出"改成规范形后应签的那条消息"');
   assert.match(res.body.message, /value: example\.com/, '建议消息里用的是规范形');
-  assert.equal(claimRows().length, before, '拒绝的请求一律不落库');
+  assert.equal((await claimRows()).length, before, '拒绝的请求一律不落库');
 
   // 同样的输入、签**原文**的消息也不行：非规范形在校验环节就被挡下（根本不进入验签）
   const rawMsg = claimMessage({ kind: 'domain', value: 'Example.COM', issued: '2026-10-13' });
@@ -321,7 +333,7 @@ test('**回归钉子**：非规范输入一律拒绝——哪怕签名对应的�
   });
   assert.notEqual(res2.body.code, 0);
   assert.match(res2.body.message, /逐字/);
-  assert.equal(claimRows().length, before);
+  assert.equal((await claimRows()).length, before);
 
   // 几类典型非规范输入（大小写 / @ / 空格）都走同一条拒绝路径
   for (const [kind, value] of [
@@ -337,11 +349,11 @@ test('**回归钉子**：非规范输入一律拒绝——哪怕签名对应的�
   const upperKind = await claim({ kind: 'DOMAIN', value: 'shop.example.com', issued: '2026-10-13', signature: '0x' + 'ab'.repeat(65) });
   assert.notEqual(upperKind.body.code, 0);
   assert.match(upperKind.body.message, /kind 需逐字为/);
-  assert.equal(claimRows().length, before, '以上全部不落库');
+  assert.equal((await claimRows()).length, before, '以上全部不落库');
 });
 
 test('issued 逐字使用：缺 / 非法日期被拒；显式给出的"别的某一天"照样通过（跨天、跨时区不受影响）', async () => {
-  const before = claimRows().length;
+  const before = (await claimRows()).length;
   const dummySig = '0x' + 'ab'.repeat(65);
   // 缺 issued：不替店主补当天（校验在验签之前，所以签名对不对无关紧要）
   const missing = await claim({ kind: 'x', value: 'no_issued', signature: dummySig });
@@ -354,7 +366,7 @@ test('issued 逐字使用：缺 / 非法日期被拒；显式给出的"别的某
     assert.notEqual(r.body.code, 0, `issued=${issued} 应被拒`);
     assert.match(r.body.message, /issued 需为 YYYY-MM-DD/);
   }
-  assert.equal(claimRows().length, before, '缺/非法 issued 不落库');
+  assert.equal((await claimRows()).length, before, '缺/非法 issued 不落库');
 
   // 显式给出的一天（与"今天"无关）必须被逐字采用：签它 → 验过 → message 里就是那一天
   for (const issued of ['2019-03-04', '2035-12-31']) {
@@ -368,35 +380,35 @@ test('issued 逐字使用：缺 / 非法日期被拒；显式给出的"别的某
 });
 
 test('POST：签名者是别人（非 operator）→ 拒绝且不落库', async () => {
-  const before = claimRows().length;
+  const before = (await claimRows()).length;
   const msg = claimMessage({ kind: 'x', value: 'someone', issued: '2026-10-13' });
   const res = await claim({ kind: 'x', value: 'someone', issued: '2026-10-13', signature: await buyer.signMessage(msg) });
   assert.notEqual(res.body.code, 0);
   assert.match(res.body.message, /签名核验不通过/);
   assert.match(res.body.message, /不是本店 operator/);
   assert.match(res.body.message, /BTY marketplace shop claim/, '把规范消息回给店主（他重签一次即可，不必猜）');
-  assert.equal(claimRows().length, before, '未通过核验的声明一律不落库');
+  assert.equal((await claimRows()).length, before, '未通过核验的声明一律不落库');
 });
 
 test('POST：签名覆盖 code 行 —— 拿别家编号签的消息在本店无效', async () => {
-  const before = claimRows().length;
+  const before = (await claimRows()).length;
   const foreign = claimMessage({ code: OTHER_CODE, kind: 'x', value: 'somehandle', issued: '2026-10-13' });
   const res = await claim({ kind: 'x', value: 'somehandle', issued: '2026-10-13', signature: await owner.signMessage(foreign) });
   assert.notEqual(res.body.code, 0);
   assert.match(res.body.message, /签名核验不通过/);
   assert.match(res.body.message, new RegExp(`code: ${CODE}`), '回给店主的是本店编号的消息');
-  assert.equal(claimRows().length, before);
+  assert.equal((await claimRows()).length, before);
 });
 
 test('POST：签名格式不合法 / 缺失 → 可读中文错，不落库', async () => {
-  const before = claimRows().length;
+  const before = (await claimRows()).length;
   const bad = await claim({ kind: 'x', value: 'handle', issued: '2026-10-13', signature: '0xdeadbeef' });
   assert.notEqual(bad.body.code, 0);
   assert.match(bad.body.message, /签名格式不合法/);
   const none = await claim({ kind: 'x', value: 'handle', issued: '2026-10-13' });
   assert.notEqual(none.body.code, 0);
   assert.match(none.body.message, /签名格式不合法/);
-  assert.equal(claimRows().length, before);
+  assert.equal((await claimRows()).length, before);
 });
 
 test('verifyClaim：三条判据缺一不可（消息形状 / operator 行 / 恢复地址）', async () => {
@@ -412,40 +424,28 @@ test('verifyClaim：三条判据缺一不可（消息形状 / operator 行 / 恢
   assert.match(verifyClaim({ message: msg, signature: '0x00', expectedOperator: OP }).reason, /签名格式不合法/);
 });
 
-// ── ④ operator / 编号取不到 ⇒ 如实报，绝不放行 ──
+// ── ④ 编号取不到 ⇒ 如实报，绝不放行 ──
+/*
+  多店改造后"本店编号"的**来源变了**（这是这组用例改写的原因，不是放宽）：
+  编号不再在每次提交声明时向 Registry 实时读 `codeOf(operator)`，而是读本地的 `shops.code`
+  ——那一列是链上 `ShopInfo.code` 的镜像，由 `termsReconciler` / 开店流程的
+  `/verify-onchain` 对账写入。于是"核验不了"的那一档来自**本店行缺失或店主地址非法**
+  （"还没在链上登记"那种状态已经不可表达：一行店铺只在链上登记之后才存在，编号由链上铸造），
+  而链不可达不再影响声明提交（链路只在**对账那一刻**需要，读不到时本地行保持原值、不写假数据）。
+  判据仍然是"核验不了就拒绝、绝不先存着"。
+*/
 
-test('未配置 registry（读不到本店编号）→ "暂无法核验店主身份"，不落库、不放行', async () => {
-  const before = claimRows().length;
-  const saved = config.chain.registryAddress;
-  config.chain.registryAddress = '';
-  resetShopCodeCache();
-  try {
-    const body = await signedBody({ kind: 'x', value: 'noregistry' });
-    const res = await claim({ kind: body.kind, value: body.value, issued: body.issued, signature: body.signature });
-    assert.notEqual(res.body.code, 0);
-    assert.match(res.body.message, /暂无法核验店主身份/);
-    assert.match(res.body.message, /MK_REGISTRY_ADDRESS/);
-    assert.equal(claimRows().length, before, '读不到就不落库（不是"先存着，回头再说"）');
-  } finally {
-    config.chain.registryAddress = saved;
-    resetShopCodeCache();
-  }
-});
 
-test('Registry 读失败（codeOf revert / RPC 故障）→ 同样"暂无法核验店主身份"，不落库', async () => {
-  const before = claimRows().length;
-  chain.fail = true;
-  resetShopCodeCache(); // 缓存命中 = 30 秒内读到过同一个编号，不是"读不到"；这里要模拟从未读到
+test('编号已对账落库 ⇒ 核验通过（链路只在**对账那一刻**需要，不在提交声明时）', async () => {
+  const before = (await claimRows()).length;
+  chain.fail = true; // 链不可达也不影响：编号已经是本地事实（读不到链时绝不改写它）
   try {
-    const body = await signedBody({ kind: 'x', value: 'rpcfail' });
+    const body = await signedBody({ kind: 'x', value: 'mirroredcode' });
     const res = await claim({ kind: body.kind, value: body.value, issued: body.issued, signature: body.signature });
-    assert.notEqual(res.body.code, 0);
-    assert.match(res.body.message, /暂无法核验店主身份/);
-    assert.match(res.body.message, /Registry 不可达/);
-    assert.equal(claimRows().length, before);
+    assertOk(res);
+    assert.equal((await claimRows()).length, before + 1);
   } finally {
     chain.fail = false;
-    resetShopCodeCache();
   }
 });
 
@@ -455,18 +455,19 @@ test('重复声明（同 kind+value+address）幂等：不新增行、不改 cre
   const body = await signedBody({ kind: 'telegram', value: 'idempotent_shop' });
   const first = await claim({ kind: body.kind, value: body.value, issued: body.issued, signature: body.signature });
   assertOk(first);
-  const rowsAfterFirst = claimRows().length;
+  const rowsAfterFirst = (await claimRows()).length;
 
   const second = await claim({ kind: body.kind, value: body.value, issued: body.issued, signature: body.signature });
   assertOk(second);
   assert.equal(second.body.data.id, first.body.data.id, '同一条记录');
-  assert.equal(claimRows().length, rowsAfterFirst, '不产生第二条记录');
+  assert.equal((await claimRows()).length, rowsAfterFirst, '不产生第二条记录');
   assert.equal(second.body.data.createdAt, first.body.data.createdAt, '幂等重发不改 createdAt');
   assert.match(second.body.message, /幂等/);
 
-  const audits = auditActions().filter((a) => a.action === 'shop.claim');
-  assert.equal(JSON.parse(audits.at(-1).detail).duplicate, true, '审计里必须能看出"这是重复提交"');
-  assert.equal(JSON.parse(audits.at(-2).detail).duplicate, false);
+  const audits = (await auditActions()).filter((a) => a.action === 'shop.claim');
+  // `audit_logs.detail` 是 JSON 列：驱动读回来**已是对象**（旧形状是 TEXT，得自己 JSON.parse）
+  assert.equal(audits.at(-1).detail.duplicate, true, '审计里必须能看出"这是重复提交"');
+  assert.equal(audits.at(-2).detail.duplicate, false);
 });
 
 test('撤销：公开列表立刻不再返回；重复撤销幂等；未知道 id 404', async () => {
@@ -478,26 +479,26 @@ test('撤销：公开列表立刻不再返回；重复撤销幂等；未知道 i
 
   const revoked = await request(app)
     .post(`/api/shop/claims/${id}/revoke`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(revoked);
   assert.ok(!(await claimsList()).some((c) => c.id === id), '撤销后不出现在公开列表');
-  assert.notEqual(claimRows().find((r) => String(r.id) === id).revoked_at, null, '库里是置 revoked_at，不是删行');
+  assert.notEqual((await claimRows()).find((r) => String(r.id) === id).revoked_at, null, '库里是置 revoked_at，不是删行');
 
   const again = await request(app)
     .post(`/api/shop/claims/${id}/revoke`)
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(again);
   assert.match(again.body.message, /此前已撤销/);
-  assert.equal(auditActions().filter((a) => a.action === 'shop.claim.revoke').length, 1, '没有变化就不重复写审计');
+  assert.equal((await auditActions()).filter((a) => a.action === 'shop.claim.revoke').length, 1, '没有变化就不重复写审计');
 
   const missing = await request(app)
     .post('/api/shop/claims/999999/revoke')
-    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(404);
   assert.equal(missing.body.code, 404);
-  const badId = await request(app).post('/api/shop/claims/abc/revoke').set('Authorization', `Bearer ${ownerToken}`).expect(200);
+  const badId = await request(app).post('/api/shop/claims/abc/revoke').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.notEqual(badId.body.code, 0);
 });
 
@@ -506,17 +507,17 @@ test('撤销后重新声明：同一行恢复生效（revoked_at 清空、create
   const created = await claim({ kind: body.kind, value: body.value, issued: body.issued, signature: body.signature });
   assertOk(created);
   const id = created.body.data.id;
-  await request(app).post(`/api/shop/claims/${id}/revoke`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
-  const rowsBefore = claimRows().length;
+  await request(app).post(`/api/shop/claims/${id}/revoke`).set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
+  const rowsBefore = (await claimRows()).length;
 
   const revived = await claim({ kind: body.kind, value: body.value, issued: body.issued, signature: body.signature });
   assertOk(revived);
   assert.match(revived.body.message, /恢复生效/);
   assert.equal(revived.body.data.id, id, '还是同一行（唯一索引不允许第二条）');
-  assert.equal(claimRows().length, rowsBefore);
-  assert.equal(claimRows().find((r) => String(r.id) === id).revoked_at, null);
+  assert.equal((await claimRows()).length, rowsBefore);
+  assert.equal((await claimRows()).find((r) => String(r.id) === id).revoked_at, null);
   assert.ok((await claimsList()).some((c) => c.id === id));
-  assert.equal(JSON.parse(auditActions().at(-1).detail).revived, true);
+  assert.equal((await auditActions()).at(-1).detail.revived, true);
 });
 
 // ── ⑥ 公开面与鉴权 ──
@@ -535,13 +536,13 @@ test('两个写入口都是 ownerOnly：未登录 401、店员 403（不能只�
   assert.equal(anon.body.code, 401, '未登录（HTTP 401 与业务码同值，见 http.js 的 makeAuthMiddleware）');
   const staff = await request(app)
     .post('/api/shop/claims')
-    .set('Authorization', `Bearer ${staffToken}`)
+    .set('Authorization', `Bearer ${staffToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ kind: body.kind, value: body.value, issued: body.issued, signature: body.signature })
     .expect(403);
   assert.equal(staff.body.code, 403, '店员不是店主：经营面可以，身份声明不行');
   const staffRevoke = await request(app)
     .post('/api/shop/claims/1/revoke')
-    .set('Authorization', `Bearer ${staffToken}`)
+    .set('Authorization', `Bearer ${staffToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(403);
   assert.equal(staffRevoke.status, 403);
 });
