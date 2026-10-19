@@ -36,4 +36,4 @@ if [ "$has_dir" = 0 ]; then
   args+=(--dir "$dir")
 fi
 
-exec bash "$TMP/deploy.sh" "${args[@]}"
+bash "$TMP/deploy.sh" "${args[@]}"
