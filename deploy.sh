@@ -490,8 +490,25 @@ db_config_from_env() {
   fi
 }
 
-parse_db_host() {
-  local raw="$1" host port
+# 宿主机上是否已经有一台在跑的 MySQL。只用于“不要重复安装”的决策，
+# 不拿它猜账号/密码：检测到也必须由部署者确认是否使用、并填连接。
+detect_local_mysql() {
+  if have mysqladmin && mysqladmin ping -h 127.0.0.1 --silent >/dev/null 2>&1; then
+    return 0
+  fi
+  if (echo >/dev/tcp/127.0.0.1/3306) >/dev/null 2>&1; then
+    return 0
+  fi
+  if have systemctl; then
+    local s
+    for s in mysql mysqld mariadb; do
+      systemctl is-active --quiet "$s" 2>/dev/null && return 0
+    done
+  fi
+  return 1
+}
+
+parse_db_host() {  local raw="$1" host port
   raw="${raw#mysql://}"
   raw="${raw%%/*}"
   case "$raw" in
@@ -514,6 +531,10 @@ parse_db_host() {
 
 resolve_db_config() {
   db_config_from_env
+  local host_mysql=0
+  if [ -z "$DB_MODE" ] && detect_local_mysql; then
+    host_mysql=1
+  fi
   if [ -n "$DB_MODE" ] && ! printf '%s' "$DB_MODE" | grep -Eq '^(external|container)$'; then
     die "--db-mode 只能是 external 或 container，当前 '$DB_MODE'"
   fi
@@ -521,8 +542,24 @@ resolve_db_config() {
   if [ -f "$ENV_FILE" ] && [ -n "${STATE_DB_MODE:-}" ] && [ "$DB_MODE_GIVEN" = 1 ] && [ "$DB_MODE" != "$STATE_DB_MODE" ]; then
     die "已有安装在用 db-mode=$STATE_DB_MODE，不能在 --update 时改成 $DB_MODE；换库请先备份并显式迁移"
   fi
+  # 已有同名 MySQL 容器：复用，不重新安装（即使 .env 丢了也不该再起一套）。
+  if [ -z "$DB_MODE" ] && dk inspect "$DB_CONTAINER" >/dev/null 2>&1; then
+    DB_MODE=container
+    DB_NAME="${DB_NAME:-$(dk inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DB_CONTAINER" 2>/dev/null | sed -n 's/^MYSQL_DATABASE=//p' | head -1)}"
+    DB_USER="${DB_USER:-$(dk inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DB_CONTAINER" 2>/dev/null | sed -n 's/^MYSQL_USER=//p' | head -1)}"
+    DB_PASSWORD="${DB_PASSWORD:-$(dk inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DB_CONTAINER" 2>/dev/null | sed -n 's/^MYSQL_PASSWORD=//p' | head -1)}"
+    info "检测到已有 MySQL 容器 $DB_CONTAINER：复用，不重新安装"
+  fi
   if [ -z "$DB_MODE" ]; then
-    if [ "$ASSUME_YES" = 1 ]; then
+    if [ "$host_mysql" = 1 ]; then
+      info "检测到本机已有 MySQL（127.0.0.1:3306 或 mysql 服务在运行）"
+      if [ "$ASSUME_YES" = 1 ]; then
+        die "检测到本机已有 MySQL，但非交互没有指定用哪套库；拒绝自动再装一个。请用 --db-mode external --db-host … --db-name … --db-user …（密码用 MK_DB_PASSWORD）使用已有库，或显式 --db-mode container 新建"
+      fi
+      local a
+      a="$(ask '  直接使用这台已有的 MySQL？[Y/n] ' 'y' '已有 MySQL 选择')"
+      case "$a" in n|N|no|NO) DB_MODE=container ;; *) DB_MODE=external ;; esac
+    elif [ "$ASSUME_YES" = 1 ]; then
       DB_MODE=container
       info "非交互未指定 --db-mode：默认由本脚本部署 MySQL 容器（$DB_CONTAINER）"
     else
@@ -545,7 +582,9 @@ resolve_db_config() {
       DB_ROOT_PASSWORD="$(random_secret 32)"
     fi
   else
-    [ -n "$DB_HOST_VALUE" ] || DB_HOST_VALUE="$(ask '  MySQL 地址（host 或 host:port）: ' '' 'MySQL 地址')"
+    local default_host=''
+    [ "$host_mysql" = 1 ] && default_host='host.docker.internal'
+    [ -n "$DB_HOST_VALUE" ] || DB_HOST_VALUE="$(ask '  MySQL 地址（host 或 host:port）: ' "$default_host" 'MySQL 地址')"
     parse_db_host "$DB_HOST_VALUE"
     DB_PORT_VALUE="${DB_PORT_VALUE:-3306}"
     [ -n "$DB_NAME" ] || DB_NAME="$(ask '  数据库名: ' '' 'MySQL 库名')"
@@ -1121,6 +1160,7 @@ if [ "$MODE" != register ]; then
       --restart unless-stopped \
       --stop-timeout "$STOP_GRACE" \
       --network "$NETWORK" --network-alias "$SERVICE" \
+      --add-host=host.docker.internal:host-gateway \
       -p "$BIND:$PORT:$CONTAINER_PORT" \
       --env-file "$ENV_FILE" \
       -v "$VOLUME:$DATA_MOUNT" \

@@ -19,7 +19,13 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/install.sh)
 ```
 
-脚本会自己取代码、构建镜像、建数据卷、启动容器并探活。首次会询问：
+脚本会自己取代码、构建镜像、建数据卷、启动容器并探活。首次会先检查本机环境：
+
+- 已有同名 MySQL 容器/数据卷：直接复用，不重新安装；
+- 本机已有 MySQL 服务：询问是否使用它；选“是”只填连接，不会另装；
+- 非交互模式检测到已有 MySQL 时拒绝自行再装，必须显式选择 `--db-mode external` 或 `--db-mode container`。
+
+随后会询问：
 
 1. 节点主钱包地址；
 2. 对外域名，以及 HTTPS 在哪终止；
@@ -83,7 +89,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/mai
 - 链上登记：打开 https://fedmall.bityuan.com →「节点登记」，用节点主钱包完成 `registerNode`
 - 开店：登记节点后，店主在前端「申请开店」提交申请；节点主设置抽成并审批，双方签票后广播 `registerShop`
 
-节点容器里的 `127.0.0.1` 指容器自己。使用外部 MySQL 时，地址必须是容器能访问到的主机/IP。
+节点容器里的 `127.0.0.1` 指容器自己。使用外部 MySQL 时，地址必须是容器能访问到的主机/IP；本机已有 MySQL 默认填 `host.docker.internal`，需要 MySQL 监听容器可达地址，不能只绑定 `127.0.0.1`。
 
 ## 日常运维
 
