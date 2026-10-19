@@ -16,7 +16,7 @@
 ## 一行部署
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/deploy.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/install.sh)
 ```
 
 脚本会自己取代码、构建镜像、建数据卷、启动容器并探活。首次会询问：
@@ -38,7 +38,7 @@ git clone https://github.com/delnull/marketplace-node.git && cd marketplace-node
 使用已有 MySQL：
 
 ```bash
-MK_DB_PASSWORD='你的密码' bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/deploy.sh) \
+MK_DB_PASSWORD='你的密码' bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/install.sh) \
   --owner 0x你的节点主钱包 --domain shop.example.com --email you@example.com \
   --db-mode external --db-host db.example.com --db-port 3306 \
   --db-name marketplace_node --db-user marketplace_node --yes
@@ -47,7 +47,7 @@ MK_DB_PASSWORD='你的密码' bash <(curl -fsSL https://raw.githubusercontent.co
 由脚本部署 MySQL：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/deploy.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/install.sh) \
   --owner 0x你的节点主钱包 --domain shop.example.com --email you@example.com \
   --db-mode container --yes
 ```
