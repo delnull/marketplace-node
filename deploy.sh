@@ -47,6 +47,12 @@
 #      --dir /opt/marketplace-node       代码/配置/Caddyfile/状态文件所在目录
 #      --service marketplace-node        容器名与服务名（同机开第二家店必须换）
 #      --volume marketplace-node-data    数据卷名（同机开第二家店必须换）
+#      --db-mode external|container      用自己的 MySQL 还是由脚本起 MySQL 容器（不给则交互询问）
+#      --db-host HOST[:PORT]             外部 MySQL 地址（也接受 mysql://HOST:PORT；不要把密码写进 URL）
+#      --db-name NAME / --db-user USER   外部库名/用户名；密码用 MK_DB_PASSWORD 环境变量传
+#      --db-container NAME               内置 MySQL 容器名（默认 <service>-mysql）
+#      --db-volume NAME                  内置 MySQL 数据卷（默认 <service>-mysql-data）
+#      --db-image IMAGE                  内置 MySQL 镜像（默认 mysql:8.4）
 #      --image marketplace-node:latest   镜像名:标签
 #      --key-file /path/key              登记用私钥文件（默认交互粘贴）
 #      --no-register / --no-domain       跳过登记 / 先不配域名
@@ -119,7 +125,9 @@ const() {
 constN() {
   local key="$1" val
   val="$(const "$key")"
-  expr "$val" + 0 >/dev/null 2>&1 || die "deploy-constants.json 的 $key 不是数字：'$val'（脚本不猜）"
+  # 不要用 `expr "$val" + 0` 判数字：`expr 0 + 0` 的输出是 0，但退出码是 1，
+  # 于是合法的 0（例如 MK_CORS_ALLOW_ALL=0）会被当成“不是数字”。这里按字符集判。
+  case "$val" in ''|*[!0-9]*) die "deploy-constants.json 的 $key 不是数字：'$val'（脚本不猜）" ;; esac
   printf '%s' "$val"
 }
 FRONTEND="$(const frontendOrigin)"
@@ -171,6 +179,11 @@ MODE=install
 DRY_RUN=0; ASSUME_YES=0; FORCE=0; NO_REGISTER=0; NO_DOMAIN=0; PULL=0
 OWNER=''; DOMAIN=''; EMAIL=''; KEY_FILE=''; PORT=''; DIR=''; SERVICE=''; VOLUME=''; IMAGE=''
 TLS_MODE=''; TLS_MODE_GIVEN=0; BIND=''; BIND_GIVEN=0; DIR_GIVEN=0; KEY_INPUT=''
+# MySQL：默认交互询问；--db-mode 供非交互/自动化显式选择。
+# external = 用户已有的 MySQL；container = 本脚本部署一个仅节点可达的 MySQL 容器。
+DB_MODE=''; DB_MODE_GIVEN=0
+DB_HOST_VALUE=''; DB_PORT_VALUE=''; DB_NAME=''; DB_USER=''; DB_PASSWORD=''
+DB_CONTAINER=''; DB_VOLUME=''; DB_IMAGE=''; DB_ROOT_PASSWORD=''
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -191,6 +204,16 @@ while [ $# -gt 0 ]; do
     --bind) BIND="${2:-}"; BIND_GIVEN=1; shift 2 ;;
     --no-register) NO_REGISTER=1; shift ;;
     --no-domain) NO_DOMAIN=1; shift ;;
+    --db-mode) DB_MODE="${2:-}"; DB_MODE_GIVEN=1; shift 2 ;;
+    --db-host) DB_HOST_VALUE="${2:-}"; shift 2 ;;
+    --db-port) DB_PORT_VALUE="${2:-}"; shift 2 ;;
+    --db-name) DB_NAME="${2:-}"; shift 2 ;;
+    --db-user) DB_USER="${2:-}"; shift 2 ;;
+    # 密码也可用环境变量 MK_DB_PASSWORD 传入（避免出现在 shell history / ps 参数里）
+    --db-password) DB_PASSWORD="${2:-}"; shift 2 ;;
+    --db-container) DB_CONTAINER="${2:-}"; shift 2 ;;
+    --db-volume) DB_VOLUME="${2:-}"; shift 2 ;;
+    --db-image) DB_IMAGE="${2:-}"; shift 2 ;;
     --pull) PULL=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
@@ -223,6 +246,35 @@ ask() {
   fi
   printf '%s' "$p" >&2; IFS= read -r a || true; printf '%s' "${a:-$d}"
 }
+
+# 密码：交互时隐藏输入；非交互只接受环境变量，绝不把密码放到 argv（ps 可见）。
+ask_secret() {
+  local p="$1" env_name="$2" a=''
+  if [ "$TTY" = 0 ]; then
+    a="${!env_name:-}"
+    [ -n "$a" ] || die "非交互环境缺少密码：请设置环境变量 $env_name（不要用 --db-password，密码会出现在 ps/history）"
+    printf '%s' "$a"; return 0
+  fi
+  printf '%s' "$p" >&2
+  IFS= read -r -s a || true
+  printf '\n' >&2
+  [ -n "$a" ] || die "密码不能为空"
+  printf '%s' "$a"
+}
+
+random_secret() {
+  local n="${1:-24}" v=''
+  if have openssl; then
+    v="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c "$n")"
+  elif [ -r /dev/urandom ]; then
+    v="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$n")"
+  fi
+  [ "${#v}" -ge "$n" ] || die "无法生成强随机密码（需要 openssl 或 /dev/urandom）"
+  printf '%s' "$v"
+}
+
+# MySQL 标识符只接受保守字符集：它既要进 SQL（由镜像初始化器使用），也要进 .env。
+valid_db_id() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_]+$'; }
 
 # 从已有 .env 里取值：**必须去掉行尾的 \r 与首尾空白**。这个文件可能是别的工具写的
 # （上一版的 PowerShell 部署器写出来的就是 CRLF），而 `cut -d= -f2-` 会把那个 \r 当成值的一部分——
@@ -285,6 +337,10 @@ if [ -f "$STATE_FILE" ]; then
   # 绑定地址同理：不记住的话，给 nginx 用的 --bind 127.0.0.1 会在下次 --update 时
   # 悄悄退回默认的 0.0.0.0（把节点暴露到所有网卡上——安全性的倒退不能靠人记得加参数）
   [ -n "${STATE_BIND:-}" ] && [ -z "$BIND" ] && BIND="$STATE_BIND"
+  [ -n "${STATE_DB_MODE:-}" ] && [ -z "$DB_MODE" ] && DB_MODE="$STATE_DB_MODE"
+  [ -n "${STATE_DB_CONTAINER:-}" ] && [ -z "$DB_CONTAINER" ] && DB_CONTAINER="$STATE_DB_CONTAINER"
+  [ -n "${STATE_DB_VOLUME:-}" ] && [ -z "$DB_VOLUME" ] && DB_VOLUME="$STATE_DB_VOLUME"
+  [ -n "${STATE_DB_IMAGE:-}" ] && [ -z "$DB_IMAGE" ] && DB_IMAGE="$STATE_DB_IMAGE"
 fi
 SERVICE="${SERVICE:-marketplace-node}"
 PORT="${PORT:-8090}"
@@ -295,6 +351,12 @@ NETWORK="${SERVICE}-net"
 CADDY_DATA="${SERVICE}-caddy-data"
 CADDY_CONFIG="${SERVICE}-caddy-config"
 IMAGE="${IMAGE:-marketplace-node:latest}"
+# MySQL：容器模式的名字/卷/镜像。显式 --db-* 优先，其次状态文件，最后按服务名派生。
+DB_CONTAINER="${DB_CONTAINER:-${SERVICE}-mysql}"
+DB_VOLUME="${DB_VOLUME:-${SERVICE}-mysql-data}"
+DB_IMAGE="${DB_IMAGE:-mysql:8.4}"
+DB_NETWORK="$NETWORK"
+DB_ROOT_FILE="$DIR/.mysql-root"
 ENV_FILE="$DIR/.env"
 UNIT_LEGACY="/etc/systemd/system/$SERVICE.service"
 
@@ -381,6 +443,182 @@ check_legacy_host_install() {
   fi
 }
 
+# ── MySQL 选择：用户已有的外部库，或本脚本用 Docker 起一个只对节点网络可见的库 ──
+# 设计判据：
+#   · 外部库：用户输入 host/port/name/user/password；脚本只写 .env，不碰对方的库；
+#   · 内置库：命名卷（不是 bind mount）+ 用户自定义网络，**不发布 3306 到宿主**；
+#     MySQL 镜像用 MYSQL_DATABASE/MYSQL_USER 初始化，应用账号只拥有该库；
+#   · 已有安装：从 .env/状态文件沿用，绝不重新询问或悄悄换库；要换库只能显式改 .env 后重建。
+db_config_from_env() {
+  [ -f "$ENV_FILE" ] || return 0
+  local host port name user pass
+  host="$(env_val MK_DB_HOST)"
+  [ -n "$host" ] || return 0
+  port="$(env_val MK_DB_PORT)"; name="$(env_val MK_DB_NAME)"
+  user="$(env_val MK_DB_USER)"; pass="$(env_val MK_DB_PASSWORD)"
+  DB_HOST_VALUE="${DB_HOST_VALUE:-$host}"
+  DB_PORT_VALUE="${DB_PORT_VALUE:-$port}"
+  DB_NAME="${DB_NAME:-$name}"
+  DB_USER="${DB_USER:-$user}"
+  DB_PASSWORD="${DB_PASSWORD:-$pass}"
+  [ -z "$DB_MODE" ] || return 0
+  if [ "$host" = "$DB_CONTAINER" ] || [ "${STATE_DB_MODE:-}" = container ]; then
+    DB_MODE=container
+  else
+    DB_MODE=external
+  fi
+}
+
+parse_db_host() {
+  local raw="$1" host port
+  raw="${raw#mysql://}"
+  raw="${raw%%/*}"
+  case "$raw" in
+    *@*) die "MySQL 地址里不要写账号/密码（会出现在历史与进程列表里）；host 与账号分项输入" ;;
+  esac
+  if printf '%s' "$raw" | grep -Eq '^\[[^]]+\](:[0-9]+)?$'; then
+    host="$(printf '%s' "$raw" | sed -E 's/^\[([^]]+)\].*/\1/')"
+    port="$(printf '%s' "$raw" | sed -nE 's/^\[[^]]+\]:([0-9]+)$/\1/p')"
+  elif printf '%s' "$raw" | grep -Eq '^[^:]+:[0-9]+$'; then
+    host="${raw%:*}"; port="${raw##*:}"
+  else
+    host="$raw"; port=''
+  fi
+  [ -n "$host" ] || die "MySQL 地址不能为空"
+  printf '%s' "$host" | grep -Eq '^[A-Za-z0-9._-]+$' || die "MySQL 地址含非法字符：$host（只收主机名/IP，可带 :端口）"
+  DB_HOST_VALUE="$host"
+  if [ -n "$port" ]; then DB_PORT_VALUE="$port"; fi
+  return 0
+}
+
+resolve_db_config() {
+  db_config_from_env
+  if [ -n "$DB_MODE" ] && ! printf '%s' "$DB_MODE" | grep -Eq '^(external|container)$'; then
+    die "--db-mode 只能是 external 或 container，当前 '$DB_MODE'"
+  fi
+  # 已有安装：模式已经由 .env/状态确定；显式换模式会指向另一套数据，直接拒绝。
+  if [ -f "$ENV_FILE" ] && [ -n "${STATE_DB_MODE:-}" ] && [ "$DB_MODE_GIVEN" = 1 ] && [ "$DB_MODE" != "$STATE_DB_MODE" ]; then
+    die "已有安装在用 db-mode=$STATE_DB_MODE，不能在 --update 时改成 $DB_MODE；换库请先备份并显式迁移"
+  fi
+  if [ -z "$DB_MODE" ]; then
+    if [ "$ASSUME_YES" = 1 ]; then
+      DB_MODE=container
+      info "非交互未指定 --db-mode：默认由本脚本部署 MySQL 容器（$DB_CONTAINER）"
+    else
+      local a
+      a="$(ask '  你有自己的 MySQL 8 吗？[y/N] ' 'n' 'MySQL 选择（y=已有，N=本脚本部署）')"
+      case "$a" in y|Y|yes|YES) DB_MODE=external ;; *) DB_MODE=container ;; esac
+    fi
+  fi
+  if [ "$DB_MODE" = container ]; then
+    DB_HOST_VALUE="$DB_CONTAINER"
+    DB_PORT_VALUE="${DB_PORT_VALUE:-3306}"
+    DB_NAME="${DB_NAME:-mk_${SERVICE//[^A-Za-z0-9_]/_}}"
+    DB_USER="${DB_USER:-mknode}"
+    DB_PASSWORD="${DB_PASSWORD:-$(random_secret 24)}"
+    if [ -f "$DB_ROOT_FILE" ]; then
+      DB_ROOT_PASSWORD="$(cat "$DB_ROOT_FILE")"
+    elif dk inspect "$DB_CONTAINER" >/dev/null 2>&1; then
+      DB_ROOT_PASSWORD="$(dk inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DB_CONTAINER" 2>/dev/null | sed -n 's/^MYSQL_ROOT_PASSWORD=//p' | head -1)"
+    else
+      DB_ROOT_PASSWORD="$(random_secret 32)"
+    fi
+  else
+    [ -n "$DB_HOST_VALUE" ] || DB_HOST_VALUE="$(ask '  MySQL 地址（host 或 host:port）: ' '' 'MySQL 地址')"
+    parse_db_host "$DB_HOST_VALUE"
+    DB_PORT_VALUE="${DB_PORT_VALUE:-3306}"
+    [ -n "$DB_NAME" ] || DB_NAME="$(ask '  数据库名: ' '' 'MySQL 库名')"
+    [ -n "$DB_USER" ] || DB_USER="$(ask '  用户名: ' '' 'MySQL 用户名')"
+    [ -n "$DB_PASSWORD" ] || DB_PASSWORD="$(ask_secret '  密码（输入不显示）: ' MK_DB_PASSWORD)"
+  fi
+  valid_db_id "$DB_NAME" || die "数据库名只能包含字母/数字/下划线：$DB_NAME"
+  valid_db_id "$DB_USER" || die "MySQL 用户名只能包含字母/数字/下划线：$DB_USER"
+  printf '%s' "$DB_PORT_VALUE" | grep -Eq '^[0-9]+$' || die "MySQL 端口非法：$DB_PORT_VALUE"
+  [ "$DB_PORT_VALUE" -ge 1 ] && [ "$DB_PORT_VALUE" -le 65535 ] || die "MySQL 端口越界：$DB_PORT_VALUE"
+  [ -n "$DB_PASSWORD" ] || die "MySQL 密码不能为空"
+  case "$DB_PASSWORD" in *$'\n'*|*$'\r'*) die "MySQL 密码不能包含换行" ;; esac
+  if [ "$DB_MODE" = external ]; then
+    case "$DB_HOST_VALUE" in 127.0.0.1|localhost|::1)
+      warn "外部 MySQL 地址是 $DB_HOST_VALUE：容器里的 127.0.0.1 指容器自己；若库在宿主上，请填宿主可达 IP 并确认 bind-address"
+      ;;
+    esac
+  fi
+}
+
+ensure_mysql_container() {
+  [ "$DB_MODE" = container ] || return 0
+  if [ -z "$DB_ROOT_PASSWORD" ] && [ -f "$DB_ROOT_FILE" ]; then
+    DB_ROOT_PASSWORD="$(cat "$DB_ROOT_FILE")"
+  fi
+  if [ -z "$DB_ROOT_PASSWORD" ] && dk inspect "$DB_CONTAINER" >/dev/null 2>&1; then
+    DB_ROOT_PASSWORD="$(dk inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DB_CONTAINER" 2>/dev/null | sed -n 's/^MYSQL_ROOT_PASSWORD=//p' | head -1)"
+  fi
+  dk network inspect "$DB_NETWORK" >/dev/null 2>&1 || dk network create "$DB_NETWORK" >/dev/null
+  dk volume inspect "$DB_VOLUME" >/dev/null 2>&1 || dk volume create "$DB_VOLUME" >/dev/null
+  if ! dk image inspect "$DB_IMAGE" >/dev/null 2>&1; then
+    info "拉取 MySQL 镜像 $DB_IMAGE（首次约数百 MB）…"
+    if have timeout; then
+      timeout 300 "${SUDO[@]}" docker pull "$DB_IMAGE" >/dev/null || die "拉取 $DB_IMAGE 失败/超时（检查 Docker 镜像源；不会带着半截镜像启动）"
+    else
+      "${SUDO[@]}" docker pull "$DB_IMAGE" >/dev/null || die "拉取 $DB_IMAGE 失败（检查 Docker 镜像源）"
+    fi
+  fi
+  if dk inspect "$DB_CONTAINER" >/dev/null 2>&1; then
+    if [ "$(dk inspect -f '{{.State.Running}}' "$DB_CONTAINER" 2>/dev/null || true)" != true ]; then
+      info "启动已有 MySQL 容器：$DB_CONTAINER"
+      dk start "$DB_CONTAINER" >/dev/null
+    else
+      info "复用已有 MySQL 容器：$DB_CONTAINER"
+    fi
+  else
+    [ -n "$DB_ROOT_PASSWORD" ] || DB_ROOT_PASSWORD="$(random_secret 32)"
+    info "创建 MySQL 容器：$DB_CONTAINER（镜像 $DB_IMAGE，卷 $DB_VOLUME，仅加入网络 $DB_NETWORK）"
+    dk run -d --name "$DB_CONTAINER" \
+      --restart unless-stopped \
+      --network "$DB_NETWORK" \
+      -e MYSQL_ROOT_PASSWORD="$DB_ROOT_PASSWORD" \
+      -e MYSQL_DATABASE="$DB_NAME" \
+      -e MYSQL_USER="$DB_USER" \
+      -e MYSQL_PASSWORD="$DB_PASSWORD" \
+      -v "$DB_VOLUME:/var/lib/mysql" \
+      "$DB_IMAGE" \
+      --character-set-server=utf8mb4 \
+      --collation-server=utf8mb4_0900_as_cs \
+      --log-bin-trust-function-creators=1 >/dev/null || die "MySQL 容器启动失败（看上面的 docker 输出；镜像 $DB_IMAGE 拉取失败也会这样）"
+  fi
+  local i ok=0
+  for i in $(seq 1 60); do
+    if dk exec "$DB_CONTAINER" mysqladmin ping -h 127.0.0.1 -uroot -p"$DB_ROOT_PASSWORD" --silent >/dev/null 2>&1; then ok=1; break; fi
+    sleep 2
+  done
+  if [ "$ok" != 1 ]; then
+    dk logs --tail 30 "$DB_CONTAINER" 2>&1 | sed 's/^/    /' || true
+    die "MySQL 容器 120 秒内没有就绪（$DB_CONTAINER）"
+  fi
+  if ! dk exec -e MYSQL_PWD="$DB_PASSWORD" "$DB_CONTAINER" \
+      mysql -h127.0.0.1 -u"$DB_USER" "$DB_NAME" -e 'SELECT 1' >/dev/null 2>&1; then
+    die "MySQL 已启动，但应用账号 $DB_USER 无法访问库 $DB_NAME（卷里是另一套旧账号？换库请显式备份/迁移）"
+  fi
+  # 节点启动时会执行 SET SESSION binlog_row_image='MINIMAL'。MySQL 8 的库级 ALL 不包含
+  # 这个全局动态权限；不给的话节点会在 initDb() 里 ER_SPECIFIC_ACCESS_DENIED_ERROR 反复重启。
+  if ! dk exec -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$DB_CONTAINER" \
+      mysql -uroot -e "ALTER DATABASE \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs;
+        GRANT SESSION_VARIABLES_ADMIN ON *.* TO '$DB_USER'@'%';
+        -- 内置库只服务本节点；节点会在临时库重放完整 schema（含触发器/视图），
+        -- 因此应用账号需要在这个隔离容器内拥有建库/建触发器/建视图的权限。
+        GRANT ALL PRIVILEGES ON *.* TO '$DB_USER'@'%';" >/dev/null 2>&1; then
+    die "无法初始化 MySQL 应用账号权限（$DB_USER）：需要 SESSION_VARIABLES_ADMIN 与临时探针库权限"
+  fi
+  ok "MySQL 就绪：$DB_CONTAINER / $DB_NAME（仅容器网络可达，不发布 3306）"
+  if [ ! -f "$DB_ROOT_FILE" ]; then
+    umask 077
+    printf '%s\n' "$DB_ROOT_PASSWORD" > "$DB_ROOT_FILE"
+    chmod 600 "$DB_ROOT_FILE" 2>/dev/null || true
+    info "MySQL root 密码保存在 $DB_ROOT_FILE（0600；备份/恢复需要，不要删）"
+  fi
+}
+
+
 if [ "$MODE" != status ] && [ "$MODE" != health ] && [ "$MODE" != uninstall ] && [ "$MODE" != purge ]; then
   ensure_docker
   check_legacy_host_install
@@ -409,6 +647,12 @@ if [ "$MODE" = status ] || [ "$MODE" = health ]; then
   step "节点现状"
   dk ps -a --filter "name=^${CONTAINER}\$" --format '  容器：{{.Names}}  状态：{{.Status}}  镜像：{{.Image}}  端口：{{.Ports}}'
   dk volume inspect "$VOLUME" --format '  数据卷：{{.Name}}' 2>/dev/null || warn "数据卷 $VOLUME 不存在"
+  if [ "$DB_MODE" = container ]; then
+    dk ps -a --filter "name=^${DB_CONTAINER}\$" --format '  MySQL：{{.Names}}  状态：{{.Status}}' || true
+    dk volume inspect "$DB_VOLUME" --format '  MySQL 数据卷：{{.Name}}' 2>/dev/null || warn "MySQL 数据卷 $DB_VOLUME 不存在"
+  elif [ -n "$DB_MODE" ]; then
+    info "MySQL：外部 $DB_HOST_VALUE:$DB_PORT_VALUE/$DB_NAME（脚本不管它）"
+  fi
   if [ -f "$ENV_FILE" ]; then
     info "配置：$ENV_FILE（$(grep -c . "$ENV_FILE") 行；密钥不在脚本这一侧）"
     grep -E '^(MK_PORT|MK_SHOP_OWNER|MK_ESCROW_START_BLOCK|MK_CORS_ORIGIN|MK_BTY_TTL_MS)=' "$ENV_FILE" | sed 's/^/    /' || true
@@ -432,7 +676,7 @@ fi
 if [ "$MODE" = uninstall ] || [ "$MODE" = purge ]; then
   step "卸载"
   if [ "$MODE" = purge ]; then
-    warn "==--purge：会**删除数据卷 $VOLUME**（附件与商品媒体全没；库在 MySQL 里，不在本卷内）—— 不可逆 =="
+    warn "==--purge：会**删除数据卷 $VOLUME**（附件与商品媒体全没）$( [ "$DB_MODE" = container ] && printf '与 MySQL 数据卷 %s' "$DB_VOLUME" )—— 不可逆 =="
     if [ "$ASSUME_YES" != 1 ]; then
       log "  确认请输入卷名：$VOLUME"
       CONFIRM="$(ask '  > ' '' '删除数据卷的确认（非交互请加 --yes）')"
@@ -442,12 +686,19 @@ if [ "$MODE" = uninstall ] || [ "$MODE" = purge ]; then
   if have docker; then
     dk rm -f "$CONTAINER" >/dev/null 2>&1 && ok "容器已移除：$CONTAINER" || info "容器不存在：$CONTAINER"
     dk rm -f "$CADDY_CONTAINER" >/dev/null 2>&1 && ok "Caddy 容器已移除：$CADDY_CONTAINER" || true
+    if [ "$DB_MODE" = container ]; then
+      dk rm -f "$DB_CONTAINER" >/dev/null 2>&1 && ok "MySQL 容器已移除：$DB_CONTAINER" || info "MySQL 容器不存在：$DB_CONTAINER"
+    fi
     dk network rm "$NETWORK" >/dev/null 2>&1 || true
     if [ "$MODE" = purge ]; then
       dk volume rm "$VOLUME" >/dev/null 2>&1 && ok "数据卷已删除：$VOLUME" || warn "数据卷删除失败（可能还在被别的容器用）"
+      if [ "$DB_MODE" = container ]; then
+        dk volume rm "$DB_VOLUME" >/dev/null 2>&1 && ok "MySQL 数据卷已删除：$DB_VOLUME" || warn "MySQL 数据卷删除失败（可能还在被别的容器用）"
+      fi
       dk volume rm "$CADDY_DATA" "$CADDY_CONFIG" >/dev/null 2>&1 || true
     else
       ok "数据卷保留：$VOLUME（要连数据一起删：bash deploy.sh --purge）"
+      [ "$DB_MODE" = container ] && info "MySQL 数据卷保留：$DB_VOLUME（--purge 才会删）"
     fi
   else
     warn "这台机器上没有 docker —— 没什么可卸的"
@@ -709,9 +960,10 @@ fi
 # =============================================================================
 step "③ 写配置（$ENV_FILE）"
 umask 077
+resolve_db_config
 DATA_MOUNT='/data'
 KEEP_EXTRA=''
-MANAGED_KEYS='MK_PORT MK_SHOP_OWNER MK_RPC_URL MK_CHAIN_ID MK_ESCROW_ADDRESS MK_REGISTRY_ADDRESS MK_BLOCKLIST_ADDRESS MK_ESCROW_START_BLOCK MK_ESCROW_TIMEOUT_BLOCKS MK_ESCROW_FINALITY_BLOCKS MK_ESCROW_POLL_MS MK_CHAIN_RECONCILE_MS MK_CORS_ORIGIN MK_CORS_ALLOW_ALL MK_ATTACH_DIR MK_AUTO_DELIVER MK_PII_RETENTION_DAYS MK_BTY_TTL_MS MK_DRAFT_TTL_MINUTES MK_REVIEW_TTL_DAYS MK_TOKEN_TTL MK_SIWE_TTL MK_TOKEN_SECRET MK_SIWE_DOMAIN'
+MANAGED_KEYS='MK_PORT MK_SHOP_OWNER MK_RPC_URL MK_CHAIN_ID MK_ESCROW_ADDRESS MK_REGISTRY_ADDRESS MK_BLOCKLIST_ADDRESS MK_ESCROW_START_BLOCK MK_ESCROW_TIMEOUT_BLOCKS MK_ESCROW_FINALITY_BLOCKS MK_ESCROW_POLL_MS MK_CHAIN_RECONCILE_MS MK_CORS_ORIGIN MK_CORS_ALLOW_ALL MK_ATTACH_DIR MK_AUTO_DELIVER MK_PII_RETENTION_DAYS MK_BTY_TTL_MS MK_DRAFT_TTL_MINUTES MK_REVIEW_TTL_DAYS MK_TOKEN_TTL MK_SIWE_TTL MK_TOKEN_SECRET MK_SIWE_DOMAIN MK_DB_HOST MK_DB_PORT MK_DB_NAME MK_DB_USER MK_DB_PASSWORD'
 if [ -f "$ENV_FILE" ]; then
   KEEP_SECRET="$(env_val MK_TOKEN_SECRET)"
   cp -a "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
@@ -767,12 +1019,10 @@ MK_CORS_ORIGIN=$CORS
 MK_CORS_ALLOW_ALL=$(constN MK_CORS_ALLOW_ALL)
 # 附件与商品媒体在**卷**里：容器删了重建数据也在，这是升级与搬家都不丢附件的前提
 MK_ATTACH_DIR=$DATA_MOUNT/attachments
-# 库在 MySQL 里、不在本卷内：MK_DB_* 由你自己写进 <安装目录>/.env（本脚本不管它们，重跑原样保留）。
-# 注意容器里的 127.0.0.1 指的是**容器自己** —— MK_DB_HOST 必须指向那台 MySQL 服务器。
 MK_AUTO_DELIVER=$(constN MK_AUTO_DELIVER)
 MK_PII_RETENTION_DAYS=$(constN MK_PII_RETENTION_DAYS)
 # 优雅关闭：收到 SIGTERM 后节点自己"停止收新连接 → 等在途响应 → 关库 → 退出"的**上限**（毫秒）。
-# ⚠️ 它与上面 `docker run --stop-timeout $STOP_GRACE` 是一对：宽限期必须**大于**这个值，
+# ⚠️ 它与上面 docker run --stop-timeout $STOP_GRACE 是一对：宽限期必须大于这个值，
 # 否则宽限期一到 SIGKILL 就把优雅关闭截断，而日志里已经打了"已关闭"。
 # 这条不等式由 node/test/deploy-plan.test.js 对 deploy-constants.json 守着，脚本不重复判。
 MK_SHUTDOWN_DRAIN_MS=$(constN MK_SHUTDOWN_DRAIN_MS)
@@ -785,6 +1035,15 @@ MK_SIWE_TTL=$(constN MK_SIWE_TTL)
 MK_TOKEN_SECRET=$KEEP_SECRET
 MK_SIWE_DOMAIN=$DOMAIN
 EOF
+# 数据库五项单独用 printf 写：密码可能含 $、反引号、反斜杠，不能经过 here-doc 展开。
+{
+  printf '# 数据库：%s 模式；容器内 127.0.0.1 指容器自己，内置库用容器名互通\n' "$DB_MODE"
+  printf 'MK_DB_HOST=%s\n' "$DB_HOST_VALUE"
+  printf 'MK_DB_PORT=%s\n' "$DB_PORT_VALUE"
+  printf 'MK_DB_NAME=%s\n' "$DB_NAME"
+  printf 'MK_DB_USER=%s\n' "$DB_USER"
+  printf 'MK_DB_PASSWORD=%s\n' "$DB_PASSWORD"
+} >> "$ENV_FILE"
 if [ -n "$KEEP_EXTRA" ]; then
   {
     printf '\n# ── 以下配置项不由 deploy.sh 管理，重跑脚本时原样保留 ──\n'
@@ -794,6 +1053,7 @@ if [ -n "$KEEP_EXTRA" ]; then
 fi
 chmod 600 "$ENV_FILE"
 ok "配置就绪：$ENV_FILE（$(grep -c . "$ENV_FILE") 行，0600）"
+ensure_mysql_container
 
 # =============================================================================
 if [ "$MODE" != register ]; then
@@ -1154,6 +1414,10 @@ STATE_VOLUME=$VOLUME
 STATE_IMAGE=$IMAGE
 STATE_CONTAINER=$CONTAINER
 STATE_TLS=$TLS_MODE
+STATE_DB_MODE=$DB_MODE
+STATE_DB_CONTAINER=$DB_CONTAINER
+STATE_DB_VOLUME=$DB_VOLUME
+STATE_DB_IMAGE=$DB_IMAGE
 STATE_EMAIL=$EMAIL
 STATE_BIND=$BIND
 STATE_NETWORK=$NETWORK
