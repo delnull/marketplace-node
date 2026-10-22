@@ -69,7 +69,7 @@ import { nodeOwner } from './shops.js';
 // 状态集合的唯一出处（见下方再导出说明）：本文件内部要用，所以先 import 再 export
 import { PII_ERASABLE_STATUS, PII_PROTECTED_STATUS } from './orderStatus.js';
 // 确认收货后的售后案件：在途判据的唯一实现（保留期扫描据此让路，见 runPiiRetention）
-import { AFTER_SALE_NOT_OPEN_SQL } from './afterSale.js';
+import { AFTER_SALE_NOT_OPEN_SQL } from './afterSaleSql.js';
 
 /** 陈述正文的墓碑（保留可读性：当事人看到的是"已删除"而不是空白/报错） */
 export const PII_TOMBSTONE = '[已按数据删除请求擦除]';

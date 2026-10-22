@@ -2,6 +2,7 @@
  * 店铺目录与开店申请（挂 `/api/shops`）。
  *
  *  GET  /                    公开：本节点**在售**店铺列表（编号/店名/卖家地址/抽成比例/在售状态）
+ *  GET  /admin/all           节点管理员：本节点**全部**店铺（含暂停接单，用于节点主恢复）
  *  GET  /:code               公开：单店详情（含在售状态与当前登记费率）
  *  POST /applications        店主提交开店申请（需登录；只有店名/公告，不填抽成、不签名）
  *  GET  /applications/list   节点主/员工查看申请队列（nodeAdmin）
@@ -51,19 +52,19 @@ import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js'
 import { verifyToken, isHost } from '../auth.js';
 import { getDb } from '../db.js';
 import { logAudit } from '../audit.js';
-import { isAddress, isZeroAddress, getProvider, getRegistry, shopCodeFromChain, shopRegisteredEventFromLogs } from '../chain.js';
+import { isAddress, isZeroAddress, getProvider, getRegistry, nodeStaffList, shopCodeFromChain, shopRegisteredEventFromLogs } from '../chain.js';
 import {
   nodeOwner,
   listListedShopRows,
+  listShopRows,
   shopDto,
   shopRowByCode,
   shopRowBySeller,
   resolveShopRef,
   shopTicketDigest,
-  recoverTicketSigner,
+  isValidTicketSignature,
 } from '../shops.js';
 import { reconcileOnce, termsReconcileStatus } from '../termsReconciler.js';
-import { isNodeStaffOf } from '../chain.js';
 
 const router = Router();
 const requireAuth = makeAuthMiddleware(verifyToken);
@@ -160,12 +161,13 @@ function applicationDto(row, nodeAddr) {
  *   · 只在 submit 验一次 ⇒ 审批/核验之间那段窗口里的改动不会被发现。
  * 判据只有这一处，两个调用点都只消费它的结论。
  */
-function sellerSignatureError(row) {
+async function sellerSignatureError(row) {
   const seller = String(row?.seller || '').toLowerCase();
   if (!seller || !String(row?.seller_sig || '').trim()) return '申请缺少店主签名（sellerSig）';
   let digest;
+  let innerHash;
   try {
-    ({ digest } = shopTicketDigest({
+    ({ digest, innerHash } = shopTicketDigest({
       host: row.host,
       seller,
       commissionBps: Number(row.commission_bps),
@@ -174,8 +176,7 @@ function sellerSignatureError(row) {
   } catch (e) {
     return `无法重算票据摘要：${e?.message || e}`;
   }
-  const signer = recoverTicketSigner(digest, row.seller_sig);
-  if (!signer || signer !== seller) {
+  if (!(await isValidTicketSignature(seller, innerHash, digest, row.seller_sig))) {
     return '申请里的店主签名与当前票据不符（票据绑定 host/seller/费率/deadline）——请驳回后让店主重新提交申请';
   }
   return null;
@@ -185,6 +186,22 @@ function sellerSignatureError(row) {
 router.get('/', wrap(async (req, res) => {
   const nodeAddr = await nodeOwner();
   const rows = await listListedShopRows();
+  ok(res, {
+    host: nodeAddr || null,
+    shops: rows.map((r) => shopDto(r, nodeAddr)),
+  });
+}));
+
+/**
+ * 节点管理员：本节点**全部**店铺（含 `listed = 0` 的暂停接单店）。
+ *
+ * 为什么必须单独一条鉴权路由，而不是给公开 `/` 加 `?all=1`：
+ * 暂停接单的店在公开面按"不存在"处理（单店详情 404），公开列表不能因为一个查询参数
+ * 就把它重新列出来。节点主恢复店铺需要看到它，判据是**节点管理员身份**（节点主或员工）。
+ */
+router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
+  const nodeAddr = await nodeOwner();
+  const rows = await listShopRows();
   ok(res, {
     host: nodeAddr || null,
     shops: rows.map((r) => shopDto(r, nodeAddr)),
@@ -213,7 +230,8 @@ router.get('/:code', wrap(async (req, res) => {
 /**
  * 提交开店申请（需登录）。
  *
- * 请求体：`{name, notice}`（**不含抽成/签名**；抽成由节点主审批时设置）
+ * 请求体：`{name, notice}`（`name` **必填**：店名是店铺在联邦目录里的身份，没有默认名；
+ * **不含抽成/签名**；抽成由节点主审批时设置）
  *   · `seller` 取**登录地址**（不由请求体给）：申请是"我请求在你的节点下开店"，
  *     让别人代提申请没有意义，也给了冒名占位的面；
  *   · 抽成是**节点主设置**的基础设施费，不是店主在申请里自报的数字；
@@ -231,6 +249,9 @@ router.post('/applications', requireAuth, applicationLimiter, wrap(async (req, r
   const { name, notice } = req.body || {};
   const nameText = String(name ?? '').trim().slice(0, 60);
   const noticeText = String(notice ?? '').trim().slice(0, 500);
+  // 店名**必填**：它是一家店在联邦目录里的身份，没有默认名可回退。
+  // 不在这里拦，空名会一路进到 shops 行，买家在目录里看到一个没有名字的店铺（或各家同名的占位）。
+  if (!nameText) return fail(res, '店名不能为空（≤60 字）：店铺在联邦目录里靠它被买家识别');
   const deadline = new Date(Date.now() + TICKET_TTL_DAYS * 86_400_000);
 
   const db = getDb();
@@ -412,15 +433,15 @@ router.post('/applications/:id/seller-sign', requireAuth, wrap(async (req, res) 
   }
   const sellerSig = String(req.body?.sellerSig || '').trim();
   if (!sellerSig) return fail(res, '缺少 sellerSig：请对当前票据摘要签名后再提交');
-  const { digest } = shopTicketDigest({
+  const { digest, innerHash } = shopTicketDigest({
     host: row.host,
     seller: row.seller,
     commissionBps: Number(row.commission_bps),
     deadline: row.deadline,
   });
-  const signer = recoverTicketSigner(digest, sellerSig);
-  if (!signer) return fail(res, 'sellerSig 不是合法的签名');
-  if (signer !== seller) return fail(res, 'sellerSig 的签名者不是登录地址（票据绑定 host/seller/比例/deadline，换一项都要重签）');
+  if (!(await isValidTicketSignature(seller, innerHash, digest, sellerSig))) {
+    return fail(res, 'sellerSig 不是该登录地址的合法签名（票据绑定 host/seller/比例/deadline，换一项都要重签）');
+  }
   await db.run('UPDATE shop_applications SET seller_sig = ?, updated_at = ? WHERE id = ?', sellerSig, new Date(), id);
   await audit(req, 'shop.application.seller_sign', 'shop_application', String(id), {
     seller,
@@ -447,7 +468,7 @@ router.post('/applications/:id/sign', nodeAdmin, wrap(async (req, res) => {
   if (!row.seller_sig) {
     return fail(res, '等待店主签署条款：节点主设置抽成后，申请人必须先对同一张票据签名，节点主才能签', 409, 409);
   }
-  const sellerErr = sellerSignatureError(row);
+  const sellerErr = await sellerSignatureError(row);
   if (sellerErr) return fail(res, sellerErr, 409, 409);
   // 过期票据不再返回可广播的 call：链上必然 ShopTicketExpired，先在这里挡住白付 gas
   if (row.deadline.getTime() <= Date.now()) {
@@ -455,20 +476,29 @@ router.post('/applications/:id/sign', nodeAdmin, wrap(async (req, res) => {
   }
   const hostSig = String(req.body?.hostSig || '').trim();
   if (!hostSig) return fail(res, '缺少 hostSig');
-  const { digest } = shopTicketDigest({
+  const { digest, innerHash } = shopTicketDigest({
     host: row.host,
     seller: row.seller,
     commissionBps: Number(row.commission_bps),
     deadline: row.deadline,
   });
-  const signer = recoverTicketSigner(digest, hostSig);
-  if (!signer) return fail(res, 'hostSig 不是合法的签名');
   /*
     签名者可以是**节点主本人**，也可以是**本节点员工**（2026-10-18：员工与节点主同权限，
-    审批开店就是他们被授予的动作之一）。链上 `registerShop` 在执行时会再验一次
-    `staffNode[signer] == host`（被解除的员工拿着旧签名回来登记会被拒）。
+    审批开店就是他们被授予的动作之一）。签名判据统一走 `isValidTicketSignature`：
+    EOA 走 ECDSA，合约账户走标准 1271 / Safe legacy；链上 `registerShop` 在执行时会再验一次，
+    被解除的员工拿着旧签名回来登记会被拒。员工名单读不到时按"没有员工"处理（fail-closed）。
   */
-  if (signer !== String(row.host).toLowerCase() && !(await isNodeStaffOf(signer, row.host))) {
+  let hostSigned = await isValidTicketSignature(row.host, innerHash, digest, hostSig);
+  if (!hostSigned) {
+    const staff = await nodeStaffList(row.host);
+    for (const s of staff || []) {
+      if (await isValidTicketSignature(s, innerHash, digest, hostSig)) {
+        hostSigned = true;
+        break;
+      }
+    }
+  }
+  if (!hostSigned) {
     return fail(res, 'hostSig 的签名者不是本节点主或本节点员工（票据绑定 host/seller/费率/deadline 四项，换一项都要重签）');
   }
   await db.run('UPDATE shop_applications SET host_sig = ?, updated_at = ? WHERE id = ?', hostSig, new Date(), id);
@@ -514,7 +544,7 @@ router.post('/applications/:id/verify-onchain', nodeAdmin, wrap(async (req, res)
     与 /sign 同一道判据（见 sellerSignatureError）：落库前必须确认"这张票据"仍是店主签过的那一张。
     只信申请行里的列 ⇒ 一次直接 UPDATE 就能让节点把（被改过条款的）申请登记成一家真实店铺。
   */
-  const sellerErr = sellerSignatureError(row);
+  const sellerErr = await sellerSignatureError(row);
   if (sellerErr) return fail(res, sellerErr, 409, 409);
   if (row.status === 'registered') return ok(res, applicationDto(row, hostAddr), '该申请已核验过（幂等）');
   if (!row.host_sig) return fail(res, '还缺节点主的签名：先走 /sign 把双签补齐，再广播 registerShop');

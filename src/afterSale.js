@@ -72,27 +72,6 @@ export const AFTER_SALE_STATUS = Object.freeze(['none', 'open', 'closed']);
 export const AFTER_SALE_ELIGIBLE_STATUS = Object.freeze(['confirmed', 'settled', 'expired']);
 
 /**
- * SQL 判据片段（**唯一拼法**）：列名与状态值只在这里出现一次，避免各调用点各写一份字符串
- * （本仓反复踩过的"同一判据抄多份、改一处漏一处全都不报错"）。
- * 两个方向都给：`AFTER_SALE_OPEN_SQL`（在途，用于队列/徽标/门控）
- * 与 `AFTER_SALE_NOT_OPEN_SQL`（无在途，用于"漏扫开案"扫描与保留期让路的候选面）。
- *
- * ⚠️ 两个片段用的是**不加表别名的列名**，所以用到它们的查询必须把 `order_chain` 接进来
- * （售后案件的列在这一张表里）。没接进来会直接报 `Unknown column 'after_sale_status'`——
- * 响亮地失败，不会静默算成"没有案件"。
- *
- * ⚠️ **`NOT_OPEN` 必须显式带上 `IS NULL`**：整单读走的是 `LEFT JOIN order_chain`
- * （没有链上镜像行的订单那一侧全是 NULL），而 `NULL <> 'open'` 在 SQL 里是 NULL——既不真也不假。
- * 漏掉这一支的后果是**静默漏掉一整类候选单**（"从未有过链上单/镜像行缺失"的单永远不进候选面），
- * 与 piiErase 里 `NOT (pc.order_id <=> di.order_id)` 那一课同源。
- *
- * ⚠️ 不要把在途判据拼成 `… = 0` 之类的**数字比较**：MySQL 把 ENUM 与数字比较解读成**枚举下标**
- * （0 不落在 1..3 里）⇒ 那条谓词静默地匹配 0 行。要比就比字符串。
- */
-export const AFTER_SALE_OPEN_SQL = "after_sale_status = 'open'";
-export const AFTER_SALE_NOT_OPEN_SQL = "(after_sale_status IS NULL OR after_sale_status <> 'open')";
-
-/**
  * 结案说明（链上 `AfterSaleClosed` 的 `note`）的长度上限 —— 与 `order_chain.after_sale_note`
  * 的 `VARCHAR(500)` **同宽**（改一处必须同批改另一处：严格模式下写超长值会让整条语句以 1406 失败，
  * 一个用户填的说明不该让整次状态回填失败）。

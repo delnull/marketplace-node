@@ -8,6 +8,7 @@
  *
  * 环境变量注入：启动时经 `node --env-file-if-exists=.env` 加载（见 package.json scripts）。
  */
+import { readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 
 function intEnv(name, fallback) {
@@ -98,8 +99,53 @@ function trustProxyOf(raw) {
   return parts;
 }
 
-/** 店铺默认名（首启/未在网页设置时使用；展示参数一律存 kv、网页编辑，不入配置文件） */
-export const DEFAULT_SHOP_NAME = '我的联邦小店';
+/**
+ * 配置层的**版本唯一真相**：`node/package.json` 的 `version`。
+ *
+ * `/healthz`、`/api/shop`、`/api/shop/registry-info` 都读 `config.version`，
+ * 不在各接口里抄字面量——抄三份的结果是版本一升，某一个接口继续报旧版本（静默假话）。
+ */
+const PKG_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+
+/**
+ * 节点默认名：只在"没设置过节点名、也没有对外域名"时用。
+ *
+ * 为什么不编一个固定的中文默认名：联邦目录里"这台机器叫什么"必须能区分不同节点，
+ * 所有没设置过的节点印同一句话等于没有名字；而域名正是这台机器在链上登记的 endpoint
+ * 与 SIWE 签名原文里用的**同一个身份**（见 `resolveNodeDomain()`），不再另造第二个标识。
+ */
+export const DEFAULT_NODE_NAME = '未命名节点';
+
+/**
+ * 节点对外域名的**唯一解析**（`MK_SIWE_DOMAIN` → `MK_REGISTER_ENDPOINT`，第一个非空生效）。
+ *
+ * 两个消费点必须同源，否则同一台机器会在钱包弹窗里叫一个域名、在目录里叫另一个名字：
+ *   · `auth.js` 的 `resolveSiweIdentity()`：SIWE 签名原文里的 domain/URI；
+ *   · `shops.js` 的 `nodeDisplayName()`：节点没设置过名字时的默认名。
+ *
+ * 为什么不是"import 时读一次存常量"：测试进程各自注入环境变量（见 db 那几个 getter 的说明），
+ * 每次调用动态读环境变量，测试才能注入；部署期改 `.env` 也立刻生效。
+ *
+ * 返回值：`{ domain, uri }`（`domain` = host[:port]，`uri` = `<协议>//<host>/`）；
+ * 没有或解析不了返回 `null`——**不编一个域名**（编出来的域名会让两台不同的节点长得一样）。
+ */
+export function resolveNodeDomain() {
+  const HOST_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$/i;
+  const raw =
+    String(process.env.MK_SIWE_DOMAIN || '').trim() || String(process.env.MK_REGISTER_ENDPOINT || '').trim();
+  if (!raw) return null;
+  try {
+    const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    const u = new URL(withScheme);
+    const host = u.host; // host[:port]（URL 自动小写 hostname）
+    const uri = `${u.protocol}//${u.host}/`;
+    // 域名形态健全性：host[:port]、无路径/query/userinfo；异常值按"没有域名"处理
+    if (host && HOST_RE.test(host)) return { domain: host, uri };
+  } catch {
+    /* raw 无法解析为 URL：按"没有域名"处理，由调用方走各自的兜底 */
+  }
+  return null;
+}
 
 /**
  * PII 保留期（天，MK_PII_RETENTION_DAYS，默认 180；显式 0 = 关闭周期擦除）。
@@ -142,6 +188,9 @@ export const PII_RETENTION_REUSE_MS = intEnvAllowZero('MK_PII_RETENTION_REUSE_MS
 export const SHUTDOWN_DRAIN_MS = intEnv('MK_SHUTDOWN_DRAIN_MS', 10_000);
 
 const config = {
+  /** 对外声称的版本号（唯一真相 = `package.json`，见 `PKG_VERSION` 的说明） */
+  version: PKG_VERSION,
+
   port: intEnv('MK_PORT', 8080),
 
   /** 优雅关闭的等待上限（见 `SHUTDOWN_DRAIN_MS` 的说明）。放进 config 是为了让 server.js 与
@@ -152,15 +201,15 @@ const config = {
     // 店主钱包地址（0x...），必填——卖家身份锚点（SIWE 鉴权/收款人）。
     // 唯一不可网页改的身份项：换店主=节点易主，走链上 transferNode 或关店重开。
     owner: process.env.MK_SHOP_OWNER || '',
-    // 店名/公告/店员白名单/通知 webhook 等经营参数——
-    // 一律存 kv 并在卖家面板「店铺设置」网页维护，不在配置文件出现。
+    // 店名/公告/店员名单/通知 webhook 等经营参数一律是库里的列/行，
+    // 在卖家面板「店铺设置」网页维护，不在配置文件出现。
   },
 
   chain: {
     rpcUrl: process.env.MK_RPC_URL || 'https://mainnet.bityuan.com/eth',
     chainId: intEnv('MK_CHAIN_ID', 2999),
-    // 托管/注册合约地址：本仓库代码尚未部署到 2999 主网，代码中不含任何默认地址，
-    // 必须由部署方部署后经 .env 注入（部署与登记见 docs/DEPLOY_NODE.md §4）；
+    // 托管/注册合约地址：代码不写死任何默认地址，由部署方经 .env 注入
+    // （当前主网批次的五项见 node/deploy-constants.json；部署与登记见 docs/DEPLOY_NODE.md §4）；
     // 留空 = 未接入对应能力（无 escrow 时仅浏览展示，不可下单）
     // 支付币种全局约定为原生 BTY（2026-09 收敛：BTY 主网无 USDT/USDC 稳定币、
     // WBTY 同名合约泛滥，不再支持 ERC20 支付配置，消除假币/approve 攻击面）
@@ -319,8 +368,15 @@ const config = {
   siwe: {
     // nonce 有效期（秒）
     ttlSeconds: intEnv('MK_SIWE_TTL', 600),
-    // 登录令牌有效期（秒）
-    tokenTtlSeconds: intEnv('MK_TOKEN_TTL', 86400),
+    /*
+      登录令牌有效期（秒）。默认 30 天：前端把会话存在**本机**（localStorage），
+      所以"这台设备上签一次名"的窗口就是它；1 天会让每天第一次打开都要再签一次。
+
+      代价：令牌是无状态的 HMAC，服务端没有"吊销单个令牌"的入口——有效期多长，
+      一枚泄露的令牌就能用多长（能力仍受每个请求的实时角色/链上状态约束，动钱仍要钱包签名）。
+      要立刻让全部令牌失效只有换 `MK_TOKEN_SECRET`（所有人重新登录）。不想要这么长就调小。
+    */
+    tokenTtlSeconds: intEnv('MK_TOKEN_TTL', 2592000),
     /*
       HMAC 签名密钥（生产必须设置强随机值）。
       **刻意没有默认值**：留空即走 server.js 的 fail-fast（<32 字符 / 缺失一律 exit(1)）。

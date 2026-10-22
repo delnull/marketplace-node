@@ -1128,8 +1128,10 @@ if [ "$MODE" != register ]; then
       && info "已把当前镜像存为回滚点：$ROLLBACK_IMAGE（${OLD_IMAGE_ID:7:12}）" \
       || warn "回滚点标记失败（不影响本次部署）"
   fi
-  info "docker build $DIR …"
-  dk build -t "$IMAGE" "$DIR" || die "镜像构建失败（看上面的输出；最常见原因：拉不到基础镜像 $BASE_IMAGE —— 服务器出网/Docker 镜像源受限）。**旧容器没有被动过，节点仍在正常服务**"
+  info "docker build --pull $DIR …"
+  # --pull：基础镜像是浮动标签（node:24-slim），不带它就会复用本机旧层——
+  # Node 的安全补丁只随基础镜像走，"--update 重建了"不等于"运行时补丁装上了"。
+  dk build --pull -t "$IMAGE" "$DIR" || die "镜像构建失败（看上面的输出；最常见原因：拉不到基础镜像 $BASE_IMAGE —— 服务器出网/Docker 镜像源受限）。**旧容器没有被动过，节点仍在正常服务**"
   IMAGE_ID="$(dk image inspect "$IMAGE" --format '{{.Id}}' | cut -c8-19)"
   # 尺寸用 docker images 的口径（落盘占用），不是 inspect 的 .Size（那是压缩层大小，
   # 两个数字差 4 倍：同一个镜像 369MB 落盘 / 83MB 压缩，报小的那个会让店主以为磁盘没事）
@@ -1346,6 +1348,9 @@ EOF
         info "  想回到备份：cp -a $CADDY_BAK $DIR/Caddyfile && docker restart $CADDY_CONTAINER"
       fi
     fi
+    # Caddy 是 TLS 入口，补丁只随镜像走；docker run 在标签已存在时不会重新拉取。
+    # 拉取失败不阻断：旧镜像仍能服务，但必须明确告警——不能把"重建了"说成"补丁装上了"。
+    dk pull "$CADDY_IMAGE" >/dev/null 2>&1 || warn "拉取 $CADDY_IMAGE 失败，继续使用本机已有镜像（可能不是最新安全版本）"
     dk rm -f "$CADDY_CONTAINER" >/dev/null 2>&1 || true
     info "拉起 Caddy（首次会去申请证书：需要 $DOMAIN 已解析到本机、80/443 可达）…"
     if dk run -d --name "$CADDY_CONTAINER" \

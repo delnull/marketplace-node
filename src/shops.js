@@ -45,9 +45,9 @@
  * 而**不报错**（见 db.js 的说明），所以这些入口用 `requireDate` 把它变成响亮失败。
  */
 import { ethers } from 'ethers';
-import config, { DEFAULT_SHOP_NAME } from './config.js';
+import config, { DEFAULT_NODE_NAME, resolveNodeDomain } from './config.js';
 import { getDb } from './db.js';
-import { isAddress, isZeroAddress } from './chain.js';
+import { isAddress, isZeroAddress, isValidContractSignature } from './chain.js';
 import { tanxinAddressOf } from './tanxin.js';
 
 /** 店铺句柄的请求头（卖家面的**范围提示**：带了必须指得中；不带则取唯一经营的那家，多店时必须点名——见 http.js） */
@@ -128,13 +128,32 @@ export function hostOperator() {
 /* ─────────────────────────── 店铺行 ─────────────────────────── */
 
 /**
- * 展示用店名（**唯一实现**：`shops.name` / `node.name` 两处同名同规则，DTO 与设置页共用）。
- * `''` = **没设置过** ⇒ 回默认名；默认名只是**展示默认值**，不是第二份真相
- * （它不落库，所以"没设置过"这个事实没有被抹掉）。
+ * 展示用**店名**（**唯一实现**；DTO 与设置页共用）。
+ *
+ * 没有默认名：店名是店铺在联邦目录里的身份，两条写入口（开店申请、店铺资料编辑）
+ * 都拒绝空名，所以"没有名字的店"在接口层不可达。曾经这里回退成"我的联邦小店"——
+ * 那是第一人称的占位，而且所有没设置过的店会印同一句，买家看到的分不清是哪一家。
+ *
+ * ⚠️ 节点名走 `nodeDisplayName()`：节点与店铺是两个实体，默认名也各是各的。
  */
 export function shopDisplayName(row) {
+  return String(row?.name || '');
+}
+
+/**
+ * 展示用**节点名**（**唯一实现**；健康检查、公开 DTO 与设置页共用）。
+ *
+ * 回退顺序：`node.name` → 节点自己的对外域名（`MK_SIWE_DOMAIN` / `MK_REGISTER_ENDPOINT`）
+ * → 中性占位 `DEFAULT_NODE_NAME`。
+ *
+ * 为什么默认名取域名而不是一个固定的中文名：联邦目录里"这台机器叫什么"必须能区分不同节点，
+ * 而域名正是它在链上登记的 endpoint 与 SIWE 签名原文里用的**同一个身份**，不再另造第二个标识。
+ * 没有域名（内网/裸机）时不编造，用中性占位——**绝不回退成店铺默认名**。
+ */
+export function nodeDisplayName(row) {
   const v = String(row?.name || '');
-  return v !== '' ? v : DEFAULT_SHOP_NAME;
+  if (v !== '') return v;
+  return resolveNodeDomain()?.domain || DEFAULT_NODE_NAME;
 }
 
 /** 展示用公告（**唯一实现**；`''` = 没设置过） */
@@ -193,6 +212,17 @@ export function shopDto(row, nodeAddr) {
 /** 全部店铺行（按链上登记顺序：`code` 是链上铸造的，排序即登记顺序） */
 export async function listShopRows() {
   return await getDb().all('SELECT * FROM shops ORDER BY created_at ASC, code ASC');
+}
+
+/**
+ * **在营**店铺行（`exited_at_block = 0`）——对外计数与"名下店铺"列表只该数它们。
+ *
+ * 店主退出后那一行留成墓碑（`exited_at_block > 0`，链上允许重开），它**不是**
+ * "现在还挂在名下的店"：把它算进 total，节点主在面板上看到的家数会比实际多，
+ * 多出来的那一家点进去也已经不接单了。
+ */
+export async function listActiveShopRows() {
+  return await getDb().all('SELECT * FROM shops WHERE exited_at_block = 0 ORDER BY created_at ASC, code ASC');
 }
 
 /** 只出**在售**店铺（公开聚合面用；listed=0 的店不进聚合） */
@@ -414,6 +444,34 @@ export function recoverTicketSigner(digest, signature) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 验签的**唯一判据**：EOA 走 `recoverTicketSigner`，合约账户（Safe/多签/金库）走 EIP-1271。
+ *
+ * 为什么节点也必须支持 1271（2026-10-21）：链上 `MarketplaceRegistry` 的注册/开店/转让
+ * 已经走 EIP-1271；如果节点仍只做裸 ECDSA，合约店主/节点主的签名会在
+ * `/seller-sign` / `/sign` / `/verify-onchain` 被节点先拒掉，链上能力等于用不了。
+ *
+ * 边界：标准 1271 验 digest（`0x1626ba7e`），Safe v1.3 legacy 重载验 inner
+ * （`0x20c13b0b`）；RPC 读不到 / 调用 revert / 返回长度不足一律 false（fail-closed）。
+ * EOA 分支不需要 RPC，节点离线时仍能验普通钱包签名。
+ *
+ * @param {string} expected 期望签名者（链上 host / seller / staff）
+ * @param {string} inner    合约 `_shopTicketInner` / `_transferInner` 的内层哈希
+ * @param {string} digest   标准 1271 / EOA 用的 EIP-191 外层（`hashMessage(inner)`）
+ * @param {string} signature 钱包或合约账户返回的签名
+ */
+export async function isValidTicketSignature(expected, inner, digest, signature, provider = null) {
+  const signer = String(expected || '').toLowerCase();
+  if (!isAddress(signer) || !String(signature || '').trim()) return false;
+  /*
+    先做**离线 ECDSA 恢复**：普通钱包的签名在这里就命中，不依赖 RPC。
+    如果先 getCode，节点离线/单测未起 RPC 时所有普通签名都会被误判为失败。
+    恢复不中才去链上问"这个地址是不是合约账户"；是才走 1271。
+  */
+  if (recoverTicketSigner(digest, signature) === signer) return true;
+  return isValidContractSignature(signer, inner, digest, signature, provider);
 }
 
 /**

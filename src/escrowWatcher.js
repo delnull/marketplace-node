@@ -277,6 +277,27 @@ export const EVENTS = [
   'ArbiterRevoked',
 ];
 
+/**
+ * 这条日志是否真的来自 canonical Escrow。
+ *
+ * `queryFilter` 的 `address` 过滤是**由 RPC 执行**的：ethers 把它翻译进 `eth_getLogs` 的 filter，
+ * 却不会在返回后重新核对 `log.address`。一个错误的 RPC 实现（或伪造/被劫持的 RPC）可以返回
+ * 任意合约的同 topic 日志，而 watcher 随后会按事件参数推进本地订单状态（退款/结算/发码）。
+ * 所以把"发布者必须是托管合约"作为**本地判据**再验一次——与收据路径
+ *（`routes/orders.js` 的 verifyPaidReceipt）和 `chain.shopRegisteredEventFromLogs` 同一条纪律。
+ *
+ * `removed=true` 是重组后撤销的日志；getLogs 正常不会返回，但既然要校验来源，就一并拒绝。
+ * 只校验来源不校验区块头：RPC 仍是节点自己配置的信任源（同一份 RPC 也提供 getOrder），
+ * 要防它整体作伪需要独立 RPC / 轻客户端，不在本函数的范围内。
+ */
+export function isCanonicalEscrowLog(log, escrowAddress) {
+  if (!log || typeof log !== 'object') return false;
+  if (log.removed === true) return false;
+  const expected = String(escrowAddress || '').trim().toLowerCase();
+  if (!expected) return false;
+  return String(log.address || '').trim().toLowerCase() === expected;
+}
+
 /** 事件史上限（防单订单无限膨胀；20 条覆盖完整生命周期富余） */
 const EVENT_HISTORY_LIMIT = 20;
 
@@ -300,7 +321,8 @@ async function localRowOf(db, escrowOrderId) {
     新增列时请回到这里补一行，而不是在分支里再查一次。
   */
   return await db.get(
-    `SELECT o.id AS order_id, o.order_no, o.status, o.buyer, o.seller, o.shop_code, o.amount_wei,
+    `SELECT o.id AS order_id, o.order_no, o.status, o.buyer, o.seller, o.shop_code, o.amount_wei, o.timeout_blocks,
+            o.commission_quoted_to,
             c.paid_tx_hash, c.refund_status
        FROM order_chain c JOIN orders o ON o.id = c.order_id
       WHERE c.escrow_order_id = ?`,
@@ -512,20 +534,67 @@ export async function settleByRefundSplit(db, orderId, refundWeiArg) {
  * 早就接受 cancelled 残镜像，冻结路径却漏了它——于是"买家在草稿被清扫/取消之后才完成支付"
  * 这一竞态留下一个死角：只要 `OrderCreated` 那次扫描也漏了（RPC 抖动/进程停机），
  * 买家随后申请退款、被拒、发起争议时，本地行会**永远停在 cancelled**，
- * 而链上那笔钱已经真的被冻结在 Disputed 里。cancelled 行取消时已释放占位，
- * 迁到 disputed 不产生占位副作用（与终局路径同理）。
+ * 而链上那笔钱已经真的被冻结在 Disputed 里。
+ *
+ * **从 cancelled 复活必须把库存占位补回来**（2026-10-22 复审）：取消流程释放过占位，
+ * 只改状态会让同一件货同时"可再售"又"已有在途单"（争议判给卖家即超卖）。见函数体内说明。
  * @returns {number} 受影响行数（0 = 未命中可迁移的行 / 本节点没有这一单）
  */
 export async function markEscrowDisputed(db, orderId) {
   const local = await db.get(
-    'SELECT o.id AS order_id FROM orders o JOIN order_chain c ON c.order_id = o.id WHERE c.escrow_order_id = ?',
+    'SELECT o.id AS order_id, o.order_no, o.status, o.shop_code FROM orders o JOIN order_chain c ON c.order_id = o.id WHERE c.escrow_order_id = ?',
     String(orderId).toLowerCase()
   );
   if (!local) return 0;
-  return (await db.run(
+  /*
+    **先认领迁移，再补占位**（顺序是判据，不是风格）。
+
+    两条路径（watcher 的 DisputeRequested 与 /sync、后台对账）可能同时处理同一单：先做
+    `UPDATE ... WHERE status IN (...)` 拿到 changes=1 的那一方才是"这次真的把它推进了"的人。
+    反过来的顺序（先补占位、再迁移）会在输掉竞争的调用点留下一笔**属于终局的**占位：
+    例如另一条路径刚把它判成 refunded，这里却因为读到的是旧 status=cancelled 而先占了位——
+    库存被一件已经退款的单永久占住（商品看起来卖光了）。`restockOrder` 自身的
+    `released_at IS NOT NULL` 认领只能防重复，防不了"为不该占的单占位"。
+  */
+  const changed = (await db.run(
     "UPDATE orders SET status = 'disputed', updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status IN ('draft','escrowed','shipped','cancelled')",
     local.order_id
   )).changes;
+  if (changed === 0 || local.status !== 'cancelled') return changed;
+  /*
+    **从 cancelled 复活必须把库存占位补回来**（2026-10-22 复审）。
+
+    取消（草稿清扫/买家取消）时占位已经释放；而"订单已取消、链上却已支付、`OrderCreated` 又漏扫"
+    是真实竞态，其后的第一手链上事实可能是 Disputed（买家已申请退款/发起争议）。旧实现只把
+    状态推成 disputed，却不碰占位——于是这件商品同时"可再售"又"已有在途单"，一旦争议判给卖家
+    就是一次超卖，而 Created 恢复分支（`restockOrder` + 告警）早就做了同一件事。
+    占位恢复失败**不阻断争议推进**：钱已经冻在链上，本地状态必须先与链上一致；差额交给店主核账，
+    与 Created 分支同一口径（那里是 `abortTx`，因为那时钱还在托管里、可以拒绝恢复）。
+  */
+  if (!(await restockOrder(local.order_id))) {
+    console.error(
+      `[escrowWatcher] 复活争议单 ${String(local.order_no).slice(0, 8)}… 的库存占位失败（限量库存不足），请店主核账扩容`
+    );
+    try {
+      await alertOnceDelivered({
+        orderId: local.order_id,
+        kind: 'hold_missing',
+        label: '[escrowWatcher]',
+        what: `（order.hold_missing，order=${String(local.order_no).slice(0, 8)}…，争议复活时占位失败）`,
+        send: () =>
+          notifyRaw('order.hold_missing', {
+            // shopCode 必填：webhook 按它选店（缺了会一次都不投递，见 Created 分支的同款说明）
+            shopCode: local.shop_code,
+            orderId: local.order_no,
+            escrowOrderId: orderId,
+            reason: '订单取消后链上才进入争议，本地复活时库存占位失败（限量库存已被他人买走）——请核对商品余量并扩容或退款处理',
+          }),
+      });
+    } catch {
+      /* 告警失败不影响状态推进（console 已留痕） */
+    }
+  }
+  return changed;
 }
 
 /**
@@ -597,7 +666,7 @@ async function applyEventCore(name, args, meta = {}) {
   */
   if (name !== 'OrderCreated' && meta.chainParams && !chainParamsMatch(local, meta.chainParams)) {
     console.warn(
-      `[escrowWatcher] 忽略与链上真值不符的事件: ${name} orderId=${orderId} 买家/卖家/金额与本地订单锁定不一致（疑似他人对同一 orderId 的诱饵单）`
+      `[escrowWatcher] 忽略与链上真值不符的事件: ${name} orderId=${orderId} 买家/卖家/金额/店铺节点与本地订单锁定不一致（疑似他人对同一 orderId 的诱饵单）`
     );
     return 0;
   }
@@ -620,12 +689,22 @@ async function applyEventCore(name, args, meta = {}) {
           amountOk = false;
         }
         match = sellerOk && buyerOk && amountOk;
+        /*
+          店铺节点也必须对上（2026-10-21 订单绑定）：同一卖家可以在多个节点下各有一家店，
+          `(seller, host)` 才唯一确定一家店。只比买卖双方+金额时，买家可以拿这个卖家的
+          **另一家店**的编号下单（host 不同），事件仍会被当成"本单已托管"。
+          `commission_quoted_to` 读不到（老行/测试桩）时跳过——不拿 seller 猜 host。
+        */
+        const wantHost = String(local.commission_quoted_to || '').toLowerCase();
+        const gotHost = String(args.host || '').toLowerCase();
+        // 本地有报价时 host 必须读得到且相等；事件字段缺失只出现在单测直调，按旧口径跳过
+        if (wantHost && args.host !== undefined && wantHost !== gotHost) match = false;
       }
       // 兜底：事件字段缺失（ABI 漂移）时用 pollOnce 预取的链上真值再比一遍
       if (match && meta.chainParams) match = chainParamsMatch(local, meta.chainParams);
       if (!match) {
         console.warn(
-          `[escrowWatcher] 忽略疑似伪造托管事件: orderId=${orderId} 金额/卖家/买家与本地订单锁定不符`
+          `[escrowWatcher] 忽略疑似伪造托管事件: orderId=${orderId} 金额/卖家/买家/店铺节点与本地订单锁定不符`
         );
         return 0; // 不推进、不记录事件史、不触发自动交付
       }
@@ -1059,12 +1138,30 @@ export async function pollOnce() {
   const logsByName = await Promise.all(
     EVENTS.map((name) => escrow.queryFilter(escrow.filters[name](), from + 1, to))
   );
+  const escrowAddress = String(config.chain.escrowAddress || '').toLowerCase();
   const all = [];
+  let foreignLogs = 0;
   logsByName.forEach((logs, i) => {
     for (const log of logs) {
+      /*
+        **本地再验一次发布者**（见 isCanonicalEscrowLog）：address 过滤是 RPC 的承诺，不是返回值的
+        性质。收据路径与 Registry 日志路径都各自核过 `log.address`，这里漏掉就等于给"别人的合约
+        发出同名事件"留了一条驱动本地订单状态的路。校验失败只丢弃这一条，不让整轮失败——否则
+        一条坏日志会把它后面的好日志一起拖进隔离重试。
+      */
+      if (!isCanonicalEscrowLog(log, escrowAddress)) {
+        foreignLogs += 1;
+        continue;
+      }
       all.push({ name: EVENTS[i], block: log.blockNumber, index: log.index, txHash: log.transactionHash, args: log.args });
     }
   });
+  if (foreignLogs > 0) {
+    console.warn(
+      `[escrowWatcher] 本轮忽略 ${foreignLogs} 条非托管合约地址的日志（address != ${escrowAddress}，或 removed=true）：` +
+        'RPC 的日志过滤不可信，已按来源丢弃'
+    );
+  }
   all.sort((a, b) => a.block - b.block || a.index - b.index);
 
   let updated = 0;
@@ -1112,7 +1209,7 @@ export async function pollOnce() {
     （重试 → 隔离），既不会「无法核对就直接落地」，也不会因一个单拖住整窗扫描。
     每个 orderId 至多一次 RPC；本地无此单的偶发事件不打 RPC（链上的单不限于本节点）。
   */
-  const paramsById = new Map(); // orderId → { ok:true, buyer, seller, amount } | { ok:false }
+  const paramsById = new Map(); // orderId → { ok:true, buyer, seller, amount, timeoutBlocks, commissionTo } | { ok:false }
   {
     const needIds = new Set();
     for (const ev of all) {
@@ -1125,7 +1222,15 @@ export async function pollOnce() {
       if (!local) continue;
       try {
         const p = await fetchOnchainOrder(oid);
-        paramsById.set(oid, { ok: true, buyer: p.buyer, seller: p.seller, amount: p.amount });
+        paramsById.set(oid, {
+          ok: true,
+          buyer: p.buyer,
+          seller: p.seller,
+          amount: p.amount,
+          timeoutBlocks: p.timeoutBlocks,
+          // 店铺节点：与本地报价列比对，挡住"同一卖家的另一家店"用同 orderId 驱动终局事件
+          commissionTo: p.commissionTerms?.commissionTo || '',
+        });
       } catch (e) {
         paramsById.set(oid, { ok: false });
         console.warn(
@@ -1175,7 +1280,14 @@ export async function pollOnce() {
         block: ev.block,
         // 链上真值（买家/卖家/金额）：非 OrderCreated 事件据此拒绝「他人对同一 orderId 的诱饵单」，
         // 见 applyEventCore 头部说明。OrderCreated 自身已用事件字段比对，无需重复传。
-        chainParams: prefetched && prefetched.ok ? { buyer: prefetched.buyer, seller: prefetched.seller, amount: prefetched.amount } : undefined,
+        chainParams: prefetched && prefetched.ok ? {
+          buyer: prefetched.buyer,
+          seller: prefetched.seller,
+          amount: prefetched.amount,
+          timeoutBlocks: prefetched.timeoutBlocks,
+          // 店铺节点：同一卖家的另一家店不能驱动本单的终局/冻结事件（见 chainOrder.chainParamsMatch）
+          commissionTo: prefetched.commissionTo || '',
+        } : undefined,
         // 本批预扫命中 或 未达链头的跨窗回放（behind）→ OrderCreated 抑制自动交付
         skipAutoDeliver: ev.name === 'OrderCreated' && (skipAutoDeliver.has(oidOfEv) || behind),
       });

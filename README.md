@@ -110,4 +110,4 @@ docker logs -f marketplace-node
 - `.env` 含令牌密钥和数据库密码，权限保持 0600，不要提交到仓库。
 - 生产环境把 `MK_CORS_ORIGIN` 收窄到实际前端域名。
 - 对外只暴露 HTTPS；MySQL 不应对公网开放。
-- 根目录的 `deploy-constants.json` 是当前主网合约批次，不要手改单个地址。
+- 根目录的 `deploy-constants.json` 记**本批**主网合约；当前已填入 2026-10-22 主网批次，`deploy.sh` 会直接使用。换批时按 `docs/DEPLOY_NODE.md` 同批更新五项；不要手改单个地址。

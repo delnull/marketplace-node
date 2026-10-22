@@ -31,10 +31,10 @@
 import crypto from 'node:crypto';
 import { ethers } from 'ethers';
 import { getDb } from './db.js';
-import config from './config.js';
+import config, { resolveNodeDomain } from './config.js';
 // 店铺行的唯一读入口（本文件不直接碰 shops 表：租户事实源只有 src/shops.js 一处）
 import { shopRowByCode, nodeOwner, nodeRow, hostOperator } from './shops.js';
-import { isNodeStaffOf, isProtocolGovernanceAddress, isForceClosedAddress } from './chain.js';
+import { isNodeStaffOf, isProtocolGovernanceAddress, isForceClosedAddress, isValidContractSignature } from './chain.js';
 
 // ── 店员白名单（`shop_operators`：**一行一人**）──
 /*
@@ -96,6 +96,8 @@ const SIWE_CHAIN_ID = 2999;
  * 取值链（第一个非空生效）：
  *   1) MK_SIWE_DOMAIN：节点对外 API 域名（部署向导填写；可带协议，host[:port] 亦可）；
  *   2) MK_REGISTER_ENDPOINT：链上登记的节点 endpoint（本质即 API 根地址）；
+ *      前两档的**解析只有一份**（`config.resolveNodeDomain()`）——节点没设置过名字时
+ *      目录里显示的默认名读的也是它，两处各解析一次必然漂移成"钱包里一个域名、目录里另一个"；
  *   3) `node.owner`（同步投影 hostOperator）：店主地址小写——无域名的直连/内网部署以节点主地址
  *      为节点身份锚（0x+40hex 为合法 host 标签，消息可正常解析验签；钱包展示为地址串，可区分各节点）。
  * 每请求动态读取（env 变更即生效，测试可注入）。
@@ -105,25 +107,11 @@ const SIWE_CHAIN_ID = 2999;
  * 留着那个占位常量只会让两个节点在钱包里显示成同一个域名。）
  */
 export function resolveSiweIdentity() {
-  const HOST_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$/i;
-  // 1) 显式域名/登记端点优先（MK_SIWE_DOMAIN → MK_REGISTER_ENDPOINT）
-  const raw =
-    String(process.env.MK_SIWE_DOMAIN || '').trim() ||
-    String(process.env.MK_REGISTER_ENDPOINT || '').trim();
-  if (raw) {
-    try {
-      const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
-      const u = new URL(withScheme);
-      const host = u.host; // host[:port]（URL 自动小写 hostname）
-      const uri = `${u.protocol}//${u.host}/`;
-      // 域名形态健全性：host[:port]、无路径/query/userinfo；异常值继续走兜底
-      if (host && HOST_RE.test(host)) {
-        return { domain: host, uri };
-      }
-    } catch {
-      /* raw 无法解析为 URL：继续走兜底 */
-    }
-  }
+  // 1) 显式域名/登记端点优先（MK_SIWE_DOMAIN → MK_REGISTER_ENDPOINT）：
+  //    解析的唯一实现在 `config.resolveNodeDomain()`（节点默认名读的是同一份，
+  //    两处各写一遍迟早会出现"钱包弹窗一个域名、联邦目录另一个名字"）
+  const identity = resolveNodeDomain();
+  if (identity) return identity;
   // 2) 节点主地址兜底：0x+40hex 形态会被 WHATWG URL 解析器当作非法数字型 host 抛错，
   //    且地址本就是"节点身份锚"而非站点——直接构造 domain/URI，不经 URL 解析。
   //    取值走 `hostOperator()`（**`node.owner` 的同步投影**），不是配置里的那一份：
@@ -216,13 +204,31 @@ export async function verifySiwe(address, message, signature) {
   if (row.message !== message) throw new Error('签名原文不匹配，请重新获取');
   if (row.expires_at.getTime() < now.getTime()) throw new Error('签名原文已过期，请重新获取');
 
-  let recovered;
+  /*
+    EOA 走离线 ECDSA；合约账户走标准 1271 或 Safe legacy。
+    EOA 的 personal_sign 签名是 `verifyMessage(message)`；标准 1271 对
+    `hashMessage(message)` 验，Safe `signMessage(message)` 则要对 **message 原文** 走
+    legacy bytes 重载。先试离线恢复，未命中再问 1271——普通钱包登录不依赖 RPC。
+  */
+  let recovered = '';
   try {
     recovered = ethers.verifyMessage(message, signature).toLowerCase();
   } catch {
-    throw new Error('签名格式无效');
+    recovered = '';
   }
-  if (recovered !== addr) throw new Error('签名地址与声明地址不一致');
+  if (recovered !== addr) {
+    const ok = await isValidContractSignature(
+      addr,
+      ethers.toUtf8Bytes(message),
+      ethers.hashMessage(message),
+      signature
+    );
+    if (!ok) {
+      if (!recovered) throw new Error('签名格式无效');
+      throw new Error('签名地址与声明地址不一致');
+    }
+    recovered = addr;
+  }
 
   /*
     一次性消费 = **条件 DELETE**，并要求恰好命中 1 行才签发令牌。

@@ -8,21 +8,23 @@
  * 联邦没有任何一处能自动发现它（合约不主动扫链、节点不主动读别家），所以需要一个只读读数。
  *
  * 事实源与取舍：
- *  - 门槛与"已登记"都从 **Registry** 读：`minStakeToRegister()`、`getActiveNodes()`
- *    （活跃登记集合）、以及 `stakingContract()`（门槛判定实际用的那个保证金合约地址）。
+ *  - 门槛与"已登记"都从 **Registry** 读：`minStakeToRegister()`、`getActiveNodes(offset, limit)`
+ *    （活跃登记集合，**分页**）、以及 `stakingContract()`（门槛判定实际用的那个保证金合约地址）。
  *    **刻意不加 `MK_STAKING_ADDRESS` 环境变量**：门槛的判据链上是 `Registry.stakingContract`
  *    （owner 可改，且改门槛前必须先链接它），再配一个环境变量就是**第二个真相源**——
  *    配错/改链上地址后本地仍按旧地址算，读数会静默说谎。链上已经发布了权威地址，就用它。
  *  - 每读一个 operator 的 `Staking.poolOf(operator)`（= 质押 + 冷却中在担额，与注册门槛同口径）。
- *    成本 = 1 次 `getActiveNodes` + N 次 `poolOf`（N = 全网活跃店数）。N 大时逐次调用
+ *    成本 = ⌈N / PAGE⌉ 次 `getActiveNodes` + N 次 `poolOf`（N = 全网活跃店数）。N 大时逐次调用
  *    会明显变慢，所以：单次读数上限 `MAX_OPERATORS`（超出置 `truncated: true`，如实说明
  *    "只核了前 N 家"），结果 `TTL_MS` 内复用（同一个读数被面板/巡检脚本反复拉取时只打一轮 RPC）。
+ *    分页（2026-10-21）是为了让**单次** RPC 的响应有界：一次拉全量在几千个自注册节点时会顶过
+ *    RPC 上限，而本读数是匿名 GET 的路径。
  *  - **降级取舍（如实写明）**：以上都读不到（未配 `MK_REGISTRY_ADDRESS`、RPC 不可达、合约未升级到
  *    有该函数的版本）时，返回 `available: false` + `reason`，**不下发任何"看起来像结论"的字段**
  *    ——"读不到"绝不能显示成"没有跌破门槛的店主"。调用方要自己比对时，`minStakeToRegisterWei`
  *    与每个 operator 的 `poolWei` 都在同一个响应里（两个数同源同刻，不会各说一套）。
  *  - 复算：本读数**完全由链上状态推出**（没有任何本地账参与），第三方可独立复算核对
- *    （`Registry.getActiveNodes()` 逐个 `Staking.poolOf`）。
+ *    （`Registry.getActiveNodes(offset, limit)` 分页读 + 逐个 `Staking.poolOf`）。
  */
 import { ethers } from 'ethers';
 import config from './config.js';
@@ -34,12 +36,12 @@ const REGISTRY_ABI = [
   /*
     在册节点行（含 operator/endpoint/编号等）。**只声明本模块会读的那一个**（纪律同
     `Staking._probeEscrow`：探的/声明的必须是会调用的）。
-    为什么不是 `getActiveNodes()`：那是一个"只返回地址数组"的读法，
-    与 `getActiveNodes()` 的判据完全相同（同一份在册集合、同样剔除治理停用者），
-    两份存在只会漂移；而 `MarketplaceRegistry` 贴着 EIP-170 的 24 576 字节上限，
-    实测删掉它能省 368 字节（见合约里的说明）。这里取 `operator` 字段即可。
+    为什么直接用 `getActiveNodes(offset, limit)` 而不是再要一个"只返回地址数组"的读法：
+    后者与它是同一份在册集合、同样的停用过滤，两份存在只会漂移；而 `MarketplaceRegistry`
+    贴着 EIP-170 的 24 576 字节上限（当年删掉那个地址数组读法正是为了省 368 字节）。
+    这里只取 `operator` 字段，其余字段由 ethers 解码后丢弃。
   */
-  'function getActiveNodes() view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code)[])',
+  'function getActiveNodes(uint256 offset, uint256 limit) view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code)[])',
 ];
 const STAKING_ABI = ['function poolOf(address operator) view returns (uint256)'];
 
@@ -50,6 +52,10 @@ const TTL_MS = 30_000;
  * 超出部分如实标记 `truncated: true` —— 宁可说"没查完"，也不假装清单完整。
  */
 const MAX_OPERATORS = 200;
+/** 分页大小：一次 RPC 只取这么多行（单次响应的上限，见文件头） */
+const PAGE = 50;
+/** 最多翻这么多页：多读一条（MAX_OPERATORS + 1）才能如实回答"是否还有更多" */
+const MAX_PAGES = Math.ceil((MAX_OPERATORS + 1) / PAGE);
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 
@@ -126,17 +132,27 @@ export async function stakingShortfall({ force = false } = {}) {
   try {
     const provider = getProvider();
     const reg = new ethers.Contract(registry, REGISTRY_ABI, provider);
-    const [minRaw, stakingRaw, nodesRaw] = await Promise.all([
+    const [minRaw, stakingRaw] = await Promise.all([
       reg.minStakeToRegister(),
       reg.stakingContract(),
-      reg.getActiveNodes(),
     ]);
     const minStakeWei = BigInt(minRaw).toString();
     const stakingAddress = String(stakingRaw || '').toLowerCase();
-    // 只取 operator 字段：本读数的判据是"谁在册"，行里其余字段与门槛无关
-    const operators = (nodesRaw || [])
-      .map((n) => String(n?.operator || '').toLowerCase())
-      .filter((a) => /^0x[0-9a-f]{40}$/.test(a));
+    /*
+      分页读在册节点（2026-10-21）：每页 PAGE 条，最多 MAX_PAGES 页。翻页直到"短页"
+      （返回条数 < PAGE）或页数用尽；只取 operator 字段——本读数的判据是"谁在册"，
+      行里其余字段与门槛无关。`truncated` 判"是否真的超过 MAX_OPERATORS"：
+      多读一条（MAX_OPERATORS + 1）就不必靠页数猜。
+    */
+    const operators = [];
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const rows = await reg.getActiveNodes(page * PAGE, PAGE);
+      for (const n of rows) {
+        const op = String(n?.operator || '').toLowerCase();
+        if (/^0x[0-9a-f]{40}$/.test(op)) operators.push(op);
+      }
+      if (rows.length < PAGE) break;
+    }
     const truncated = operators.length > MAX_OPERATORS;
     const checked = operators.slice(0, MAX_OPERATORS);
     // 门槛为 0（默认）时无需再读池子：合约语义下"跌破"不成立

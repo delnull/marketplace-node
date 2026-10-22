@@ -51,7 +51,8 @@ import { feeChargeableForOrder, feeSnapshotReadOf } from '../fees.js';
 // 事件史对外的唯一折算点（库里的 at 是毫秒，出口一律 ISO；见 src/reputation.js）
 import { eventsForDto } from '../reputation.js';
 // 确认收货后的售后案件：在途判据与 DTO 字段的唯一实现（见 src/afterSale.js）
-import { AFTER_SALE_OPEN_SQL, afterSaleFieldsOf } from '../afterSale.js';
+import { AFTER_SALE_OPEN_SQL } from '../afterSaleSql.js';
+import { afterSaleFieldsOf } from '../afterSale.js';
 // 队列等待读数（计数 + 最久等待）的唯一实现：本文件的两个列表与 /api/shop/metrics 共用
 import { queueWait } from '../opsMetrics.js';
 // 主图区缩略图的读取口径（图片取 url、视频取 poster）——**唯一实现**，卡片/订单/仲裁台共用
@@ -141,6 +142,13 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null } = {}) {
     */
     orderNo: actor && o.escrow_order_id && (await isArbiterForOrder(actor, o.escrow_order_id, { force: true })) ? o.order_no : null,
     escrowOrderId: o.escrow_order_id,
+    /*
+      订单身份的另一半：**快照哈希**。仲裁动作要在本地复算
+      `orderId = keccak(快照哈希 ‖ 卖家 ‖ 买家 ‖ 本地单号)` 并与节点下发的
+      `escrowOrderId` 逐字比对，才能挡住“同一对当事人、同一金额、换一笔单”的签名目标替换。
+      哈希本身是公开事实（商品快照的哈希，订单详情里本来就展示），不含个人信息。
+    */
+    snapshotHash: o.snapshot_hash || null,
     productSlug: o.product_slug,
     productTitle: snap.title || o.product_slug,
     productKind: snap.kind || 'physical',

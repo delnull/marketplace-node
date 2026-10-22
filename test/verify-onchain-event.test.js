@@ -136,8 +136,10 @@ async function approvedApplication({ commissionBps = 250 } = {}) {
   const sellerSig = seller.signingKey.sign(digest).serialized;
   seq += 1;
   const ins = await db.run(
+    // 店名必填（见 POST /applications 的门禁）：夹具也按真实申请的形状带店名，
+    // 不带的话 verify-onchain 会以"申请没有店名"诚实失败
     `INSERT INTO shop_applications (seller, host, name, notice, commission_to, commission_bps, deadline, status, seller_sig, host_sig)
-     VALUES (?, ?, '', '', NULL, ?, ?, 'approved', ?, ?)`,
+     VALUES (?, ?, '链上核验用店铺', '', NULL, ?, ?, 'approved', ?, ?)`,
     seller.address.toLowerCase(),
     OWNER,
     commissionBps,

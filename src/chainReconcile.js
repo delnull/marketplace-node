@@ -28,7 +28,7 @@
  * ## 表与键（2026-10 MySQL 重设计）
  *
  *  - 整单读走读模型 `v_orders`；状态写 `orders`、链上镜像列写 `order_chain`——
- *    `afterSale.js` 的两个谓词（AFTER_SALE_OPEN_SQL / AFTER_SALE_NOT_OPEN_SQL）**不带别名**，
+ *    `afterSaleSql.js` 的两个谓词（AFTER_SALE_OPEN_SQL / AFTER_SALE_NOT_OPEN_SQL）**不带别名**，
  *    就是为读模型写的（`NOT_OPEN` 里的 `IS NULL` 分支只在 LEFT JOIN 出的空镜像行上成立）；
  *  - 子表写入与 `appendSyncMirrorEvent` / `restockOrder` 一律用**内部键** `order_id`，
  *    日志、告警 payload 与 `/healthz` 用**对外单号** `order_no`（旧形状里两者同名 `orders.id`，
@@ -56,12 +56,19 @@ import config from './config.js';
 import { getDb, withTransaction } from './db.js';
 // node 单例行的唯一读入口（游标落在它上面；行由 db.js 的 initDb() 在启动期建立）
 import { nodeRow } from './shops.js';
-import { fetchOrderFor, fetchAfterSaleCase, chainParamsMatch } from './chainOrder.js';
+import { fetchOrderFor, fetchAfterSaleCase, chainParamsMatch, orderCreatedMatches } from './chainOrder.js';
 import { getEscrow } from './chain.js';
-import { settleByRefundSplit, markEscrowDisputed, mapChainTerminal, readRefundedWei } from './escrowWatcher.js';
+import {
+  settleByRefundSplit,
+  markEscrowDisputed,
+  mapChainTerminal,
+  readRefundedWei,
+  isCanonicalEscrowLog,
+} from './escrowWatcher.js';
 import { appendSyncMirrorEvent, appendOrderCreatedEvent, applyRefundFlags } from './routes/orders.js';
 // 售后案件本地镜像的唯一判据层（事件/sync/对账三条路径同源，见 src/afterSale.js）
-import { AFTER_SALE_OPEN_SQL, AFTER_SALE_NOT_OPEN_SQL, AFTER_SALE_ELIGIBLE_STATUS, applyAfterSaleFromChain } from './afterSale.js';
+import { AFTER_SALE_OPEN_SQL, AFTER_SALE_NOT_OPEN_SQL } from './afterSaleSql.js';
+import { AFTER_SALE_ELIGIBLE_STATUS, applyAfterSaleFromChain } from './afterSale.js';
 // 集合 → SQL IN 片段的唯一拼法（见 src/orderStatus.js）
 import { sqlIn } from './orderStatus.js';
 import { restockOrder } from './stockHold.js';
@@ -295,11 +302,14 @@ export async function reconcileOrder(row) {
     return 'skipped';
   }
   // 防"诱饵单"（与 watcher/sync 同规则）：草稿的 orderId 对拿到详情链接的人可见，链上真值的
-  // 买家/卖家/金额必须与本行锁定值一致；不一致说明这是别人对同一 orderId 的单，不能据它改本地状态
+  // 买家/卖家/金额/验货窗口/**店铺节点**必须与本行锁定值一致；不一致说明这是别人对同一 orderId
+  // 的单（含同一卖家在另一个节点下的店），不能据它改本地状态。
+  // 传**整份链上读数**而不是手挑的四个字段：`chainParamsMatch` 的身份判据以后再加一项时，
+  // 手挑对象的调用点会静默漏掉它（2026-10-22：店铺节点就是这样漏掉的）。
   if (onchain && onchain.status && onchain.status !== 'None') {
-    if (!chainParamsMatch(row, { buyer: onchain.buyer, seller: onchain.seller, amount: onchain.amount })) {
+    if (!chainParamsMatch(row, onchain)) {
       console.warn(
-        `[chainReconcile] 跳过与链上真值不符的订单（order=${String(row.order_no).slice(0, 8)}…）：买家/卖家/金额与本地锁定不一致（疑似诱饵单）`
+        `[chainReconcile] 跳过与链上真值不符的订单（order=${String(row.order_no).slice(0, 8)}…）：买家/卖家/金额/验货窗口/店铺节点与本地锁定不一致（疑似诱饵单）`
       );
       return 'skipped';
     }
@@ -346,7 +356,17 @@ export async function reconcileOrder(row) {
         onchain.createdAtBlock,
         onchain.createdAtBlock
       );
-      if (logs.length) paidTxHash = String(logs[0].transactionHash).toLowerCase();
+      /*
+        `queryFilter` 的 address 过滤是 RPC 的承诺，不是返回值的性质：与 /paid、/sync 同一判据，
+        只把**真的由本托管合约发出、且字段属于本单**的 OrderCreated 当作支付凭证。
+        归属核对（orderCreatedMatches：orderId/buyer/seller/amount/host）不能省：只按地址过滤时，
+        同一卖家在另一个节点下的店可以用同一 orderId 建单，它的 txHash 会被写成本单的支付凭证
+        （2026-10-22 复审）。`orderCreatedMatches` 缺字段一律 false（凭证动作，读不到就不落库）。
+      */
+      const canonical = logs.filter(
+        (l) => isCanonicalEscrowLog(l, config.chain.escrowAddress) && orderCreatedMatches(row, l.args)
+      );
+      if (canonical.length) paidTxHash = String(canonical[0].transactionHash).toLowerCase();
     } catch (e) {
       console.warn(
         `[chainReconcile] 恢复订单 ${String(row.order_no).slice(0, 8)}… 前补落支付凭证的链上读失败（不阻断恢复，下次 /sync 可补）：`,

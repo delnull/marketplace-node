@@ -21,7 +21,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { Interface } from 'ethers';
-import { makeCtx, login, assertOk, shopRef, insertOrder as insertOrderRow, insertProduct } from './setup.mjs';
+import { makeCtx, login, assertOk, shopRef, insertOrder as insertOrderRow, insertProduct, skuInv } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, buyer, owner } = ctx;
@@ -73,6 +73,11 @@ const createdEvent = () => EVENT_IFACE.getEvent('OrderCreated');
 
 /** 当前用例的链上真值（/sync 经 ethers → 本地假 RPC 读取） */
 let chainOrderFor = null;
+/**
+ * 覆盖 `commissionTermsAtCreate.payee`（= 订单所属店铺的节点 host）。
+ * 默认取 `chainOrderFor.seller`（夹具的报价列），用来模拟"同一卖家在另一个节点下的店"时改成别的地址。
+ */
+let chainHostOverride = null;
 /** 事件日志开关：watcher 轮询（eth_getLogs）用 */
 let emitCreatedLog = null;
 /** 收据开关：paid 快路径（eth_getTransactionReceipt）用 */
@@ -85,9 +90,18 @@ function handleRpc(j) {
     const method = j.method;
     if (method === 'eth_call' && String(j.params?.[0]?.to || '').toLowerCase() === config.chain.escrowAddress.toLowerCase()) {
       const selector = String(j.params?.[0]?.data || '').slice(0, 10);
-      // 创建时的抽成条款：本文件不验它 ⇒ 确证"不抽成"（零地址 + 0 bps），别让它变成未知档
+      /*
+        创建时的抽成条款：本文件不验条款内容 ⇒ bps 0（确证不抽成）。
+        **payee 必须等于本地报价列**（夹具默认 = seller）：host 是订单身份的一部分，
+        桩再回零地址就等于"链上这笔单属于另一个节点"，`/sync` 会（正确地）拒绝推进。
+      */
       if (selector === iface.getFunction('commissionTermsAtCreate').selector) {
-        return { result: iface.encodeFunctionResult('commissionTermsAtCreate', ['0x' + '0'.repeat(40), 0]) };
+        // chainHostOverride === '' 模拟"这一项读不到"（RPC 半失败）：调用方必须 fail-closed
+        if (chainHostOverride === '') {
+          return { error: { code: -32000, message: 'unit-test: 抽成条款读不到' } };
+        }
+        const host = String(chainHostOverride ?? o?.seller ?? '').toLowerCase() || '0x' + '0'.repeat(40);
+        return { result: iface.encodeFunctionResult('commissionTermsAtCreate', [host, 0]) };
       }
       // 买家精确金额授权：本文件不验它 ⇒ 0（未授权）
       if (selector === iface.getFunction('acceptedPartialRefund').selector) {
@@ -103,7 +117,7 @@ function handleRpc(j) {
           o.seller,
           BigInt(o.amount),
           BigInt(o.feeBps || 0),
-          100n,
+          BigInt(o.timeoutBlocks ?? 120960),
           BigInt(o.createdAtBlock || 1),
           !!o.refundRequested,
           !!o.refundRejected,
@@ -305,6 +319,8 @@ test('同一链上终局：/sync 与 reconcileOrder 得到同一个本地状态�
       buyer: BUYER,
       seller: SELLER,
       amount: AMOUNT,
+      // 链上读数现在**总是**带顶层 commissionTo（订单身份的一部分）；夹具的报价 host = seller
+      commissionTo: SELLER,
       feeBps: 0,
       refundedAmount: c.onchain.refundedAmount,
       createdAtBlock: 7,
@@ -675,6 +691,145 @@ test('/sync 把 cancelled 恢复为 escrowed 时**在同一事务内**补写支�
     (await rowOf(o.orderId)).paid_tx_hash,
     '同步一次之后该行即满足发货前置（旧实现这里为空 ⇒ /ship 被拒，逼卖家再同步一次）'
   );
+});
+
+/*
+  ── 跨店诱饵单：订单身份包含**店铺节点**（2026-10-21 修复，2026-10-22 补齐读链路径）────────
+  同一卖家可以在多个节点下各开一家店。买家拿 A 店草稿的 orderId、用 B 店的编号在链上建一笔
+  "同买家/同卖家/同金额/同窗口、**不同 host**"的单，若 `/sync` 只比买家/卖家/金额，就会把这笔
+  属于 B 店的钱认成 A 店已支付的单：A 的账本、抽成快照与库存全部记到一笔不属于它的订单上
+  （交付闸另有条款比对会拦住发货，但账目已经错了）。这里钉住"host 不符 ⇒ 拒绝推进"。
+*/
+test('/sync 拒绝同一卖家在另一个节点下的店的链上单（host 不符），本地状态不动', async () => {
+  const o = await insertOrder({ status: 'draft', paidTxHash: null });
+  chainOrderFor = {
+    buyer: BUYER,
+    seller: SELLER,
+    amount: AMOUNT,
+    feeBps: 0,
+    refundedAmount: '0',
+    createdAtBlock: 11,
+    status: 'Created',
+  };
+  chainHostOverride = '0x' + '9'.repeat(40); // 另一家店（另一个节点）的 host
+  let bad;
+  try {
+    bad = await request(app)
+      .post(`/api/orders/${o.orderNo}/sync`)
+      .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+      .send({});
+  } finally {
+    // 断言抛错/请求抛错时也必须还原：这是文件级共享的桩，残留会让后续用例一起假红
+    chainHostOverride = null;
+  }
+  assert.equal(bad.status, 200);
+  assert.notEqual(bad.body.code, 0, `host 不符必须拒绝推进：${JSON.stringify(bad.body)}`);
+  assert.equal((await rowOf(o.orderId)).status, 'draft', '本地仍是未支付草稿');
+  assert.equal((await rowOf(o.orderId)).paid_tx_hash, null, '不得把别家店的支付凭证写进本单');
+
+  // 对照：同一份链上真值、host 正确 ⇒ 正常推进（证明上面的拒绝只来自 host 这一项）
+  const good = await request(app)
+    .post(`/api/orders/${o.orderNo}/sync`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({});
+  assert.equal(good.body.code, 0, `host 匹配时应正常推进：${JSON.stringify(good.body)}`);
+  assert.equal((await rowOf(o.orderId)).status, 'escrowed');
+});
+
+/*
+  ── cancelled → disputed：复活必须把库存占位补回来（2026-10-22 复审）────────────────
+  取消（草稿清扫/买家取消）时占位已释放。若 `OrderCreated` 漏扫、买家在取消后付款并直接进入
+  争议，旧实现只把状态推成 disputed，不碰占位 ⇒ 同一件货"可再售"又"已有在途单"，争议判给卖家
+  时就是一次超卖。这里钉住：状态推进 + `released_at` 被重新认领 + `committed` 补回。
+*/
+test('/sync 把 cancelled 直接恢复为 disputed 时补回库存占位（否则同一件货可再售）', async () => {
+  const { productId, slug } = await insertProduct(db, {
+    title: '争议复活占位',
+    kind: 'physical',
+    skus: [{ key: '', priceUsdtMicro: 100, capacity: 5, committed: 1 }],
+  });
+  const o = await insertOrder({ status: 'cancelled', productId, holdQty: 1, releasedAt: new Date(), paidTxHash: null });
+  const before = await skuInv(db, slug);
+
+  chainOrderFor = {
+    buyer: BUYER,
+    seller: SELLER,
+    amount: AMOUNT,
+    feeBps: 0,
+    refundedAmount: '0',
+    createdAtBlock: 12,
+    status: 'Disputed',
+  };
+  const res = await request(app)
+    .post(`/api/orders/${o.orderNo}/sync`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({});
+  assert.equal(res.body.code, 0, `争议复活应成功：${JSON.stringify(res.body)}`);
+
+  const row = await rowOf(o.orderId);
+  assert.equal(row.status, 'disputed');
+  assert.equal(
+    (await db.get('SELECT released_at FROM orders WHERE id = ?', o.orderId)).released_at,
+    null,
+    '占位必须被重新认领（released_at 清空）'
+  );
+  const after = await skuInv(db, slug);
+  assert.equal(
+    Number(after.committed),
+    Number(before.committed) + 1,
+    'committed 必须补回本单占用的 1 件（旧实现停在 released 状态 ⇒ 同一件可再售）'
+  );
+});
+
+/*
+  ── /cancel 的链上归属核对：false 的方向在这里是反的 ────────────────────────────────
+  `/cancel` 用 `chainParamsMatch` 决定"能不能安全取消"：match ⇒ 拒绝取消（可能已支付）。
+  而身份判据对"读不到 host"也返回 false（对推进动作是 fail-closed），到了这里却变成
+  fail-open——一次 RPC 半失败就能把一笔可能已上链的单在本地取消。2026-10-22 复审在路由里
+  把"读不到"单列为未知（不取消），这里钉住该方向；同时保留"确证是另一家店 ⇒ 允许清理"。
+*/
+test('/cancel：链上读数属于本单或读不到店铺条款时都拒绝取消；确证是别家店才放行', async () => {
+  const escrowedNoProof = async () => {
+    const o = await insertOrder({ status: 'escrowed', paidTxHash: null });
+    chainOrderFor = {
+      buyer: BUYER,
+      seller: SELLER,
+      amount: AMOUNT,
+      feeBps: 0,
+      refundedAmount: '0',
+      createdAtBlock: 13,
+      status: 'Created',
+    };
+    return o;
+  };
+  const cancel = (no) =>
+    request(app)
+      .post(`/api/orders/${no}/cancel`)
+      .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+      .send({});
+
+  // ① 读不到店铺条款 ⇒ 不取消（未知不是"不是本单"）
+  const a = await escrowedNoProof();
+  chainHostOverride = '';
+  let res;
+  try {
+    res = await cancel(a.orderNo);
+  } finally {
+    chainHostOverride = null;
+  }
+  assert.notEqual(res.body.code, 0, '读不到归属时不得取消可能已支付的单');
+  assert.equal((await rowOf(a.orderId)).status, 'escrowed', '本地状态不动');
+
+  // ② 确证是同一卖家另一家店的单（诱饵/他单占号）⇒ 允许取消并重下
+  const b = await escrowedNoProof();
+  chainHostOverride = '0x' + '9'.repeat(40);
+  try {
+    res = await cancel(b.orderNo);
+  } finally {
+    chainHostOverride = null;
+  }
+  assert.equal(res.body.code, 0, `确证不是本单 ⇒ 允许清理：${JSON.stringify(res.body)}`);
+  assert.equal((await rowOf(b.orderId)).status, 'cancelled');
 });
 
 

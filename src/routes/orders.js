@@ -115,7 +115,6 @@ import { getRates, usdtMicroToPayWei, isPayableAmount } from '../rates.js';
 import {
   INCOME_STATUS as ORDER_INCOME_STATUS,
   ORDER_STATUS,
-  ACTIVE_IN,
   PRE_PAID_IN,
   PII_ERASABLE_STATUS,
 } from '../orderStatus.js';
@@ -151,12 +150,12 @@ import {
 } from '../evidenceFiles.js';
 // 链上终局 → 本地终态的唯一实现（事件路径与快照路径共用；见 escrowWatcher 的 mapChainTerminal）
 // + 授权额落列的唯一实现（事件路径与 /sync 快照路径共用；同上）
-import { mapChainTerminal, applyAcceptedPartialRefund, readRefundedWei } from '../escrowWatcher.js';
+import { mapChainTerminal, applyAcceptedPartialRefund, readRefundedWei, isCanonicalEscrowLog, markEscrowDisputed } from '../escrowWatcher.js';
 // 确认收货后的售后案件：DTO 字段与链上真值回填的**唯一实现**（watcher/对账/sync 同源）
-import { afterSaleFieldsOf, isAfterSaleOpen, applyAfterSaleFromChain, AFTER_SALE_OPEN_SQL } from '../afterSale.js';
+import { afterSaleFieldsOf, isAfterSaleOpen, applyAfterSaleFromChain } from '../afterSale.js';
 // 售后案件的链上只读读数 + **交付闸**（可注入；三个手动交付入口与自动交付共用同一个判据，
 // 见 chainOrder.js 的 deliveryGate 说明）
-import { fetchAfterSaleCase, deliveryGate, chainParamsMatch } from '../chainOrder.js';
+import { fetchAfterSaleCase, deliveryGate, chainParamsMatch, orderCreatedMatches } from '../chainOrder.js';
 import { notify } from '../webhook.js';
 // 下单风控闸（可选，默认关闭）：店主自配的建单前准入服务——见 orderGate.js 的边界说明
 import { checkOrderGate } from '../orderGate.js';
@@ -185,6 +184,7 @@ import { sellerTodoCounts } from '../opsMetrics.js';
 // 店铺判据（"能不能卖"的唯一实现）与抽成条款：下单闸与商品闸共用同一份文案
 import { sellableError, orderTermsOf, shopRowByCode } from '../shops.js';
 import { findOrderInShop } from '../orderScope.js';
+import { sellerOrderFilters } from '../sellerOrderFilters.js';
 
 const router = Router();
 const requireAuth = makeAuthMiddleware(verifyToken);
@@ -770,27 +770,12 @@ async function verifyPaidReceipt(order, txHash) {
     } catch {
       continue;
     }
-    if (parsed && parsed.name === 'OrderCreated') {
-      const created = parsed.args;
-      // 防伪托管 + 账户一致性：Escrow 仅收原生 BTY，但事件可能被同名 orderId 干扰——
-      // 必须核对事件中的金额/卖家/买家与本地订单锁定值一致（真实入金必然同值；
-      // 买家比对防「他人钱包代付」把资金锁死在他人 buyer 名下/误触发交付）。
-      const orderIdOk = String(created.orderId).toLowerCase() === order.escrow_order_id;
-      const sellerOk = String(created.seller || '').toLowerCase() === String(order.seller || '').toLowerCase();
-      const buyerOk = String(created.buyer || '').toLowerCase() === String(order.buyer || '').toLowerCase();
-      let amountOk = false;
-      try {
-        amountOk = BigInt(created.amount) === BigInt(order.amount_wei || '0');
-      } catch {
-        amountOk = false;
-      }
-      if (orderIdOk && sellerOk && buyerOk && amountOk) {
-        return {
-          ok: true,
-          canonicalHash: String(receipt.hash || txHash).toLowerCase(),
-          blockNumber: receipt.blockNumber || null,
-        };
-      }
+    if (parsed && parsed.name === 'OrderCreated' && orderCreatedMatches(order, parsed.args)) {
+      return {
+        ok: true,
+        canonicalHash: String(receipt.hash || txHash).toLowerCase(),
+        blockNumber: receipt.blockNumber || null,
+      };
     }
   }
   return { ok: false, message: '交易中未找到与本单锁定匹配的托管事件（需 OrderCreated 且金额/卖家/买家一致，疑似未托管/他人代付或伪造托管）' };
@@ -915,7 +900,7 @@ async function notePaidTxHash(order, canonicalHash) {
 /**
  * 创建订单草稿：锁定商品快照 + 汇率与应付金额（单价×数量）+ 链上 orderId。
  * 鉴权（防匿名占位 DoS，P1-2）：需登录且目标买家=登录地址，店主可代买家下单（卖家面板代客单）；
- * 叠加每地址活跃草稿上限（防注册地址批量占位）。
+ * 叠加每 (发起人, 买家) 活跃草稿上限（防注册地址批量占位，也防店主用代客单占满别人额度）。
  * orderId = keccak256(快照hash ‖ seller ‖ buyer ‖ 草稿 UUID)——UUID 随机化：
  *  - 同买家同商品可反复购买（v2 需求，不再防重拦截）；
  *  - 链上预占不可行（攻击者无法预知 orderId，原「确定性 orderId 占位 DoS」随之消除）。
@@ -1006,6 +991,11 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
   const target = bodyBuyer ? String(bodyBuyer).toLowerCase() : me;
   if (!isAddress(target)) return fail(res, 'buyer 需为 0x 开头的以太坊地址');
   if (me !== target && me !== owner) return fail(res, '只能为本人下单（店主可代买家下单）', 403, 403);
+  /*
+    代客单的额度记在 **(发起人, 买家)** 名下，不占买家自己的十张额度：否则店主可以拿代客草稿
+    把任意买家的额度占满（见 draftQuota.js 文件头）。判据是"这次是谁发起"，不是 buyer != seller。
+  */
+  const quotaSeller = target === me ? null : owner;
   // ── 所选 SKU：价格与库存的权威来源 ──
   // 无规格商品的唯一组合 sku_key 为 ''，故这里不需要「有无规格」的分支。
   // 未指定 skuKey 时：只有一个组合就自动选中（简化调用仍可用）；
@@ -1150,7 +1140,12 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
       并发请求谁先占到谁算数，不靠任何人串行化。
       代价：超限请求会先花掉一次风控外呼才被拒（原来在闸之前就拒），换回闸真的拦得住。
     */
-    const quota = await reserveDraftQuota({ buyer: target, productId: product.id, units: qty });
+    const quota = await reserveDraftQuota({
+      buyer: target,
+      productId: product.id,
+      units: qty,
+      proxySeller: quotaSeller,
+    });
     if (quota?.fail) return abortTx({ fail: quota.fail });
     /*
       池式商品（digital 码池 / nft tokenId 池）的可用量：占位同样只有一条带守卫的 UPDATE
@@ -1221,6 +1216,11 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
       INSERT"的时序巧合成立，中间插一句别人的 INSERT 就会把子行挂到别单上）。
     */
     const orderId = ins.insertId;
+    /*
+      代客单标记：触发器据此决定"离开 draft 时减 (店主, 买家) 的代客账还是买家自己的账"。
+      必须与订单行同一事务；缺了它，代客草稿会去减买家的额度（买家被凭空扣一次）。
+    */
+    if (quotaSeller) await db.run('INSERT INTO proxy_drafts (order_id) VALUES (?)', orderId);
     await db.run(`INSERT INTO order_shipping
         (order_id, name, phone, address, note, invoice_title, invoice_tax_no)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -1412,69 +1412,15 @@ router.get('/seller', staffOnly, wrap(async (req, res) => {
   const page = Math.max(1, Math.ceil(parseInt(req.query.page, 10) || 1));
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
   const offset = (page - 1) * pageSize;
-  // 店铺限定放**第一项**：params 的顺序必须与 SQL 里 ? 的出现顺序一致（后续条件依次 push）。
-  // 判据是 `shop_code`（而不是 `lower(seller)`）：订单归属现在是一条**外键**（orders.shop_code →
-  // shops.code），它随下单那一行一起落定、不随链上读数或地址大小写变化；拿 seller 比只是
-  // 同一件事的间接写法（一家店一个收款地址），而且要多一层 lower() 才能和写入端对齐。
-  let where = 'shop_code = ?';
-  const params = [String(req.shop.code)];
-  if (req.query.status) {
-    const st = String(req.query.status);
-    if (!ORDER_STATUS.includes(st)) return fail(res, `status 无效（可选：${ORDER_STATUS.join('/')}）`);
-    where += ' AND status = ?';
-    params.push(st);
-  }
-  // 售后维度筛选（P 评审新增）：refund=requested 直达"退款待处理"视图
-  if (req.query.refund) {
-    const r = String(req.query.refund);
-    if (!['requested', 'rejected'].includes(r)) return fail(res, 'refund 需为 requested / rejected');
-    where += ' AND refund_status = ?';
-    params.push(r);
-    /*
-      「退款待处理」必须与 /seller/status-counts 的 pendingRefund **同一谓词**。
-      只按 refund_status='requested' 筛会把**已经退完款**的单（status=refunded，
-      refund_status 仍停在 requested）也拉进"待处理"，于是店主看到
-      「徽标 0 / 列表 1 单」，会以为统计坏了——而真相是那单已经没有待办。
-      能由店主表态的只有 escrowed / shipped / disputed 这三种状态。
-    */
-    if (r === 'requested') where += ` AND status IN ${ACTIVE_IN}`;
-  }
-  /*
-    售后案件维度筛选（确认收货后开的案）：afterSale=open 直达"在途案件"视图，closed 查历史。
-    为什么必须有：徽标（status-counts 的 pendingAfterSale）只告诉店主"有几单"，
-    而这些单的 status 是**终局**（settled/confirmed/expired）——按状态筛选永远找不到它们
-    （案子不改订单状态，见 src/afterSale.js）。没有这个筛选，徽标上的数字就没有可点进去的入口。
-    谓词与徽标/仲裁队列/退货窗口/证据门控**同一处**（AFTER_SALE_OPEN_SQL / 同一列语义）。
-  */
-  if (req.query.afterSale) {
-    const a = String(req.query.afterSale);
-    if (!['open', 'closed'].includes(a)) return fail(res, 'afterSale 需为 open / closed');
-    where += a === 'open' ? ` AND ${AFTER_SALE_OPEN_SQL}` : " AND after_sale_status = 'closed'";
-  }
-  // 卖家检索买家来询时按地址/单号/商品无从查起——q 走买家地址精确/
-  // **订单号**前缀/商品标题·slug 模糊（大小写不敏感由下面谓词上的 COLLATE 给，见注释）
-  if (req.query.q) {
-    const q = String(req.query.q).trim().toLowerCase();
-    if (!q) return fail(res, 'q 不能为空');
-    if (q.length > 200) return fail(res, 'q 过长（≤200 字符）');
-    // 转义 LIKE 通配符（%/_/转义符本身）：把检索词当字面量匹配，防 % 或 _ 被当
-    // 通配符拉回全表/宽泛命中（复查 13441c5 发现；参数化已防注入，此处防通配语义）。
-    // `ESCAPE '\\'` 的写法是 **MySQL 字面量**：反斜杠自身要在字符串里转义，
-    // 所以 SQL 文本里是两个反斜杠、JS 源码里是四个（写成一个就是 ER_PARSE_ERROR）。
-    // 搜单号搜的是 `order_no`（内部 `orders.id` 不是任何人的标识，用户手上只有单号；
-    // 旧的 `id LIKE` 在新形状里会命中代理键 —— 那是把"搜不到"变成"搜到别人的单"）。
-    // `COLLATE utf8mb4_0900_ai_ci` 是**必须**的：库/表是 `_as_cs`（大小写敏感），
-    // 而单号与商品标识都是大写 Crockford 串、快照里是任意大小写的商品文本——
-    // 少了它，"搜 b0v3 找不到 B0V3…"就是买家/店主直接看得见的功能倒退
-    // （db.js 的 R5 给的路子：需要不敏感时在**谓词上**声明，而不是把库改成不敏感）。
-    const esc = (s) => s.replace(/[\\%_]/g, (m) => `\\${m}`);
-    const like = `%${esc(q)}%`;
-    where += " AND (buyer = ? OR order_no COLLATE utf8mb4_0900_ai_ci LIKE ? ESCAPE '\\\\' OR product_slug COLLATE utf8mb4_0900_ai_ci LIKE ? ESCAPE '\\\\' OR product_snapshot COLLATE utf8mb4_0900_ai_ci LIKE ? ESCAPE '\\\\')";
-    params.push(q, like, like, like);
-  }
+  // 店铺限定放**第一项且写死在 SQL 文本里**：`sellerOrderFilters` 只返回筛选条件，
+  // 不再把安全边界藏进返回值（判据是 `shop_code` 这条外键，而不是 `lower(seller)`——
+  // 订单归属随下单那一行落定，不随链上读数或地址大小写变化）。
+  const filters = sellerOrderFilters(req.query);
+  if ('error' in filters) return fail(res, filters.error);
+  const { where, params } = filters;
   const db = getDb();
-  const total = (await db.get(`SELECT COUNT(*) AS c FROM v_orders WHERE ${where}`, ...params)).c;
-  const rows = await db.all(`SELECT * FROM v_orders WHERE ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`, ...params, pageSize, offset);
+  const total = (await db.get(`SELECT COUNT(*) AS c FROM v_orders WHERE shop_code = ? AND ${where}`, String(req.shop.code), ...params)).c;
+  const rows = await db.all(`SELECT * FROM v_orders WHERE shop_code = ? AND ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`, String(req.shop.code), ...params, pageSize, offset);
   /*
     `poolEmpty` 必须 await：它是一次真正的库查询（池内可用量与已交付行数，见 poolAlert.js）。
     漏掉 await 时 `JSON.stringify` 会把 Promise 序列化成 `{}` —— 卖家面板读到的
@@ -1508,12 +1454,11 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
   const range = [];
   const rangeParams = [];
   /*
-    店铺限定**放第一项**（理由同 /seller：多店之下这是安全边界，判据是那一条外键）。
-    `range` 是共用片段，汇总查询与分页查询都拼它 ⇒ 两处口径不可能分叉。
-    参数顺序必须与 SQL 里 ? 的出现顺序一致：INCOME_STATUS 的 marks 在前，随后才是 range 各项。
+    店铺限定**写死在下面两条 SQL 文本里**（理由同 /seller：多店之下这是安全边界，判据是
+    那一条外键）。`range` 只放时间条件，汇总与分页共用 ⇒ 两处口径不可能分叉。
+    参数顺序必须与 SQL 里 ? 的出现顺序一致：店铺编号在最前，随后是 INCOME_STATUS 的 marks，
+    最后才是 range 各项。
   */
-  range.push('shop_code = ?');
-  rangeParams.push(String(req.shop.code));
   const rawFrom = req.query.from;
   const rawTo = req.query.to;
   const fromMs = rawFrom === undefined || rawFrom === '' ? null : parseInt(rawFrom, 10);
@@ -1557,7 +1502,7 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
 
     `refunded_amount_wei` 住在 order_chain，所以这一读走读模型视图（三表 JOIN 一次读全）。
   */
-  const incomeRows = await db.all(`SELECT status, amount_wei, usdt_micro, fee_bps, fee_collector_at_create, commission_bps, commission_to, refunded_amount_wei FROM v_orders WHERE status IN (${marks})${rangeSql}`, ...INCOME_STATUS, ...rangeParams);
+  const incomeRows = await db.all(`SELECT status, amount_wei, usdt_micro, fee_bps, fee_collector_at_create, commission_bps, commission_to, refunded_amount_wei FROM v_orders WHERE shop_code = ? AND status IN (${marks})${rangeSql}`, String(req.shop.code), ...INCOME_STATUS, ...rangeParams);
   /**
    * 累加一条腿：任一行未知 ⇒ 该腿合计恒为 null（未知），后续再累也回不来 —— 这就是"不知道"的传播。
    *
@@ -1634,7 +1579,7 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
     }
   }
 
-  const rows = await db.all(`SELECT * FROM v_orders WHERE status IN (${marks})${rangeSql} ORDER BY updated_at DESC LIMIT ? OFFSET ?`, ...INCOME_STATUS, ...rangeParams, pageSize, offset);
+  const rows = await db.all(`SELECT * FROM v_orders WHERE shop_code = ? AND status IN (${marks})${rangeSql} ORDER BY updated_at DESC LIMIT ? OFFSET ?`, String(req.shop.code), ...INCOME_STATUS, ...rangeParams, pageSize, offset);
   const ledgerOrders = await Promise.all(rows.map(async (o) => {
     const rd = settlementReadOf(o);
     return {
@@ -2441,10 +2386,19 @@ router.post('/:id/cancel', requireAuth, wrap(async (req, res) => {
       if (onchain.status !== 'None') {
         // 「这个链上单号是不是我这一单」只有一处实现（chainParamsMatch，交付闸/watcher/对账共用）
         const match = chainParamsMatch(order, onchain);
-        if (match) {
+        /*
+          ⚠️ 这一处 false 的语义与其它调用点**相反**：别处 false = 拒绝推进（fail-closed），
+          这里 false = 允许取消。而 `chainParamsMatch` 对"读不到 host"同样返回 false——
+          对身份判据是 fail-closed，对取消动作却成了 fail-open：一次 RPC 半失败就能把一笔
+          可能已支付的单在本地取消掉。所以这里把"本地有报价、链上 host 为空"单列为未知，
+          未知就不取消（宁可让店主先同步一次，也不动可能已上链的单）。
+        */
+        const hostUnreadable =
+          !!String(order.commission_quoted_to || '') && !String(onchain.commissionTo || '');
+        if (match || hostUnreadable) {
           return fail(
             res,
-            '链上已存在该订单的托管记录（支付可能已上链但未回写）——请对该订单执行「同步核实」恢复状态，勿直接取消'
+            '链上已存在该订单的托管记录（或本次读不到店铺条款，无法确认这笔托管是否属于本单）——请对该订单执行「同步核实」恢复状态，勿直接取消'
           );
         }
       }
@@ -2658,7 +2612,7 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
     // 与 chainParamsMatch 的"缺字段跳过"相反，于是同一个问题又有了两套语义）。
     const match = chainParamsMatch(order, onchain);
     if (!match) {
-      return fail(res, '链上订单的金额/卖家/买家与本单锁定不一致，疑似伪造托管或他人代付，已拒绝同步');
+      return fail(res, '链上订单的金额/卖家/买家/店铺节点与本单锁定不一致（或读不到店铺条款），疑似伪造托管、他人代付或同一卖家的另一家店，已拒绝同步');
     }
     // 补落支付凭证：链上确存在本单托管但本地未落 paid_tx_hash（历史数据/事件漏扫）时，
     // 按链上订单创建块单块反查 OrderCreated 日志取规范哈希补录——发货防呆（空哈希拒发）
@@ -2671,8 +2625,17 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
           onchain.createdAtBlock,
           onchain.createdAtBlock
         );
-        if (logs.length) {
-          createdTxHash = String(logs[0].transactionHash).toLowerCase();
+        /*
+          **发布者必须在本地再验一次**（与 watcher/chainReconcile 同一判据：
+          `queryFilter` 的 address 过滤是 RPC 的承诺，不是返回值的性质）。缺这一条时，
+          一个错误/被劫持的 RPC 可以用别的合约发同名事件，把一笔假 txHash 写成本单的
+          支付凭证——它会被发货闸、导出与信誉画像当作"真实支付"。
+        */
+        const canonicalLogs = logs.filter(
+          (l) => isCanonicalEscrowLog(l, config.chain.escrowAddress) && orderCreatedMatches(order, l.args)
+        );
+        if (canonicalLogs.length) {
+          createdTxHash = String(canonicalLogs[0].transactionHash).toLowerCase();
           /*
             状态守卫与 `notePaidTxHash`（本文件上方）**逐字同口径**（源码审计 2026-09 修复）：
 
@@ -2765,14 +2728,27 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
     */
     try {
       const truth = await fetchAfterSaleCase(order.escrow_order_id);
-      const applied = await applyAfterSaleFromChain(order.escrow_order_id, truth);
-      syncWrites.afterSale = applied.changed > 0;
-      syncBackfill.afterSale = 'read';
-      // 人工/对账改的是**镜像列**而不是链上事件，故不写进链上事件史，只留一条服务端日志
-      if (applied.changed > 0) {
+      /*
+        案件读数同样要回答"这个链上单号确实是我这单吗"：`fetchAfterSaleCase` 只按 orderId 读，
+        而 orderId 可以被同一卖家在另一个节点下的店复用（也是他人 1 wei 诱饵单的入口）。
+        与 /paid、/sync 主体、对账使用**同一个**判据（chainParamsMatch，含店铺节点），
+        不匹配就整条不落地——否则别人的案件会点亮本店的售后队列与陈述门控。
+      */
+      if (!chainParamsMatch(order, truth)) {
+        syncBackfill.afterSale = 'unreadable';
         console.warn(
-          `[orders] /sync 按链上真值回填售后案件：order=${order.order_no.slice(0, 8)}… → ${applied.to}（事件漏扫兜底）`
+          `[orders] /sync 跳过与链上真值不符的售后案件（order=${order.order_no}）：买家/卖家/金额/店铺节点与本地锁定不一致`
         );
+      } else {
+        const applied = await applyAfterSaleFromChain(order.escrow_order_id, truth);
+        syncWrites.afterSale = applied.changed > 0;
+        syncBackfill.afterSale = 'read';
+        // 人工/对账改的是**镜像列**而不是链上事件，故不写进链上事件史，只留一条服务端日志
+        if (applied.changed > 0) {
+          console.warn(
+            `[orders] /sync 按链上真值回填售后案件：order=${order.order_no.slice(0, 8)}… → ${applied.to}（事件漏扫兜底）`
+          );
+        }
       }
     } catch (e) {
       /* 见上：读不到就保持本地原值（watcher 事件/后台对账仍会补） */
@@ -2854,14 +2830,17 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
     case 'Disputed': {
       /*
         争议推进 + 售后标记按链上真值刷新（超时直争议可带 refundRequested 残留，仲裁摘要如实展示）。
-        from 集**含 cancelled**（源码审计 2026-09 对齐 watcher/对账的 `markEscrowDisputed`）：
-        草稿被清扫/取消之后买家才完成支付是真实竞态，若 OrderCreated 那次扫描也漏了，
-        之后争议发生时本地行会永远停在 cancelled，而链上那笔钱已被冻结——三条修复路径
-        （事件/sync/对账）必须同一集合，漏一条就留下一块谁都不修的死角。
-        cancelled 行取消时已释放占位，迁移无占位副作用。
+
+        推进走**唯一实现** `markEscrowDisputed`（watcher / 对账 / sync 三条路径共用）：
+          · from 集含 **cancelled**（源码审计 2026-09）：草稿被清扫/取消之后买家才完成支付是真实
+            竞态，若 OrderCreated 那次扫描也漏了，之后争议发生时本地行会永远停在 cancelled，
+            而链上那笔钱已被冻结——三条修复路径必须同一集合，漏一条就留下一块谁都不修的死角；
+          · 从 cancelled 复活时**补回库存占位**（2026-10-22 复审，超卖方向）：取消时占位已经释放，
+            只改状态会让同一件货同时"可再售"又"已有在途单"；占位恢复失败不阻断争议推进
+            （钱已冻在链上，本地状态必须先与链上一致），由该实现记告警。
       */
       const movedToDisputed = await withTransaction(async () => {
-        const moved = await transition(order.order_id, ['draft', 'escrowed', 'shipped', 'cancelled'], 'disputed');
+        const moved = await markEscrowDisputed(db, order.escrow_order_id);
         if (moved) {
           await appendSyncMirrorEvent(order.order_id, 'disputed', { block: onchain.createdAtBlock });
         }
@@ -2872,6 +2851,24 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
       break;
     }
     case 'Settled': {
+      /*
+        终态推进的前置：**链上已退金额必须读得到**（2026-10-22 复审）。
+
+        链上 `Settled` 是两个不同的结局：`refundedAmount = 0` 是全额判卖家/超时释放，
+        `0 < refundedAmount < amount` 是拆分结算（部分退款 + 部分结算）。本地终态与账本净额
+        都由这个数分岔（`mapChainTerminal` → `refunded` / `settled`，`refunded_amount_wei` 决定净额）。
+        读不到时推进状态会把"不知道退了多少"写成 `refunded_amount_wei = 0`——卖家的流水与统计
+        会按"一分没退"报一个偏高的净额，而且此后两边同错、对账自证一致。
+        watcher（`settleByRefundSplit` 直接抛错）与后台对账（`planChainRepair` 返回 unreadable、不推进）
+        早就是这条口径；`/sync` 是第三条路径，必须同判据（2026-10-22 三处收口）。
+      */
+      if (chainRefunded === null) {
+        return fail(
+          res,
+          '链上「已退买家金额」本次读不到：无法区分「全额退款」与「部分退款/判给卖家」，' +
+            '为避免把账目记反，本次不推进终态（watcher 与后台对账同口径）。请稍后重试，或改用链上直查核对。'
+        );
+      }
       /*
         超时释放/仲裁判卖家/争议中买家撤诉放款均为链上 Settled；**仲裁拆分结算**也落链上
         Settled，所以本地终态必须按链上 refundedAmount 分岔——判据走 mapChainTerminal
@@ -3037,7 +3034,7 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
         ? '；但链上"已退买家金额"这次没读到，账本金额**未被改动**（下次同步/对账会补）'
         : '') +
       (unreadable.length
-        ? `；${unreadable.join('、')}这次读不到（RPC 失败，**不是**"没有"）——本地原值保持不变，稍后重试或等后台轮询补录`
+        ? `；${unreadable.join('、')}这次没能采用（读不到，或链上读数不属于本单——两者都**不是**"没有"）——本地原值保持不变，稍后重试或等后台轮询补录`
         : '')
   );
 }));

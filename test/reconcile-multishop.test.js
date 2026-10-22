@@ -121,7 +121,7 @@ const rpcServer = http.createServer((req, res) => {
             o.seller,
             o.amount,
             0n,
-            100n,
+            120960n,
             1n,
             false,
             false,

@@ -62,6 +62,8 @@ setChainOrderFetcher(async (orderIdHex) => {
     seller: row.seller,
     amount: row.amount_wei,
     timeoutBlocks: Number(row.timeout_blocks),
+    // 订单身份的一部分（顶层）：交付闸的 chainParamsMatch 读它，桩必须与真实读取器同形
+    commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
     commissionTerms: {
       commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
       commissionBps: Number(row.commission_quoted_bps) || 0,

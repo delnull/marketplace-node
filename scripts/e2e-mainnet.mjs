@@ -5,7 +5,7 @@
  * 验证「合约 ↔ 联邦节点 ↔ 主网事件轮询」全链路：
  *   店主登录 → 上架数字商品 + 码池 → 买家登录下单（quantity）→ 链上 createOrder 真实托管
  *   → POST /paid 四要素校验 → 自动发码置 shipped → 买家 confirmReceipt → watcher 回写 confirmed
- *   → 卖家流水入账 →（可选）Registry 登记（四字段签名 endpoint+escrowAddress+chainId+registryAddress）并验证 getActiveNodes。
+ *   → 卖家流水入账 →（可选）Registry 登记（四字段签名 endpoint+escrowAddress+chainId+registryAddress）并验证 getNode 在册。
  *
  * 前置：
  *   1) 一个连到目标 Escrow 的节点实例已在运行（MK_PORT 等由你配置），店主=下方 owner；
@@ -34,7 +34,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Wallet, JsonRpcProvider, Contract, keccak256, AbiCoder, getBytes, formatEther } from 'ethers';
+import { Wallet, JsonRpcProvider, Contract, keccak256, AbiCoder, getBytes, formatEther, encodeBytes32String } from 'ethers';
 
 /* ── 参数 ── */
 const args = process.argv.slice(2);
@@ -137,16 +137,17 @@ const login = async (wallet) => {
 const step = (s) => console.log(`\n== ${s} ==`);
 
 const ESCROW_ABI = [
-  'function createOrder(bytes32 orderId, address seller, uint256 amount, uint64 timeoutBlocks) payable',
+  'function createOrder(bytes32 orderId, address seller, uint256 amount, uint64 timeoutBlocks, tuple(address commissionTo, uint16 commissionBps, bytes32 shopCode) terms) payable',
   'function confirmReceipt(bytes32 orderId)',
 ];
 const REGISTRY_ABI = [
   'function registerNode(address operator, string endpoint, address escrowAddress, bytes signature)',
   'function deregisterNode()',
-  // getActiveNodes 的 tuple 必须与 contracts/src/MarketplaceRegistry.sol 的 NodeInfo 逐字对应：
+  // getNode 的 tuple 必须与 contracts/src/MarketplaceRegistry.sol 的 NodeInfo 逐字对应：
   // 末尾的 string code（店铺编号，8 位 Crockford Base32）不可省——ABI 字段数不符时 ethers
-  // 解码结果整体错位（code 会读成空/报错），冒烟脚本的"注销后本店应不在列"判定随之失真
-  'function getActiveNodes() view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code)[])',
+  // 解码结果整体错位（code 会读成空/报错），"注销后本店不应在册"的判定随之失真。
+  // 2026-10-21：不再读 `getActiveNodes()`（已改分页）；本脚本只关心自己这一行，`getNode` 是精确读法。
+  'function getNode(address operator) view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code))',
 ];
 
 async function waitOrderStatus(id, token, targets, tries = 20, intervalMs = 4000) {
@@ -166,8 +167,9 @@ async function main() {
     step('注销 Registry 登记');
     const registry = new Contract(REGISTRY, REGISTRY_ABI, owner);
     await broadcast(registry.deregisterNode(), 'deregisterNode');
-    const nodes = await registry.getActiveNodes();
-    console.log(`注销后 getActiveNodes()=${nodes.length}（本店应不在列）`);
+    const row = await registry.getNode(owner.address);
+    if (row.active) throw new Error(`注销后仍在册（active=true，registeredAtBlock=${row.registeredAtBlock}）`);
+    console.log(`注销后本店 active=${row.active}（registeredAtBlock=${row.registeredAtBlock} 保留）`);
     return;
   }
 
@@ -206,8 +208,25 @@ async function main() {
   step('3. 买家链上 createOrder（真实托管）');
   const escrow = new Contract(ESCROW, ESCROW_ABI, buyer);
   const amount = BigInt(draft.amountWei);
+  /*
+    `createOrder` 的第 5 个参数是**本单的抽成条款**（多店模型起）。草稿 DTO 的 `commission`
+    就是节点向买家报的那一份；缺它时不能拿 0 抽成去签（那会让节点主的分账静默归零），
+    直接中止并给出可读原因。
+  */
+  const quoted = draft.commission;
+  if (!quoted || !quoted.to) {
+    throw new Error('草稿缺少抽成条款（draft.commission.to）——当前合约 createOrder 是 5 参，不能按 4 参签');
+  }
+  if (!draft.shopCode) {
+    throw new Error('草稿缺少店铺编号（draft.shopCode）——新的下单闸按编号绑定店铺，拒绝按旧形状签单');
+  }
+  const terms = {
+    commissionTo: quoted.to,
+    commissionBps: Number(quoted.bps) || 0,
+    shopCode: encodeBytes32String(String(draft.shopCode)),
+  };
   await broadcast(
-    escrow.createOrder(draft.escrowOrderId, draft.seller, amount, BigInt(draft.timeoutBlocks ?? 0), { value: amount }),
+    escrow.createOrder(draft.escrowOrderId, draft.seller, amount, BigInt(draft.timeoutBlocks ?? 0), terms, { value: amount }),
     'createOrder'
   );
 
@@ -266,10 +285,11 @@ async function main() {
     const sig = await owner.signMessage(getBytes(digest));
     const registry = new Contract(REGISTRY, REGISTRY_ABI, owner);
     await broadcast(registry.registerNode(owner.address, ENDPOINT, ESCROW, sig), 'registerNode');
-    const nodes = await registry.getActiveNodes();
-    const mine = nodes.find((n) => n.operator.toLowerCase() === owner.address.toLowerCase());
-    if (!mine || mine.escrowAddress.toLowerCase() !== ESCROW.toLowerCase()) throw new Error('Registry 登记验证失败');
-    console.log(`已登记: endpoint=${mine.endpoint} escrow=${mine.escrowAddress} registeredAtBlock=${mine.registeredAtBlock}`);
+    const row = await registry.getNode(owner.address);
+    if (!row.active || row.suspended || row.escrowAddress.toLowerCase() !== ESCROW.toLowerCase()) {
+      throw new Error('Registry 登记验证失败（未在册 / 被停用 / 托管地址不符）');
+    }
+    console.log(`已登记: endpoint=${row.endpoint} escrow=${row.escrowAddress} registeredAtBlock=${row.registeredAtBlock}`);
   }
 
   console.log('\n✅ E2E 验收通过（合约 ↔ 节点 ↔ 主网事件轮询全链路）');

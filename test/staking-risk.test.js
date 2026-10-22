@@ -80,8 +80,8 @@ test('未配置 MK_REGISTRY_ADDRESS：available=false + reason，且不下发任
 const REGISTRY_ABI = new Interface([
   'function minStakeToRegister() view returns (uint256)',
   'function stakingContract() view returns (address)',
-  // 只声明被测模块会读的那一个（模块侧同款纪律）：`getActiveNodes()` 取 operator 字段
-  'function getActiveNodes() view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code)[])',
+  // 只声明被测模块会读的那一个（模块侧同款纪律）：`getActiveNodes(offset, limit)` 取 operator 字段
+  'function getActiveNodes(uint256 offset, uint256 limit) view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code)[])',
 ]);
 const STAKING_ABI = new Interface(['function poolOf(address operator) view returns (uint256)']);
 
@@ -107,8 +107,11 @@ function handleRpc(j) {
       return { result: REGISTRY_ABI.encodeFunctionResult('stakingContract', [chain.staking]) };
     }
     if (selector === REGISTRY_ABI.getFunction('getActiveNodes').selector) {
+      // 分页参数（2026-10-21）：offset/limit 各占一个 32 字节槽
+      const offset = Number(BigInt('0x' + data.slice(10, 74)));
+      const limit = Number(BigInt('0x' + data.slice(74, 138)));
       // 本读数的判据是"谁在册"，所以只有 operator 字段需要有值；其余按空串/零填
-      const rows = chain.operators.map((op) => [
+      const rows = chain.operators.slice(offset, offset + limit).map((op) => [
         op,
         '',
         '0x0000000000000000000000000000000000000000',

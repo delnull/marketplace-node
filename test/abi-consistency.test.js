@@ -4,7 +4,7 @@
  * 为什么需要（源码审计 2026-09 复审）：本仓的 ABI 声明是手写的（合约 sol / `node/src/chain.js` /
  * `frontend/src/chain.ts` / `node/scripts/register-node.mjs`），它们之间的漂移**全是静默的**：
  *   · `Escrow.Order` 加一个字段而 `Staking.IEscrowMinimal.Order` 漏改 ⇒ 跨合约静态调用按**位置**
- *     解码，字段错位不报错，只会读到错的字（历史上真发生过：所有罚没测试报 OrderNotFinal）；
+ *     解码，字段错位不报错，只会读到错的字（历史上真发生过：所有罚没测试报 OrderNotSettled）；
  *   · 前端 ABI 少写一个 `error X()` ⇒ ethers v6 解不出自定义错误，用户拿到
  *     `execution reverted (unknown custom error)` 而不是中文提示；
  *   · `MarketplaceRegistry.NodeInfo` 加一个 `string code` 而登记脚本漏改 ⇒ 末尾字段恒 undefined
@@ -154,9 +154,10 @@ guard('Staking.IEscrowMinimal.Order 与 Escrow.Order 字段顺序一致', () => 
   );
 });
 
-/** 取一段 ABI 文本里 `returns (tuple(...))` 的字段列表（要求显式 `tuple(`，避免误匹配函数参数表） */
+/** 取一段 ABI 文本里 `returns (tuple(...))` 的字段列表（要求显式 `tuple(`，避免误匹配函数参数表）。
+ *  参数表允许任意内容（分页的 `getActiveNodes(uint256,uint256)`、精确读的 `getNode(address)` 都要能取到）。 */
 function tupleFieldsOf(text, fnName) {
-  const m = text.match(new RegExp(`${fnName}\\(\\) view returns \\(tuple\\(([^)]*)\\)`));
+  const m = text.match(new RegExp(`${fnName}\\([^)]*\\) view returns \\(tuple\\(([^)]*)\\)`));
   assert.ok(m, `${fnName} 的 tuple 声明没找到`);
   return m[1];
 }
@@ -179,12 +180,21 @@ guard('NodeInfo 的字段全部出现在前端的 tuple 声明里', () => {
   }
 });
 
-guard('NodeInfo 的字段全部出现在登记脚本的 tuple 声明里', () => {
-  const fields = structFields(SOURCE.sol.MarketplaceRegistry, 'NodeInfo');
-  const tuple = tupleFieldsOf(SOURCE.registerScript, 'getActiveNodes');
-  for (const f of fields) {
-    assert.ok(new RegExp(`\\b${f}\\b`).test(tuple), `登记脚本的 tuple 少了字段 ${f}（当前声明：${tuple}）`);
-  }
+guard('NodeInfo 的字段/类型/顺序全部出现在登记脚本的 tuple 声明里', () => {
+  /*
+    2026-10-21：登记脚本从 `getActiveNodes(0,1000)` 改成精确的 `getNode(operator)`——
+    前者在活跃节点 ≥1000 时会把"交易已上链"误报成"未查到本店"。
+    这里同时比**类型与顺序**，不再只比字段名：`uint64`/`bool`/`string` 错一位不会报错，
+    只会在运行时把相邻字段解成错的值。
+  */
+  const fields = structTypedFields(SOURCE.sol.MarketplaceRegistry, 'NodeInfo');
+  const tuple = tupleFieldsOf(SOURCE.registerScript, 'getNode');
+  const want = fields.map((f) => f.split(/\s+/)[0].toLowerCase()).join(',');
+  const got = tuple
+    .split(',')
+    .map((f) => f.trim().split(/\s+/)[0].toLowerCase())
+    .join(',');
+  assert.equal(got, want, `登记脚本的 NodeInfo tuple 与合约不一致（当前声明：${tuple}；期望：${want}）`);
 });
 
 /** 与 `structFields` 同源，但**带上类型**（`['address host', …]`）：类型错了名字是对的，只有比类型才看得见 */
@@ -333,7 +343,7 @@ guard('createOrder 的参数序列在合约/节点/前端/dev 脚本四处一致
   assert.ok(sol[1], '没能从 Escrow.sol 里切出 createOrder 的签名');
   /*
     合约侧写的是**具名结构体** `ShopTerms calldata terms`，而各端 ABI 里是内联元组
-    `tuple(address commissionTo, uint16 commissionBps)`——两者在选择器上等价，所以先把
+    `tuple(address commissionTo, uint16 commissionBps, bytes32 shopCode)`——两者在选择器上等价，所以先把
     结构体按它的字段类型展开，再与四端逐字比对（顺带把结构体字段类型也钉住）。
   */
   const tupleOfStruct = (structName) =>
@@ -341,12 +351,13 @@ guard('createOrder 的参数序列在合约/节点/前端/dev 脚本四处一致
       .map((f) => f.split(/\s+/)[0].toLowerCase())
       .join(',')})`;
   const want = paramTypesOf(sol[1]).map((t) => (t === 'shopterms' ? tupleOfStruct('ShopTerms') : t));
-  assert.deepEqual(want, ['bytes32', 'address', 'uint256', 'uint64', 'tuple(address,uint16)'], `合约侧参数序列变了：${want.join(',')}`);
+  assert.deepEqual(want, ['bytes32', 'address', 'uint256', 'uint64', 'tuple(address,uint16,bytes32)'], `合约侧参数序列变了：${want.join(',')}`);
   for (const [label, text] of [
     ['node/src/chain.js', SOURCE.nodeChain],
     ['frontend/src/chain.ts', SOURCE.feChain],
     ['scripts/dev/dev-orders.mjs', SOURCE.read('scripts/dev/dev-orders.mjs')],
     ['scripts/dev/dev-scenarios.mjs', SOURCE.read('scripts/dev/dev-scenarios.mjs')],
+    ['node/scripts/e2e-mainnet.mjs', SOURCE.read('node/scripts/e2e-mainnet.mjs')],
   ]) {
     assert.deepEqual(
       createOrderTypes(text, label),
@@ -612,6 +623,55 @@ guard('escrowWatcher 的 EVENTS 清单都能在节点 ABI 里解析出过滤器'
     missing,
     [],
     `node/src/chain.js 未声明 watcher 要扫的事件：${missing.join(', ')}（queryFilter 会拿到 undefined 过滤器）`
+  );
+});
+
+/**
+ * **前端治理台的全量登记靠节点事件枚举 operator**（`frontend/src/utils/registryLogScan.ts`）。
+ *
+ * `Contract.queryFilter(签名, …)` 解析签名用的是**那份 ABI 的 interface**：签名没进 ABI 时
+ * 它连请求都不发就抛 `unknown fragment`，于是整张登记表读不到，而界面把它报成
+ * "RPC 不可达或超时"。2026-10-20 就是这样：真链与本地 anvil 都正常，治理台整页空。
+ *
+ * 三条判据（都取**合约声明**这一真值）：
+ *   1. 清单里每条签名必须与合约里的 `Node*` 事件**逐字相等**（topic0 是整条签名的哈希，
+ *      参数名/类型/顺序错一个 ⇒ 一条日志都取不到，而且不会报错，只会"看起来没有节点"）；
+ *   2. `NodeRegistered` 与 `NodeTransferred` 必须在清单里——前者是 operator 的来源，
+ *      后者是"受让方从没自己登记过"的唯一记录；缺任一条，那一类行整批消失；
+ *   3. 清单必须真的进 `REGISTRY_ABI`（scan 与 ABI 共用同一份），且扫描端不得自己抄第二份。
+ */
+guard('前端扫描的节点事件与合约声明逐字一致，且同一份清单进了 ABI', () => {
+  const normalize = (s) => s.replace(/\s+/g, ' ').trim();
+  const solEvents = new Set(
+    [...SOURCE.sol.MarketplaceRegistry.matchAll(/^\s*event\s+(Node\w+)\s*\(([^)]*)\)\s*;/gm)].map(
+      ([, name, params]) => normalize(`event ${name}(${params})`)
+    )
+  );
+  assert.ok(solEvents.size >= 7, `合约里只认出 ${solEvents.size} 个 Node* 事件——正则或合约结构变了`);
+
+  const list = SOURCE.feChain.match(/export const REGISTRY_NODE_EVENTS = \[([\s\S]*?)\] as const;/);
+  assert.ok(list, 'frontend/src/chain.ts 里找不到 REGISTRY_NODE_EVENTS（日志扫描的事件签名清单）');
+  const feEvents = [...list[1].matchAll(/(['"`])(event\s[^'"`]+)\1/g)].map((m) => normalize(m[2]));
+
+  const dead = feEvents.filter((sig) => !solEvents.has(sig));
+  assert.deepEqual(dead, [], '这些前端扫描签名在合约里不存在（逐字不等）⇒ 永远取不到日志：' + dead.join(' / '));
+
+  assert.equal(
+    feEvents.filter((s) => /event (NodeRegistered|NodeTransferred)\(/.test(s)).length,
+    2,
+    '清单缺 NodeRegistered 或 NodeTransferred：前者是 operator 的来源，后者是受让方的唯一记录'
+  );
+
+  assert.match(
+    SOURCE.feChain,
+    /export const REGISTRY_ABI = \[[\s\S]*?\.\.\.REGISTRY_NODE_EVENTS,/,
+    'REGISTRY_ABI 没有收录扫描用的事件：queryFilter 解析签名走的就是这份 interface，会抛 unknown fragment'
+  );
+  const scan = SOURCE.read('frontend/src/utils/registryLogScan.ts');
+  assert.match(scan, /REGISTRY_NODE_EVENTS/, 'registryLogScan 没有用 chain.ts 的同一份事件清单');
+  assert.ok(
+    !/const NODE_EVENT_SIGNATURES/.test(scan),
+    'registryLogScan 又抄了一份事件签名：两份必然漂移，漂了就是"unknown fragment"或永远取不到日志'
   );
 });
 

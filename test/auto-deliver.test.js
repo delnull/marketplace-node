@@ -56,6 +56,8 @@ const chainSaysOpen = async (orderIdHex) => {
     refundRejected: false,
     refundedAmount: '0',
     timeoutBlocks: Number(row?.timeout_blocks),
+    // 订单身份的一部分（顶层）：chainParamsMatch 读它，桩必须与真实读取器同形
+    commissionTo: String(row?.commission_quoted_to ?? '0x0000000000000000000000000000000000000000').toLowerCase(),
     commissionTerms: {
       commissionTo: String(row?.commission_quoted_to ?? '0x0000000000000000000000000000000000000000').toLowerCase(),
       commissionBps: Number(row?.commission_quoted_bps) || 0,

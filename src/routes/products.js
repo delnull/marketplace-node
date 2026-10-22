@@ -562,6 +562,18 @@ async function rowToPublic(row) {
   const minMicro = skus.length ? Math.min(...skus.map((s) => s.priceUsdtMicro)) : 0;
   return {
     slug: r.slug,
+    /**
+     * 这件商品属于**哪家店**（链上店铺编号）。
+     *
+     * 商品行原本只带 `slug`，于是聚合首页面对"一个节点下有多家店"时无法回答这件货是谁的：
+     * `utils/shopRowCode` 只在该节点**恰有一家店**时才敢回退，多店节点只能把卡片渲染成
+     * 无店名、无链接的裸商品——同一件货在两列里并排出现，其中一列连店都指不出来。
+     * 归属在库里本来就有（`products.shop_code`），在 DTO 这一层如实带出去，
+     * 卡片才能用目录行解析店名并构造 `/product/<店铺编号>/<slug>`。
+     *
+     * 它**不进快照**：归属是发布位置，买了什么由快照回答；改归属不应让老订单报"内容被修改"。
+     */
+    shopCode: r.shop_code,
     title: r.title,
     description: r.description,
     /** 详情块（权威内容）：[{type:'text',text} | {type:'image',url}]；空数组时前端按 description 纯文本渲染 */
@@ -1519,6 +1531,46 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
 }));
 
 /**
+ * 公开读的可见性判据（**商品详情与评价列表共用**，2026-10-22 复审）。
+ *
+ * 商品从公开视野消失有三条独立路径：店主下架（`active = 0`）、协议侧链上冻结
+ * （Blocklist 的 Product 类）、所属店铺暂停/退出（`shops.listed != 1`）。
+ * 详情页三条都查，而评价列表此前只查"这一行存在"⇒ 下架/冻结商品的评价仍能被匿名读取，
+ * 且 200/404 的差别成了一个"这件商品存在过"的 oracle。
+ *
+ * 返回 `null` = 可见；否则返回给调用方的拒绝描述。`mine`（本店经营人员）只有详情页会传：
+ * 店主必须看得见自己被冻结/下架的商品；评价列表是匿名读，没有这个豁免。
+ */
+async function publicProductGate(row, { mine = false } = {}) {
+  if (!row.active && !mine) return { status: 404, code: 404, message: '商品不存在或已下架' };
+  if (mine) return null;
+  /*
+    链上名单的商品类条目（**详情页同样要查**，2026-10 自审补）：
+    只在列表里过滤 = 半个过滤——列表看不到、直链进来照样能下单，
+    而被冻结的正是"要通过直链传播"的那类商品。判据与列表共用同一份名单与同一段读法。
+    读不到名单 ⇒ 与列表同一条纪律：**拒绝**，不按"名单里没有它"放行。
+  */
+  if (config.chain.blocklistAddress) {
+    let hit;
+    try {
+      hit = (await blockedProductSlugs()).has(String(row.slug));
+    } catch (e) {
+      return {
+        status: 404,
+        code: 404,
+        message: `读不到链上黑名单（${e?.message || e}）：无法确认这件商品是否已被全网冻结，本次按 fail-closed 不返回内容`,
+      };
+    }
+    if (hit) return { status: 404, code: 404, message: '该商品已被全网冻结，不再展示' };
+  }
+  const shop = await shopRowByCode(row.shop_code);
+  if (!shop || Number(shop.listed) !== 1) {
+    return { status: 200, code: 200, message: notSellableReason(shop) };
+  }
+  return null;
+}
+
+/**
  * 商品详情（公开；已下架商品仅本店店主/店员登录可见——匿名与第三人 404，防下架内容被探测/收录）。
  *
  * ⚠️ 这是**公开**端点，所以**不能**用 `requireShopProduct`（那个按请求解析出的店铺上下文判归属）：
@@ -1541,36 +1593,8 @@ router.get('/:slug', wrap(async (req, res) => {
     authed = null;
   }
   const mine = !!authed && (await isStaff(authed.address, row.shop_code));
-  if (!row.active) {
-    if (!mine) return fail(res, '商品不存在或已下架', 404, 404);
-  }
-  if (!mine) {
-    /*
-      链上名单的商品类条目（**详情页同样要查**，2026-10 自审补）：
-      只在列表里过滤 = 半个过滤——列表看不到、直链进来照样能下单，
-      而被冻结的正是"要通过直链传播"的那类商品。判据与列表共用同一份名单与同一段读法。
-      读不到名单 ⇒ 与列表同一条纪律：**拒绝**，不按"名单里没有它"放行。
-      `mine` 为真（本店 staff）时不过这道闸：店主得能看见并处理自己那件被冻结的商品。
-    */
-    if (config.chain.blocklistAddress) {
-      let hit;
-      try {
-        hit = (await blockedProductSlugs()).has(String(row.slug));
-      } catch (e) {
-        return fail(
-          res,
-          `读不到链上黑名单（${e?.message || e}）：无法确认这件商品是否已被全网冻结，本次按 fail-closed 不返回详情`,
-          404,
-          404
-        );
-      }
-      if (hit) return fail(res, '该商品已被全网冻结，不再展示', 404, 404);
-    }
-    const shop = await shopRowByCode(row.shop_code);
-    if (!shop || Number(shop.listed) !== 1) {
-      return fail(res, notSellableReason(shop), 200, 200);
-    }
-  }
+  const gate = await publicProductGate(row, { mine });
+  if (gate) return fail(res, gate.message, gate.status, gate.code);
   const r = await rowToPublic(row);
   const stats = await productReviewSummary(row.id);
   ok(res, { ...r, reviewSummary: stats });
@@ -1586,7 +1610,19 @@ router.get('/:slug/reviews', wrap(async (req, res) => {
   const sort = ['new', 'old', 'high', 'low'].includes(String(req.query.sort))
     ? String(req.query.sort)
     : 'new';
-  const data = await productReviews(req.params.slug, page, pageSize, filter, sort);
+  /*
+    公开读的可见性判据与详情页**共用一处**（`publicProductGate`）：评价列表不能成为
+    "商品还在不在"的第二条信息通道——下架/被链上冻结的商品，评价同样不可匿名读取。
+    这里没有 `mine` 豁免（匿名接口），**隐藏类**拒绝一律按 404 处理：
+      · 下架 / 链上冻结 / 店铺已退出（`status:404`）⇒ 404，不泄露存在性；
+      · 店铺**暂停接单**（`status:200`）⇒ 详情页本来就按"可读原因"展示这件商品，
+        评价随详情一起保持可见（隐藏它反而与详情页自相矛盾，也不是本判据要挡的泄露面）。
+  */
+  const row = await getDb().get('SELECT * FROM products WHERE slug = ?', String(req.params.slug || ''));
+  if (!row) return fail(res, '商品不存在', 404, 404);
+  const gate = await publicProductGate(row);
+  if (gate && gate.status === 404) return fail(res, gate.message, 404, 404);
+  const data = await productReviews(row.slug, page, pageSize, filter, sort);
   if (!data) return fail(res, '商品不存在', 404, 404);
   ok(res, data);
 }));

@@ -73,6 +73,7 @@ function mustEvent(name) {
 }
 const SEL_GET_ORDER = mustFunction('getOrder').selector;
 const SEL_ACCEPTED = mustFunction('acceptedPartialRefund').selector;
+const SEL_COMMISSION_TERMS = mustFunction('commissionTermsAtCreate').selector;
 const TOPIC_PARTIAL = mustEvent('PartialRefundAccepted').topicHash.toLowerCase();
 
 /** 当前用例的链上真值：getOrder 元组（/sync 与 watcher 预取都读它） */
@@ -104,7 +105,7 @@ function handleRpc(j) {
             o.seller,
             BigInt(o.amount),
             BigInt(o.feeBps || 0),
-            100n,
+            120960n,
             BigInt(o.createdAtBlock || 900),
             !!o.refundRequested,
             !!o.refundRejected,
@@ -114,6 +115,14 @@ function handleRpc(j) {
             false,
           ]),
         };
+      }
+      /*
+        非 OrderCreated 事件的防伪预取还会读 `commissionTermsAtCreate`（订单绑定的节点 host）。
+        本地默认报价 host = seller；不回答它会让 `fetchOnchainOrder` 的条款读空，host 校验
+        按 fail-closed 拒绝事件（测试会假红）。
+      */
+      if (selector === SEL_COMMISSION_TERMS && chainOrder) {
+        return { result: iface.encodeFunctionResult('commissionTermsAtCreate', [SELLER, 0]) };
       }
       return { error: { code: -32601, message: `unit-test: 未预期的 eth_call selector ${selector}` } };
     }
@@ -198,11 +207,13 @@ const rowOf = async (orderId) => await db.get('SELECT * FROM v_orders WHERE orde
 // 事件史是 JSON 列：读回来已是数组
   const eventsOf = async (orderId) => (await rowOf(orderId)).onchain_events || [];
 
-/** 链上真值（getOrder 形状）：与本文件插入的订单行逐项一致 */
+/** 链上真值（getOrder 形状）：与本文件插入的订单行逐项一致；host 取夹具报价列（= seller） */
 const chainTruth = (status = 'Created') => ({
   buyer: BUYER,
   seller: SELLER,
   amount: AMOUNT,
+  // 店铺节点是订单身份的一部分：chainParamsMatch 现在要求它必须读得到且相等
+  commissionTo: SELLER,
   refundedAmount: '0',
   createdAtBlock: 900,
   status,

@@ -140,11 +140,17 @@ test('商品列表与详情：分页、快照一致性（算法可复算）', as
   assertOk(list);
   assert.equal(list.body.data.products.length, 1);
   assert.equal(list.body.data.products[0].slug, productSlug);
+  assert.equal(
+    list.body.data.products[0].shopCode,
+    shopRef.value,
+    '商品行必须带店铺编号：聚合页靠它解析店名与 /product/<店铺编号>/<slug> 链接'
+  );
   assert.ok(list.body.data.rates && list.body.data.rates.stale === true, '汇率走兜底应标记 stale');
 
   const detail = await request(app).get(`/api/products/${productSlug}`).expect(200);
   assertOk(detail);
   const p = detail.body.data;
+  assert.equal(p.shopCode, shopRef.value, '详情与列表使用同一个字段回答“这件商品属于哪家店”');
 
   // 复算快照：与前端 utils/snapshot.ts 相同的规范化算法（见 products.js 注释）
   const { snapshotObject, computeSnapshotHash } = await import('../src/routes/products.js');

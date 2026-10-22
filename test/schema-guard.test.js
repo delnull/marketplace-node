@@ -132,7 +132,8 @@ test('表与视图清单被钉住：少建一张或多建一张都要当场现�
     'audit_logs', 'buyer_draft_quota', 'buyer_product_quota', 'dispute_evidence',
     'evidence_files', 'node', 'order_alerts', 'order_chain', 'order_delivery_claims',
     'order_delivery_items', 'order_returns', 'order_shipping', 'orders', 'product_codes',
-    'product_nft_tokens', 'product_skus', 'products', 'reviews', 'shop_applications',
+    'product_nft_tokens', 'product_skus', 'products', 'proxy_drafts', 'reviews',
+    'seller_proxy_draft_quota', 'seller_proxy_product_quota', 'shop_applications',
     'shop_claims', 'shop_operators', 'shop_webhook', 'shops', 'siwe', 'v_orders',
   ].sort();
   assert.deepEqual(names, expected, 'DDL 里的表/视图清单与预期不一致——多一张少一张都会让某条链路静默失效');
@@ -160,7 +161,6 @@ test('配额计数器的触发器必须与计数器同在（少了它计数只�
     'trg_delivery_pool_claim_release',
     'trg_delivery_pool_release',
     'trg_orders_delete_pool_release',
-    'trg_orders_delete_product_quota_release',
     'trg_orders_delete_quota_release',
     'trg_orders_draft_quota_release',
     'trg_orders_pool_codes_release',
@@ -168,6 +168,8 @@ test('配额计数器的触发器必须与计数器同在（少了它计数只�
     'trg_orders_pool_tokens_release',
     'trg_orders_pool_tokens_restore',
     'trg_orders_product_quota_release',
+    'trg_orders_proxy_draft_quota_release',
+    'trg_orders_proxy_product_quota_release',
   ], '少一个触发器就少一条库侧判据（计数只增不减 / 审计行可被改删）——那是静默且永久的错账');
   /*
     新加的两条是"一码一次"的库侧判据（见 db.js 的 order_delivery_claims 与 TRIGGER_DDL ③'）：
@@ -209,8 +211,8 @@ test('配额计数器的触发器必须与计数器同在（少了它计数只�
   const deleteTriggers = triggers.filter((t) => t.includes('_delete_'));
   assert.deepEqual(
     deleteTriggers,
-    ['trg_orders_delete_pool_release', 'trg_orders_delete_product_quota_release', 'trg_orders_delete_quota_release'],
-    '三个计数器（池占位 / 商品配额 / 草稿配额）在 DELETE 那一侧都缺一不可'
+    ['trg_orders_delete_pool_release', 'trg_orders_delete_quota_release'],
+    '删除订单必须结清池占位与两种草稿配额（买家/代客），且代客标记要在四本账处理完之后才删'
   );
   for (const t of deleteTriggers) {
     const body = src.slice(src.indexOf(`CREATE TRIGGER ${t}`), src.indexOf(`CREATE TRIGGER ${t}`) + 700);

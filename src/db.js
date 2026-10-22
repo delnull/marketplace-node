@@ -668,7 +668,8 @@ export function abortTx(value) {
  */
 export async function withTransaction(fn) {
   const outer = als.getStore();
-  if (outer) {
+  /* 已结束的作用域不是外层事务：它的连接已经归还池子，绝不能拿来开 SAVEPOINT（见 exec 的说明） */
+  if (outer && !outer.closed) {
     outer.depth += 1;
     const name = `mk_sp_${outer.depth}`;
     await outer.conn.query(`SAVEPOINT ${name}`);
@@ -691,7 +692,7 @@ export async function withTransaction(fn) {
   }
   if (!pool) throw new Error('db not initialized');
   const conn = await pool.getConnection();
-  const store = { conn, depth: 1 };
+  const store = { conn, depth: 1, closed: false };
   activeTx.add(store);
   try {
     return await als.run(store, async () => {
@@ -707,6 +708,17 @@ export async function withTransaction(fn) {
       }
     });
   } finally {
+    /*
+      **先作废作用域，再归还连接**（2026-10-22 复审）。
+
+      归还之后这条连接会被池子交给别的请求，而它的对象引用仍留在 AsyncLocalStorage 里：
+      事务回调里起过、没有 await 的 promise 链（`alertAck` 的投递后续就是一处）会在提交之后
+      继续用 `store.conn` 执行 SQL——轻则写进一个已经结束的事务（连接已回到 autocommit），
+      重则**混进另一个请求正在开的事务**（跟着别人的 ROLLBACK 一起消失，或把别人的锁带超时）。
+      `closed` 让这些续作不再被当成"仍在事务里"（见 exec：此后读走池子、写各自开一笔新事务），
+      于是**没有任何路径会再用那条已归还的连接**。
+    */
+    store.closed = true;
     activeTx.delete(store);
     conn.release();
   }
@@ -764,8 +776,19 @@ const WRITE_VERB = /^\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b/i;
 
 async function exec(sql, params, wantMeta = false) {
   const store = als.getStore();
-  if (store?.conn) {
-    const [rows] = await store.conn.query(sql, params);
+  /*
+    **已结束的事务作用域一律不认**（2026-10-22 复审）。
+
+    事务提交后连接会归还池子，此时 AsyncLocalStorage 里仍留着那个 store：事务回调里起过、
+    没有 await 的 promise 链（通知投递的后续、告警的结算）会带着它继续跑。若继续用 `store.conn`，
+    写下去的东西要么落在一个已经结束的事务里，要么**混进另一个请求正在开的事务**
+    （跟着别人的 ROLLBACK 一起消失，或把别人的锁拖到超时）。
+    语义上此刻已经没有事务可加入，所以这里把它当作"没有事务上下文"：读走池子、写各自开一笔
+    新事务。**绝不再碰那条已归还的连接。**
+  */
+  const tx = store && !store.closed ? store : null;
+  if (tx?.conn) {
+    const [rows] = await tx.conn.query(sql, params);
     return wantMeta ? rows : rows;
   }
   /*
@@ -1599,7 +1622,7 @@ const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS node (
     id            TINYINT UNSIGNED NOT NULL DEFAULT 1,
     owner         CHAR(42) NOT NULL,                    -- 节点主钱包（小写）
-    name          VARCHAR(60) NOT NULL DEFAULT '',      -- 节点对外店名（公开可见）
+    name          VARCHAR(60) NOT NULL DEFAULT '',      -- 节点对外名称（公开可见；空 = 没设置过，展示时回退域名/中性占位）
     notice        VARCHAR(500) NOT NULL DEFAULT '',     -- 节点公告（公开可见）
     /*
       谈信地址（公开客服联系方式）：0x… 或 1… 两种写法，**原样保存**。
@@ -1725,14 +1748,14 @@ const SCHEMA_DDL = `
     CONSTRAINT fk_operators_shop FOREIGN KEY (shop_code) REFERENCES shops (code) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
-  /* 店主对外身份声明（可离线核验的签名）。证明"某地址签过这句话"，**不证明**域名/GitHub 归他。 */
+  /* 店主对外身份声明（EOA 可离线 verifyMessage；合约账户走 1271）。证明"某地址签过这句话"，**不证明**域名/GitHub 归他。 */
   CREATE TABLE IF NOT EXISTS shop_claims (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     shop_code  CHAR(9) NOT NULL,
     kind       ENUM('domain','github','x','telegram') NOT NULL,
     value      VARCHAR(320) NOT NULL,                   -- 规范形（归一与上限的唯一实现在 src/claims.js）
     address    CHAR(42) NOT NULL,
-    message    TEXT NOT NULL,                           -- 逐字节原样（离线核验的唯一输入）
+    message    TEXT NOT NULL,                           -- 逐字节原样（核验的唯一输入）
     signature  VARCHAR(200) NOT NULL,
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     revoked_at DATETIME(3) NULL,                        -- NULL = 有效
@@ -2287,6 +2310,48 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
   /*
+    店主**代客下单**的草稿配额（与买家自己的草稿配额分开记账）。
+
+    为什么必须分开：「POST /orders」允许店主替任意买家建草稿（代客单），而旧实现把额度记在
+    「buyer」上——店主可以拿十张代客草稿把某个买家的额度占满，让那位买家自己再也下不了单。
+    额度属于**发起人与买家的这一对**：代客单记在 (店主, 买家) 名下，自购单记在买家名下。
+
+    「proxy_drafts」是"这一行是代客单"的唯一标记（触发器据此决定减哪一本账）；
+    它随订单级联删除。不要把"buyer != seller"当成判据：一个店主完全可以在别家店买东西，
+    那时 buyer != seller，但那是自购、只能减买家自己的额度。
+  */
+  CREATE TABLE IF NOT EXISTS proxy_drafts (
+    order_id BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (order_id)
+    /*
+      刻意**不加** 「ON DELETE CASCADE」：删除订单时，减哪一本额度账必须靠这一行判断；
+      而级联删除发生在 「AFTER DELETE」 触发器之前——marker 若被级联先删掉，触发器就只能
+      去减买家那本账（代客单从没加过它），买家的额度会被凭空扣掉。marker 由删除触发器在
+      四本账都处理完之后显式删除（见 TRIGGER_DDL 的删除触发器）。
+    */
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+
+  CREATE TABLE IF NOT EXISTS seller_proxy_draft_quota (
+    seller        CHAR(42) NOT NULL,
+    buyer         CHAR(42) NOT NULL,
+    active_drafts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    PRIMARY KEY (seller, buyer),
+    CONSTRAINT ck_seller_proxy_draft_quota_seller_lower CHECK (seller = LOWER(seller)),
+    CONSTRAINT ck_seller_proxy_draft_quota_buyer_lower CHECK (buyer = LOWER(buyer))
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+
+  CREATE TABLE IF NOT EXISTS seller_proxy_product_quota (
+    seller     CHAR(42) NOT NULL,
+    buyer      CHAR(42) NOT NULL,
+    product_id BIGINT UNSIGNED NOT NULL,
+    units      SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    PRIMARY KEY (seller, buyer, product_id),
+    CONSTRAINT ck_seller_proxy_product_quota_seller_lower CHECK (seller = LOWER(seller)),
+    CONSTRAINT ck_seller_proxy_product_quota_buyer_lower CHECK (buyer = LOWER(buyer)),
+    CONSTRAINT fk_sppq_product FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+
+  /*
     ── 订单聚合的**读模型** ──
 
     orders 拆成三张表之后，"把一张订单读全"是一次三表 JOIN。**读**统一走它，
@@ -2369,8 +2434,10 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
  *
  * ## 语句形式
  *
- * 配额触发器每条都是**单语句体**：读的人一眼能看全，也便于从启动失败时的修复清单里
- * 原样复制。审计守卫必须表达"不满足条件就拒绝"，那在 MySQL 里只有 `IF … THEN SIGNAL`
+ * 配额触发器绝大多数是**单语句体**：读的人一眼能看全，也便于从启动失败时的修复清单里
+ * 原样复制。唯一的复合体是"整单删除"那一支（四本额度账 + 删除代客 marker 必须按序完成；
+ * 拆成多个同事件触发器时，第一个删掉 marker 之后后面的就只能误减买家账）。
+ * 审计守卫必须表达"不满足条件就拒绝"，那在 MySQL 里只有 `IF … THEN SIGNAL`
  * 一条路（复合体）。实测（8.0.46）：复合体与其它 DDL 一起用 `multipleStatements` 下发
  * **不会**被拆散——服务器按完整语法解析 `BEGIN … END`，内部分号属于复合体的语句列表。
  * `DROP … IF EXISTS` + `CREATE` 是幂等的：MySQL 的 `CREATE TRIGGER` 没有 IF NOT EXISTS。
@@ -2400,13 +2467,31 @@ const TRIGGER_DDL = [
   `DROP TRIGGER IF EXISTS trg_orders_draft_quota_release`,
   `CREATE TRIGGER trg_orders_draft_quota_release AFTER UPDATE ON orders FOR EACH ROW
      UPDATE buyer_draft_quota SET active_drafts = GREATEST(0, CAST(active_drafts AS SIGNED) - 1)
-      WHERE buyer = OLD.buyer AND OLD.status = 'draft' AND NEW.status <> 'draft'`,
+      WHERE buyer = OLD.buyer AND OLD.status = 'draft' AND NEW.status <> 'draft'
+        AND NOT EXISTS (SELECT 1 FROM proxy_drafts p WHERE p.order_id = OLD.id)`,
+  /*
+    代客草稿的额度记在 **(店主, 买家)** 名下，不能减到买家自己的账上：否则十张代客草稿就能把
+    某个买家的额度占满（见 proxy_drafts 的说明）。两组触发器各自只在自己的账本上动作。
+  */
+  `DROP TRIGGER IF EXISTS trg_orders_proxy_draft_quota_release`,
+  `CREATE TRIGGER trg_orders_proxy_draft_quota_release AFTER UPDATE ON orders FOR EACH ROW
+     UPDATE seller_proxy_draft_quota SET active_drafts = GREATEST(0, CAST(active_drafts AS SIGNED) - 1)
+      WHERE seller = OLD.seller AND buyer = OLD.buyer AND OLD.status = 'draft' AND NEW.status <> 'draft'
+        AND EXISTS (SELECT 1 FROM proxy_drafts p WHERE p.order_id = OLD.id)`,
   `DROP TRIGGER IF EXISTS trg_orders_product_quota_release`,
   `CREATE TRIGGER trg_orders_product_quota_release AFTER UPDATE ON orders FOR EACH ROW
      UPDATE buyer_product_quota
         SET units = GREATEST(0, CAST(units AS SIGNED) - CAST(OLD.quantity AS SIGNED))
       WHERE buyer = OLD.buyer AND product_id = OLD.product_id
-        AND OLD.status = 'draft' AND NEW.status <> 'draft'`,
+        AND OLD.status = 'draft' AND NEW.status <> 'draft'
+        AND NOT EXISTS (SELECT 1 FROM proxy_drafts p WHERE p.order_id = OLD.id)`,
+  `DROP TRIGGER IF EXISTS trg_orders_proxy_product_quota_release`,
+  `CREATE TRIGGER trg_orders_proxy_product_quota_release AFTER UPDATE ON orders FOR EACH ROW
+     UPDATE seller_proxy_product_quota
+        SET units = GREATEST(0, CAST(units AS SIGNED) - CAST(OLD.quantity AS SIGNED))
+      WHERE seller = OLD.seller AND buyer = OLD.buyer AND product_id = OLD.product_id
+        AND OLD.status = 'draft' AND NEW.status <> 'draft'
+        AND EXISTS (SELECT 1 FROM proxy_drafts p WHERE p.order_id = OLD.id)`,
   /*
     ③ 交付一件 ⇒ 该商品池的占位减 1（这一件不再需要从池里留着了）。
     「交付行」是**所有**交付路径的唯一共同事实（池自动分配 / 手动填码 / 自由文本 / NFT 登记），
@@ -2519,15 +2604,37 @@ const TRIGGER_DDL = [
     直连 SQL 删掉一行交付行再重新交付同一个池内资源会被认领账挡住——账与交付行就此分家。
   */
   `DROP TRIGGER IF EXISTS trg_orders_delete_quota_release`,
-  `CREATE TRIGGER trg_orders_delete_quota_release AFTER DELETE ON orders FOR EACH ROW
-     UPDATE buyer_draft_quota SET active_drafts = GREATEST(0, CAST(active_drafts AS SIGNED) - 1)
-      WHERE buyer = OLD.buyer AND OLD.status = 'draft'`,
+  `DROP TRIGGER IF EXISTS trg_orders_delete_proxy_quota_release`,
   `DROP TRIGGER IF EXISTS trg_orders_delete_product_quota_release`,
-  `CREATE TRIGGER trg_orders_delete_product_quota_release AFTER DELETE ON orders FOR EACH ROW
+  `DROP TRIGGER IF EXISTS trg_orders_delete_proxy_product_quota_release`,
+  /*
+    整单删除：**一个复合体**处理四本账，然后才删代客标记。
+    为什么必须是一个触发器：删除订单时"这一行是不是代客单"只能靠 proxy_drafts 回答；
+    如果把四本账拆成多个 AFTER DELETE 触发器，第一个把标记删掉之后，后面的触发器就只能
+    误减买家那本账（代客单从没加过它）。复合体里四本账都处理完，最后一行才删标记。
+    为什么 proxy_drafts 没有 ON DELETE CASCADE：级联在 AFTER DELETE 触发器之前发生，
+    marker 会先消失——这正是上面那个"误减买家账"的形状。
+  */
+  `CREATE TRIGGER trg_orders_delete_quota_release AFTER DELETE ON orders FOR EACH ROW
+   BEGIN
+     UPDATE buyer_draft_quota SET active_drafts = GREATEST(0, CAST(active_drafts AS SIGNED) - 1)
+      WHERE buyer = OLD.buyer AND OLD.status = 'draft'
+        AND NOT EXISTS (SELECT 1 FROM proxy_drafts p WHERE p.order_id = OLD.id);
+     UPDATE seller_proxy_draft_quota SET active_drafts = GREATEST(0, CAST(active_drafts AS SIGNED) - 1)
+      WHERE seller = OLD.seller AND buyer = OLD.buyer AND OLD.status = 'draft'
+        AND EXISTS (SELECT 1 FROM proxy_drafts p WHERE p.order_id = OLD.id);
      UPDATE buyer_product_quota
         SET units = GREATEST(0, CAST(units AS SIGNED) - CAST(OLD.quantity AS SIGNED))
       WHERE buyer = OLD.buyer AND product_id = OLD.product_id
-        AND OLD.status = 'draft'`,
+        AND OLD.status = 'draft'
+        AND NOT EXISTS (SELECT 1 FROM proxy_drafts p WHERE p.order_id = OLD.id);
+     UPDATE seller_proxy_product_quota
+        SET units = GREATEST(0, CAST(units AS SIGNED) - CAST(OLD.quantity AS SIGNED))
+      WHERE seller = OLD.seller AND buyer = OLD.buyer AND product_id = OLD.product_id
+        AND OLD.status = 'draft'
+        AND EXISTS (SELECT 1 FROM proxy_drafts p WHERE p.order_id = OLD.id);
+     DELETE FROM proxy_drafts WHERE order_id = OLD.id;
+   END`,
   /*
     ⑧ 整单删除 ⇒ 池占位结清「尚未交付」的件数（与 ④ 同一算式、同一个"剩余"口径）。
     用 `OLD.status` 而不是"无条件减"：已终结的单在 ④ 那一刻就已经结清过，

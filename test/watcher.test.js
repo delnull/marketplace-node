@@ -253,6 +253,8 @@ function createdArgs(orderId, overrides = {}) {
     orderId,
     buyer: GOOD_BUYER,
     seller: GOOD_SELLER,
+    // `insertOrder` 的默认报价 host = seller；真实事件必带 host
+    host: GOOD_SELLER,
     amount: GOOD_AMOUNT,
     ...overrides,
   };
@@ -273,6 +275,29 @@ test('防伪：卖家不符的托管事件不推进', async () => {
   assert.equal(
     (await db.get('SELECT status FROM v_orders WHERE order_id = ?', a.orderId)).status,
     'draft'
+  );
+});
+
+test('防伪：店铺节点不符的托管事件不推进（同一卖家的另一家店）', async () => {
+  const a = await insertOrder('draft');
+  const quotedHost = '0x' + '4'.repeat(40);
+  await db.run('UPDATE orders SET commission_quoted_to = ? WHERE id = ?', quotedHost, a.orderId);
+
+  // 同一卖家、同一金额，但事件 host 是另一家店 ⇒ 不得把本店草稿推进为 escrowed
+  assert.equal(
+    await applyEvent('OrderCreated', createdArgs(a.escrowOrderId, { host: '0x' + '5'.repeat(40) })),
+    0
+  );
+  assert.equal(
+    (await db.get('SELECT status FROM v_orders WHERE order_id = ?', a.orderId)).status,
+    'draft'
+  );
+
+  // host 对上才推进（避免把正经的自营/租户店误杀）
+  assert.equal(await applyEvent('OrderCreated', createdArgs(a.escrowOrderId, { host: quotedHost })), 1);
+  assert.equal(
+    (await db.get('SELECT status FROM v_orders WHERE order_id = ?', a.orderId)).status,
+    'escrowed'
   );
 });
 
@@ -332,6 +357,8 @@ test('拆分结算：部分退款（refundWei < amount）落 settled 并记录�
       buyer: '0x00000000000000000000000000000000000000aa',
       seller: '0x00000000000000000000000000000000000000bb',
       amount: '1000000000000000000',
+      // 夹具的报价 host 默认就是 seller（见 setup.mjs 的 insertOrderRow）：链上真值必须逐字相等
+      commissionTo: '0x00000000000000000000000000000000000000bb',
     },
   });
   assert.equal(changed, 1);
@@ -392,12 +419,43 @@ test('防伪（终局事件）：链上买家与本单买家不符的 OrderExpir
     txHash: '0x' + 'a'.repeat(64),
     block: 100,
     // pollOnce 预取的链上真值：买家是攻击者、金额 1 wei（诱饵单）
-    chainParams: { buyer: OTHER_BUYER, seller: '0x' + 'b'.repeat(40), amount: '1' },
+    chainParams: { buyer: OTHER_BUYER, seller: '0x' + 'b'.repeat(40), amount: '1', commissionTo: '0x' + 'b'.repeat(40) },
   });
   assert.equal(changed, 0, '与链上真值不符的终局事件不推进');
   assert.equal(await statusOf(a.orderId), 'draft', '受害者草稿保持未支付');
   const row = await db.get('SELECT onchain_events FROM v_orders WHERE order_id = ?', a.orderId);
   assert.ok(!row.onchain_events || !String(row.onchain_events).includes('OrderExpiredReleased'), '伪造事件不得进入事件史');
+});
+
+test('防伪（终局事件）：店铺节点不符的 OrderExpiredReleased 不得推进（同一卖家另一家店）', async () => {
+  const a = await insertOrder('draft');
+  const host = '0x' + '4'.repeat(40);
+  await db.run('UPDATE orders SET commission_quoted_to = ? WHERE id = ?', host, a.orderId);
+
+  const base = {
+    buyer: '0x00000000000000000000000000000000000000aa',
+    seller: '0x00000000000000000000000000000000000000bb',
+    amount: '1000000000000000000',
+  };
+  assert.equal(
+    await applyEvent('OrderExpiredReleased', { orderId: a.escrowOrderId }, {
+      txHash: '0x' + 'a'.repeat(64),
+      block: 102,
+      chainParams: { ...base, commissionTo: '0x' + '5'.repeat(40) },
+    }),
+    0,
+    '店铺节点不符的终局事件不推进'
+  );
+  assert.equal(await statusOf(a.orderId), 'draft');
+  assert.equal(
+    await applyEvent('OrderExpiredReleased', { orderId: a.escrowOrderId }, {
+      txHash: '0x' + 'b'.repeat(64),
+      block: 103,
+      chainParams: { ...base, commissionTo: host },
+    }),
+    1
+  );
+  assert.equal(await statusOf(a.orderId), 'expired', '本店 host 匹配时正常推进');
 });
 
 test('防伪（终局事件）：链上真值一致时正常推进（真实超时释放不受影响）', async () => {
@@ -409,6 +467,7 @@ test('防伪（终局事件）：链上真值一致时正常推进（真实超�
       buyer: '0x00000000000000000000000000000000000000aa',
       seller: '0x00000000000000000000000000000000000000bb',
       amount: '1000000000000000000',
+      commissionTo: '0x00000000000000000000000000000000000000bb',
     },
   });
   assert.equal(changed, 1);
@@ -422,6 +481,7 @@ test('防伪（仲裁/退款类事件）：链上金额不符的 Arbitrated 不�
       buyer: '0x00000000000000000000000000000000000000aa',
       seller: '0x00000000000000000000000000000000000000bb',
       amount: '1', // 诱饵单金额
+      commissionTo: '0x00000000000000000000000000000000000000bb',
     },
   });
   assert.equal(changed, 0);
@@ -433,6 +493,7 @@ test('防伪（仲裁/退款类事件）：链上金额不符的 Arbitrated 不�
       buyer: '0x00000000000000000000000000000000000000aa',
       seller: '0x00000000000000000000000000000000000000bb',
       amount: '1000000000000000000',
+      commissionTo: '0x00000000000000000000000000000000000000bb',
     },
   });
   assert.equal(done, 1);
@@ -618,4 +679,37 @@ test('order.hold_missing：投递失败不写标记（事件重放会重试）�
   } finally {
     setWebhookSender(capture);
   }
+});
+
+/*
+  ── alertAck 的连接归属（2026-10-22 复审）─────────────────────────────────────────────
+  告警的预占行与"送达/释放"写在同一笔事务里时，释放必须**看得见**那条尚未提交的 INSERT。
+  若实现改用另一条连接（或已归还池子的连接），DELETE 会命中 0 行、预占永久留下——告警此后
+  被静默吞掉，正是 alertAck 存在的理由。这条用例把"投递先于提交返回"这个时序钉死：
+  `send` 立即结算为失败，然后在事务内轮询预占行是否真的被撤掉。
+*/
+test('alertAck：投递先于提交返回时，释放写必须走调用方的事务连接', async () => {
+  const { alertOnceDelivered } = await import('../src/alertAck.js');
+  const { withTransaction } = await import('../src/db.js');
+  const a = await insertOrder('escrowed');
+  const flagged = async () =>
+    !!(await db.get('SELECT 1 AS one FROM order_alerts WHERE order_id = ? AND kind = ?', a.orderId, 'hold_missing'));
+
+  await withTransaction(async () => {
+    await alertOnceDelivered({
+      orderId: a.orderId,
+      kind: 'hold_missing',
+      label: '[test]',
+      what: '',
+      // 立即结算为"未送达"：`.then` 会在本事务提交之前跑
+      send: async () => false,
+    });
+    let gone = false;
+    for (let i = 0; i < 100 && !gone; i += 1) {
+      gone = !(await flagged());
+      if (!gone) await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(gone, true, '释放必须在本事务内可见（跨连接写会看不见未提交的预占行）');
+  });
+  assert.equal(await flagged(), false, '提交后也不得留下预占行（留下 = 永久不再重试）');
 });

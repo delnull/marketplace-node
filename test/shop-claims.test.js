@@ -4,7 +4,8 @@
  *
  * 覆盖六组：
  *  ① **消息确定性**：同一组入参逐字节相同（LF 连接、无尾随换行、固定字段顺序），
- *     且 `message` 原样存储/下发——第三方重算 `verifyMessage` 用的就是这两个字节；
+ *     且 `message` 原样存储/下发——EOA 重算 `verifyMessage`、合约账户做 1271 核验，
+ *     用的都是这两个字节；
  *  ② **声明值规则**：domain/github/x/telegram 各自的合法形态与可读中文错（含 `@` 前缀归一、
  *     ASCII 折小写、超长直接拒绝）；
  *  ③ **签名核验**：签名有效 / 签名者不是 operator / 签名格式不合法 / 消息绑定了别家 code
@@ -414,14 +415,62 @@ test('POST：签名格式不合法 / 缺失 → 可读中文错，不落库', as
 test('verifyClaim：三条判据缺一不可（消息形状 / operator 行 / 恢复地址）', async () => {
   const msg = claimMessage({ kind: 'x', value: 'jack', issued: '2026-10-13' });
   const sig = await owner.signMessage(msg);
-  assert.deepEqual(verifyClaim({ message: msg, signature: sig, expectedOperator: OP }), { ok: true, signer: OP, reason: null });
-  assert.equal(verifyClaim({ message: '随便一段文本', signature: sig, expectedOperator: OP }).ok, false, '不是规范消息 ⇒ 不算');
+  assert.deepEqual(await verifyClaim({ message: msg, signature: sig, expectedOperator: OP }), { ok: true, signer: OP, reason: null });
+  assert.equal((await verifyClaim({ message: '随便一段文本', signature: sig, expectedOperator: OP })).ok, false, '不是规范消息 ⇒ 不算');
   assert.equal(
-    verifyClaim({ message: msg, signature: sig, expectedOperator: buyer.address.toLowerCase() }).ok,
+    (await verifyClaim({ message: msg, signature: sig, expectedOperator: buyer.address.toLowerCase() })).ok,
     false,
     '消息里的 operator 不是本店 ⇒ 不算（防拿别店消息在本店登记）'
   );
-  assert.match(verifyClaim({ message: msg, signature: '0x00', expectedOperator: OP }).reason, /签名格式不合法/);
+  assert.match(
+    (await verifyClaim({ message: msg, signature: '0x00', expectedOperator: OP })).reason,
+    /签名格式不合法/
+  );
+});
+
+test('verifyClaim：合约账户走标准 1271 / Safe legacy，不再要求 EOA 签名', async () => {
+  const contract = Wallet.createRandom().address.toLowerCase();
+  const msg = claimMessage({ operator: contract, kind: 'domain', value: 'contract.example.com', issued: '2026-10-13' });
+  const sig = '0x5afe';
+  const erc1271 = new Interface([
+    'function isValidSignature(bytes32 hash, bytes signature) view returns (bytes4)',
+    'function isValidSignature(bytes data, bytes signature) view returns (bytes4)',
+  ]);
+
+  const standard = {
+    getCode: async () => '0x60006000',
+    call: async ({ data }) => {
+      assert.ok(String(data).startsWith('0x1626ba7e'));
+      return erc1271.encodeFunctionResult('isValidSignature(bytes32,bytes)', ['0x1626ba7e']);
+    },
+  };
+  assert.deepEqual(await verifyClaim({ message: msg, signature: sig, expectedOperator: contract, provider: standard }), {
+    ok: true,
+    signer: contract,
+    reason: null,
+  });
+
+  let standardCalls = 0;
+  const safe = {
+    getCode: async () => '0x60006000',
+    call: async ({ data }) => {
+      const selector = String(data).slice(0, 10).toLowerCase();
+      if (selector === '0x1626ba7e') {
+        standardCalls += 1;
+        return erc1271.encodeFunctionResult('isValidSignature(bytes32,bytes)', ['0xffffffff']);
+      }
+      assert.equal(selector, '0x20c13b0b');
+      return erc1271.encodeFunctionResult('isValidSignature(bytes,bytes)', ['0x20c13b0b']);
+    },
+  };
+  assert.equal((await verifyClaim({ message: msg, signature: sig, expectedOperator: contract, provider: safe })).ok, true);
+  assert.equal(standardCalls, 1);
+
+  const bad = {
+    getCode: async () => '0x60006000',
+    call: async () => erc1271.encodeFunctionResult('isValidSignature(bytes32,bytes)', ['0xffffffff']),
+  };
+  assert.equal((await verifyClaim({ message: msg, signature: sig, expectedOperator: contract, provider: bad })).ok, false);
 });
 
 // ── ④ 编号取不到 ⇒ 如实报，绝不放行 ──
@@ -527,7 +576,7 @@ test('GET 公开只读：无需登录；形状是 { claims: [...] }（不是裸�
   assertOk(res);
   assert.ok(Array.isArray(res.body.data.claims));
   assert.equal(typeof res.body.data, 'object');
-  assert.match(res.body.message, /离线核验/, '响应里带上核验方法（第三方不需要读我们的文档）');
+  assert.match(res.body.message, /离线 verifyMessage|1271/, '响应里带上核验方法（第三方不需要读我们的文档）');
 });
 
 test('两个写入口都是 ownerOnly：未登录 401、店员 403（不能只挡匿名）', async () => {

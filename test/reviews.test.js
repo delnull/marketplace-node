@@ -182,3 +182,18 @@ test('店铺级评价聚合 /api/shop/reviews/stats', async () => {
   assert.ok(stats.body.data.count >= 4, '店级计数包含历史评价');
   assert.ok(stats.body.data.avg > 0);
 });
+
+/**
+ * 公开读的**可见性判据只有一处**（`publicProductGate`）：评价列表不能成为"这件商品还在不在"
+ * 的第二条信息通道。此前它只查"这一行存在"，于是下架/冻结商品的评价仍能被匿名读取，
+ * 200 与 404 的差别本身就是一个存在性 oracle（2026-10-22 复审）。
+ */
+test('评价列表与商品详情同判据：下架商品不可匿名读（不再有第二条存在性通道）', async () => {
+  const p = await listProduct(productPayload({ title: '下架商品评价' }));
+  // 控制：上架且在售 ⇒ 200（空列表也是正常回答）
+  const okRes = await request(app).get(`/api/products/${p.slug}/reviews`).expect(200);
+  assert.equal(okRes.body.code, 0);
+  // 下架 ⇒ 与详情页一致，404（不泄露"它存在过"）
+  await db.run('UPDATE products SET active = 0 WHERE slug = ?', p.slug);
+  await request(app).get(`/api/products/${p.slug}/reviews`).expect(404);
+});

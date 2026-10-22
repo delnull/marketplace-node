@@ -149,7 +149,7 @@ const rpcServer = http.createServer((req, res) => {
             OWNER,
             chain.createdAmount,
             chain.factsFeeBps,
-            100n,
+            120960n,
             1n,
             false,
             false,

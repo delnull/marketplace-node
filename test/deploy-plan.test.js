@@ -318,7 +318,10 @@ guard('售后窗口：上限（360 天 = 6 220 800 块）本身通过，超上�
  *   · 但一旦填了地址，`escrowCodeHash` 就**必须**在，且必须等于本地编译产物的
  *     `keccak256(deployedBytecode)` —— 与 `Registry.CANONICAL_ESCROW_CODE_HASH` /
  *     `Staking.CANONICAL_ESCROW_CODE_HASH` 是**同一个值、同一条纪律**（地址 + 哈希互验）。
- *   于是"改了合约却没换批"这件事会在**本测试**里当场变红，而不是等部署上线后由节点自检发现。
+ *   于是"改了 **Escrow** 却没换批"这件事会在**本测试**里当场变红，而不是等部署上线后由节点
+ *   自检发现。判据只覆盖 Escrow：Registry / Blocklist / Staking 的部署身份没有可离线复算的
+ *   代码锚（Registry 的 immutable 地址在部署时被写进运行时字节码，拿编译产物算不出链上哈希），
+ *   它们的换批靠当批部署提交回填 `contracts` 五项。
  *
  * `contracts/out/**` 是 Foundry 的构建产物（`forge build` 生成、不进 git）：
  * 不在时**跳过而不是失败**——判据是"有没有编译产物可比"，不是"必须编译过"。

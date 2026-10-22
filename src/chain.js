@@ -29,7 +29,7 @@ export const ESCROW_ABI = [
   // refundWei：卖家同意的退款金额。合约 2026-09 收紧为**只接受两种金额**：
   //   · refundWei == amount                             → 全额认赔（不需要任何授权）
   //   · refundWei == acceptedPartialRefund[orderId]      → 买家已**精确授权**过的那个数
-  // 其它一律 revert RefundAmountNotAccepted（0 → RefundAmountZero，> amount → RefundAmountExceeds；
+  // 其它一律 revert RefundAmountNotAccepted（0 → RefundAmountZero，> amount → RefundAmountOutOfRange；
   // 旧的 RefundNotFull 错误已随本轮契约变更删除）。仲裁人票决 voteSettlement 不受此限（任意比例拆分）。
   'event RefundApproved(bytes32 indexed orderId, uint256 refundWei)',
   // 买家对**具体金额**的部分退款授权（= 让"双方已谈拢的部分退款"不必绕道仲裁人）。
@@ -63,7 +63,7 @@ export const ESCROW_ABI = [
     ⚠️ 这份声明是**给脚本/测试看的参考**：真正的调用在买家钱包侧（frontend/src/api/escrowTx.ts），
     改签名必须那一端同批改，否则下单会在 ethers 的参数编码处直接失败。
   */
-  'function createOrder(bytes32 orderId, address seller, uint256 amount, uint64 timeoutBlocks, tuple(address commissionTo, uint16 commissionBps) terms) payable',
+  'function createOrder(bytes32 orderId, address seller, uint256 amount, uint64 timeoutBlocks, tuple(address commissionTo, uint16 commissionBps, bytes32 shopCode) terms) payable',
   'function confirmReceipt(bytes32 orderId)',
   'function requestDispute(bytes32 orderId)',
   /*
@@ -183,9 +183,9 @@ export const ESCROW_ABI = [
   'function feeBps() view returns (uint256)',
   /// @notice 平台治理 owner（角色互斥判据：owner 只能当 owner；节点侧店铺员工登记要拒它）
   'function owner() view returns (address)',
-  // 费用收取方（**全局**披露与兜底口径）：契约层 2026-09 起扣费判据是**每单**的创建时快照
-  // `feeCollectorAtCreate`（getOrder 元组新增字段，_settle 只读它），本全局函数在新合约上可能
-  // 已移除 ⇒ 读失败即 known=false ⇒ 账本对"没有快照的行"按可能扣费处理（保守，见 fees.js）
+  // 费用收取方（**全局**披露与兜底口径）：扣费判据是**每单**的创建时快照
+  // `feeCollectorAtCreate`（getOrder 元组字段，_settle 只读它）。本全局函数在现行合约上仍存在，
+  // 但 RPC 读失败时一律 known=false ⇒ 账本对"没有快照的行"按可能扣费处理（保守，见 fees.js）
   'function feeCollector() view returns (address)',
 ];
 
@@ -452,6 +452,112 @@ export function getProvider() {
   return _provider;
 }
 
+const ERC1271_IFACE = new ethers.Interface([
+  'function isValidSignature(bytes32 hash, bytes signature) view returns (bytes4)',
+  'function isValidSignature(bytes data, bytes signature) view returns (bytes4)',
+]);
+const ERC1271_MAGIC = '0x1626ba7e';
+const SAFE_LEGACY_MAGIC = '0x20c13b0b';
+
+/** `eth_getCode` 短缓存 + 单次超时：1271 验签不能被一次挂死的 RPC 拖住整个请求。 */
+const CODE_CACHE_TTL_MS = 60_000;
+const CODE_CACHE_MAX = 500;
+const CODE_CALL_TIMEOUT_MS = 1_200;
+const _codeCache = new Map(); // address -> { at, code }
+
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`RPC timeout > ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+function rememberCode(key, code, now) {
+  if (_codeCache.size >= CODE_CACHE_MAX) {
+    for (const [k, v] of _codeCache) {
+      if (now - v.at >= CODE_CACHE_TTL_MS) _codeCache.delete(k);
+    }
+    while (_codeCache.size >= CODE_CACHE_MAX) {
+      _codeCache.delete(_codeCache.keys().next().value);
+    }
+  }
+  _codeCache.set(key, { at: now, code });
+}
+
+async function codeAt(address, provider) {
+  const key = String(address).toLowerCase();
+  const now = Date.now();
+  const hit = _codeCache.get(key);
+  if (hit && now - hit.at < CODE_CACHE_TTL_MS) return hit.code;
+  const code = await withTimeout(provider.getCode(key), CODE_CALL_TIMEOUT_MS);
+  rememberCode(key, code, now);
+  return code;
+}
+
+/** 把 32 字节 inner 或 SIWE 原文转成 `bytes`；hex 字符串按字节解，普通字符串按 UTF-8 */
+function asBytes(value) {
+  if (value instanceof Uint8Array) return value;
+  const s = String(value ?? '');
+  return s.startsWith('0x') ? ethers.getBytes(s) : ethers.toUtf8Bytes(s);
+}
+
+async function call1271(provider, signer, data) {
+  const ret = await withTimeout(provider.call({ to: String(signer).toLowerCase(), data }), CODE_CALL_TIMEOUT_MS);
+  return String(ret || '0x');
+}
+
+/**
+ * 合约账户的 1271 验签（**唯一实现**）：先按标准 EIP-1271 验 `isValidSignature(digest, sig)`，
+ * 再按 Safe v1.3 `CompatibilityFallbackHandler` 的 legacy `isValidSignature(inner, sig)` 验。
+ *
+ * 为什么两条（2026-10-21 复审修 H1）：
+ *   · 标准 1271：`digest` = EIP-191 外层（`hashMessage(inner)`），返回 `0x1626ba7e`；
+ *   · Safe `signMessage(inner)` 签的是 Safe EIP-712 的 `SafeMessage(inner)`；Safe 的 bytes32
+ *     重载会把 digest 再包成 `SafeMessage(abi.encode(digest))`，所以标准路径永远不中。
+ *     它对应的是 legacy bytes 重载（选择器/旧魔数 `0x20c13b0b`），必须传 **inner 原始字节**。
+ *
+ * 两次调用都是 fail-closed；调用方先做离线 ECDSA，未命中才进来。
+ */
+export async function isValidContractSignature(signer, inner, digest, signature, provider = null) {
+  if (!isAddress(signer)) return false;
+  let p;
+  try {
+    p = provider || getProvider();
+    const code = await codeAt(signer, p);
+    if (code === '0x') return false;
+  } catch {
+    return false;
+  }
+
+  try {
+    const data = ERC1271_IFACE.encodeFunctionData('isValidSignature(bytes32,bytes)', [
+      String(digest),
+      String(signature),
+    ]);
+    const ret = await call1271(p, signer, data);
+    const decoded = ERC1271_IFACE.decodeFunctionResult('isValidSignature(bytes32,bytes)', ret);
+    if (String(decoded[0]).toLowerCase() === ERC1271_MAGIC) return true;
+  } catch {
+    // 标准重载不可用/不认：继续试 Safe legacy
+  }
+
+  try {
+    const data = ERC1271_IFACE.encodeFunctionData('isValidSignature(bytes,bytes)', [
+      asBytes(inner),
+      String(signature),
+    ]);
+    const ret = await call1271(p, signer, data);
+    const decoded = ERC1271_IFACE.decodeFunctionResult('isValidSignature(bytes,bytes)', ret);
+    const magic = String(decoded[0]).toLowerCase();
+    return magic === SAFE_LEGACY_MAGIC || magic === ERC1271_MAGIC;
+  } catch {
+    return false;
+  }
+}
+
 /** 获取 Escrow 合约实例（只读调用/事件过滤；签名交易由钱包侧发起） */
 export function getEscrow() {
   if (!config.chain.escrowAddress) {
@@ -474,7 +580,7 @@ export function getEscrow() {
  *
  * ⚠️ **抽成收款人不在结构体里**：它不是可配字段，恒为 `host`（节点地址）——
  * 谁提供基础设施，抽成就给谁。下单时 `commissionTo` 必须等于它，Escrow 在
- * `createOrder` 里读 `shopStateOf` 逐字核验（买方不能自签一个别的收款人）。
+ * `createOrder` 里读 `shopStateOfByCode` 逐字核验（买方不能自签一个别的收款人）。
  *
  * ⚠️ 店的身份是 **(店主, 节点)** 这一对，所以读一家店要两个参数（`getShop(seller, host)`），
  * 而"这家店现在能不能卖"问的是**编号**（`shopListed(code)`）——编号才是"哪一家店"的钥匙。
@@ -506,7 +612,7 @@ export const REGISTRY_ABI = [
   */
   `function shopListed(bytes32 code) view returns (bool)`,
   /// @notice 下单闸读法：该店的当前费率 + 是否在售（Escrow 在 createOrder 里用同一处判据）
-  'function shopStateOf(address seller, address host) view returns (uint16 commissionBps, bool listed)',
+  'function shopStateOfByCode(bytes32 shopCode, address seller) view returns (address host, uint16 commissionBps, bool listed)',
   /*
     节点员工（2026-10-18）：`staffNode` 是 O(1) 反查（一个地址最多属于一个节点），
     `nodeStaff` 是可枚举名单。员工与节点主同权限（审批开店、停用/恢复店铺），
@@ -870,6 +976,16 @@ export async function fetchOnchainOrder(orderIdHex) {
      * 归一成 `''`=未知 / 零地址=本单不扣费）。合约按它决定这一单扣不扣费，账本必须按单判定。
      */
     feeCollectorAtCreate: String(o.feeCollectorAtCreate ?? '').toLowerCase(),
+    /**
+     * **订单的店铺节点**（= 创建时快照的抽成收款人 = Registry 里这家店的 host），顶层字段。
+     *
+     * 为什么要单列一份（而不是让调用方自己从 `commissionTerms` 里取）：它是**订单身份**的一部分
+     * （同一卖家在多个节点下各有一家店），`chainParamsMatch` 必须能在**每一条**读链路径上比对它。
+     * 2026-10-21 的跨店诱饵单修复只让 watcher 手工把嵌套字段摊平，于是 `/sync` 与后台对账
+     * 拿到的对象没有这个字段 ⇒ 比对被"缺字段跳过"的分支静默放行（2026-10-22 复审）。
+     * 现在由读取器统一给出：读不到条款 ⇒ **空串**（不是 undefined）⇒ 比对**拒绝**，不再有跳过。
+     */
+    commissionTo: String(terms?.payee ?? terms?.[0] ?? '').toLowerCase(),
     /**
      * **创建时快照的节点抽成条款**（`{commissionTo, commissionBps}`；`null` = 本次没读到）。
      * 三态由 `fees.commissionSnapshotOf` 归一：读到 ⇒ 已知（零地址 = 确证这单不抽成）、

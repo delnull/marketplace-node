@@ -11,7 +11,7 @@ import { getDb, serverCapabilities } from './db.js';
 import { verifyAuditChain } from './auditChain.js';
 // 节点叫什么由**节点资料**回答（`node` 单例行的 name/notice，与任何一家店无关）
 import { nodeNameOf } from './routes/shop.js';
-import { listShopRows, nodeRow, nodeOwnerOf } from './shops.js';
+import { listActiveShopRows, nodeRow, nodeOwnerOf } from './shops.js';
 import { cachedShopCode } from './shopCode.js';
 import { escrowWatcherStatus } from './escrowWatcher.js';
 import { piiRetentionStatus } from './piiErase.js';
@@ -257,7 +257,8 @@ export function createApp() {
     一个**看起来正常**的响应（`shops: {}`、`node: {}`），而健康检查照样绿。
   */
   app.get('/healthz', wrap(async (req, res) => {
-    const shopRows = await listShopRows();
+    // 只数**在营**店铺：已退出（墓碑）的行不算"名下还有几家店"
+    const shopRows = await listActiveShopRows();
     const node = await nodeRow();
     const owner = nodeOwnerOf(node);
     const watcher = await escrowWatcherStatus();
@@ -317,7 +318,7 @@ export function createApp() {
       nodeCode: cachedShopCode() || null,
       shops: { total: shopRows.length, listed: shopRows.filter((r) => Number(r.listed) === 1).length },
       escrowAddress: config.chain.escrowAddress || null,
-      version: '0.1.0',
+      version: config.version,
       /* 时刻是 `Date`（对外 JSON 为 ISO-8601）：与库列/接口的其余时间同一种形状 */
       now: new Date(),
       /*

@@ -18,7 +18,7 @@ const NODE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const CONSTANTS = JSON.parse(fs.readFileSync(path.join(NODE_DIR, 'deploy-constants.json'), 'utf8'));
 const DEPLOY_SH = fs.readFileSync(path.join(NODE_DIR, 'deploy.sh'), 'utf8');
 
-test('deploy-constants.json：合约四项要么全空（本批尚未部署），要么三者形状俱全', () => {
+test('deploy-constants.json：合约四项要么全空（本批未部署），要么三者形状俱全', () => {
   /*
     ⚠️ **"留空"是一个合法状态**（2026-10-16 改判据）：`contracts` 记的是**本批部署产物**，
     只有真部署过才知道；而此前每一批都已整体作废（缺当前源码里店主分账所需的读法，

@@ -47,7 +47,7 @@ const rpcServer = http.createServer((req, res) => {
               owner.address,
               BigInt(AMOUNT),
               0n,
-              100n,
+              120960n,
               2n,
               false,
               false,
@@ -59,7 +59,12 @@ const rpcServer = http.createServer((req, res) => {
           };
         }
         if (sel === iface.getFunction('commissionTermsAtCreate').selector) {
-          return { result: iface.encodeFunctionResult('commissionTermsAtCreate', ['0x' + '0'.repeat(40), 0]) };
+          /*
+            抽成条款的 payee 就是店铺 host，是订单身份的一部分：夹具的报价列 = 节点主（owner），
+            所以链上真值必须回同一份。回零地址会让 `/sync` 正确地判成"另一家店/读不到条款"，
+            本用例要测的三处补录（凭证/授权额/售后案件）就根本走不到。
+          */
+          return { result: iface.encodeFunctionResult('commissionTermsAtCreate', [owner.address, 0]) };
         }
         // acceptedPartialRefund / afterSaleOpen / afterSaleOpenedAtBlock：本用例模拟"这三个读不到"
         return { error: { code: -32000, message: 'unit-test: RPC 读不到这一项' } };
@@ -110,7 +115,15 @@ test('/sync：三处补录读不到 ⇒ 响应带 syncBackfill 第三态 + warn 
     '三处补录都读不到时，读数必须是 unreadable（不是 missing/recovered/read）'
   );
   assert.equal(res.body.data.paidTxHash, null, '本地凭证原值不变（不写 0/空串冒充）');
-  assert.match(String(res.body.message), /这次读不到/, '响应文案必须说清"读不到 ≠ 没有"');
+  /*
+    文案覆盖两种"没采用"：读不到，以及读到了但**不属于本单**（跨店/诱饵单）。
+    两者都不是"没有"，都不能把本地原值改成一个假结论。
+  */
+  assert.match(String(res.body.message), /没能采用/, '响应文案必须说清"没采用 ≠ 没有"');
+  assert.ok(
+    String(res.body.message).includes('**不是**"没有"'),
+    '必须明确否掉"没有"这个误读（原文里的强调写法是契约的一部分，界面按纯文本渲染）'
+  );
   assert.match(String(res.body.message), /支付凭证补录/);
   assert.match(String(res.body.message), /售后案件回填/);
 

@@ -52,6 +52,20 @@ async function attemptDraft(buyer, productId, units) {
   });
 }
 
+/**
+ * 走**店主代客下单**那条路径：额度记在店主名下，订单行 + 代客标记同一事务。
+ * 与生产路由（routes/orders.js）同一形状——marker 缺了，触发器就会去减买家的额度。
+ */
+async function attemptProxyDraft(seller, buyer, productId, units) {
+  return await withTransaction(async () => {
+    const quota = await reserveDraftQuota({ buyer, productId, units, proxySeller: seller });
+    if (quota?.fail) return abortTx({ fail: quota.fail });
+    const { orderId } = await insertOrder(db, { buyer, seller, productId, quantity: units });
+    await db.run('INSERT INTO proxy_drafts (order_id) VALUES (?)', orderId);
+    return 'ok';
+  });
+}
+
 const counterOf = async (buyer) => (await db.get('SELECT active_drafts FROM buyer_draft_quota WHERE buyer = ?', buyer))?.active_drafts ?? null;
 const unitsOf = async (buyer, productId) => (await db.get('SELECT units FROM buyer_product_quota WHERE buyer = ? AND product_id = ?', buyer, productId))?.units ?? null;
 const draftRows = async (buyer) => await db.all("SELECT id, quantity FROM orders WHERE buyer = ? AND status = 'draft'", buyer);
@@ -117,7 +131,7 @@ test('减量：走应用的取消路径与**不经应用**的直改 status 都�
   assert.equal((await attemptDraft(buyer, p.productId, 1)), 'ok', '额度回来了就必须能再下单');
 });
 
-test('端到端：HTTP 40 并发下单 → 恰好 10 个成功，其余都是"草稿过多"', async () => {
+test('端到端：HTTP 40 并发代客下单 → 恰好 10 个成功，且不占买家自己的额度', async () => {
   const listed = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
@@ -126,6 +140,7 @@ test('端到端：HTTP 40 并发下单 → 恰好 10 个成功，其余都是"�
   assertOk(listed);
   const slug = listed.body.data.slug;
   const buyer = Wallet.createRandom();
+  const buyerToken = (await login(ctx, buyer)).token;
 
   const bodies = await Promise.all(
     Array.from({ length: 40 }, () =>
@@ -144,7 +159,28 @@ test('端到端：HTTP 40 并发下单 → 恰好 10 个成功，其余都是"�
     /草稿过多/,
     '被拒的必须是"草稿过多"这条闸（而不是库存/风控等别的拒绝）'
   );
-  assert.equal(await counterOf(buyer.address.toLowerCase()), MAX_ACTIVE_DRAFTS);
+  /*
+    代客单的额度属于**发起人（店主）**：店主被自己的代客上限挡住，而不是把买家的额度占满。
+    旧实现把十张代客草稿记在 buyer 上，这位买家自己一张也建不出来。
+  */
+  assert.equal(
+    Number((await db.get(
+      'SELECT active_drafts AS v FROM seller_proxy_draft_quota WHERE seller = ? AND buyer = ?',
+      owner.address.toLowerCase(),
+      buyer.address.toLowerCase()
+    ))?.v ?? 0),
+    MAX_ACTIVE_DRAFTS,
+    '代客额度按 (店主, 买家) 记账'
+  );
+  assert.equal(await counterOf(buyer.address.toLowerCase()), null, '买家自己的额度不能被动用');
+
+  const own = await request(app)
+    .post('/api/orders')
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ productSlug: slug, quantity: 1 })
+    .expect(200);
+  assertOk(own, '买家自己的第一张草稿必须不受别人代客草稿影响');
+  assert.equal(await counterOf(buyer.address.toLowerCase()), 1);
 });
 
 test('闸 2 的两侧边界：80 + 19 = 99 放行；再加 1 件被拒且拒因带 99/99', async () => {
@@ -170,4 +206,29 @@ test('不变量：计数器恒等于"该买家 draft 行数"与"该商品 draft 
   assert.equal(await counterOf(buyer), Number(truth.c), 'active_drafts 必须等于 draft 行数');
   assert.equal(await unitsOf(buyer, p.productId), Number(truth.u), 'units 必须等于 draft 件数合计');
   assert.ok(MAX_DRAFT_UNITS_PER_PRODUCT === 99, '上限口径写死在这里：改它就要同批改这两条断言');
+});
+
+test('删除代客草稿：按 (店主, 买家) 还额度，并在四本账处理完之后删掉 marker', async () => {
+  const p = await insertProduct(db, { kind: 'digital', title: '代客删除回补' });
+  const buyer = Wallet.createRandom().address.toLowerCase();
+  const seller = owner.address.toLowerCase();
+  const made = await attemptProxyDraft(seller, buyer, p.productId, 2);
+  assert.equal(made, 'ok');
+  const proxyCounter = async () =>
+    Number((await db.get(
+      'SELECT active_drafts AS v FROM seller_proxy_draft_quota WHERE seller = ? AND buyer = ?',
+      seller,
+      buyer
+    ))?.v ?? 0);
+  assert.equal(await proxyCounter(), 1);
+
+  const row = await db.get("SELECT id FROM orders WHERE buyer = ? AND status = 'draft'", buyer);
+  await db.run('DELETE FROM orders WHERE id = ?', row.id);
+
+  assert.equal(await proxyCounter(), 0, '删除代客草稿必须还回代客额度');
+  assert.equal(
+    Number((await db.get('SELECT COUNT(*) AS c FROM proxy_drafts WHERE order_id = ?', row.id)).c),
+    0,
+    'marker 必须在四本账处理完之后删掉（否则下一单会误减买家账）'
+  );
 });

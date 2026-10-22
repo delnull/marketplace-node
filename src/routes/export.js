@@ -31,7 +31,8 @@ import {
   settlementReadOf,
 } from '../fees.js';
 // 入账口径与订单状态集合的唯一出处（与流水页/看板/可评价同源，见 src/orderStatus.js）
-import { INCOME_STATUS as ORDER_INCOME_STATUS, ORDER_STATUS } from '../orderStatus.js';
+import { INCOME_STATUS as ORDER_INCOME_STATUS } from '../orderStatus.js';
+import { sellerOrderFilters } from '../sellerOrderFilters.js';
 
 const router = Router();
 const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true });
@@ -231,31 +232,38 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     动态数组里的第一个条件很容易在某次重构中被改掉/挪走，而这条过滤是**安全边界**不是筛选条件。
     写死在 SQL 文本里，`shop_code = ?` 就不可能"顺手"丢。
   */
-  const where = [];
-  const params = [String(req.shop.code)];
-  if (req.query.status) {
-    const st = String(req.query.status);
-    // 状态全集取 src/orderStatus.js（唯一出处；与 db.js 的 ENUM 取值同源）
-    const valid = ORDER_STATUS;
-    if (!valid.includes(st)) return fail(res, `status 无效（可选：${valid.join('/')}）`);
-    where.push('status = ?');
-    params.push(st);
-  }
+  /*
+    与卖家订单列表共用同一份筛选谓词：页面按退款/售后/检索筛出的范围，
+    导出必须拿到同一个范围；否则“按当前筛选条件导出”是一句假话。
+    时间区间是导出独有的，追加在共用谓词之后。
+
+    ⚠️ 店铺维度**写死在 SQL 文本里**：`sellerOrderFilters` 只返回筛选条件，不返回安全边界。
+    这条 `shop_code = ?` 是 ownerOnly 之后的第二道、也是真正回答“哪一家店”的判据；
+    把它放进动态片段里，静态守卫与读代码的人都看不出边界还在不在。
+  */
+  const filters = sellerOrderFilters(req.query);
+  if ('error' in filters) return fail(res, filters.error);
+  const { where, params } = filters;
   // from/to 校验同 ledger.csv（防静默忽略/from>to 空集误导）
   const fromP = timeParamOf(req.query.from, 'from');
   if (fromP.error) return fail(res, fromP.error);
   const toP = timeParamOf(req.query.to, 'to');
   if (toP.error) return fail(res, toP.error);
   if (fromP.value && toP.value && fromP.value.getTime() > toP.value.getTime()) return fail(res, 'from 不得晚于 to');
+  let rangeWhere = where;
+  const rangeParams = [String(req.shop.code), ...params];
   if (fromP.value) {
-    where.push('created_at >= ?');
-    params.push(fromP.value);
+    rangeWhere += ' AND created_at >= ?';
+    rangeParams.push(fromP.value);
   }
   if (toP.value) {
-    where.push('created_at <= ?');
-    params.push(toP.value);
+    rangeWhere += ' AND created_at <= ?';
+    rangeParams.push(toP.value);
   }
-  const rows = await db.all(`SELECT * FROM v_orders WHERE shop_code = ?${where.length ? ' AND ' + where.join(' AND ') : ''} ORDER BY created_at ASC`, ...params);
+  const rows = await db.all(
+    `SELECT * FROM v_orders WHERE shop_code = ? AND ${rangeWhere} ORDER BY created_at ASC`,
+    ...rangeParams
+  );
   const csvRows = rows.map((o) => {
     /* 与 ledger.csv 同一口径（五腿、按单快照判定；两处必须逐字同源） */
     const rd = settlementReadOf(o);
@@ -274,7 +282,13 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
       o.tracking_no || '', o.carrier || '', isoCell(o.created_at), isoCell(o.updated_at),
     ];
   });
-  await auditExport(req, 'export.orders', '-', { rows: rows.length, status: req.query.status || 'all' });
+  await auditExport(req, 'export.orders', '-', {
+    rows: rows.length,
+    status: req.query.status || 'all',
+    refund: req.query.refund || 'all',
+    afterSale: req.query.afterSale || 'all',
+    q: req.query.q ? 'filtered' : 'all',
+  });
   sendCsv(res, 'orders.csv', ORDER_COLUMNS, csvRows);
 }));
 

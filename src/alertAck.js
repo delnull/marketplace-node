@@ -86,6 +86,15 @@ export async function alertOnceDelivered({ orderId, kind, send, label = '[alert]
 
   const release = async () => {
     try {
+      /*
+        投递是异步的：结算回调可能在**事务提交之前或之后**才跑（调用点都在 withTransaction 里）。
+        所以这里不能自己挑连接，只能交给 `exec` 按"当前作用域还有没有效"决定：
+          · 提交前 ⇒ 走调用方的事务连接，DELETE 看得见刚 INSERT 的预占行；
+          · 提交后 ⇒ `withTransaction` 已把作用域标 closed，`exec` 不再碰那条已归还的连接，
+            另走一笔（预占行已提交，DELETE 照样命中）。
+        **不要**在这里强制换成"脱离事务"的连接：投递先于提交返回时，那条 DELETE 看不见未提交的
+        预占行，于是 0 行受影响、预占永久留下 —— 告警被静默吞掉，正是本模块要防的那件事。
+      */
       await db.run('DELETE FROM order_alerts WHERE order_id = ? AND kind = ?', id, kind);
     } catch (e) {
       // 释放失败 ⇒ 这一行会挡住重试（静默丢失）。响亮报出来，让人能手工删那一行。
@@ -114,6 +123,7 @@ export async function alertOnceDelivered({ orderId, kind, send, label = '[alert]
           送达时刻由**服务器**盖章（`CURRENT_TIMESTAMP(3)`），不接应用端时钟：
           这一列是"这条告警是什么时候真的送出去的"的唯一落点，而节点时钟偏了不该写进库里
           （会话时区已在 db.js 钉成 '+00:00'，两端的口径一致）。
+          与预占释放同款：连接由 `exec` 按作用域状态决定（提交后走池子），不在调用点挑。
         */
         await db.run('UPDATE order_alerts SET sent_at = CURRENT_TIMESTAMP(3) WHERE order_id = ? AND kind = ?', id, kind);
       } catch (e) {

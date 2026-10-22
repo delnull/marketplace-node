@@ -8,16 +8,18 @@
     "无代码地址会让 Registry 构造直接 revert BlocklistNotConfigured ⇒ 它没有\"以后再加\"这条路径；",
     "节点读它做地址类拒单与商品类过滤，留空的代价是这两道闸整体不生效且不报错。",
     "escrowCodeHash = `cast keccak $(cast code <ESCROW>)`，与 Registry 和 Staking 各自锚定的那个哈希是同一个值；",
-    "它同时被 node/test/deploy-plan.test.js 拿来与本地编译产物比对——那是「仓库记的地址与本批源码是不是同一代」",
-    "的**唯一机械判据**（改合约而忘了换批时，那条测试会当场变红，而不是等部署上线后由节点自检发现）。",
+    "它同时被 node/test/deploy-plan.test.js 拿来与本地编译产物比对——那是「仓库记的 Escrow 与本批源码是不是同一代」",
+    "的**唯一机械判据**（Escrow 源码一改而没换批时，那条测试会当场变红，而不是等部署上线后由节点自检发现；",
+    "Registry / Blocklist / Staking 的换批不在它的射程内：它们没有可离线复算的代码锚）。",
     "appDefaults 是两条路径都必须写进 .env 的运行参数：写偏了不会报错，只会让某个后台任务悄悄不跑、",
     "或者让同一家店在两种宿主上行为不同——所以它也算常量，不算'各自的本机状态'。",
     "runtime.stopGraceSeconds 是**容器**的停机宽限期（docker run --stop-timeout），它必须**大于**",
     "appDefaults.MK_SHUTDOWN_DRAIN_MS（节点自己等在途请求的上限）：两者相等或更短时，优雅关闭正好被",
     "SIGKILL 截断——而日志里已经打了'已关闭'，于是没人会去查。node/test/deploy-plan.test.js 守这条不等式。",
     "contracts 五项必须与主网当批部署结果一致：escrow / registry / blocklist / startBlock / escrowCodeHash。",
-    "2026-10-19 批次：Escrow 0x3926…、Registry 0x85a5…、Blocklist 0x534b…、startBlock 47931055、",
-    "escrowCodeHash 0x8bb01a…（由 scripts/deploy-mainnet.cjs 部署并在链上复核）。"
+    "当前主网批次已部署（2026-10-22）：Escrow 0xdd18Cd12Ff20B1A60BBFc5EB8422C95D1BC11620（block 47971370）、",
+    "Registry 0xC8861A65bbf4C837B7e5cF69FDfC4A409fF0Bd49、Blocklist 0x14943079f94347118854Fc90A7d3Fc4300f220Cc；",
+    "escrowCodeHash 0xdcb4f91d98343a60dbd16c4d0996c2e537dc3aaef57a6f13afc57d2af18b23a8。换批时五项必须同批改。"
   ],
   "network": {
     "rpcUrl": "https://mainnet.bityuan.com/eth",
@@ -25,11 +27,11 @@
     "frontendOrigin": "https://fedmall.bityuan.com"
   },
   "contracts": {
-    "escrow": "0x3926a983b9d3a514ddb6fbbef2d944a4d9d26f85",
-    "registry": "0x85a545ac2039bc312e1e7fe0b3dcbf2dea58cc87",
-    "blocklist": "0x534b8f46d7940ce0ad6a2ca932cba77111e20054",
-    "startBlock": 47931055,
-    "escrowCodeHash": "0x8bb01aaea40ea662de68f481e72403bf36bfa93d78375dcaa29049d1f778f198"
+    "escrow": "0xdd18Cd12Ff20B1A60BBFc5EB8422C95D1BC11620",
+    "registry": "0xC8861A65bbf4C837B7e5cF69FDfC4A409fF0Bd49",
+    "blocklist": "0x14943079f94347118854Fc90A7d3Fc4300f220Cc",
+    "startBlock": 47971370,
+    "escrowCodeHash": "0xdcb4f91d98343a60dbd16c4d0996c2e537dc3aaef57a6f13afc57d2af18b23a8"
   },
   "runtime": {
     "containerPort": 8090,

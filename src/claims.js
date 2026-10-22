@@ -3,9 +3,10 @@
  *
  * 要解决的问题：`code`（店铺编号）只解决"唯一"（链上锻造、一店一号），**不解决"哪个才是官方那家"**
  * ——编号本身不携带任何外部身份信息。店主用钱包私钥对一段**规范消息**签名，把
- * "域名 / GitHub / X / Telegram" 这些外部身份绑定到店铺地址上；此后任何人都能**离线核验**：
- * 拿 `message` + `signature` 重算一次 `ethers.verifyMessage(message, signature)` 得到签名者地址，
- * 与响应里的 `address`（以及 `message` 内的 `operator:` 行）比对即可——**不需要信任节点**。
+ * "域名 / GitHub / X / Telegram" 这些外部身份绑定到店铺地址上，此后第三方可核验：
+ *   · EOA：拿 `message` + `signature` 重算 `ethers.verifyMessage`，与 `address` 比对；
+ *   · 合约账户（Safe/多签）：对 `address` 调标准 EIP-1271 digest，或 Safe legacy
+ *     `isValidSignature(bytes,bytes)`；**不能**用 EOA 的离线复算。
  * 节点只做两件事：存储与转发（`message`/`signature` 原样落库、原样下发）。
  *
  * ⚠️ 它证明什么、不证明什么（必须原样传达给用户，**不得**标成"已认证/官方"）：
@@ -50,11 +51,12 @@
  * 时间（`issued`）由**调用方从请求体带来**，本模块不生成日期（见 buildClaimMessage）。
  */
 import { ethers } from 'ethers';
+import { isValidContractSignature } from './chain.js';
 
 /** 允许的声明类型（顺序即报错文案里的顺序）。每种类型的值规则见 RULES */
 export const CLAIM_KINDS = Object.freeze(['domain', 'github', 'x', 'telegram']);
 
-/** 规范消息的标题行（第三方离线核验时据此确认"这确实是一条声明消息"） */
+/** 规范消息的标题行（第三方核验时据此确认"这确实是一条声明消息"） */
 export const CLAIM_MESSAGE_HEADER = 'BTY marketplace shop claim';
 
 /**
@@ -256,7 +258,7 @@ export function buildClaimMessage({ code, operator, kind, value, issued } = {}) 
  * 行数、行序、字段名都固定（见文件头），多一行/少一行/换序一律 null。
  *
  * 刻意**不**在这里做"值是否符合该 kind 的规范形"的判断：解析回答的是"这是不是一条声明消息"，
- * 形态策略在写入路径的 `checkClaimValue`（离线核验方只关心"签名覆盖了这些字节"）。
+ * 形态策略在写入路径的 `checkClaimValue`（核验方只关心"签名覆盖了这些字节"）。
  *
  * @param {unknown} message
  * @returns {{code: string, operator: string, kind: string, value: string, issued: string}|null}
@@ -289,15 +291,18 @@ export function parseClaimMessage(message) {
  *     只是"他签过某个字符串"，与店铺身份无关；
  *  2. 消息里的 `operator:` 行必须等于 `expectedOperator`（本店 operator）——防"拿 A 店的消息
  *     来 B 店登记"（消息里绑定了 code/operator，签名覆盖了它们）；
- *  3. `verifyMessage` 恢复出的地址必须等于该 operator。
+ *  3. EOA 用 `verifyMessage` 恢复；合约账户（Safe/多签）用标准 EIP-1271 或 Safe legacy
+ *     `isValidSignature` 验，标准路径失败后回退到 Safe `signMessage(message)` 的 bytes 重载。
  *
  * 返回值刻意是 `{ok, signer, reason}` 而不是抛错：调用方需要把"签名者是谁"如实报出来
  * （"签名者不是本店 operator"与"签名格式不合法"是两种完全不同的处置）。
  *
- * @param {{message: unknown, signature: unknown, expectedOperator: unknown}} args
- * @returns {{ok: boolean, signer: string|null, reason: string|null}}
+ * `provider` 仅供测试注入；生产传 null，走节点默认 RPC。EOA 命中时不需要 RPC。
+ *
+ * @param {{message: unknown, signature: unknown, expectedOperator: unknown, provider?: object|null}} args
+ * @returns {Promise<{ok: boolean, signer: string|null, reason: string|null}>}
  */
-export function verifyClaim({ message, signature, expectedOperator } = {}) {
+export async function verifyClaim({ message, signature, expectedOperator, provider = null } = {}) {
   const want = asciiLower(String(expectedOperator ?? '').trim());
   if (!ethers.isAddress(want) || want === ethers.ZeroAddress) {
     return { ok: false, signer: null, reason: 'operator 地址不合法（无法判定签名者应该是谁）' };
@@ -309,16 +314,31 @@ export function verifyClaim({ message, signature, expectedOperator } = {}) {
   if (parsed.operator !== want) {
     return { ok: false, signer: null, reason: `消息里的 operator 是 ${parsed.operator}，不是本店 operator ${want}` };
   }
-  let signer = null;
+  let signer = '';
   try {
     signer = asciiLower(ethers.verifyMessage(message, String(signature ?? '')));
   } catch {
+    signer = '';
+  }
+  if (signer === want) return { ok: true, signer, reason: null };
+  /*
+    非 EOA：先试标准 1271 digest，再试 Safe `signMessage(message)` 的 legacy bytes。
+    失败是 fail-closed；EOA 错签名也会走到这里，但合约调用会返回 false，不会误放行。
+  */
+  const contractOk = await isValidContractSignature(
+    want,
+    ethers.toUtf8Bytes(message),
+    ethers.hashMessage(message),
+    String(signature ?? ''),
+    provider
+  );
+  if (contractOk) return { ok: true, signer: want, reason: null };
+  if (!signer) {
     return {
       ok: false,
       signer: null,
-      reason: '签名格式不合法（需 65 字节 0x hex 的 personal_sign 签名，即钱包对消息原文签名得到的那个）',
+      reason: '签名格式不合法（需 65 字节 0x hex 的 EOA personal_sign 签名，或合约账户的 EIP-1271 签名）',
     };
   }
-  if (signer !== want) return { ok: false, signer, reason: `签名者是 ${signer}，不是本店 operator ${want}` };
-  return { ok: true, signer, reason: null };
+  return { ok: false, signer, reason: `签名者是 ${signer}，不是本店 operator ${want}` };
 }

@@ -61,6 +61,8 @@ const chainOrder = (overrides = {}) => ({
   buyer: BUYER,
   seller: SELLER,
   amount: AMOUNT,
+  // 店铺节点是订单身份的一部分：夹具报价列 = seller，链上真值必须给同一份（chainParamsMatch 读顶层）
+  commissionTo: SELLER,
   refundedAmount: '0',
   createdAtBlock: 42,
   status: 'Created',

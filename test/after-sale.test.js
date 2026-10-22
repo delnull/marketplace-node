@@ -59,7 +59,7 @@ function handleRpc(j) {
           chainCase.seller,
           BigInt(chainCase.amount),
           0n,
-          100n,
+          120960n,
           7n,
           false,
           false,
@@ -69,6 +69,14 @@ function handleRpc(j) {
           true, // buyerConfirmed：售后案件正是"买家确认过之后"的救济路径
         ]),
       };
+    }
+    /*
+      创建时抽成条款：host 取链上订单的 seller（与夹具的报价列一致）。
+      它是订单身份的一部分——桩若省略这一项，`fetchOnchainOrder` 会给空 host，
+      `/sync` 的售后回填会按"跨店/诱饵单"正确拒绝，用例就测不到回填本身了。
+    */
+    if (selector === iface.getFunction('commissionTermsAtCreate').selector) {
+      return { result: iface.encodeFunctionResult('commissionTermsAtCreate', [chainCase.seller, 0]) };
     }
     if (selector === iface.getFunction('acceptedPartialRefund').selector) {
       return { result: iface.encodeFunctionResult('acceptedPartialRefund', [0n]) };

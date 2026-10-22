@@ -27,7 +27,7 @@ import { getDb } from './db.js';
 import config from './config.js';
 import { getEscrow, getProvider, isZeroAddress, weiToDecimal } from './chain.js';
 import { ACTIVE_IN, ESCROW_RELEASABLE_IN, INCOME_IN, ORDER_STATUS } from './orderStatus.js';
-import { AFTER_SALE_OPEN_SQL } from './afterSale.js';
+import { AFTER_SALE_OPEN_SQL } from './afterSaleSql.js';
 import { refreshFeeCollector, feeStatus } from './fees.js';
 // `timeMs`：时间列的毫秒读数（唯一实现）。库里的 DATETIME(3) 读出来是 `Date`，
 // 而这一层的队列等待、SLA 耗时都在毫秒域里算（见 reputation.js 的说明）。

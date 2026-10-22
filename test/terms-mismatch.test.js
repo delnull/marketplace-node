@@ -48,6 +48,8 @@ const chain = (over = {}) => ({
   timeoutBlocks: 17280,
   refundRequested: false,
   status: 'Created',
+  // 订单身份的一部分（顶层）：交付闸的 chainParamsMatch 读它；夹具报价 host = HOST
+  commissionTo: HOST,
   commissionTerms: { commissionTo: HOST, commissionBps: 500 },
   ...over,
 });

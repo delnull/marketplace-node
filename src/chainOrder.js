@@ -47,14 +47,23 @@ export function fetchOrderFor(orderIdHex) {
 }
 
 /**
- * 链上真值与本地订单锁定参数逐项比对（买家/卖家/金额三者皆不可变）。
- * 缺字段（单测直调/兼容旧调用）时返回 true（跳过比对）。
+ * 链上真值与本地订单锁定参数逐项比对（买家/卖家/金额/验货窗口/**店铺节点**皆不可变）。
+ *
+ * **店铺节点是必比项**（2026-10-22 复审）：本地有报价时，链上 host 读不到或不等一律 false。
+ * 此前的"缺字段跳过"正是跨店诱饵单的入口——读取器只给了嵌套的 `commissionTerms`，
+ * `/sync` 与后台对账把原对象直接传进来，`commissionTo` 结构性缺失，于是 host 这一项
+ * **在所有非 watcher 路径上恒真**。现在读取器统一给出顶层 `commissionTo`（读不到 = 空串），
+ * 比对不再有"跳过"这个分支；`undefined`（老调用/测试桩）也按"读不到"处理。
+ *
+ * 其余四项保留"缺字段跳过"：读取器从创建起就提供它们，生产形状上不存在缺失，
+ * 而测试桩会用部分对象。改动这一形状时要同时改本函数的调用点与 test/chain-amounts.test.js。
  *
  * 为什么住在这里而不是各调用点：草稿的 `escrowOrderId` 虽然**不在匿名列表里**（见 routes/orders.js
  * 的可见性判据），但详情页以不可枚举的 order_no 为键，拿到那张 URL 的人就能读出支付参数；
  * 任何**按链上读数动钱或发货**的地方都必须先回答"这个链上单号确实是我这单吗"，
  * 否则一个 1 wei 的诱饵单就能驱动本地状态（库存占位释放、自动发码、事件史造假）。
- * 判据只有这一份：交付闸（`deliveryGate`）、watcher 的事件分支、后台对账（chainReconcile）共用它。
+ * 判据只有这一份：交付闸（`deliveryGate`）、watcher 的事件分支、后台对账（chainReconcile）、
+ * `/sync`、`/cancel` 共用它。
  */
 export function chainParamsMatch(local, p) {
   if (!p) return true;
@@ -68,7 +77,66 @@ export function chainParamsMatch(local, p) {
       amountOk = false;
     }
   }
-  return buyerOk && sellerOk && amountOk;
+  /*
+    验货窗口也是订单身份的一部分：同一对当事人、同一金额、**不同 timeoutBlocks** 的诱饵单
+    同样能驱动本地状态（例如本地 7 天窗口的单被判成 1 块窗口的单，随后被快速 releaseExpired）。
+    本地/链上任一侧读不到时不做比较（老行/测试桩），读到就必须逐字相等。
+  */
+  const lt = Number(local.timeout_blocks);
+  const ct = Number(p.timeoutBlocks);
+  const timeoutOk =
+    !Number.isSafeInteger(lt) || lt <= 0 || !Number.isSafeInteger(ct) || ct <= 0 || lt === ct;
+  /*
+    店铺节点也是订单身份的一部分（2026-10-21 订单绑定）：同一卖家在多个节点下各有一家店，
+    只比买卖双方/金额/超时时，攻击者可用同一 orderId + 同卖家同金额的**另一家店**建诱饵单，
+    再用终局事件驱动本地草稿/在途单。`commissionTermsAtCreate.payee` 是链上快照的 host。
+    **本地有报价时链上必须读得到且相等**：读取器读不到条款会给空串，这里一律拒绝
+    （不再有"字段缺失就跳过"的分支——那个分支曾经让两条读链路径完全绕过这道闸）。
+  */
+  const wantHost = String(local.commission_quoted_to || '').toLowerCase();
+  const gotHost = String(p.commissionTo ?? '').toLowerCase();
+  const hostOk = !wantHost || (!!gotHost && wantHost === gotHost);
+  return buyerOk && sellerOk && amountOk && timeoutOk && hostOk;
+}
+
+/**
+ * 一条解码后的 `OrderCreated` 日志是否属于**本单**（orderId + 买家 + 卖家 + 金额 + 店铺节点）。
+ *
+ * 为什么加 `host`（2026-10-21 订单绑定）：合约按**店铺编号**校验后把 `commissionTo`
+ * 快照进订单并以 `host` 发事件；同一卖家可以在多个节点下各有一家店。只比买卖双方+金额时，
+ * 买家可以拿这个卖家的**另一家店**的编号下单（节点主不同），事件仍会被当成"本单已托管"。
+ * `(seller, host)` 唯一确定一家店（Registry 一个节点下一人只能有一家），所以 host 对上
+ * 就等于"这笔钱落在本单这家店"。
+ *
+ * 读不到（老行/测试桩）时跳过这一项；读到就必须相等。
+ *
+ * 为什么不能只靠 `queryFilter` 的 indexed 过滤：那同样是 RPC 的承诺。`/sync` 拿日志补
+ * `paid_tx_hash`、`/paid` 拿收据日志确认托管——两处都已核对 `log.address`，但地址只证明
+ * "这条日志由托管合约发出"，不证明它属于这一单。`/sync` 此前只按地址过滤，一个错误/被
+ * 劫持的 RPC 可以返回**另一个订单**的 OrderCreated（同样来自托管地址），把它的 txHash
+ * 写成本单的支付凭证。这里把事件字段与本地锁定值逐项对齐，两处共用这一份。
+ *
+ * 缺字段一律 false（与 `chainParamsMatch` 的"缺字段跳过"相反：这是收据/凭证动作，
+ * 读不到就不该落库）。
+ */
+export function orderCreatedMatches(order, args, escrowOrderId = order?.escrow_order_id) {
+  if (!order || !args) return false;
+  const id = String(args.orderId || '').toLowerCase();
+  const wantId = String(escrowOrderId || order.escrow_order_id || '').toLowerCase();
+  if (!id || id !== wantId) return false;
+  const buyerOk = String(args.buyer || '').toLowerCase() === String(order.buyer || '').toLowerCase();
+  const sellerOk = String(args.seller || '').toLowerCase() === String(order.seller || '').toLowerCase();
+  if (!buyerOk || !sellerOk) return false;
+  // `(seller, host)` 唯一确定一家店：host 不一致 = 这笔托管落在同一卖家的另一家店。
+  // 只认节点自己报过的那一列；读不到就跳过（不拿 seller 猜 host——那会把"没报价"误判成自营店）。
+  const wantHost = String(order.commission_quoted_to || '').toLowerCase();
+  const gotHost = String(args.host || '').toLowerCase();
+  if (wantHost && gotHost && wantHost !== gotHost) return false;
+  try {
+    return BigInt(args.amount) === BigInt(order.amount_wei || '0');
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -169,7 +237,7 @@ export function termsMismatchOf(order, chain) {
  *   · 链上读不到 ⇒ **拒绝**（fail-closed）。代价如实写明：节点 RPC 故障期间卖家发不了货，
  *     而"读不到就放行"恰恰会把上面那个窗口原样还回来（买家的钱包走的是它自己的 RPC，
  *     链可以在本节点读不到的时候继续前进）。这正是 autoDeliver 早已采取的同一方向。
- *   · 链上同单号的买家/卖家/金额与本单不符 ⇒ 拒绝（诱饵单，见 chainParamsMatch）。
+ *   · 链上同单号的买家/卖家/金额/店铺节点与本单不符 ⇒ 拒绝（诱饵单，见 chainParamsMatch）。
  *
  * ── 残余窗口（如实写明）────────────────────────────────────────────────────
  * 判据是**读的那一刻**的链上真值，从读数到本地落库之间仍有**一次 RPC 往返**的窗口——
@@ -203,7 +271,7 @@ export async function deliveryGate(order) {
     return {
       ok: false,
       code: 'decoy',
-      message: '链上同单号的托管单与本单的买家/卖家/金额不一致（疑似他人对同一单号的诱饵单）——已阻止交付，请核对该订单',
+      message: '链上同单号的托管单与本单的买家/卖家/金额/店铺节点不一致（或读不到店铺条款）——疑似他人对同一单号的诱饵单、同一卖家在另一个节点下的店，已阻止交付，请核对该订单',
     };
   }
   if (String(chain.status) !== 'Created') {
@@ -265,7 +333,7 @@ export async function deliveryGate(order) {
  * 抛错让 /sync 与对账都跳过该单（保持本地原值），比照着一个解码错位的读数改库安全得多。
  *
  * @returns {Promise<{open: boolean, openedAtBlock: number|null, status: string,
- *                    buyer: string, seller: string, amount: string}>}
+ *                    buyer: string, seller: string, amount: string, commissionTo: string}>}
  */
 export async function fetchAfterSaleFor(orderIdHex) {
   const c = getEscrow();
@@ -289,6 +357,12 @@ export async function fetchAfterSaleFor(orderIdHex) {
     buyer: order.buyer,
     seller: order.seller,
     amount: order.amount,
+    /*
+      店铺节点随读数一起带出：售后案件同样按 orderId 定位，而 orderId 可以被同一卖家在
+      另一个节点下的店复用（2026-10-21 的跨店诱饵单）。调用方拿 `chainParamsMatch` 比对本对象时
+      必须能比到 host——少这一项就等于把跨店案件放进本店的售后队列/陈述门控。
+    */
+    commissionTo: order.commissionTo,
   };
 }
 

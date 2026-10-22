@@ -122,7 +122,7 @@ const REGISTRY_ABI = [
   'function registerNode(address operator, string endpoint, address escrowAddress, bytes signature)',
   // NodeInfo 共 **8** 个字段（末尾是店铺编号 code）——少写一个不会立刻报错（末尾字段缺失时
   // ethers 仍能解码前面的），但 .code 恒为 undefined，属潜伏错位（源码审计 2026-09 复审，P3）
-  'function getActiveNodes() view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code)[])',
+  'function getNode(address operator) view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code))',
 ];
 
 async function main() {
@@ -155,11 +155,17 @@ async function main() {
     if (i === 39) fail(`交易未在时限内确认（${lastErr?.message || 'RPC 无响应'}）——稍后可重跑本脚本或到网页「开店向导」补登记`);
   }
 
-  console.log('  ③ 核验 getActiveNodes() …');
-  const rows = await registry.getActiveNodes();
-  const mine = rows.find((n) => n.operator.toLowerCase() === ownerAddr && n.endpoint.replace(/\/+$/, '').toLowerCase() === ENDPOINT.toLowerCase());
-  if (!mine) fail('登记已上链但活跃列表中未查到本店——请稍后到网页「开店向导」核对状态');
-  console.log(`✅ 登记成功：operator=${mine.operator} endpoint=${mine.endpoint} escrow=${mine.escrowAddress} registeredAtBlock=${mine.registeredAtBlock}`);
+  console.log('  ③ 核验 getNode(operator) …');
+  /*
+    精确读本行（2026-10-21）：`getActiveNodes` 现在是分页的（单页上限 100），
+    登记脚本只关心自己这一行，读目录再用 `find` 会在节点数超过一页时误报失败。
+  */
+  const row = await registry.getNode(ownerAddr);
+  if (!row || !row.active || row.suspended) fail('登记已上链但本行不在册或被治理停用——请稍后到网页「开店向导」核对状态');
+  if (String(row.operator).toLowerCase() !== ownerAddr) fail('登记已上链但 operator 与预期不一致');
+  if (String(row.endpoint).replace(/\/+$/, '').toLowerCase() !== ENDPOINT.toLowerCase()) fail('登记已上链但 endpoint 与预期不一致');
+  if (String(row.escrowAddress).toLowerCase() !== ESCROW.toLowerCase()) fail('登记已上链但 escrowAddress 与预期不一致');
+  console.log(`✅ 登记成功：operator=${row.operator} endpoint=${row.endpoint} escrow=${row.escrowAddress} registeredAtBlock=${row.registeredAtBlock}`);
   console.log('  买家聚合首页将直连本店（交叉核验托管地址一致后显示绿条）。');
   console.log('  提示：若刚才是临时密钥文件登记，请立即删除该文件（operator 权限=店主私钥权限）。');
 }

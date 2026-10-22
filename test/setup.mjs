@@ -169,6 +169,12 @@ export async function makeCtx() {
         读数；要验"买家签了另一份条款"的用例自己覆盖 `commissionTerms` / `timeoutBlocks`。
       */
       timeoutBlocks: Number(row.timeout_blocks),
+      /*
+        店铺节点必须与 `commissionTerms` 一起出现在**顶层**：`chainParamsMatch` 的身份判据读的是
+        `p.commissionTo`（真实读取器 `fetchOnchainOrder` 也是这样给的）。桩只给嵌套那份时，
+        交付闸/对账会把"读不到 host"判成诱饵单——这正是 2026-10-22 修的那条，桩必须同形。
+      */
+      commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
       commissionTerms: {
         commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
         commissionBps: Number(row.commission_quoted_bps) || 0,

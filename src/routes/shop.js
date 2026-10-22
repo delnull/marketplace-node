@@ -18,7 +18,7 @@
  *  GET  /reviews/stats   店铺买家评价聚合（公开只读）
  *  GET  /buyer-signal    买家履约信号（ownerOnly；**本店视角**，口径见 src/buyerSignal.js）
  *  POST /claims          提交一条身份声明 {kind,value,issued,signature}（ownerOnly；签名核验见 src/claims.js）
- *  GET  /claims          公开列出**有效**声明（原样带 message/signature，供第三方离线核验；不标"认证"）
+ *  GET  /claims          公开列出**有效**声明（原样带 message/signature，供第三方核验；不标"认证"）
  *  POST /claims/:id/revoke  撤销一条声明（ownerOnly；已撤销的不再出现在公开列表；入审计）
  *  GET  /metrics         运营指标（ownerOnly；待办/超时/挂账/对账读数，口径见 src/opsMetrics.js）
  *  GET  /sla             卖家 SLA 读数（ownerOnly；三份待办清单 + 发货时长分布，同上）
@@ -52,13 +52,15 @@ import {
 // Promise 序列化成 `{}`，而为了一个展示字段让公开首页等一次 RPC 也不划算。
 import { cachedShopCode } from '../shopCode.js';
 // 店铺（租户）事实源 + 节点单例（owner/节点资料）的唯一读入口：都从这里取，不在本文件另算一份
-// `shopDisplayName/Notice` 是展示形的**唯一实现**（`''` = 没设置过 ⇒ 回默认名，默认名不落库）
+// `shopDisplayName/Notice`（店铺）与 `nodeDisplayName`（节点）是展示形的**唯一实现**：
+// 店铺没有默认名（写入口拒绝空名），节点在 `''` 时回退对外域名/中性占位——见各自的说明
 import {
-  listShopRows,
+  listActiveShopRows,
   listListedShopRows,
   shopDto,
   shopDisplayName,
   shopDisplayNotice,
+  nodeDisplayName,
   nodeOwner,
   nodeOwnerOf,
   nodeRow,
@@ -105,9 +107,9 @@ const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true });
  * 行本身由 db.js 的 initDb() 种入，本模块只读写它。
  */
 
-/** 节点对外名称（`node.name` 的展示形；'' = 没设置过 ⇒ 回默认名） */
+/** 节点对外名称（`node.name` 的展示形；'' = 没设置过 ⇒ 回退对外域名，再回退中性占位） */
 export async function nodeNameOf() {
-  return shopDisplayName(await nodeRow());
+  return nodeDisplayName(await nodeRow());
 }
 
 /** 节点公告（`node.notice` 的展示形；'' = 没设置过） */
@@ -238,7 +240,7 @@ router.get('/', optionalShop, wrap(async (req, res) => {
       **节点自己的名字/公告**（不是某家店的名字）：开节点与开店铺是两个独立动作，
       一个节点可以一家店都没有，但它仍然要在目录里显示一个名字。
     */
-    name: shopDisplayName(node),
+    name: nodeDisplayName(node),
     notice: shopDisplayNotice(node),
     /** 节点自己的谈信地址（公开客服联系方式）；null = 没设置过 */
     tanxinAddress: tanxinAddressOf(node),
@@ -249,7 +251,7 @@ router.get('/', optionalShop, wrap(async (req, res) => {
     timeoutBlocks: config.escrow.timeoutBlocks,
     shops: listed.map((r) => shopDto(r, owner)),
     ...(shop ? { shop: shopDto(shop, owner) } : {}),
-    version: '0.1.0',
+    version: config.version,
   });
 }));
 
@@ -264,14 +266,14 @@ router.get('/registry-info', wrap(async (req, res) => {
   ok(res, {
     host: owner || null,
     owner: owner || null,
-    name: shopDisplayName(node),
+    name: nodeDisplayName(node),
     notice: shopDisplayNotice(node),
     tanxinAddress: tanxinAddressOf(node),
     chainId: config.chain.chainId,
     escrowAddress: config.chain.escrowAddress || null,
     registryAddress: config.chain.registryAddress || null,
     canRegister: !!(owner && config.chain.escrowAddress && config.chain.registryAddress),
-    version: '0.1.0',
+    version: config.version,
   });
 }));
 
@@ -287,13 +289,14 @@ router.get('/registry-info', wrap(async (req, res) => {
  * **不含**订单、买家、金额、商品等任何店铺经营明细——那些只有该店店主能通过店铺级端点读到。
  */
 router.get('/node', nodeAdmin, wrap(async (req, res) => {
-  const rows = await listShopRows();
+  // **名下店铺**只数在营的：已退出（墓碑）的行不是"现在还挂在名下的店"
+  const rows = await listActiveShopRows();
   const node = await nodeRow();
   const owner = nodeOwnerOf(node);
   ok(res, {
     host: owner || null,
     // 节点资料（名称/公告/谈信地址）：与任何一家店无关，见 nodeNameOf 的说明
-    name: shopDisplayName(node),
+    name: nodeDisplayName(node),
     notice: shopDisplayNotice(node),
     tanxinAddress: tanxinAddressOf(node),
     shops: rows.map((r) => shopDto(r, owner)),
@@ -525,12 +528,13 @@ router.post('/webhook-test', ownerOnly, wrap(async (req, res) => {
   ok(res, r, '测试事件投递成功（接收方应已收到 type=webhook.test 的 POST）');
 }));
 
-// ── 店铺身份声明（shop claim：店主钱包签名、可离线核验的外部身份声明）──
+// ── 店铺身份声明（shop claim：店主钱包签名、可核验的外部身份声明）──
 /*
   为什么要它：`code`（店铺编号）解决"唯一"，不解决"哪个才是官方那家"——编号本身不带外部身份。
   本组端点让店主用钱包**对一段规范消息签名**，把 domain / github / x / telegram 绑定到店铺地址上；
-  任何人都能拿 message + signature 重算 `ethers.verifyMessage` 离线核验，**不需要信任节点**。
-  节点只做存储与转发。⚠️ 它证明"某个地址签过这句话"，**不证明**那个域名/账号真的属于他——
+  EOA 可离线 `ethers.verifyMessage`；合约账户（Safe/多签）走标准 1271 或 Safe legacy 链上核验。
+  节点提交时已验过，第三方不依赖节点也能按账户类型自行核验。⚠️ 它证明"某个地址签过这句话"，
+  **不证明**那个域名/账号真的属于他——
   归属核验（DNS TXT / gist / OAuth）不在本机制内，故对外**不得**标成"已认证/官方"。
 */
 
@@ -543,8 +547,8 @@ function claimDto(row) {
     kind: row.kind,
     value: row.value,
     address: row.address,
-    // message 与 signature **原样**下发：第三方离线重算用的就是这两个字节，
-    // 任何"顺手规整一下"（去尾换行、重排字段）都会让重算出的地址与 address 不一致。
+    // message 与 signature **原样**下发：第三方核验用的就是这两个字节，
+    // 任何"顺手规整一下"（去尾换行、重排字段）都会让重算出的地址/1271 摘要与 address 不一致。
     message: row.message,
     signature: row.signature,
     // `created_at` 是 DATETIME(3) → `Date`，对外 JSON 是 ISO-8601（前端按 ISO 解析）
@@ -649,7 +653,7 @@ router.post('/claims', ownerOnly, wrap(async (req, res) => {
     return fail(res, e.message);
   }
   // ③ 验签：验的就是上面那条逐字拼出来的消息
-  const v = verifyClaim({ message, signature, expectedOperator: me.operator });
+  const v = await verifyClaim({ message, signature, expectedOperator: me.operator });
   if (!v.ok) {
     /*
       验签失败时把**这条消息**回给店主：前端一旦按别的字节（例如自己先做了归一）去签，
@@ -703,7 +707,7 @@ router.post('/claims', ownerOnly, wrap(async (req, res) => {
       ? '该声明此前已提交过（幂等：未产生新记录）'
       : revived
         ? '该声明此前已撤销，现按新签名恢复生效'
-        : '声明已记录：第三方可用 verifyMessage(message, signature) 离线核验其签名与 operator 是否一致'
+        : '声明已记录：EOA 可用 verifyMessage(message, signature) 离线核验；合约账户用标准 1271 或 Safe legacy 链上核验'
   );
 }));
 
@@ -713,8 +717,9 @@ router.post('/claims', ownerOnly, wrap(async (req, res) => {
  * 只呈现**原始事实**：message / signature / address / kind / value / createdAt——
  * 刻意**不加**任何"已认证 / 官方 / verified"字段：节点能证明的只有"这个地址签过这句话"，
  * 证明不了"这个域名真是他的"（见文件头）。把它标成认证，就是在替第三方做一个做不了的判断。
- * 核验方式（响应 message 里也写了一遍，界面/脚本照做即可）：对每条重算
- * `ethers.verifyMessage(message, signature)`，与 address 比对。
+ * 核验方式（响应 message 里也写了一遍，界面/脚本照做即可）：EOA 重算
+ * `ethers.verifyMessage(message, signature)` 与 address 比对；合约账户对 address 调
+ * 标准 1271 digest 或 Safe legacy `isValidSignature(bytes,bytes)`。
  *
  * 形状 `{ claims: [...] }` 而不是裸数组：与其它列表端点一样留出扩展位（将来要加 total/截断标记
  * 时不至于为了一个字段改整个响应形状）。
@@ -736,7 +741,7 @@ router.get('/claims', listedShopScope, claimsLimiter, wrap(async (req, res) => {
   ok(
     res,
     { claims: rows.map((r) => ({ ...claimDto(r), shopCode: r.shop_code || '' })) },
-    '声明由店主钱包签名，可离线核验：重算 ethers.verifyMessage(message, signature) 并与 address 比对即可（无需信任本节点）；节点不判定域名/账号归属'
+    '声明由店主钱包签名：EOA 可离线 verifyMessage；合约账户用标准 1271 或 Safe legacy 链上核验（无需信任本节点）；节点不判定域名/账号归属'
   );
 }));
 

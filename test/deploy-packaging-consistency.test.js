@@ -95,8 +95,8 @@ test('拷贝规则作用于一批文件名时的实际结果（.env 被排掉、
   这一组把新形状钉住，同样是结构性的：
     · `.env.example`（会被搬到服务器）必须写全 MK_DB_* 键，且口令必须是空的——否则全新安装
       既不知道要配什么，又可能把一个真口令当模板发出去；
-    · deploy.sh 的 MANAGED_KEYS **不得**包含任何 MK_DB_*：口令是运维自己写进 .env 的，
-      部署脚本既不该生成、也不该覆盖（脚本重跑要原样保留它）。
+    · deploy.sh 的 MANAGED_KEYS **必须**包含 MK_DB_*：一键部署会询问/生成库连接并写进
+      本机 .env（0600）；重跑时由脚本重写，而不是当成"外部配置"原样保留。
 */
 test('.env.example 写全 MK_DB_* 键，且口令位留空（模板会跟着代码发布出去）', () => {
   const lines = read('.env.example')
@@ -112,14 +112,16 @@ test('.env.example 写全 MK_DB_* 键，且口令位留空（模板会跟着代�
   assert.equal(valueOf('MK_DB_PASSWORD'), '', 'MK_DB_PASSWORD 在模板里必须留空（真实口令只写进本机 .env）');
 });
 
-test('deploy.sh 不代管任何 MK_DB_* 键（口令由运维写进 .env，脚本既不生成也不覆盖）', () => {
-  const managed = /MANAGED_KEYS='([^']*)'/.exec(read('deploy.sh'));
-  assert.ok(managed, 'deploy.sh 里找不到 MANAGED_KEYS（重跑时原样保留的键清单）');
+test('deploy.sh 统一写 MK_DB_* 到本机 .env（0600），重跑时重写而不是当外部配置保留', () => {
+  const script = read('deploy.sh');
+  const managed = /MANAGED_KEYS='([^']*)'/.exec(script);
+  assert.ok(managed, 'deploy.sh 里找不到 MANAGED_KEYS（重跑时脚本负责重写的键清单）');
   const keys = managed[1].split(/\s+/);
-  const dbKeys = keys.filter((k) => k.startsWith('MK_DB_'));
-  assert.deepEqual(dbKeys, [], `这些库连接键不该由部署脚本代管：${dbKeys.join(' ')}`);
-  // 反向控制：脚本确实**告知**了运维该在哪里写 MK_DB_*（否则全新安装会卡在"连不上库"而没人知道为什么）
-  assert.match(read('deploy.sh'), /MK_DB_HOST/, 'deploy.sh 必须写明 MK_DB_* 由运维写进 .env（否则连不上库时无从下手）');
+  for (const key of ['MK_DB_HOST', 'MK_DB_PORT', 'MK_DB_NAME', 'MK_DB_USER', 'MK_DB_PASSWORD']) {
+    assert.ok(keys.includes(key), `${key} 必须由 deploy.sh 管理（一键部署会生成库连接）`);
+  }
+  assert.match(script, /chmod 600 "\$ENV_FILE"/, '含数据库口令的 .env 必须是 0600');
+  assert.match(script, /printf 'MK_DB_PASSWORD=%s\\n'/, '口令必须由脚本写入 .env，不能靠用户手工补');
 });
 
 test('Dockerfile 里 COPY 的每个源文件，都不会被拷贝规则误杀（否则镜像构建必炸）', () => {
