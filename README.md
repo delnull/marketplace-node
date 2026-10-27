@@ -11,6 +11,24 @@
 
 宿主只需要 Docker；没有 Docker 时脚本会按发行版自动安装。Node、依赖和运行环境都在镜像里。
 
+## 节点合约（首次部署必须先做）
+
+每个节点自己部署 `TokenPayoutVault`、`Escrow`、`Staking`、`NodeGovernance`；公开仓里的
+`contracts/` 是源码与 Foundry 脚本，节点启动前先从这一份部署：
+
+```bash
+cd contracts
+export DEPLOYER_PRIVATE_KEY=0x...       # 节点 operator，也是 E/S 的 owner
+export ARBITERS=0x...,0x...,0x...      # 至少 3 人，阈值小于人数
+export ARBITER_THRESHOLD=2
+forge script script/DeployNode.s.sol:DeployNodeScript --rpc-url <rpc> --broadcast
+```
+
+把输出的 Escrow、Staking 与最早部署块填进 `deploy-constants.json` 的 `contracts` 三项，再启动节点。
+`deploy-constants.json` 里留空/`startBlock=0` 会被部署脚本当场拒绝，不会静默接错合约。
+
+> 合约源码与 `frontend/` 无关；前端不随节点仓发布。合约地址与 Registry 登记由节点方自己完成。
+
 > Windows 原生路径 `deploy.ps1` 仍使用已有 MySQL；自动 MySQL 容器只随 Linux/macOS 的 `deploy.sh`。
 
 ## 一行部署
