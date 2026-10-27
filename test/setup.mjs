@@ -81,6 +81,7 @@ export async function makeCtx() {
   shopRef.value = TEST_SHOP_CODE;
   // 虚拟托管地址：仅用于"已接入链上托管"分支（paid 的链上校验不在单测覆盖）
   process.env.MK_ESCROW_ADDRESS = '0x2222222222222222222222222222222222222222';
+  process.env.MK_STAKING_ADDRESS = '0x3333333333333333333333333333333333333333';
   process.env.MK_FALLBACK_BTY_USDT = '0.1'; // 1 BTY = 0.1 USDT（唯一的行情腿：USDT→BTY）
   process.env.MK_TOKEN_SECRET = 'unit-test-secret-0123456789abcdef';
   /*
@@ -119,19 +120,19 @@ export async function makeCtx() {
   }
   await initDb();
   /*
-    **店铺行必须由测试自己造**：节点不再在启动时替节点主开一家"自营店"。
-    这是模型的一部分而不是测试的麻烦——开节点与开店铺是两个独立动作，一行店铺只在
-    "链上已经有了这家店"之后才存在（落库走 routes/shops.js 的 verify-onchain）。
-    seller = 节点主，抽成 0（节点主自己开的店，收款人恒为节点地址 = 他自己）。
+    **店铺行必须由测试自己造**：节点不在启动时替节点主开店。
+    开节点与开店铺是两个独立动作，一行店铺只在**本节点审批通过**之后才存在
+    （落库走 routes/shops.js 的 review approve）。
+    seller = 节点主。
 
-    ⚠️ 新 schema 下 `shops` 没有 host 列（一库一节点，节点主在 node.owner）、
-    `pending_*` 的"没有待决提案"是 **NULL**（不是 0/空串）、时间由服务器盖章所以不传。
-    `code` 是 CHAR(9) 且有外键引用它（products/orders/siwe/...）——
+    ⚠️ 新 schema 下 `shops` 没有 host 列（一库一节点，节点主在 node.owner），
+    也没有任何链上镜像/抽成列；时间由服务器盖章所以不传。
+    `code` 是 CHAR(9) 且有外键引用它（products/orders/...）——
     这个 fixture 造出来的这一行，就是全测试套件里**唯一合法的店铺归属**。
   */
   await getDb().run(
-    `INSERT INTO shops (code, seller, name, notice, listed, commission_bps)
-     VALUES (?, ?, '', '', 1, 0)
+    `INSERT INTO shops (code, seller, name, notice, listed)
+     VALUES (?, ?, '', '', 1)
      ON DUPLICATE KEY UPDATE seller = seller`,
     TEST_SHOP_CODE, owner.address.toLowerCase()
   );
@@ -140,10 +141,23 @@ export async function makeCtx() {
     现在一律经 `chainOrder.deliveryGate` 读**链上真值**（status=Created 且 refundRequested=false；
     读不到即拒绝）。单测默认的 MK_RPC_URL 指向一个必然拒连的本地端口，所以这里装一个
     "链上确实有这一单、仍在托管、未被申请退款"的读数桩：按 escrow_order_id 回读本地行并原样回显
-    buyer/seller/amount —— 这正是 chainParamsMatch 期待的"链上就是这一单"的正常形态。
+    buyer/seller/amount/timeoutBlocks —— 这正是 chainParamsMatch 期待的"链上就是这一单"的正常形态。
     需要"链上冻结 / 已终局 / 读不到 / 诱饵单"这些档的用例自己调 setChainOrderFetcher 覆盖
     （见 test/delivery-gate.test.js 与 test/auto-deliver.test.js，传 null 恢复本桩）。
   */
+  /*
+    单测没有真链：把“确认边界”钉成 latest，避免每个假 RPC 都要实现 eth_blockNumber。
+    需要验证 finality 的用例显式覆盖这个 reader（见 chain-reconcile / sync 的 finality 用例）。
+  */
+  const { setFinalizedBlockTagReader } = await import('../src/chain.js');
+  setFinalizedBlockTagReader(async () => 'latest');
+  /*
+    单测没有真 Escrow：链上 supportedToken 默认视为开启；需要“未开启 → 拒单”的用例
+    自己 setTokenSupportReader 覆盖（见 payment-tokens / orders-v2）。
+  */
+  const { setTokenSupportReader } = await import('../src/paymentTokens.js');
+  setTokenSupportReader(async () => true);
+
   const { setChainOrderFetcher } = await import('../src/chainOrder.js');
   setChainOrderFetcher(async (orderIdHex) => {
     /*
@@ -151,7 +165,7 @@ export async function makeCtx() {
       `orders` 表已经没有这一列（见 src/db.js 的三表拆分）。
     */
     const row = await getDb().get(
-      `SELECT buyer, seller, amount_wei, commission_quoted_to, commission_quoted_bps, timeout_blocks
+      `SELECT buyer, seller, amount_wei, timeout_blocks, payment_token
          FROM v_orders WHERE escrow_order_id = ?`,
       String(orderIdHex || '').toLowerCase()
     );
@@ -164,37 +178,10 @@ export async function makeCtx() {
       buyer: row.buyer,
       seller: row.seller,
       amount: row.amount_wei,
-      /*
-        交付闸会核对**报价条款**（抽成收款人/比例、验货窗口）。默认桩回"链上与本地报价一致"的
-        读数；要验"买家签了另一份条款"的用例自己覆盖 `commissionTerms` / `timeoutBlocks`。
-      */
       timeoutBlocks: Number(row.timeout_blocks),
-      /*
-        店铺节点必须与 `commissionTerms` 一起出现在**顶层**：`chainParamsMatch` 的身份判据读的是
-        `p.commissionTo`（真实读取器 `fetchOnchainOrder` 也是这样给的）。桩只给嵌套那份时，
-        交付闸/对账会把"读不到 host"判成诱饵单——这正是 2026-10-22 修的那条，桩必须同形。
-      */
-      commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
-      commissionTerms: {
-        commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
-        commissionBps: Number(row.commission_quoted_bps) || 0,
-      },
+      token: row.payment_token,
     };
   });
-  /*
-    店铺员工的链上治理身份判据：单测 RPC 拒连，而 `PUT /staff` / `roleOf` 现在要求
-    `isProtocolGovernance` 可读（读不到 = 拒绝）。默认桩回答 false（测试里的地址都不是治理 owner），
-    需要验证角色互斥的用例自己 `setProtocolGovernanceReader` 覆盖。
-  */
-  const { setProtocolGovernanceReader, setForceClosedReader } = await import('../src/chain.js');
-  setProtocolGovernanceReader(async () => false);
-  /*
-    强制关闭状态（`Registry.isForceClosed`）：单测 RPC 拒连 ⇒ 默认桩回答"没人被强制关闭"。
-    这条判据在被 forceClose 的员工鉴权、`isNodeAdmin`、`PUT /staff` 三处都是 fail-closed，
-    没有这个默认桩，普通员工用例会全部掉成 user（看起来像鉴权坏了）。需要验证拒绝路径的
-    用例自己 `setForceClosedReader` 覆盖。
-  */
-  setForceClosedReader(async () => false);
   const { createApp } = await import('../src/app.js');
   return { app: createApp(), db: getDb(), owner, buyer, request };
 }
@@ -399,12 +386,6 @@ const ORDER_SPEC_COLUMNS = {
   usdtMicro: 'usdt_micro',
   shippingFeeUsdtMicro: 'shipping_fee_usdt_micro',
   btyUsdtRate: 'bty_usdt_rate',
-  feeBps: 'fee_bps',
-  feeCollectorAtCreate: 'fee_collector_at_create',
-  commissionBps: 'commission_bps',
-  commissionTo: 'commission_to',
-  commissionQuotedBps: 'commission_quoted_bps',
-  commissionQuotedTo: 'commission_quoted_to',
   holdQty: 'hold_qty',
   releasedAt: 'released_at',
   trackingNo: 'tracking_no',
@@ -466,6 +447,10 @@ const PRODUCT_SPEC_COLUMNS = {
   ageRestricted: 'age_restricted',
   nftContract: 'nft_contract',
   nftStandard: 'nft_standard',
+  claimable: 'claimable',
+  claimType: 'claim_type',
+  claimWindowDays: 'claim_window_days',
+  claimInstructions: 'claim_instructions',
   specs: 'specs',
   attributes: 'attributes',
   terms: 'terms',
@@ -597,14 +582,6 @@ export async function insertOrder(db, spec = {}) {
       status: 'draft',
       amountWei: '0',
       usdtMicro: 0,
-      /*
-        **条款报价的默认值**（2026-10-18）：交付闸现在对"本单没有报价快照"是 fail-closed
-        （`termsMismatchOf` 返回 unreadable），而直插夹具的行通常只关心别的列。默认写一份
-        "与当前店铺条款一致"的报价：抽成 0、收款人 = 卖家（夹具店的 seller 就是节点主），
-        验货窗口取默认 7 天。要验"未报价/不一致"的用例显式传 null / 别的值覆盖。
-      */
-      commissionQuotedBps: 0,
-      commissionQuotedTo: String(seller).toLowerCase(),
       timeoutBlocks: 120960,
       ...spec,
       orderNo: spec.orderNo ?? newOrderId(),

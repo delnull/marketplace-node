@@ -55,6 +55,35 @@ export async function fetchReturnByOrder(orderId) {
   return await getDb().get('SELECT * FROM order_returns WHERE order_id = ?', orderId) || null;
 }
 
+/**
+ * 卖家填写/修改退货地址（买家发起退货申请后）。
+ * 只允许 open 状态；已寄出/已收货再改地址没有意义，反而会让买家按旧地址寄丢。
+ */
+export async function setReturnAddress({ returnRow, address }) {
+  if (!returnRow) return { error: '退货单不存在（请先由买家发起退货申请）' };
+  const addr = String(address ?? '').trim().slice(0, 300);
+  if (!addr) return { error: '退货地址不能为空' };
+  const moved = (await getDb().run(
+    "UPDATE order_returns SET address = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status = 'open'",
+    addr,
+    returnRow.id
+  )).changes;
+  if (moved !== 1) return { error: '退货单状态已变化（已寄出/已收货），不能再改地址' };
+  return { ok: true, data: await fetchReturnByOrder(returnRow.order_id) };
+}
+
+/**
+ * 买家发起退货申请：仅创建一条 open 的空地址退货单，地址由卖家补。
+ * 门控复用 createReturn（已交付 + 退款/售后窗口），这里只补买家身份。
+ */
+export async function requestReturn({ order, buyer, note }) {
+  if (!order) return { error: '订单不存在', notFound: true };
+  if (String(order.buyer || '').toLowerCase() !== String(buyer || '').toLowerCase()) {
+    return { error: '仅买家本人可发起退货申请', forbidden: true };
+  }
+  return createReturn({ order, address: '', note: `买家申请退货：${String(note ?? '').trim().slice(0, 500)}` });
+}
+
 /** 对外字段（时间列是 Date → JSON 给出 ISO-8601；NULL 的三态原样透出为 null） */
 export function returnToPublic(r) {
   if (!r) return null;
@@ -187,14 +216,19 @@ export async function settleReturn({ order, returnRow, waived }) {
     */
     const moved = (await getDb().run("UPDATE order_returns SET status = 'received', waived = ?, received_at = CURRENT_TIMESTAMP(3), updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status IN ('open','shipped')", waived ? 1 : 0, returnRow.id)).changes;
     if (moved !== 1) return abortTx({ error: '退货单状态已变化（可能已被处理），请刷新后重试' });
+    /*
+      事务内重读并锁订单状态：路由入口读到的是旧快照，事务提交前 watcher 可能已把订单
+      推到 refunded。用旧快照分支会两支都不命中，`received_at` 落了而占位永久滞留。
+    */
+    const fresh = await getDb().get('SELECT status FROM orders WHERE id = ? FOR UPDATE', order.order_id);
+    if (!fresh) return abortTx({ error: '订单不存在' });
     // 链上退款已终局（refunded）→ 占位回补；未终局由 releaseRefundedEscrow 在事件迁移时兜底
-    if (order && order.status === 'refunded') {
+    if (fresh.status === 'refunded') {
       await releaseHoldsForOrderIds([order.order_id]);
     }
-    // D1：订单已终局为成交态（settled/confirmed/expired——资金判给卖家）时才 receive/waive
-    // （watcher 事件先到、卖家收货动作后到的顺序）：货已实际回到卖家侧/放弃追回 → 当场回补占位
-    // （released_at 幂等；releaseHoldsForReturnReceived 判据含 received_at 非空，此处刚落库即命中）
-    else if (order && ['settled', 'confirmed', 'expired'].includes(order.status)) {
+    // 订单已终局为成交态（settled/confirmed/expired——资金判给卖家）时才 receive/waive：
+    // 货已实际回到卖家侧/放弃追回 → 当场回补占位（released_at 幂等；判据含 received_at 非空）
+    else if (['settled', 'confirmed', 'expired'].includes(fresh.status)) {
       await releaseHoldsForReturnReceived(order.escrow_order_id);
     }
     return { ok: true };

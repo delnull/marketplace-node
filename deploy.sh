@@ -36,7 +36,7 @@
 #      bash deploy.sh --owner 0x… --domain shop.example.com --email me@x.com
 #      bash deploy.sh --tls-mode caddy|nginx|none       # 跳过 TLS 选择（--no-tls 等价于 --tls-mode none）
 #      bash deploy.sh --dry-run            # 只打印计划，什么都不改（含"要不要装 Docker"）
-#      bash deploy.sh --status | --health | --update | --register | --uninstall
+#      bash deploy.sh --status | --health | --update | --uninstall
 #      bash deploy.sh --update --pull      # 升级（并强制从公开仓拉最新代码）
 #      bash deploy.sh --purge              # 卸载并**删除数据卷**（不可逆，需二次确认）
 #      bash deploy.sh --help
@@ -54,16 +54,12 @@
 #      --db-volume NAME                  内置 MySQL 数据卷（默认 <service>-mysql-data）
 #      --db-image IMAGE                  内置 MySQL 镜像（默认 mysql:8.4）
 #      --image marketplace-node:latest   镜像名:标签
-#      --key-file /path/key              登记用私钥文件（默认交互粘贴）
-#      --no-register / --no-domain       跳过登记 / 先不配域名
+#      --no-domain                       先不配域名
 #      --pull                            --update 时强制从公开仓拉最新代码（没有 git 的安装用）
 #      --yes / --force                   不交互 / 覆盖同名容器
 #
 #  ── 关于私钥 ───────────────────────────────────────────────────────────────
-#  链上登记必须用**店主本人的私钥**签名（registerNode 的 operator 就是你）。粘贴方式下私钥
-#  只经标准输入进容器、随容器一起销毁：**宿主磁盘上不落任何文件**。之后也可以随时到
-#  https://fedmall.bityuan.com →「开店/登记我的节点」用钱包插件完成登记（推荐）。
-#  登记要花一点点 BTY 当 gas（约 0.001 BTY 量级），钱包里留 0.01 BTY 就够。
+#  链上登记由店主在 $FRONTEND 的「开店/登记我的节点」用钱包插件完成（部署脚本不持私钥、不代登记）。
 # =============================================================================
 set -Eeuo pipefail
 
@@ -74,27 +70,14 @@ set -Eeuo pipefail
 # 为什么是 JSON 而不是这里的 shell 常量：PowerShell 读 JSON 是一等公民（ConvertFrom-Json），
 # 读 shell 变量则要自己解析；反过来 bash 用一行 sed 就能从固定结构里取值。
 #
-# ⚠️ 换批时：改 `deploy-constants.json` 的 contracts 五项（Escrow / Registry / Blocklist /
-# startBlock / escrowCodeHash），两边脚本**同时**生效，不需要改脚本本体。
-#   · Registry 把 Escrow 的**地址与运行时字节码哈希**钉成 immutable（canonical 双锚定），
-#     只换其中一个 ⇒ 节点登记会被链上以 EscrowNotCanonical 拒绝；
-#   · Blocklist 同样是 Registry 构造函数里的 immutable（先发 Escrow，再发 Blocklist(owner, escrow)，
-#     再把它的地址传给 Registry）：换 Registry 就必须同批换名单，空值会被下面的结构门禁当场拒绝
-#     ——它没有"以后再加"这条路；
-#   · Staking 自 2026-10-14 起也把事实源钉成 immutable 双锚定（**换源能力已整条删除**），
-#     所以换 Escrow 必须连带重部署 Staking——这条在合约层是硬约束，不是运维建议；
-#   · startBlock 错成旧高度只会空扫一轮（不报错），但错成**更高**的高度会**漏扫历史事件**；
-#   · escrowCodeHash 是**本批部署产物**的 keccak256（`cast keccak $(cast code <ESCROW>)`），
-#     `node/test/deploy-plan.test.js` 拿它与本地编译产物比对——它是"仓库记的地址与本批源码
-#     是不是同一代"的唯一机械判据。
+# ⚠️ 换批时：改 `deploy-constants.json` 的 contracts 三项（escrow / staking / startBlock），
+# 两边脚本**同时**生效，不需要改脚本本体。
+#   · 平台 Registry 只是前端发现层；每个节点自己部署 Escrow + Staking（contracts/script/DeployNode.s.sol）；
+#   · 本节点 Escrow 与 Staking 必须互相回指，且 owner 都是节点 operator；
+#   · startBlock 取 Escrow/Staking 中最早的部署块；错成更高高度会漏扫历史事件；
+#   · 链上登记由店主在前端用钱包完成，部署脚本**不持私钥、不自动登记**。
 #
-# **为什么 contracts 五项现在是空的**（2026-10-16）：主网此前部署过的每一批都已**整体作废**
-# （全部缺当前源码里店主分账所需的 `commissionTermsAtCreate` / `commissionAtSettle`，
-# 本节点的启动期代次自检会直接判定代次不符并拒绝工作），下一批由部署方按当批结果填。
-# 这里**刻意不放任何地址**：内置一个已作废的地址，症状是"节点照常启动、商品照常展示，
-# 只有买家付款路径指向一个没人维护的合约"，而 deploy.sh 的形状门禁当场拒绝空值 ——
-# **空值会响亮地停下，旧值只会静默地接错**。两代历史（2026-09-23、2026-10-13）都属这一类，
-# 弃用前实测均无业务数据、余额为 0，因此没有迁移成本。
+# contracts 四项留空 / startBlock=0 = 未部署：下面的形状门禁会当场拒绝，而不是静默接错。
 # 取源码用（只在"宿主机没有源码也没有 git"时启用；见 ② 取代码）
 SRC_REPO='https://github.com/delnull/marketplace-node.git'
 SRC_TARBALL='https://codeload.github.com/delnull/marketplace-node/tar.gz/refs/heads/main'
@@ -155,8 +138,7 @@ FRONTEND="$(const frontendOrigin)"
 RPC_URL="$(const rpcUrl)"
 CHAIN_ID="$(const chainId)"
 ESCROW="$(const escrow)"
-REGISTRY="$(const registry)"
-BLOCKLIST="$(const blocklist)"
+STAKING="$(const staking)"
 START_BLOCK="$(const startBlock)"
 CONTAINER_PORT="$(const containerPort)"
 # 容器停机宽限期（秒）⇒ `docker run --stop-timeout`。它必须**大于** .env 里的
@@ -175,31 +157,28 @@ CADDY_IMAGE='caddy:2-alpine'
 # 判据只做**结构性**校验（地址形状 + 起始块非 0）：「是不是上一批已弃用的那个合法地址」
 # 脚本无法判断，只能由部署者按发布检查表逐项核对。
 if ! printf '%s' "$ESCROW" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
-   || ! printf '%s' "$REGISTRY" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
-   || ! printf '%s' "$BLOCKLIST" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+   || ! printf '%s' "$STAKING" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
    || ! printf '%s' "$START_BLOCK" | grep -Eq '^[0-9]+$' \
    || [ "$START_BLOCK" = '0' ]; then
   cat >&2 <<EOF
 [deploy.sh] 拒绝执行：deploy-constants.json 里的合约常量不合法。
 
-  取到的值：escrow=$ESCROW  registry=$REGISTRY  blocklist=$BLOCKLIST  startBlock=$START_BLOCK
+  取到的值：escrow=$ESCROW  staking=$STAKING  startBlock=$START_BLOCK
 
   本脚本把这些值编进镜像（店主不需要、也不该自己填），它们必须由部署方按当批部署结果填：
-    1) 部署当批合约：node scripts/deploy-mainnet.cjs
-    2) 把输出的 Escrow / Registry / Blocklist / 起始扫描块填进 deploy-constants.json 的 contracts
+    1) 节点合约：contracts/script/DeployNode.s.sol（Escrow + Staking + 委员会 + NodeGovernance）
+    2) 把 DeployNode 输出的 Escrow / Staking / 起始扫描块填进 deploy-constants.json 的 contracts
        （**不要改脚本**：Windows 原生路径 deploy.ps1 读的是同一份文件）
     3) 起始块不能是 0（0 = 从最新块开始 ⇒ 漏扫历史事件且不报错）
-    4) Blocklist 是 Registry 构造函数的 immutable：先发 Escrow，再发 Blocklist(owner, escrow)，再发 Registry；
-       必须与 Registry 同批，空值/无代码地址会让 Registry 构造直接 revert（BlocklistNotConfigured），
-       而节点侧会静默丢掉两道名单闸
+    4) Escrow 与 Staking 必须由同一节点部署、互相回指、owner 都是该节点 operator
 EOF
   exit 1
 fi
 
 MODE=install
-DRY_RUN=0; ASSUME_YES=0; FORCE=0; NO_REGISTER=0; NO_DOMAIN=0; PULL=0
-OWNER=''; DOMAIN=''; EMAIL=''; KEY_FILE=''; PORT=''; DIR=''; SERVICE=''; VOLUME=''; IMAGE=''
-TLS_MODE=''; TLS_MODE_GIVEN=0; BIND=''; BIND_GIVEN=0; DIR_GIVEN=0; KEY_INPUT=''
+DRY_RUN=0; ASSUME_YES=0; FORCE=0; NO_DOMAIN=0; PULL=0
+OWNER=''; DOMAIN=''; EMAIL=''; PORT=''; DIR=''; SERVICE=''; VOLUME=''; IMAGE=''
+TLS_MODE=''; TLS_MODE_GIVEN=0; BIND=''; BIND_GIVEN=0; DIR_GIVEN=0
 # MySQL：默认交互询问；--db-mode 供非交互/自动化显式选择。
 # external = 用户已有的 MySQL；container = 本脚本部署一个仅节点可达的 MySQL 容器。
 DB_MODE=''; DB_MODE_GIVEN=0
@@ -211,7 +190,6 @@ while [ $# -gt 0 ]; do
     --owner) OWNER="${2:-}"; shift 2 ;;
     --domain) DOMAIN="${2:-}"; shift 2 ;;
     --email) EMAIL="${2:-}"; shift 2 ;;
-    --key-file) KEY_FILE="${2:-}"; shift 2 ;;
     --port) PORT="${2:-}"; shift 2 ;;
     --dir) DIR="${2:-}"; DIR_GIVEN=1; shift 2 ;;
     --service) SERVICE="${2:-}"; shift 2 ;;
@@ -223,7 +201,6 @@ while [ $# -gt 0 ]; do
     # 不配 TLS 就绑 0.0.0.0，因为外部负载均衡要从**私网 IP** 连进来，绑 127.0.0.1 它就连不上）。
     # 需要收紧时显式指定，例如同机已有 nginx 反代：--bind 127.0.0.1
     --bind) BIND="${2:-}"; BIND_GIVEN=1; shift 2 ;;
-    --no-register) NO_REGISTER=1; shift ;;
     --no-domain) NO_DOMAIN=1; shift ;;
     --db-mode) DB_MODE="${2:-}"; DB_MODE_GIVEN=1; shift 2 ;;
     --db-host) DB_HOST_VALUE="${2:-}"; shift 2 ;;
@@ -239,7 +216,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --force) FORCE=1; shift ;;
-    --status|--health|--update|--register|--uninstall|--purge) MODE="${1#--}"; shift ;;
+    --status|--health|--update|--uninstall|--purge) MODE="${1#--}"; shift ;;
     -h|--help) MODE=help; shift ;;
     *) printf '未知参数：%s（bash deploy.sh --help）\n' "$1" >&2; exit 2 ;;
   esac
@@ -328,8 +305,7 @@ if [ "$MODE" = help ]; then
   awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
   exit 0
 fi
-case "$MODE" in status|health|update|register|uninstall|purge) ;; *) MODE=install ;; esac
-[ "$MODE" = update ] && NO_REGISTER=1
+case "$MODE" in status|health|update|uninstall|purge) ;; *) MODE=install ;; esac
 
 # ── 目录/名字/端口的默认值 ──
 if [ "${DIR_GIVEN}" = 0 ]; then
@@ -805,9 +781,7 @@ fetch_code_via_container() {
   ' || die "容器内下载源码失败（服务器能否访问 GitHub？）—— 也可以在本机下载 ZIP 后上传解压，再在解压目录里跑本脚本"
 }
 
-if [ "$MODE" = register ]; then
-  info "补登记模式：不构建镜像、不重启容器（只用现有安装的配置与镜像）"
-elif [ "$MODE" = update ]; then
+if [ "$MODE" = update ]; then
   # 升级必须**真的换掉代码**，否则 rc/local 上的改动永远上不去：
   # 之前这里只打印一句"更新模式"就直接去重建镜像 —— 用的是安装目录里那份**旧代码**，
   # 于是"升级到最新版"对跟文档走的店主是假的（他们克隆一次之后再也升不动）。
@@ -860,14 +834,11 @@ fi
 if [ "$DRY_RUN" != 1 ]; then
   [ -f "$DIR/Dockerfile" ] || die "$DIR 里没有 Dockerfile —— 这不是一份节点代码（用 --dir 指到正确目录）"
 fi
-if [ "$MODE" = register ]; then
-  [ -f "$ENV_FILE" ] || die "补登记需要已有安装（找不到 $ENV_FILE）——请先跑一次 bash deploy.sh"
-fi
 
 # =============================================================================
 # 店主地址 / 域名 / TLS 选择
 # =============================================================================
-if [ "$MODE" != register ]; then
+if true; then
   if [ -z "$OWNER" ] && [ -f "$ENV_FILE" ]; then
     OWNER="$(env_val MK_SHOP_OWNER)"
   fi
@@ -918,7 +889,7 @@ fi
 #  这里刻意不写"有域名就默认在本机申请证书"：那样"我只填个域名、证书自己在别处弄"会被**悄悄
 #  解释成**"在本机起 Caddy 去占 80/443 申请证书"，在已有入口的机器上只会留下一条 warn，
 #  而店主以为自己配好了。要一键全包就显式 `--tls-mode caddy`。
-if [ "$MODE" != register ]; then
+if true; then
   if [ "$TLS_MODE_GIVEN" = 0 ] && [ -n "$DOMAIN" ]; then
     if [ "$TTY" = 1 ] && [ "$ASSUME_YES" != 1 ]; then
       log ""
@@ -962,34 +933,12 @@ if [ "$MODE" != register ]; then
   fi
 fi
 
-# ── 登记私钥（可选）──
-DO_REGISTER=0
-if [ "$NO_REGISTER" != 1 ] && [ -n "$ENDPOINT" ] && [ "$MODE" != update ]; then
-  if [ -n "$KEY_FILE" ]; then
-    [ -f "$KEY_FILE" ] || die "私钥文件不存在：$KEY_FILE"
-    DO_REGISTER=1
-  elif [ "$ASSUME_YES" != 1 ] && [ "$TTY" = 1 ]; then
-    log ""
-    log "  现在就在链上登记这家店吗？（登记后买家立刻能在 $FRONTEND 看到你）"
-    log "    1) 现在登记 —— 需要粘贴店主钱包私钥（不回显；只经标准输入进容器，宿主不留文件）"
-    log "    2) 稍后登记 —— 到 $FRONTEND 的「开店/登记我的节点」用钱包插件完成（推荐，更安全）"
-    ANS="$(ask '  请选择（默认 2）> ' '2')"
-    if [ "$ANS" = "1" ]; then
-      printf '    店主私钥（输入不回显，粘贴后回车）> ' >&2
-      read -r -s KEY_INPUT || true
-      printf '\n' >&2
-      [ -n "$KEY_INPUT" ] || die "未输入私钥"
-      DO_REGISTER=1
-    fi
-  fi
-fi
-
 log ""
 info "店主地址：$OWNER"
 info "对外域名：${ENDPOINT:-（未指定，节点不会被买家发现）}"
 info "HTTPS   ：$TLS_MODE"
-info "链上登记：$([ "$DO_REGISTER" = 1 ] && echo '本次脚本完成' || echo '稍后（前端开店向导）')"
-info "合约：Escrow=$ESCROW  Registry=$REGISTRY  Blocklist=$BLOCKLIST（已内置）"
+info "链上登记：稍后到 $FRONTEND 的「开店/登记我的节点」用钱包完成（部署脚本不持私钥）"
+info "合约：Escrow=$ESCROW  Staking=$STAKING（已内置）"
 # 域名给了但本机不申请证书时，在这里把"这不等于不能上 https"说清楚（拓扑 A 的定位说明）
 if [ -n "$ENDPOINT" ] && [ "$TLS_MODE" = none ]; then
   info "证书    ：本机不申请（TLS 在哪终止、证书就在哪申请 —— 见上面第 ⑧ 步）"
@@ -1012,7 +961,6 @@ if [ "$DRY_RUN" = 1 ]; then
   else
     info "未指定域名：本机不申请证书，节点只在 http://127.0.0.1:$PORT 上可访问"
   fi
-  [ "$DO_REGISTER" = 1 ] && info "将在容器里执行链上登记"
   info "去掉 --dry-run 即真正执行"
   exit 0
 fi
@@ -1023,7 +971,7 @@ umask 077
 resolve_db_config
 DATA_MOUNT='/data'
 KEEP_EXTRA=''
-MANAGED_KEYS='MK_PORT MK_SHOP_OWNER MK_RPC_URL MK_CHAIN_ID MK_ESCROW_ADDRESS MK_REGISTRY_ADDRESS MK_BLOCKLIST_ADDRESS MK_ESCROW_START_BLOCK MK_ESCROW_TIMEOUT_BLOCKS MK_ESCROW_FINALITY_BLOCKS MK_ESCROW_POLL_MS MK_CHAIN_RECONCILE_MS MK_CORS_ORIGIN MK_CORS_ALLOW_ALL MK_ATTACH_DIR MK_AUTO_DELIVER MK_PII_RETENTION_DAYS MK_BTY_TTL_MS MK_DRAFT_TTL_MINUTES MK_REVIEW_TTL_DAYS MK_TOKEN_TTL MK_SIWE_TTL MK_TOKEN_SECRET MK_SIWE_DOMAIN MK_DB_HOST MK_DB_PORT MK_DB_NAME MK_DB_USER MK_DB_PASSWORD'
+MANAGED_KEYS='MK_PORT MK_SHOP_OWNER MK_RPC_URL MK_CHAIN_ID MK_ESCROW_ADDRESS MK_STAKING_ADDRESS MK_ESCROW_START_BLOCK MK_ESCROW_TIMEOUT_BLOCKS MK_ESCROW_FINALITY_BLOCKS MK_ESCROW_POLL_MS MK_CHAIN_RECONCILE_MS MK_CORS_ORIGIN MK_CORS_ALLOW_ALL MK_ATTACH_DIR MK_AUTO_DELIVER MK_PII_RETENTION_DAYS MK_BTY_TTL_MS MK_DRAFT_TTL_MINUTES MK_REVIEW_TTL_DAYS MK_TOKEN_TTL MK_SIWE_TTL MK_TOKEN_SECRET MK_SIWE_DOMAIN MK_DB_HOST MK_DB_PORT MK_DB_NAME MK_DB_USER MK_DB_PASSWORD'
 if [ -f "$ENV_FILE" ]; then
   KEEP_SECRET="$(env_val MK_TOKEN_SECRET)"
   cp -a "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
@@ -1067,8 +1015,7 @@ MK_SHOP_OWNER=$OWNER
 MK_RPC_URL=$RPC_URL
 MK_CHAIN_ID=$CHAIN_ID
 MK_ESCROW_ADDRESS=$ESCROW
-MK_REGISTRY_ADDRESS=$REGISTRY
-MK_BLOCKLIST_ADDRESS=$BLOCKLIST
+MK_STAKING_ADDRESS=$STAKING
 MK_ESCROW_START_BLOCK=$START_BLOCK
 MK_ESCROW_TIMEOUT_BLOCKS=$(constN MK_ESCROW_TIMEOUT_BLOCKS)
 MK_ESCROW_FINALITY_BLOCKS=$(constN MK_ESCROW_FINALITY_BLOCKS)
@@ -1116,7 +1063,7 @@ ok "配置就绪：$ENV_FILE（$(grep -c . "$ENV_FILE") 行，0600）"
 ensure_mysql_container
 
 # =============================================================================
-if [ "$MODE" != register ]; then
+if true; then
   step "④ 构建镜像（$IMAGE）"
   # 重建前先把**当前这个镜像**另存一个 tag：新镜像构建失败/起不来时可以一键回到它。
   # 为什么必须有：下面第 ⑥ 步会先删掉旧容器再起新的，如果新镜像有问题，线上就空窗了
@@ -1191,6 +1138,23 @@ if [ "$MODE" != register ]; then
     return 1
   }
 
+  # 升级前先落一份库备份：镜像回滚不等于数据回滚。内置 MySQL 容器用 mysqldump
+  # --single-transaction；外部库没有可信的本机客户端，只明确告警并给出命令，不假装备份成功。
+  if [ "$MODE" = update ]; then
+    if [ "$DB_MODE" = container ]; then
+      BACKUP_FILE="$DIR/db-backup-$(date -u +%Y%m%d-%H%M%S).sql.gz"
+      if dk exec -e MYSQL_PWD="$DB_PASSWORD" "$DB_CONTAINER" \
+        mysqldump -u"$DB_USER" --single-transaction --routines --events "$DB_NAME" 2>/dev/null | gzip > "$BACKUP_FILE"; then
+        ok "升级前数据库已备份：$BACKUP_FILE"
+      else
+        rm -f "$BACKUP_FILE"
+        warn "升级前数据库备份失败（继续部署，但这次没有可回滚的数据快照）"
+      fi
+    else
+      warn "外部 MySQL 不做自动备份：升级前请先执行 mysqldump（见 node/docs/OPERATIONS.md §2）"
+    fi
+  fi
+
   step "⑥ 启动节点容器（$CONTAINER）"
   if dk ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     if [ "$FORCE" != 1 ] && [ "$MODE" != update ]; then
@@ -1202,6 +1166,14 @@ if [ "$MODE" != register ]; then
   if [ -z "$BIND" ]; then
     BIND='127.0.0.1'
     [ "$TLS_MODE" = none ] && BIND='0.0.0.0'
+  fi
+  # 只在**绑定回环**时自动信任代理：此时外部无法直连节点，请求只能来自宿主 nginx（127.0.0.1）
+  # 或同机 Docker 网络里的 Caddy（172.16/12）。绑 0.0.0.0 时无法知道代理网段，保持关闭并让
+  # 运维按 docs/OPERATIONS.md 显式配置——不能把“任意客户端可伪造 XFF”当成默认。
+  # 用户已显式设置时原样保留（MK_TRUST_PROXY 不在 MANAGED_KEYS 里）。
+  if [ "$BIND" = '127.0.0.1' ] && [ -z "$(env_val MK_TRUST_PROXY)" ]; then
+    printf 'MK_TRUST_PROXY=loopback,172.16.0.0/12\n' >> "$ENV_FILE"
+    info "已启用代理信任：MK_TRUST_PROXY=loopback,172.16.0.0/12（绑定 127.0.0.1，仅本机/Docker 代理可连）"
   fi
   case "$BIND" in
     0.0.0.0|127.0.0.1|'[::]'|'::') ;;
@@ -1306,6 +1278,11 @@ $DOMAIN {
 	reverse_proxy $SERVICE:$CONTAINER_PORT
 	header {
 		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		Content-Security-Policy "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; media-src https: blob:; connect-src *"
 	}
 }
 EOF
@@ -1428,6 +1405,10 @@ server {
     server_name $DOMAIN;
 
     client_max_body_size 20m;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     location / {
         proxy_pass http://127.0.0.1:$PORT;
         proxy_http_version 1.1;
@@ -1494,27 +1475,6 @@ EOF
 fi
 
 # =============================================================================
-if [ "$DO_REGISTER" = 1 ]; then
-  step "⑨ 链上登记（在容器里跑 register-node.mjs）"
-  info "私钥只经标准输入进容器，随容器一起销毁：宿主磁盘上不落任何文件"
-  REG_CMD='umask 077; cat > "$MK_KEY_FILE"; exec node scripts/register-node.mjs --endpoint "$MK_REGISTER_ENDPOINT" --owner "$MK_REGISTER_OWNER"'
-  reg_args=(--rm -i --env-file "$ENV_FILE" -e MK_KEY_FILE=/tmp/owner.key
-            -e MK_REGISTER_ENDPOINT="$ENDPOINT" -e MK_REGISTER_OWNER="$OWNER" "$IMAGE" sh -c "$REG_CMD")
-  REG_OK=0
-  if [ -n "$KEY_FILE" ]; then
-    dk run "${reg_args[@]}" < "$KEY_FILE" && REG_OK=1
-  else
-    printf '%s\n' "$KEY_INPUT" | dk run "${reg_args[@]}" && REG_OK=1
-    unset KEY_INPUT
-  fi
-  if [ "$REG_OK" = 1 ]; then
-    ok "登记成功：$ENDPOINT"
-  else
-    die "链上登记失败（见上面输出）。节点本身已在运行，也可以稍后到 $FRONTEND 的「开店向导」完成登记"
-  fi
-fi
-
-# =============================================================================
 step "完成"
 ok "节点：http://127.0.0.1:$PORT/healthz（容器 $CONTAINER，数据卷 $VOLUME）"
 [ -n "$ENDPOINT" ] && ok "对外：$ENDPOINT"
@@ -1523,18 +1483,13 @@ if [ -n "$ENDPOINT" ] && [ "$TLS_MODE" = none ]; then
   log "    入口那边的自检：curl -s $ENDPOINT/healthz 应返回 \"code\":0）"
 fi
 log ""
-if [ "$MODE" = register ] || [ "$DO_REGISTER" = 1 ]; then
-  log "  你的店已上链登记，打开 $FRONTEND 首页即可看到（首次显示可能需要几十秒）。"
-else
-  log "  还差最后一步：打开 $FRONTEND →「开店/登记我的节点」，用钱包签名完成登记，"
-  log "  登记后买家才能发现你（没有登记过的节点前端一定看不到——这是刻意的，没有静态兜底列表）。"
-fi
+log "  还差最后一步：打开 $FRONTEND →「开店/登记我的节点」，用钱包签名完成登记，"
+log "  登记后买家才能发现你（没有登记过的节点前端一定看不到——这是刻意的，没有静态兜底列表）。"
 log ""
 log "  常用命令："
 log "    docker logs -f $CONTAINER            # 看日志（容器版没有 systemd 单元）"
 log "    bash deploy.sh --health              # 探活（健康时一行结论；不健康才带最近日志）"
 log "    bash deploy.sh --update              # 重新构建镜像并用同一个数据卷重建容器（数据不丢）"
-log "    bash deploy.sh --register            # 补登记（或换域名后重新登记）"
 log "    docker restart $CONTAINER            # 重启节点"
 log "    bash deploy.sh --uninstall           # 停掉并移除容器（数据卷保留）"
 log ""

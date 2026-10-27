@@ -1580,11 +1580,11 @@ const SCHEMA_DDL = `
     MySQL 8 原生 schema（**不是 SQLite 设计的翻译**）。六条贯穿全库的形状规则：
 
     R1 代理键：每张表 id BIGINT UNSIGNED AUTO_INCREMENT 作聚簇主键；业务标识各自 UNIQUE。
-       唯一例外是 shops.code CHAR(9)——它 9 字节、链上铸造、不可变，再套一层代理键只会多一次 JOIN。
+       唯一例外是 shops.code CHAR(9)——它 9 字节、**由本节点铸造**、不可变，再套一层代理键只会多一次 JOIN。
        （旧形状是 orders.id VARCHAR(40) 当主键，5 张子表各背 40 字节外键。）
     R2 类型按语义精确：地址 CHAR(42)、交易哈希/托管单号 CHAR(66)、店铺编号 CHAR(9)、
        订单号 CHAR(21)、商品标识 CHAR(11)；wei 金额 DECIMAL(38,0)、微 USDT BIGINT UNSIGNED、
-       费率 DECIMAL(20,10)、bps SMALLINT UNSIGNED。
+       汇率 DECIMAL(20,10)。
        （旧形状把 9 位编号放进 VARCHAR(64)、把地址与金额放进 TEXT。）
 
     R2b **地址与店铺编号的大小写是库级约束，不是调用点纪律**：库级排序规则 as_cs 下
@@ -1592,7 +1592,7 @@ const SCHEMA_DDL = `
        任何直连 SQL / 导入脚本写进一个带校验和的地址，那一行对所有小写查询**永久不可见**
        且不报错（本仓实测过这一类）。所以判据挂在列上：每个 CHAR(42) 地址列带
        CHECK (col = LOWER(col))，每个 CHAR(9) 店铺编号列带 CHECK (col = UPPER(col))
-       （Crockford Base32 的唯一规范形是大写，编号来自链上铸造）。新增地址/店铺编号列
+       （Crockford Base32 的唯一规范形是大写，编号由本节点铸造）。新增地址/店铺编号列
        必须同批带上这条约束——test/schema-identity-case.test.js 从本段 DDL 派生清单并在
        缺一条时变红。
     R3 闭合集合用 ENUM：值域写在列定义里、占 1 字节、SHOW COLUMNS 自带文档。
@@ -1631,6 +1631,12 @@ const SCHEMA_DDL = `
     */
     tanxin_address VARCHAR(64) NULL,
     escrow_address CHAR(42) NULL,                       -- 托管合约地址锚（换址门禁读它）
+    /*
+      本节点的保证金合约地址锚（MK_STAKING_ADDRESS）。它与 escrow 一对一（链上 Registry
+      登记时校验 escrow.staking() / staking.escrow() 互为对方），节点只读它算出金下限。
+      留空 = 未接入保证金层（卖家不能质押，罚没/提货赔付路径不可用）。
+    */
+    staking_address CHAR(42) NULL,
     watcher_block BIGINT UNSIGNED NULL,                 -- 事件轮询游标（已处理到的块）
     watcher_hash  CHAR(66) NULL,                        -- 该块的哈希（短重组回退用）
     auto_flush_pending TINYINT(1) NOT NULL DEFAULT 0,   -- 轮询落后时挂起、下一趟补扫的标记
@@ -1656,76 +1662,96 @@ const SCHEMA_DDL = `
     PRIMARY KEY (id),
     CONSTRAINT ck_node_singleton CHECK (id = 1),
     CONSTRAINT ck_node_owner_lower CHECK (owner = LOWER(owner)),
-    CONSTRAINT ck_node_escrow_address_lower CHECK (escrow_address = LOWER(escrow_address))
+    CONSTRAINT ck_node_escrow_address_lower CHECK (escrow_address = LOWER(escrow_address)),
+    CONSTRAINT ck_node_staking_address_lower CHECK (staking_address = LOWER(staking_address))
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+
+  /* ── 节点级 ERC20 支付资产 ──
+     这是**节点自己的经营配置**（收哪些币、按什么价折算），不是店铺配置；只有节点主能改。
+     链上 Escrow.supportedToken 仍是"能不能收"的唯一授权：本表只决定"节点愿不愿意报价"，
+     公开支付方式接口会把本表与链上 supportedToken 取交集。两处职责不同，不互为真相。
+     mode='oracle' 时 fixed 是行情源失败时的兜底价（可空；空 = 行情不可用时该币不可支付）。 */
+  CREATE TABLE IF NOT EXISTS payment_tokens (
+    address       CHAR(42) NOT NULL,                    -- token 合约地址（小写）
+    symbol        VARCHAR(20) NOT NULL,
+    decimals      TINYINT UNSIGNED NOT NULL,
+    mode          ENUM('fixed','oracle') NOT NULL DEFAULT 'fixed',
+    fixed_usdt_micro_per_token DECIMAL(38,0) NULL,      -- 1 个整 token = 多少微 USDT（fixed 必填；oracle 为兜底）
+    price_url     VARCHAR(2048) NULL,                   -- oracle 行情源（https）
+    created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (address),
+    CONSTRAINT ck_payment_tokens_address_lower CHECK (address = LOWER(address)),
+    CONSTRAINT ck_payment_tokens_decimals CHECK (decimals <= 36),
+    CONSTRAINT ck_payment_tokens_fixed_positive CHECK (
+      fixed_usdt_micro_per_token IS NULL OR fixed_usdt_micro_per_token > 0
+    ),
+    CONSTRAINT ck_payment_tokens_mode_rate CHECK (
+      (mode = 'fixed' AND fixed_usdt_micro_per_token IS NOT NULL)
+      OR (mode = 'oracle' AND price_url IS NOT NULL AND price_url <> '')
+    )
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
   /* ── 店铺（租户表）──
+     店铺是**节点链下**的事实：平台目录只登记节点（operator/escrow/staking/endpoint），
+     不登记店铺；因此 code 由**本节点**铸造（9 位 Crockford Base32，见 src/ids.js 的
+     newShopCode），不是任何链上返回值，也没有"链上镜像"字段可对账。
      去掉 host 列：一库一节点，节点主就在 node 表那一行里，店铺行再存一遍是第二份真相。
      店名/公告也回到这里（旧形状把它们放在 kv，那是"配置极简"时代的形状，不是数据模型）。 */
   CREATE TABLE IF NOT EXISTS shops (
-    code          CHAR(9) NOT NULL,                     -- 链上铸造：8 位数据 + 1 位加权校验
+    code          CHAR(9) NOT NULL,                     -- 本节点铸造：8 位数据 + 1 位加权校验
     seller        CHAR(42) NOT NULL,                    -- 店主钱包（小写）= 订单的 seller
     name          VARCHAR(60) NOT NULL DEFAULT '',
     notice        VARCHAR(500) NOT NULL DEFAULT '',
     /* 本店谈信地址（公开客服联系方式）；形状与保存口径见 node 表的同名列说明 */
     tanxin_address VARCHAR(64) NULL,
+    /*
+      listed = 0 = **不能接单 + 不进前端聚合**（节点主/员工暂停）。
+      它不是"店下线"：该店的发货、同意/拒绝退款、售后案件、个人信息擦除、自有资料维护
+      全部照常可用（见 shops.js 文件头）。
+      listed_reason / listed_at 是**暂停这一动作**的两个事实：原因给店主看（他要知道该找谁、
+      改什么），时间给节点管理面排序。恢复接单时原因清空、时间保留为"最近一次切换"。
+    */
     listed        TINYINT(1) NOT NULL DEFAULT 1,
-    commission_bps SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-    registered_tx CHAR(66) NULL,
-    registered_at_block BIGINT UNSIGNED NULL,
-    -- 链上 ShopInfo.exitedAtBlock 的镜像；>0 = 店主已退出（墓碑行）。重开时归零。
-    -- 不能拿 listed=0 当墓碑判据：暂停接单、节点停用、黑名单同样让 listed=0。
-    exited_at_block BIGINT UNSIGNED NOT NULL DEFAULT 0,
-    synced_at     DATETIME(3) NULL,                     -- NULL = 从未对账过
+    listed_reason VARCHAR(200) NOT NULL DEFAULT '',
+    listed_at     DATETIME(3) NULL,
     created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     PRIMARY KEY (code),
     /*
       **一个地址在一个节点上只能开一家店**——这条由本唯一键在库里钉死（不是靠应用记得判）。
-      口径的三个面（2026-10-16 逐条核实并写死）：
-        · **本表**：seller 唯一 ⇒ 本节点内一个地址最多一行 ⇒ 最多一家店；
-        · **链上**：MarketplaceRegistry 的 _shopOf[seller][host]，而"一个节点 = 一个 host 值"
-          （本库的 node.owner）——两个键合起来在本节点内同样唯一；
-        · **所以"可经营多家店"只可能来自另一个来源**：这个地址被**另一家店**写进了店员名单
-          （shop_operators 表）。见 http.js 的 soleOperatedShop：那才是"请指明哪一家"唯一
-          真实的成因（写"你开了多家店"是假话）。
-      跨节点的那一维在这里看不见（本库只认识一个 host），所以状态里那个 host 对**本节点**
-      恒等于 node.owner —— 这也是"一库一节点 + GET_LOCK"那条纪律的另一面。
+      本表：seller 唯一 ⇒ 本节点内一个地址最多一行 ⇒ 最多一家店。
+      "可经营多家店"只可能来自另一个来源：这个地址被**另一家店**写进了店员名单
+      （shop_operators 表）。见 http.js 的 soleOperatedShop。
     */
     UNIQUE KEY uq_shops_seller (seller),
     KEY idx_shops_listed (listed, code),
-    CONSTRAINT ck_shops_bps CHECK (commission_bps <= 1000),
     CONSTRAINT ck_shops_code_upper CHECK (code = UPPER(code)),
-    CONSTRAINT ck_shops_seller_lower CHECK (seller = LOWER(seller))
+    CONSTRAINT ck_shops_seller_lower CHECK (seller = LOWER(seller)),
+    CONSTRAINT ck_shops_listed_bool CHECK (listed IN (0, 1))
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
-  /* 开店申请（链下审批流）。不是店铺的第二份真相：店是否存在只由链上回答。 */
+  /*
+    开店申请（**节点链下审批流**）。不是店铺的第二份真相：店存不存在只由 shops 回答，
+    审批通过时由同一事务铸造编号并插入 shops 行。
+    没有双签票据/费率/链上交易哈希：这些概念随"店铺上链"一起删除了。
+  */
   CREATE TABLE IF NOT EXISTS shop_applications (
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     seller        CHAR(42) NOT NULL,
-    host          CHAR(42) NOT NULL,
     name          VARCHAR(60) NOT NULL DEFAULT '',
     notice        VARCHAR(500) NOT NULL DEFAULT '',
-    commission_to CHAR(42) NULL,                        -- 收款人回显（恒为节点主；bps=0 时为 NULL）
-    commission_bps SMALLINT UNSIGNED NOT NULL,
-    deadline      DATETIME(3) NOT NULL,                 -- 票据失效时刻
-    status        ENUM('pending','approved','rejected','registered') NOT NULL DEFAULT 'pending',
-    seller_sig    VARCHAR(200) NOT NULL DEFAULT '',
-    host_sig      VARCHAR(200) NOT NULL DEFAULT '',
+    status        ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
     reject_reason VARCHAR(200) NOT NULL DEFAULT '',
-    tx_hash       CHAR(66) NULL,
+    reviewed_at   DATETIME(3) NULL,                     -- 审批/驳回时刻（NULL = 还没人看过）
     created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
-    -- 一个钱包只允许一条**未终结**的申请；被拒之后换条款再申请仍然可行（旧行走 rejected）。
-    -- **registered 不算未终结**（2026-10-18）：店已上链只是这条申请的终局；店主退出（墓碑）后
-    -- 重开要能再提交一条申请。把 registered 算进未终结会让"注销过的钱包永远无法重新申请"。
-    -- MySQL 没有部分唯一索引，用函数索引把"未终结"之外的行折成 NULL。
-    UNIQUE KEY uq_applications_open ((IF(status IN ('pending','approved'), seller, NULL))),
-    KEY idx_applications_host (host, status, id),
-    CONSTRAINT ck_shop_applications_seller_lower CHECK (seller = LOWER(seller)),
-    CONSTRAINT ck_shop_applications_host_lower CHECK (host = LOWER(host)),
-    CONSTRAINT ck_shop_applications_commission_to_lower CHECK (commission_to = LOWER(commission_to))
+    -- 一个钱包只允许一条**未终结**的申请；被拒之后改名再申请仍然可行（旧行走 rejected）。
+    -- approved 也算未终结：审批通过即已建店，这条申请到此为止，不再占用"可再次申请"的位子。
+    UNIQUE KEY uq_applications_open ((IF(status = 'pending', seller, NULL))),
+    KEY idx_applications_status (status, id),
+    CONSTRAINT ck_shop_applications_seller_lower CHECK (seller = LOWER(seller))
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
   /* 店员白名单：**一行一人**。
@@ -1778,6 +1804,17 @@ const SCHEMA_DDL = `
     CONSTRAINT fk_webhook_shop FOREIGN KEY (shop_code) REFERENCES shops (code) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
+  /* ── 节点员工（链下名单，一行一人；见 auth.js 的 isNodeStaffOf）──
+     节点级动作（审批开店、停用店铺、看节点级读数）是**这台机器**的运营权限，与平台合约无关，
+     所以名单住这里。真正的鉴权判据只有 auth.isNodeAdmin（operator ∪ 本表）；
+     节点后台权限不读 Registry。 */
+  CREATE TABLE IF NOT EXISTS node_staff (
+    address   CHAR(42) NOT NULL,
+    added_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (address),
+    CONSTRAINT ck_node_staff_address_lower CHECK (address = LOWER(address))
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+
   /* ── 商品 ── */
   CREATE TABLE IF NOT EXISTS products (
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -1804,23 +1841,46 @@ const SCHEMA_DDL = `
     tags          JSON NOT NULL DEFAULT ('[]'),                        -- [{key,display}]，**不入快照**（检索维度）
     snapshot_hash CHAR(66) NOT NULL,
     auto_deliver  TINYINT NOT NULL DEFAULT -1,          -- -1 跟随全局 / 0 关 / 1 开
+    /*
+      **提货声明**（NFT 商品：买家买的是一枚 token，实物/服务由卖家在链下兑付）。
+      四个列只对 kind='nft' 有意义，但**不进商品快照**：它们是履约政策，改了不该让
+      已成交订单的快照哈希失效。判据与流程见 src/nftClaim.js。
+       · claimable = 1 才允许 POST /api/claims；0 = 这枚 token 只是收藏品，没有线下兑付；
+       · claim_window_days：自**交付该 token 的订单终局**起算的声明窗口（NULL = 不限期）；
+       · claim_instructions 是给持有人的兑付说明（纯文本，≤500 字）。
+    */
+    claimable     TINYINT(1) NOT NULL DEFAULT 0,
+    claim_type    ENUM('physical','digital','service') NOT NULL DEFAULT 'physical',
+    claim_window_days INT UNSIGNED NULL,                -- NULL = 不限期；>0 = 自订单终局起 N 天
+    claim_instructions VARCHAR(500) NOT NULL DEFAULT '',
     stock_alert_at INT UNSIGNED NULL,                   -- NULL = 不提醒
     -- 池式商品的**已占位未交付**计数：把"检查池量再插单"落成一个可条件更新的计数器
     reserved_codes  INT UNSIGNED NOT NULL DEFAULT 0,
     reserved_tokens INT UNSIGNED NOT NULL DEFAULT 0,
-    active        TINYINT(1) NOT NULL DEFAULT 1,        -- 可见性只有这一个判据
+    active        TINYINT(1) NOT NULL DEFAULT 1,        -- 店主侧的可见性：1=在售，0=草稿/已下架
+    /*
+      **节点侧强制下架**：与 active 正交——店主可以改 active，但改不动这一列。
+      两个判据各自回答不同的问题：active 是"店主愿不愿意卖"，node_hidden 是"本节点允不允许卖"。
+      公开列表/详情/下单必须同时满足，任一为 0 都不可售；恢复只能由节点管理员操作。
+      reason 给店主看（他要知道为什么被下架、该改什么），at 给管理面排序。
+    */
+    node_hidden   TINYINT(1) NOT NULL DEFAULT 0,
+    node_hidden_reason VARCHAR(200) NOT NULL DEFAULT '',
+    node_hidden_at DATETIME(3) NULL,
     published_at  DATETIME(3) NULL,                     -- 首次上架时刻（NULL = 从未发布过）
     created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
     UNIQUE KEY uq_products_slug (slug),
     KEY idx_products_shop (shop_code, active),
+    KEY idx_products_public (active, node_hidden, id),
     KEY idx_products_tags ((CAST(tags->'$[*].key' AS CHAR(64) ARRAY))),
     KEY idx_products_attrs ((CAST(attributes->'$[*].pair' AS CHAR(128) ARRAY))),
     CONSTRAINT fk_products_shop FOREIGN KEY (shop_code) REFERENCES shops (code),
     CONSTRAINT ck_products_nft CHECK ((kind = 'nft') = (nft_contract IS NOT NULL)),
     CONSTRAINT ck_products_shop_code_upper CHECK (shop_code = UPPER(shop_code)),
-    CONSTRAINT ck_products_nft_contract_lower CHECK (nft_contract = LOWER(nft_contract))
+    CONSTRAINT ck_products_nft_contract_lower CHECK (nft_contract = LOWER(nft_contract)),
+    CONSTRAINT ck_products_node_hidden_bool CHECK (node_hidden IN (0, 1))
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
   CREATE TABLE IF NOT EXISTS product_skus (
@@ -1883,21 +1943,21 @@ const SCHEMA_DDL = `
     quantity      TINYINT UNSIGNED NOT NULL,
     status        ENUM('draft','escrowed','shipped','confirmed','disputed','settled','refunded','expired','cancelled')
                   NOT NULL DEFAULT 'draft',
-    -- 金额与条款：建单时冻结，watcher 只补录费率（两列成对写，见 src/fees.js）
-    amount_wei    DECIMAL(38,0) NOT NULL,               -- 原生 BTY wei（精确整数，可比较、可求和）
+    -- 金额：建单时冻结。**零费模型**：没有平台费、没有节点抽成，
+    -- 结算只有买家/卖家两条腿 ⇒ 本地只记毛额（本列）与链上已退额（order_chain.refunded_amount_wei），
+    -- 净额 = amount_wei − refunded_amount_wei（读模型 v_orders.amount_net_wei 现算）。
+    amount_wei    DECIMAL(38,0) NOT NULL,               -- 支付资产最小单位（原生 wei 或 ERC20 token 单位）
+    payment_token CHAR(42) NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
+    payment_symbol VARCHAR(20) NOT NULL DEFAULT 'BTY',
+    payment_decimals TINYINT UNSIGNED NOT NULL DEFAULT 18,
+    token_usdt_micro_per_token DECIMAL(38,0) NOT NULL DEFAULT 0,
+    payment_rate_source ENUM('bty','fixed','oracle') NOT NULL DEFAULT 'bty',
+    -- 行情源失败后按 fixed 兜底时必须如实标记；否则订单会声称"这是 oracle 报价"
+    payment_rate_stale TINYINT(1) NOT NULL DEFAULT 0,
+    payment_rate_quoted_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     usdt_micro    BIGINT UNSIGNED NOT NULL,             -- 成交时微 USDT（1 USDT = 1e6）
     shipping_fee_usdt_micro BIGINT UNSIGNED NOT NULL DEFAULT 0,
     bty_usdt_rate DECIMAL(20,10) NOT NULL DEFAULT 0,
-    fee_bps       SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-    fee_collector_at_create CHAR(42) NULL,              -- NULL = 从未补录（三态，**不是空串**）
-    commission_bps SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-    commission_to CHAR(42) NULL,                        -- 链上实际执行的分账收款人（NULL = 未补录）
-    /*
-      报价条款（建草稿时的那一份）。必须与上面两列分开：上面两列会被链上值覆盖，
-      一列两个含义就永远比不出"买家签的和我们说的不一样"——而那正是要发现的东西。
-    */
-    commission_quoted_bps SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-    commission_quoted_to CHAR(42) NULL,                 -- NULL = 从未报价过
     -- 履约
     hold_qty      TINYINT UNSIGNED NOT NULL DEFAULT 0,
     released_at   DATETIME(3) NULL,                     -- 释放幂等标记（非空 = 已释放）
@@ -1981,12 +2041,10 @@ const SCHEMA_DDL = `
     CONSTRAINT ck_orders_shop_code_upper CHECK (shop_code = UPPER(shop_code)),
     CONSTRAINT ck_orders_buyer_lower CHECK (buyer = LOWER(buyer)),
     CONSTRAINT ck_orders_seller_lower CHECK (seller = LOWER(seller)),
-    CONSTRAINT ck_orders_fee_collector_at_create_lower CHECK (fee_collector_at_create = LOWER(fee_collector_at_create)),
-    CONSTRAINT ck_orders_commission_to_lower CHECK (commission_to = LOWER(commission_to)),
-    CONSTRAINT ck_orders_commission_quoted_to_lower CHECK (commission_quoted_to = LOWER(commission_quoted_to)),
+    CONSTRAINT ck_orders_payment_token_lower CHECK (payment_token = LOWER(payment_token)),
+    CONSTRAINT ck_orders_payment_decimals CHECK (payment_decimals <= 36),
     CONSTRAINT ck_orders_qty CHECK (quantity BETWEEN 1 AND 99),
     CONSTRAINT ck_orders_money CHECK (usdt_micro <= 9007199254740991 AND shipping_fee_usdt_micro <= 9007199254740991),
-    CONSTRAINT ck_orders_bps CHECK (fee_bps <= 10000 AND commission_bps <= 10000 AND commission_quoted_bps <= 10000),
     -- 第二道网：计数器被绕过时（直连 SQL / 未来的新写入点）也存不下越界的账
     CONSTRAINT ck_orders_evidence_bytes CHECK (evidence_bytes <= 20971520)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
@@ -2041,6 +2099,107 @@ const SCHEMA_DDL = `
     KEY idx_chain_after_sale (after_sale_status, after_sale_opened_at),
     KEY idx_chain_refund (refund_status, refund_requested_at),
     CONSTRAINT fk_chain_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+
+  /*
+    ── NFT 提货声明（**节点链下**；链上只有"提货争议"那一步，见 Escrow.ClaimCase）──
+
+    流程：持有人对"某枚已被卖家在已完成订单里交付过的 token"提交兑付声明（收货信息），
+    卖家 approve → shipped → fulfilled，或 rejected；提交人在提交后绑定（A-policy），
+    卖家发货前可复核链上持有人，若 token 已转手则取消（新持有人可再声明）。
+
+    为什么 claim_no 与 id 分开：id 是内部主键（子表/日志用），claim_no 是给持有人报的
+    对外标识（与订单号同一套 Crockford 格式，不可枚举）。
+    dispute_claim_id 是链上 ClaimCase 的键（bytes32）——只有节点主钱包能开案
+    （openClaimDispute 是 onlyOwner），节点**不持私钥**，所以这里只是"这次开案用的是哪个 id"
+    的记账；watcher 按它把 ClaimDisputeOpened/ClaimClosed 的结论写回这一行。
+  */
+  CREATE TABLE IF NOT EXISTS nft_claims (
+    id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    claim_no      CHAR(21) NOT NULL,                    -- C + 10 位时间 + 10 位随机（与订单号同一套格式）
+    shop_code     CHAR(9) NOT NULL,
+    product_id    BIGINT UNSIGNED NULL,                 -- 商品删除后置 NULL（slug/快照仍在）
+    product_slug  CHAR(11) NOT NULL,
+    order_id      BIGINT UNSIGNED NOT NULL,             -- 交付这枚 token 的订单（必须是终局成交态）
+    order_no      CHAR(21) NOT NULL,
+    seller        CHAR(42) NOT NULL,                    -- 该订单的卖家（提货由他兑付；= orders.seller 快照）
+    token_contract CHAR(42) NOT NULL,                   -- NFT 合约（小写）
+    token_id      VARCHAR(78) NOT NULL,                 -- 十进制字符串（防 uint256 精度丢失）
+    /*
+      提交人 = **提交那一刻**的链上持有人（A-policy：声明与提交人绑定，不随后续转手漂移）。
+      之后 token 若已转手，卖家可在发货前复核并取消；新持有人可以另提一条声明。
+    */
+    claimant      CHAR(42) NOT NULL,
+    status        ENUM('requested','approved','shipped','fulfilled','rejected','cancelled','expired')
+                  NOT NULL DEFAULT 'requested',
+    -- 收货信息（个人信息）：声明终局（fulfilled/rejected/cancelled/expired）后随订单擦除清空；
+    -- 仍在 requested/approved/shipped 时整单擦除被拒（地址正在用于履约）
+    shipping_name    VARCHAR(60) NOT NULL DEFAULT '',
+    shipping_phone   VARCHAR(30) NOT NULL DEFAULT '',
+    shipping_address VARCHAR(300) NOT NULL DEFAULT '',
+    note          VARCHAR(200) NOT NULL DEFAULT '',
+    reject_reason VARCHAR(200) NOT NULL DEFAULT '',
+    tracking_no   VARCHAR(100) NULL,                    -- 发货单号（NULL = 还没发）
+    -- 链上提货争议（节点侧发起，Escrow 裁决）
+    claim_amount_wei DECIMAL(38,0) NULL,                -- 争议金额上限（NULL = 未申请）
+    dispute_claim_id CHAR(66) NULL,
+    dispute_state ENUM('none','opened','closed','cancelled') NOT NULL DEFAULT 'none',
+    dispute_opened_at DATETIME(3) NULL,
+    dispute_closed_at DATETIME(3) NULL,
+    created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_claims_no (claim_no),
+    /*
+      **一枚 token 同时只能有一条未完结的声明**（A-policy 的另一半）：
+      requested/approved/shipped 占位；fulfilled 是"已兑付"的终局，同样占位（同一枚 token
+      不能被兑付两次）；rejected/cancelled/expired 让位——token 转手后新持有人要能再声明。
+      MySQL 没有部分唯一索引，用函数索引把"已让位"的行折成 NULL。
+    */
+    UNIQUE KEY uq_claims_active_token
+      ((IF(status IN ('requested','approved','shipped','fulfilled'), CONCAT(token_contract, ':', token_id), NULL))),
+    KEY idx_claims_shop (shop_code, status, id),
+    KEY idx_claims_claimant (claimant, id),
+    KEY idx_claims_order (order_id),
+    KEY idx_claims_dispute (dispute_claim_id),
+    KEY idx_claims_seller (seller, status, id),
+    CONSTRAINT fk_nft_claims_shop FOREIGN KEY (shop_code) REFERENCES shops (code) ON DELETE CASCADE,
+    CONSTRAINT fk_nft_claims_product FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE SET NULL,
+    CONSTRAINT fk_nft_claims_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE,
+    CONSTRAINT ck_nft_claims_shop_code_upper CHECK (shop_code = UPPER(shop_code)),
+    CONSTRAINT ck_nft_claims_seller_lower CHECK (seller = LOWER(seller)),
+    CONSTRAINT ck_nft_claims_token_contract_lower CHECK (token_contract = LOWER(token_contract)),
+    CONSTRAINT ck_nft_claims_claimant_lower CHECK (claimant = LOWER(claimant)),
+    CONSTRAINT ck_nft_claims_amount CHECK (claim_amount_wei IS NULL OR claim_amount_wei > 0)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+
+/*
+  买家在本节点的屏蔽（**不是浏览器本地名单**）：拉黑的对象只在本节点生效；
+  同一买家在别的节点要重新设置。节点目录/店铺列表按登录买家过滤，订单历史不隐藏。
+  · target_type='shop'：target_value = 本节点店铺编号（shop_code 同步存一份便于 JOIN）
+  · target_type='seller'：target_value = 链上收款地址
+  · 不存 origin/owner：一台节点多店，拉黑节点主会连带无关店铺，已有产品取舍明确不做。
+*/
+CREATE TABLE IF NOT EXISTS buyer_blocks (
+    id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    buyer         CHAR(42) NOT NULL,
+    target_type   ENUM('shop','seller') NOT NULL,
+    target_value  VARCHAR(42) NOT NULL,
+    shop_code     CHAR(9) NULL,
+    reason        VARCHAR(200) NOT NULL DEFAULT '',
+    created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_buyer_block (buyer, target_type, target_value),
+    KEY idx_buyer_blocks_buyer (buyer, id),
+    KEY idx_buyer_blocks_shop (shop_code),
+    CONSTRAINT fk_buyer_blocks_shop FOREIGN KEY (shop_code) REFERENCES shops (code) ON DELETE CASCADE,
+    CONSTRAINT ck_buyer_blocks_buyer_lower CHECK (buyer = LOWER(buyer)),
+    CONSTRAINT ck_buyer_blocks_shop_code_upper CHECK (shop_code = UPPER(shop_code)),
+    CONSTRAINT ck_buyer_blocks_target CHECK (
+      (target_type = 'shop' AND shop_code IS NOT NULL AND target_value = shop_code)
+      OR (target_type = 'seller' AND shop_code IS NULL AND target_value = LOWER(target_value))
+    )
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
 CREATE TABLE IF NOT EXISTS product_codes (
@@ -2189,6 +2348,12 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     buyer         CHAR(42) NOT NULL,
     rating        TINYINT UNSIGNED NOT NULL,
     content       VARCHAR(1000) NOT NULL DEFAULT '',
+    /* 评价图（最多 3 张；节点相对 URL /api/uploads/<uuid>.<ext>）。 */
+    images        JSON NOT NULL DEFAULT ('[]'),
+    /* 追评（一次；可带图）。followup_at IS NULL = 还没追评。 */
+    followup_content VARCHAR(1000) NOT NULL DEFAULT '',
+    followup_images  JSON NOT NULL DEFAULT ('[]'),
+    followup_at     DATETIME(3) NULL,
     reply_content VARCHAR(1000) NOT NULL DEFAULT '',
     reply_at      DATETIME(3) NULL,
     created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -2370,9 +2535,16 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     o.id AS order_id, o.order_no, o.shop_code, o.product_id, o.product_slug,
     o.product_snapshot, o.snapshot_hash, o.sku_key, o.sku_specs,
     o.buyer, o.seller, o.quantity, o.status,
-    o.amount_wei, o.usdt_micro, o.shipping_fee_usdt_micro, o.bty_usdt_rate,
-    o.fee_bps, o.fee_collector_at_create, o.commission_bps, o.commission_to,
-    o.commission_quoted_bps, o.commission_quoted_to,
+    o.amount_wei, o.payment_token, o.payment_symbol, o.payment_decimals, o.token_usdt_micro_per_token,
+    o.payment_rate_source, o.payment_rate_stale, o.payment_rate_quoted_at,
+    o.usdt_micro, o.shipping_fee_usdt_micro, o.bty_usdt_rate,
+    /*
+      **净额 = amount_wei − refunded_amount_wei**（零费模型：没有平台费、没有节点抽成，
+      结算只有退款 + 卖家两条腿）。退款额住在 order_chain（链上镜像表，LEFT JOIN 可能为 NULL），
+      所以用 COALESCE 兜成 0：**"这单没有链上镜像"时净额就是毛额**（一分钱都还没退过），
+      这与链上"未退款托管单"的语义一致，不是把"读不到"当 0。
+    */
+    o.amount_wei - COALESCE(c.refunded_amount_wei, 0) AS amount_net_wei,
     o.hold_qty, o.released_at, o.tracking_no, o.carrier, o.shipped_at,
     o.timeout_blocks, o.age_ack, o.created_boot, o.created_mono,
     o.pii_erased_at, o.pii_cleanup_pending, o.created_at, o.updated_at,
@@ -2549,12 +2721,12 @@ const TRIGGER_DDL = [
         AND OLD.status IN ('draft','escrowed','shipped','disputed')
         AND NEW.status NOT IN ('draft','escrowed','shipped','disputed')`,
   /*
-    ⑤ 订单从「已结清」回到在途（唯一的形状是 cancelled → escrowed：买家在草稿被清扫/取消之后
-    才完成支付，watcher / `/sync` / 链上对账三条路都会把它恢复）⇒ 把池占位**占回来**。
+    ⑤ 订单从「已结清」回到在途（cancelled → escrowed：买家在草稿被清扫/取消之后才完成支付；
+    cancelled → disputed：支付晚到后先进入争议，watcher / `/sync` / 链上对账都会恢复）⇒ 把池占位**占回来**。
     为什么这一处也在触发器里、而不是 `stockHold.restockOrder`：它能拿到的"只做一次"凭据
     （`orders.released_at`）是**限量占位**那一套的标记，池式订单的 hold_qty 恒 0、那一列根本不参与；
     而三条恢复路径的调用时机还不一样（watcher/`/sync` 在状态迁移**之前**调、对账在**之后**调），
-    应用层拿不到一个与顺序无关的认领。触发器不认时机：`cancelled → escrowed` 这条迁移本身
+    应用层拿不到一个与顺序无关的认领。触发器不认时机：`→ escrowed/disputed` 这条迁移本身
     就是凭据（每条迁移只发生一次），所以"恢复时把占位占回来"恰好执行一次。
     没有守卫（不像下单那样可能被拒）：钱已经在链上了，订单必须恢复；池不够时由既有的
     池空告警（`order.pool_empty`）暴露给店主——方向安全（占位偏多 ⇒ 少卖，而不是超卖）。
@@ -2567,7 +2739,7 @@ const TRIGGER_DDL = [
                WHERE d.order_id = OLD.id AND d.kind = 'code'), 0)
       WHERE p.id = OLD.product_id AND p.kind = 'digital'
         AND OLD.status NOT IN ('draft','escrowed','shipped','disputed')
-        AND NEW.status = 'escrowed'`,
+        AND NEW.status IN ('escrowed','disputed')`,
   `DROP TRIGGER IF EXISTS trg_orders_pool_tokens_restore`,
   `CREATE TRIGGER trg_orders_pool_tokens_restore AFTER UPDATE ON orders FOR EACH ROW
      UPDATE products p
@@ -2576,7 +2748,7 @@ const TRIGGER_DDL = [
                WHERE d.order_id = OLD.id AND d.kind = 'nft'), 0)
       WHERE p.id = OLD.product_id AND p.kind = 'nft'
         AND OLD.status NOT IN ('draft','escrowed','shipped','disputed')
-        AND NEW.status = 'escrowed'`,
+        AND NEW.status IN ('escrowed','disputed')`,
   /*
     ── ⑥⑦⑧ **删除**这一侧（2026-10-16 补，此前一条都没有）────────────────────────
     上面六条全是 `AFTER UPDATE` / `AFTER INSERT`，于是 `DELETE` 是一条**静默的口径分叉**：
@@ -2701,7 +2873,7 @@ END`,
  * 节点自身那一行（**单行表**，`CHECK (id = 1)` 保证存在且只有一行）。
  *
  * `owner` 是**配置的镜像**（`MK_SHOP_OWNER`），每次启动刷新：配置是节点身份的唯一真相
- * （换节点主是链上 `transferNode` 的事，不是网页能改的），库里这一份的用处是让
+ * （节点 operator 是链上 Registry 的登记主体，不是网页能改的），库里这一份的用处是让
  * "这台机器是谁的"有一个可审计的落点。
  *
  * 其余几列（合约地址锚、两个轮询游标、隔离事件）**只种不覆盖**：
@@ -2717,6 +2889,16 @@ async function ensureNodeRow() {
     */
     console.error('[db] MK_SHOP_OWNER 未配置：节点主是这家节点的身份锚（店铺、鉴权、订单都挂在它下面）。');
     console.error('[db] 请在 node/.env 填 MK_SHOP_OWNER=<店主钱包地址> 后重新启动。');
+    process.exit(1);
+  }
+  /*
+    形状也要在启动期拦：`0x123` / 零地址这类值能通过"非空"，却会让 nodeOwnerOf 判非法后返回空，
+    于是节点以"无主"状态运行（所有 nodeAdmin/hostOnly 恒 403、开店申请无人受理、/nonce 可能 500），
+    而运维看到的启动日志一切正常。与"缺库列/弱密钥/合约锚不符"同一道 fail-fast。
+  */
+  if (!/^0x[0-9a-f]{40}$/.test(owner) || /^0x0{40}$/.test(owner)) {
+    console.error(`[db] MK_SHOP_OWNER 形状非法：${JSON.stringify(config.shop.owner)}（需为 0x 开头的 40 位十六进制地址，且不能是零地址）。`);
+    console.error('[db] 请修正 node/.env 的 MK_SHOP_OWNER 后重新启动。');
     process.exit(1);
   }
   await getDb().run(

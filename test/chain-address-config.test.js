@@ -20,7 +20,7 @@ const ZERO = '0x0000000000000000000000000000000000000000';
 function runConfig(extraEnv) {
   const env = { ...process.env };
   for (const k of Object.keys(env)) {
-    if (/^MK_(ESCROW|REGISTRY|BLOCKLIST)_ADDRESS$|^MK_TRUST_PROXY$/.test(k)) delete env[k];
+    if (/^MK_(ESCROW|STAKING)_ADDRESS$|^MK_TRUST_PROXY$/.test(k)) delete env[k];
   }
   Object.assign(env, extraEnv);
   return spawnSync(
@@ -34,18 +34,17 @@ test('已配置的合约地址必须是非零 20 字节 hex；非法即拒绝启
   const bad = [
     { MK_ESCROW_ADDRESS: ZERO },
     { MK_ESCROW_ADDRESS: '0x123' }, // 少位
-    { MK_REGISTRY_ADDRESS: 'not-an-address' },
-    { MK_BLOCKLIST_ADDRESS: `0x${'0'.repeat(40)}` },
+    { MK_STAKING_ADDRESS: ZERO },
     { MK_TRUST_PROXY: '10.0.0.0/99' }, // 网段前缀越界：反代边界同样必须在启动期可判
   ];
   for (const env of bad) {
     const r = runConfig(env);
     assert.notEqual(r.status, 0, `${JSON.stringify(env)} 必须让进程拒绝启动（实际 stdout=${r.stdout} stderr=${r.stderr}）`);
-    assert.match(r.stderr, /MK_(ESCROW|REGISTRY|BLOCKLIST)_ADDRESS|MK_TRUST_PROXY/, '错误必须点名是哪个配置项');
+    assert.match(r.stderr, /MK_(ESCROW|STAKING)_ADDRESS|MK_TRUST_PROXY/, '错误必须点名是哪个配置项');
   }
 
   // 空串是合法的（= 未接入该能力，纯展示节点）；合法地址照常启动
-  const empty = runConfig({ MK_ESCROW_ADDRESS: '', MK_REGISTRY_ADDRESS: '', MK_BLOCKLIST_ADDRESS: '' });
+  const empty = runConfig({ MK_ESCROW_ADDRESS: '', MK_STAKING_ADDRESS: '' });
   assert.equal(empty.status, 0, `空值必须允许（实际 ${empty.stderr}）`);
   const valid = runConfig({ MK_ESCROW_ADDRESS: '0xAbCdEf0123456789aBcDeF0123456789AbCdEf01' });
   assert.equal(valid.status, 0, `合法地址必须启动（实际 ${valid.stderr}）`);

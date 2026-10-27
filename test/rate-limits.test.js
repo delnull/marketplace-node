@@ -85,7 +85,7 @@ test('重导出限流：四路 CSV 共用一把窗口，达到阈值后 429（�
   assert.ok(hit, '导出（全表 SELECT）必须有节点内限流');
 
   // 导出被限流不影响普通只读端点（各自独立窗口）
-  const detail = await request(app).get('/api/shop/registry-info');
+  const detail = await request(app).get('/api/shop/node-identity');
   assert.equal(detail.status, 200);
 });
 

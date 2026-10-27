@@ -28,6 +28,23 @@ before(async () => {
   assert.ok(ownerToken && buyerToken);
 });
 
+/** 支付资产现在是库配置（页面写入口）；测试直接走同一个 upsert 入口。 */
+async function seedPaymentToken(token, over = {}) {
+  const { upsertPaymentToken } = await import('../src/paymentTokens.js');
+  await upsertPaymentToken({
+    address: token,
+    symbol: 'USDT',
+    decimals: 6,
+    mode: 'fixed',
+    fixedUsdtMicroPerToken: '1000000',
+    ...over,
+  });
+}
+async function clearPaymentToken(token) {
+  const { deletePaymentToken } = await import('../src/paymentTokens.js');
+  await deletePaymentToken(token);
+}
+
 /** 上架商品（owner），返回产物 */
 async function listProduct(payload) {
   const res = await request(app)
@@ -295,6 +312,97 @@ test('草稿占用合计上限：同买家同商品 99 件放行、100 件被拒
   库里另有一道 CHECK（金额上界 = 9007199254740991）让它根本存不下；本用例钉住的是**入口**那道闸：
   商品侧上限（PRICE_MAX_MICRO）保证正常路径到不了这里，这里兜的是绕过校验的历史脏数据与直连调用。
 */
+test('ERC20 支付：草稿按节点固定行情锁定 token 金额并落支付资产列', async () => {
+  const token = '0x1111111111111111111111111111111111111111';
+  await seedPaymentToken(token);
+  try {
+    const p = await listProduct(productPayload({ title: 'ERC20 支付商品', capacity: null }));
+    const res = await request(app)
+      .post('/api/orders')
+      .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+      .send({ productSlug: p.slug, quantity: 1, buyer: buyer.address, paymentToken: token })
+      .expect(200);
+    assertOk(res);
+    const d = res.body.data;
+    assert.equal(d.paymentToken, token);
+    assert.equal(d.paymentSymbol, 'USDT');
+    assert.equal(d.paymentDecimals, 6);
+    assert.equal(d.paymentRateSource, 'fixed');
+    assert.ok(d.paymentRateQuotedAt, '下单时必须记录行情锁定时刻');
+    assert.equal(d.amountWei, String(d.usdtMicro), '1 token = 1 USDT 的固定行情下，6 位 token 金额 = 微 USDT');
+
+    const row = await db.get('SELECT payment_token, payment_symbol, payment_decimals, token_usdt_micro_per_token, payment_rate_source, bty_usdt_rate FROM v_orders WHERE order_no = ?', d.id);
+    assert.equal(row.payment_token, token);
+    assert.equal(row.payment_symbol, 'USDT');
+    assert.equal(Number(row.payment_decimals), 6);
+    assert.equal(String(row.token_usdt_micro_per_token), '1000000');
+    assert.equal(row.payment_rate_source, 'fixed');
+    assert.equal(Number(row.bty_usdt_rate), 0, 'ERC20 单没有 BTY 汇率腿');
+  } finally {
+    await clearPaymentToken(token);
+  }
+});
+test('ERC20 支付方式：/api/shop/payment-methods 返回 native + 节点配置 token 的报价', async () => {
+  const token = '0x1111111111111111111111111111111111111111';
+  await seedPaymentToken(token);
+  try {
+    const res = await request(app).get('/api/shop/payment-methods?usdtMicro=2500000').expect(200);
+    assertOk(res);
+    assert.equal(res.body.data.native.symbol, 'BTY');
+    assert.equal(res.body.data.tokens.length, 1);
+    assert.equal(res.body.data.tokens[0].token, token);
+    assert.equal(res.body.data.tokens[0].amountWei, '2500000');
+  } finally {
+    await clearPaymentToken(token);
+  }
+});
+
+test('ERC20 支付资产管理：节点主可见库配置与链上 supported 核验位', async () => {
+  const token = '0x1111111111111111111111111111111111111111';
+  await seedPaymentToken(token);
+  try {
+    const res = await request(app)
+      .get('/api/shop/payment-tokens')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    assertOk(res);
+    assert.equal(res.body.data.tokens.length, 1);
+    assert.equal(res.body.data.tokens[0].token, token);
+    assert.ok('supported' in res.body.data.tokens[0]);
+  } finally {
+    await clearPaymentToken(token);
+  }
+});
+
+test('支付资产配置写入口：非法地址/非法配置明确拒绝；删除不存在 404', async () => {
+  const badAddr = await request(app)
+    .post('/api/shop/payment-tokens')
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({ address: 'nope', symbol: 'X', decimals: 6, mode: 'fixed', fixedUsdtMicroPerToken: '1000000' })
+    .expect(200);
+  assert.notEqual(badAddr.body.code, 0);
+  assert.match(String(badAddr.body.message), /地址/);
+
+  const badRate = await request(app)
+    .post('/api/shop/payment-tokens')
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({
+      address: '0x4444444444444444444444444444444444444444',
+      symbol: 'X',
+      decimals: 6,
+      mode: 'fixed',
+      fixedUsdtMicroPerToken: '0',
+    })
+    .expect(200);
+  assert.notEqual(badRate.body.code, 0);
+  assert.match(String(badRate.body.message), /正整数/);
+
+  await request(app)
+    .delete('/api/shop/payment-tokens/0x5555555555555555555555555555555555555555')
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .expect(404);
+});
+
 test('回归：SKU 单价被改成超过安全整数上限的脏数据时，下单必须被明确拒绝且不落库', async () => {
   const p = await listProduct(productPayload({ title: '脏价格商品', capacity: null }));
   // 直接改库模拟"绕过商品校验写进来的历史行"：1e15 微 = 1e9 USDT（旧上限），×99 件即越过 2^53

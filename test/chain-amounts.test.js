@@ -33,12 +33,14 @@ test('decimalToWei：与 weiToDecimal 互逆（合法入参逐位一致，不丢
   }
 });
 
-test('orderCreatedMatches：OrderCreated 必须 orderId/买家/卖家/金额四项都属于本单', () => {
+test('orderCreatedMatches：orderId/买家/卖家/金额/支付资产全部属于本单才通过', () => {
+  const zero = '0x0000000000000000000000000000000000000000';
   const order = {
     escrow_order_id: `0x${'aa'.repeat(32)}`,
     buyer: '0x0000000000000000000000000000000000000002',
     seller: '0x0000000000000000000000000000000000000003',
     amount_wei: '1000',
+    payment_token: zero,
   };
   const args = {
     orderId: `0x${'aa'.repeat(32)}`,
@@ -46,7 +48,7 @@ test('orderCreatedMatches：OrderCreated 必须 orderId/买家/卖家/金额四�
     seller: order.seller,
     amount: 1000n,
   };
-  assert.equal(orderCreatedMatches(order, args), true, '同一单（地址大小写不敏感）必须通过');
+  assert.equal(orderCreatedMatches(order, args, order.escrow_order_id, zero), true, '同一单（地址大小写不敏感）必须通过');
   for (const bad of [
     { ...args, orderId: `0x${'bb'.repeat(32)}` },
     { ...args, buyer: '0x0000000000000000000000000000000000000004' },
@@ -55,31 +57,55 @@ test('orderCreatedMatches：OrderCreated 必须 orderId/买家/卖家/金额四�
     { ...args, amount: 'not-a-number' },
     {},
   ]) {
-    assert.equal(orderCreatedMatches(order, bad), false, `伪造/缺字段必须拒绝：${String(bad.amount ?? '')} ${String(bad.orderId ?? '')}`);
+    assert.equal(
+      orderCreatedMatches(order, bad, order.escrow_order_id, zero),
+      false,
+      `伪造/缺字段必须拒绝：${String(bad.amount ?? '')} ${String(bad.orderId ?? '')}`
+    );
   }
+
+  // P0：token 单的金额与原生单相同，不能只看金额。链上 token 与本地报价不一致即拒绝。
+  const tokenOrder = { ...order, payment_token: '0x00000000000000000000000000000000000000ff' };
+  assert.equal(
+    orderCreatedMatches(tokenOrder, args, tokenOrder.escrow_order_id, zero),
+    false,
+    'token 单不能由原生 OrderCreated 认领'
+  );
+  assert.equal(
+    orderCreatedMatches(order, args, order.escrow_order_id, tokenOrder.payment_token),
+    false,
+    '原生单不能由 token OrderCreated 认领'
+  );
+  assert.equal(
+    orderCreatedMatches(tokenOrder, args, tokenOrder.escrow_order_id, tokenOrder.payment_token),
+    true,
+    '同资产 token 单必须通过'
+  );
+  assert.equal(orderCreatedMatches(order, args), false, '没有链上 token 读数时必须 fail-closed');
 });
 
-test('chainParamsMatch：店铺节点不符的终局/冻结事件也拒绝（同一卖家另一家店）', () => {
+test('chainParamsMatch：买家/卖家/金额/验货窗口/支付资产任一项不符即拒绝', () => {
+  const zero = '0x0000000000000000000000000000000000000000';
   const local = {
     buyer: '0x0000000000000000000000000000000000000002',
     seller: '0x0000000000000000000000000000000000000003',
     amount_wei: '1000',
     timeout_blocks: 10,
-    commission_quoted_to: '0x0000000000000000000000000000000000000004',
+    payment_token: zero,
   };
   const p = {
     buyer: local.buyer,
     seller: local.seller,
     amount: '1000',
     timeoutBlocks: 10,
-    commissionTo: '0x0000000000000000000000000000000000000005',
+    token: zero,
   };
-  assert.equal(chainParamsMatch(local, p), false, 'host 不同 ⇒ 不是本单的另一家店');
-  assert.equal(chainParamsMatch(local, { ...p, commissionTo: local.commission_quoted_to }), true);
-  // 本地有报价但链上 host 读不到 ⇒ 拒绝（不回退成"跳过"）
-  assert.equal(chainParamsMatch(local, { ...p, commissionTo: '' }), false);
-  // **字段整个缺失**也必须拒绝：2026-10-21 的跨店修复就死在这儿——读取器只给嵌套的
-  // `commissionTerms`，而这里判"缺字段 ⇒ 跳过"，于是 /sync 与对账两条路径的 host 校验恒真。
-  const { commissionTo: _omitted, ...withoutHost } = p;
-  assert.equal(chainParamsMatch(local, withoutHost), false, '缺字段 = 读不到 = 不匹配（不得再跳过）');
+  assert.equal(chainParamsMatch(local, p), true);
+  assert.equal(chainParamsMatch(local, { ...p, buyer: '0x0000000000000000000000000000000000000009' }), false);
+  assert.equal(chainParamsMatch(local, { ...p, seller: '0x0000000000000000000000000000000000000009' }), false);
+  assert.equal(chainParamsMatch(local, { ...p, amount: '999' }), false);
+  // 验货窗口也是身份的一部分：同一对当事人、同一金额、不同窗口的诱饵单同样不该驱动本地状态
+  assert.equal(chainParamsMatch(local, { ...p, timeoutBlocks: 11 }), false);
+  // 支付资产：同数字的 token 单不能驱动原生单
+  assert.equal(chainParamsMatch(local, { ...p, token: '0x00000000000000000000000000000000000000ff' }), false);
 });

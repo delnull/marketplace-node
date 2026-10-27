@@ -11,12 +11,10 @@ import { getDb, serverCapabilities } from './db.js';
 import { verifyAuditChain } from './auditChain.js';
 // 节点叫什么由**节点资料**回答（`node` 单例行的 name/notice，与任何一家店无关）
 import { nodeNameOf } from './routes/shop.js';
-import { listActiveShopRows, nodeRow, nodeOwnerOf } from './shops.js';
-import { cachedShopCode } from './shopCode.js';
+import { listShopRows, nodeRow, nodeOwnerOf } from './shops.js';
 import { escrowWatcherStatus } from './escrowWatcher.js';
 import { piiRetentionStatus } from './piiErase.js';
 import { chainReconcileStatus } from './chainReconcile.js';
-import { termsReconcileStatus } from './termsReconciler.js';
 import { escrowAnchorStatus } from './chainAnchor.js';
 // 仲裁人读数与下单超时窗口自检：两者都有"读不到"这一档，而**读不到必须能看见**
 import { committeeStatus, orderTimeoutSelfCheck } from './chain.js';
@@ -36,6 +34,8 @@ import piiRouter from './routes/pii.js';
 import ratesRouter from './routes/rates.js';
 import arbitrationRouter from './routes/arbitration.js';
 import shopsRouter from './routes/shops.js';
+import claimsRouter from './routes/claims.js';
+import blocksRouter from './routes/blocks.js';
 
 /**
  * `/healthz` 的**审计链**读数：最近 `AUDIT_CHAIN_WINDOW` 行的哈希链还接得上吗？
@@ -180,8 +180,18 @@ export function createApp() {
       `/metrics`、`/sla` 都是 ownerOnly 的经营数据——默认无 Cache-Control 就等于交给中间层，
       而这三个端点的响应里带着"谁在这家店退过款、哪些单压着没发"。
     */
+    /*
+      敏感响应禁缓存。判据有两层（**不再只靠手工 URL 清单**）：
+        ① 任何带 Bearer 令牌的响应一律 `private, no-store`——需要登录的端点天然带这个头，
+           新增路由忘了往正则里补也不会把私域数据交给共享缓存；
+        ② 少数**匿名可读但含隐私**的端点（仲裁待办、nonce/登录、码池/证据等）仍按路径兜住。
+      旧实现只有 ②，而正则曾把 `/api/claims/nft/mine` 写成 `/api/claims/mine`——真实路由永不命中，
+      提货记录的收货信息（姓名/电话/地址）就落在"没有 Cache-Control"的默认行为上。
+    */
+    const hasBearer = /^Bearer\s+/i.test(String(req.headers.authorization || ''));
     if (
-      /^\/(api\/orders|api\/shop\/(settings|orders|retention|export|audit|stats|metrics|sla|buyer-signal)|api\/auth|api\/products\/all|api\/products\/[^/]+\/(codes|tokens)|api\/arbitration)(\/|$)/.test(
+      hasBearer ||
+      /^\/(api\/orders|api\/claims|api\/shop\/(settings|orders|retention|export|audit|stats|metrics|sla|buyer-signal|webhook-status|node|node-staff|payment-tokens|claims)|api\/shops\/admin|api\/auth|api\/products\/all|api\/products\/[^/]+\/(codes|tokens)|api\/arbitration)(\/|$)/.test(
         req.path || ''
       )
     ) {
@@ -257,8 +267,7 @@ export function createApp() {
     一个**看起来正常**的响应（`shops: {}`、`node: {}`），而健康检查照样绿。
   */
   app.get('/healthz', wrap(async (req, res) => {
-    // 只数**在营**店铺：已退出（墓碑）的行不算"名下还有几家店"
-    const shopRows = await listActiveShopRows();
+    const shopRows = await listShopRows();
     const node = await nodeRow();
     const owner = nodeOwnerOf(node);
     const watcher = await escrowWatcherStatus();
@@ -313,11 +322,9 @@ export function createApp() {
       healthy: true,
       name: await nodeNameOf(),
       host: owner || null,
-      // 兼容字段名 owner：语义是"这台机器的登记人"（节点主），不再是订单卖家
-      owner: owner || null,
-      nodeCode: cachedShopCode() || null,
       shops: { total: shopRows.length, listed: shopRows.filter((r) => Number(r.listed) === 1).length },
       escrowAddress: config.chain.escrowAddress || null,
+      stakingAddress: config.chain.stakingAddress || null,
       version: config.version,
       /* 时刻是 `Date`（对外 JSON 为 ISO-8601）：与库列/接口的其余时间同一种形状 */
       now: new Date(),
@@ -354,9 +361,6 @@ export function createApp() {
       // 三者都只靠 console 日志时，容器里丢日志就等于没有信号——尤其 retention 是不可逆操作，
       // 静默失败会一直留着个人信息。
       reconcile: chainReconcileStatus(),
-      // 佣金条款对账：把链上 `shopListed` 与当前 `commissionBps` 抄回本地镜像——
-      // 费率由节点主链上单方调整，节点不索引事件，不轮询就发现不了本地那一份已经过期。
-      terms: termsReconcileStatus(),
       piiRetention: piiRetentionStatus(),
       /*
         托管合约地址锚点（源码评审 2026-09）：启动时"这次用的地址与上次记录的是否一致、
@@ -372,7 +376,7 @@ export function createApp() {
         而在此之前这个状态**只能靠翻日志**看：`/healthz` 一切正常、仲裁人只看到自己被拒，
         运维无从知道是"你不是仲裁人"还是"节点读不到"。
         `known:false` = 本次没确证（此时 `committee` 为 null），`lastOk` 只是排障线索、不参与判定。
-        与 `fees.feeStatus()` 同款三态——"读不到"必须能作为一个独立结论被看见。
+        三态口径——"读不到"必须能作为一个独立结论被看见。
       */
       committee: committeeStatus(),
       /*
@@ -411,6 +415,8 @@ export function createApp() {
   }));
 
   app.use('/api/auth', authRouter);
+  // 买家在本节点的屏蔽名单：持久化在节点 DB，不依赖浏览器/平台目录
+  app.use('/api/me/blocks', blocksRouter);
   // 店铺目录与开店申请（多店改造新增）：公开列表 /api/shops、详情 /api/shops/:code、申请与审批
   app.use('/api/shops', shopsRouter);
   app.use('/api/shop', shopRouter);
@@ -424,16 +430,13 @@ export function createApp() {
   app.use('/api/orders', evidenceFilesRouter); // 证据附件（P0-2）
   app.use('/api/rates', ratesRouter);
   app.use('/api/arbitration', arbitrationRouter);
+  // NFT 提货声明（持有人提交、卖家处理、节点管理员生成链上争议参数）
+  app.use('/api/claims', claimsRouter);
 
 /*
-  启动预热**节点编号**：`/api/shop` 与 `/healthz` 读的是**同步缓存** `cachedShopCode()`
-  （不为了一个展示字段去等 RPC）；不预热的话首个响应里 `nodeCode` 是 null（前端会退回主机名
-  形状，等目录加载后才切到编号）。预热只发一次链上读，失败也不影响启动——缓存为空时读法
-  返回 ''、DTO 下发 null，不会编一个编号。
-  ⚠️ 导出名是 `nodeCode`（节点编号，链上 `Registry.codeOf(node.owner)`）：它与**店铺编号**
-  （`shops.code`）是两条独立的链上序列，混用会让链接指向不存在的店（见 src/shopCode.js 文件头）。
+  启动预热不需要任何东西：`/api/shop` 与 `/healthz` 只读库里那一行节点资料与本节点配置，
+  不再有"链上节点编号"这种要预热的展示字段（平台目录以 endpoint + operator 标识节点）。
 */
-import('./shopCode.js').then((m) => void m.nodeCode()).catch(() => {});
 
   // 404
   app.use((req, res) => {

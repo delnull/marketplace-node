@@ -1,5 +1,5 @@
 /**
- * 代次探针清单的**漂移守卫**（2026-10-14）。
+ * 代次探针清单的**漂移守卫**。
  *
  * 背景（真实发生过的失效）：`assertEscrowGeneration` 曾经把三个探针内联写死，于是"链上有这三个读法、
  * 却没有 `sellerOpenExposure`"的 Escrow 能让节点**绿灯启动**，然后在运行时把四条出金路径整体弄死。
@@ -8,14 +8,11 @@
  * 守三条（每条都对应一种"静默失效"）：
  *   ① 清单里的形状必须真的出现在节点自己的 `ESCROW_ABI` 里——否则探针会以
  *      "本节点 ABI 里没有这个片段" 报错，运维看到的是"合约不对"，真因却是清单/ABI 漂移；
- *   ② 清单里的形状必须与**合约源码**里真实存在的函数同名——否则探针探的是一个不存在的读法，
- *      它会永远失败 ⇒ 节点永远拒绝启动（配置期锁死，比运行期死掉好，但仍然是错）；
+ *   ② 清单里的形状必须与**合约源码**里真实存在的函数同名——否则探针探的是一个不存在的读法；
  *   ③ 清单必须覆盖"合约伙伴会调、而旧一代没有"的那几个读法（`sellerOpenExposure` /
- *      `sellerNetAtSettle` / `totalOpenExposure`）——它们是 `Staking` 的出金与罚没判据，
- *      漏掉就等于把"店主提不出钱"这种状态放行。
+ *      `sellerNetAtSettle` / `totalOpenExposure`）、委员会读法与提货争议读法。
  *
- * 判据来源是**文本对拍**（合约源码 + 本包 ABI 字符串），与 `abi-consistency.test.js` 同款：
- * 跨语言镜像只能靠对拍守，靠注释是守不住的。
+ * 判据来源是**文本对拍**（合约源码 + 本包 ABI 字符串）：跨语言镜像只能靠对拍守。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -45,11 +42,17 @@ function solFunctionNames() {
 
 /** 合约源码里 `public` 的 mapping/变量（会生成同名 getter，探针读的就是它们） */
 function solPublicGetterNames() {
-  return new Set(
-    [...ESCROW_SOL.matchAll(/\b(?:mapping\s*\([^)]*\)|uint\d*|address|bool|bytes32)\s+public\s+(\w+)/g)].map(
-      (m) => m[1]
-    )
-  );
+  const out = new Set();
+  /*
+    修饰词顺序不定（`uint64 public constant` / `address public immutable` / `uint64 constant public`）：
+    先收整段修饰词，再确认其中有 public，名字取修饰词之后那个标识符。
+  */
+  for (const m of ESCROW_SOL.matchAll(
+    /\b(?:mapping\s*\([^)]*\)|uint\d*|address|bool|bytes32)\s+((?:(?:public|private|internal|constant|immutable|override)\s+)+)(\w+)\s*(?:=|;)/g
+  )) {
+    if (/\bpublic\b/.test(m[1])) out.add(m[2]);
+  }
+  return out;
 }
 
 test('代次探针：每个形状都在本节点的 Escrow ABI 里有对应片段', () => {
@@ -68,24 +71,22 @@ test('代次探针：每个形状在 Escrow.sol 里都真实存在（函数或 p
   assert.deepEqual(missing, [], `探针形状在 Escrow.sol 里不存在（探一个不存在的读法 = 节点永远拒绝启动）：${missing.join(', ')}`);
 });
 
-test('代次探针：必须覆盖合约伙伴会调、而旧一代没有的那几个读法', () => {
+test('代次探针：必须覆盖合约伙伴/提货争议/委员会那几组读法', () => {
   /*
     这三项不是"节点自己调"的，而是 `Staking` 调的：
       · `sellerOpenExposure` ⇒ `payoutFloors`（四条出金路径的前置）——缺它 = 店主提不出钱；
       · `sellerNetAtSettle`  ⇒ `_penaltyBase`（罚没单笔上限基准）——缺它 = 罚没 fail-closed 上限 0；
       · `totalOpenExposure`  ⇒ `Staking._probeEscrow` 的形状判据。
-    把它们算进本节点的代次门禁，是因为缺任一项的表现都是"店主资金动不了而日志无声"。
   */
   const names = new Set(ESCROW_GENERATION_PROBES.map((p) => p.shape.split('(')[0]));
   for (const required of ['sellerOpenExposure', 'sellerNetAtSettle', 'totalOpenExposure']) {
     assert.ok(names.has(required), `代次探针清单必须包含 ${required}（否则那种"自检通过但出金死掉"的状态又能进来）`);
   }
-  /*
-    委员会读法同理（2026-10-18：多仲裁人 + 订单级届次快照）：
-    缺 `arbiters/arbiterThreshold/committeeEpoch` ⇒ 当前届读不到（仲裁人视角整体关闭）；
-    缺 `orderEpoch/orderArbiters/orderThreshold` ⇒ 换届后**这一单是谁的**读不到，
-    旧届成员与在途争议一起被切断。见 chain.committeeForOrder 的说明。
-  */
+  // 提货争议读法：缺失时提货声明永远停在"处理中"（watcher 读不到结论），而节点日志里只有一条读不到
+  for (const required of ['claimCase', 'sellerClaimExposure', 'claimEpoch']) {
+    assert.ok(names.has(required), `代次探针清单必须包含提货争议读法 ${required}`);
+  }
+  // 委员会读法：缺 `arbiters/arbiterThreshold/committeeEpoch` ⇒ 仲裁人视角整体关闭
   for (const required of ['arbiters', 'arbiterThreshold', 'committeeEpoch', 'orderEpoch', 'orderArbiters', 'orderThreshold']) {
     assert.ok(names.has(required), `代次探针清单必须包含委员会读法 ${required}`);
   }
@@ -98,7 +99,7 @@ test('代次探针：运行时 getCommittee / committeeForOrder 用到的选择�
     调用，再要求它们逐个出现在探针清单里——"清单写着 A、代码调 B"在文本层面就红。
   */
   const start = CHAIN_SRC.indexOf('// ── 委员会');
-  const end = CHAIN_SRC.indexOf('// ── 节点员工');
+  const end = CHAIN_SRC.indexOf('// ── 委员会读取结束');
   assert.ok(start > 0 && end > start, 'chain.js 的委员会区段标记变了——本守卫需要同步更新');
   const used = new Set(
     [...CHAIN_SRC.slice(start, end).matchAll(/\bescrow\.(\w+)\s*\(/g)].map((m) => m[1])

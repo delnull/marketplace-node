@@ -57,7 +57,7 @@ import { getDb, withTransaction } from './db.js';
 // node 单例行的唯一读入口（游标落在它上面；行由 db.js 的 initDb() 在启动期建立）
 import { nodeRow } from './shops.js';
 import { fetchOrderFor, fetchAfterSaleCase, chainParamsMatch, orderCreatedMatches } from './chainOrder.js';
-import { getEscrow } from './chain.js';
+import { getEscrow, finalizedBlockTag } from './chain.js';
 import {
   settleByRefundSplit,
   markEscrowDisputed,
@@ -288,11 +288,11 @@ async function alertChainMissingOnce(order, data) {
  *        paid_tx_hash / buyer / seller / amount_wei
  * @returns {Promise<'repaired'|'missing'|'none'|'skipped'>}（异常向上抛，由轮询逐行兜住）
  */
-export async function reconcileOrder(row) {
+export async function reconcileOrder(row, { blockTag = 'latest' } = {}) {
   const db = getDb();
   let onchain;
   try {
-    onchain = await fetchOrderFor(row.escrow_order_id);
+    onchain = await fetchOrderFor(row.escrow_order_id, { blockTag });
   } catch (e) {
     // RPC 读取失败**不是**"链上没有"：本轮跳过，下一轮再试（绝不据此改状态）
     console.warn(
@@ -302,14 +302,14 @@ export async function reconcileOrder(row) {
     return 'skipped';
   }
   // 防"诱饵单"（与 watcher/sync 同规则）：草稿的 orderId 对拿到详情链接的人可见，链上真值的
-  // 买家/卖家/金额/验货窗口/**店铺节点**必须与本行锁定值一致；不一致说明这是别人对同一 orderId
-  // 的单（含同一卖家在另一个节点下的店），不能据它改本地状态。
+  // 买家/卖家/金额/验货窗口必须与本行锁定值一致；不一致说明这是别人对同一 orderId 的单
+  // （含同一卖家在另一个节点下的店），不能据它改本地状态。
   // 传**整份链上读数**而不是手挑的四个字段：`chainParamsMatch` 的身份判据以后再加一项时，
-  // 手挑对象的调用点会静默漏掉它（2026-10-22：店铺节点就是这样漏掉的）。
+  // 手挑对象的调用点会静默漏掉它。
   if (onchain && onchain.status && onchain.status !== 'None') {
     if (!chainParamsMatch(row, onchain)) {
       console.warn(
-        `[chainReconcile] 跳过与链上真值不符的订单（order=${String(row.order_no).slice(0, 8)}…）：买家/卖家/金额/验货窗口/店铺节点与本地锁定不一致（疑似诱饵单）`
+        `[chainReconcile] 跳过与链上真值不符的订单（order=${String(row.order_no).slice(0, 8)}…）：买家/卖家/金额/验货窗口与本地锁定不一致（疑似诱饵单）`
       );
       return 'skipped';
     }
@@ -364,7 +364,7 @@ export async function reconcileOrder(row) {
         （2026-10-22 复审）。`orderCreatedMatches` 缺字段一律 false（凭证动作，读不到就不落库）。
       */
       const canonical = logs.filter(
-        (l) => isCanonicalEscrowLog(l, config.chain.escrowAddress) && orderCreatedMatches(row, l.args)
+        (l) => isCanonicalEscrowLog(l, config.chain.escrowAddress) && orderCreatedMatches(row, l.args, row.escrow_order_id, onchain.token)
       );
       if (canonical.length) paidTxHash = String(canonical[0].transactionHash).toLowerCase();
     } catch (e) {
@@ -401,6 +401,7 @@ export async function reconcileOrder(row) {
             what: `（order.hold_missing，order=${String(row.order_no).slice(0, 8)}…，对账恢复时占位失败）`,
             send: () =>
               notifyRaw('order.hold_missing', {
+                shopCode: row.shop_code,
                 orderId: row.order_no,
                 escrowOrderId: row.escrow_order_id || null,
                 reason: '对账恢复订单时占位失败（取消期间限量库存已被他人买走）——请核对该商品余量并扩容或退款处理',
@@ -503,7 +504,7 @@ export async function reconcileOrder(row) {
  * @param {{now?:number, batch?:number}} opts
  * @returns {Promise<{scanned:number, repaired:number, skippedRows:number, failed:number}>}
  */
-export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_SALE_BATCH } = {}) {
+export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_SALE_BATCH, blockTag = 'latest' } = {}) {
   if (!config.chain.escrowAddress) return { scanned: 0, repaired: 0, skippedRows: 0, failed: 0 };
   const db = getDb();
   let scanned = 0;
@@ -515,7 +516,7 @@ export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_S
   const checkRow = async (row) => {
     let truth;
     try {
-      truth = await fetchAfterSaleCase(row.escrow_order_id);
+      truth = await fetchAfterSaleCase(row.escrow_order_id, { blockTag });
     } catch (e) {
       // 读不到**不是**"没有案件"：本轮跳过，下一轮再试（与主对账同口径，绝不据此改状态）
       console.warn(
@@ -580,7 +581,7 @@ export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_S
 
   // ① 在途案件复核（最旧的先查：等待最久的案件最可能因停机漏掉了结案事件）
   const openRows = await db.all(`SELECT o.order_id, o.order_no, o.status, o.escrow_order_id, o.after_sale_status,
-              o.after_sale_opened_at, o.buyer, o.seller, o.shop_code, o.amount_wei
+              o.after_sale_opened_at, o.buyer, o.seller, o.shop_code, o.amount_wei, o.payment_token
          FROM v_orders o WHERE ${AFTER_SALE_OPEN_SQL} AND o.escrow_order_id IS NOT NULL
         ORDER BY o.after_sale_opened_at ASC LIMIT ?`, batch);
   for (const row of openRows) {
@@ -607,7 +608,7 @@ export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_S
     const after = cur ? ' AND (o.updated_at > ? OR (o.updated_at = ? AND o.order_id > ?))' : '';
     const tail = cur ? [cur.at, cur.at, cur.id] : [];
     return await db.all(`SELECT o.order_id, o.order_no, o.status, o.escrow_order_id, o.after_sale_status,
-              o.after_sale_opened_at, o.buyer, o.seller, o.shop_code, o.amount_wei, o.updated_at
+              o.after_sale_opened_at, o.buyer, o.seller, o.shop_code, o.amount_wei, o.payment_token, o.updated_at
            FROM v_orders o
           WHERE o.status IN ${sqlIn(AFTER_SALE_ELIGIBLE_STATUS)}
             AND o.escrow_order_id IS NOT NULL
@@ -653,6 +654,16 @@ export async function reconcileChainOnce({ now = Date.now(), minAgeMs = MIN_AGE_
   if (!config.chain.escrowAddress) {
     return { skipped: true, reason: 'MK_ESCROW_ADDRESS 未配置' };
   }
+  /*
+    终态只能从**确认过的区块**读：watcher 等 head−finality，对账不能读 latest 就写 settled/refunded。
+    确定不了确认边界时整轮跳过（下轮重试），不退回 latest。
+  */
+  let blockTag;
+  try {
+    blockTag = await finalizedBlockTag();
+  } catch (e) {
+    return { skipped: true, reason: `确认边界读取失败：${e?.message || e}` };
+  }
   const db = getDb();
   const cutoff = new Date(now - minAgeMs);
   const marks = NON_TERMINAL.map(() => '?').join(',');
@@ -676,7 +687,7 @@ export async function reconcileChainOnce({ now = Date.now(), minAgeMs = MIN_AGE_
     const after = cur ? ' AND (o.updated_at > ? OR (o.updated_at = ? AND o.order_id > ?))' : '';
     const tail = cur ? [cur.at, cur.at, cur.id] : [];
     return await db.all(`SELECT o.order_id, o.order_no, o.status, o.escrow_order_id, o.paid_tx_hash,
-              o.buyer, o.seller, o.shop_code, o.amount_wei, o.updated_at
+              o.buyer, o.seller, o.shop_code, o.amount_wei, o.payment_token, o.updated_at
            FROM v_orders o
           WHERE o.status IN (${marks}) AND o.escrow_order_id IS NOT NULL AND o.updated_at <= ?${after}
           ORDER BY o.updated_at ASC, o.order_id ASC LIMIT ?`, ...NON_TERMINAL, cutoff, ...tail, limit);
@@ -701,7 +712,7 @@ export async function reconcileChainOnce({ now = Date.now(), minAgeMs = MIN_AGE_
   let failed = 0;
   for (const row of rows) {
     try {
-      const r = await reconcileOrder(row);
+      const r = await reconcileOrder(row, { blockTag });
       if (r === 'repaired') repaired += 1;
       else if (r === 'missing') missing += 1;
       else if (r === 'skipped') skippedRows += 1;
@@ -723,7 +734,7 @@ export async function reconcileChainOnce({ now = Date.now(), minAgeMs = MIN_AGE_
   */
   let afterSale = { scanned: 0, repaired: 0, skippedRows: 0, failed: 0 };
   try {
-    afterSale = await reconcileAfterSaleOnce({ now, batch });
+    afterSale = await reconcileAfterSaleOnce({ now, batch, blockTag });
   } catch (e) {
     console.error('[chainReconcile] 售后案件对账整体异常（下轮重试）:', e?.message || e);
   }

@@ -87,7 +87,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/mai
 
 - 本机健康检查：`curl http://127.0.0.1:8090/healthz`
 - 链上登记：打开 https://fedmall.bityuan.com →「节点登记」，用节点主钱包完成 `registerNode`
-- 开店：登记节点后，店主在前端「申请开店」提交申请；节点主设置抽成并审批，双方签票后广播 `registerShop`
+- 开店：登记节点后，店主在前端「申请开店」提交申请；节点主/员工在节点面板审批通过后，**本节点**直接建店并分配编号（店铺/商品/订单全在节点链下，没有链上开店交易）
 
 节点容器里的 `127.0.0.1` 指容器自己。使用外部 MySQL 时，地址必须是容器能访问到的主机/IP；本机已有 MySQL 默认填 `host.docker.internal`，需要 MySQL 监听容器可达地址，不能只绑定 `127.0.0.1`。
 
@@ -110,4 +110,4 @@ docker logs -f marketplace-node
 - `.env` 含令牌密钥和数据库密码，权限保持 0600，不要提交到仓库。
 - 生产环境把 `MK_CORS_ORIGIN` 收窄到实际前端域名。
 - 对外只暴露 HTTPS；MySQL 不应对公网开放。
-- 根目录的 `deploy-constants.json` 记**本批**主网合约；当前已填入 2026-10-22 主网批次，`deploy.sh` 会直接使用。换批时按 `docs/DEPLOY_NODE.md` 同批更新五项；不要手改单个地址。
+- 根目录的 `deploy-constants.json` 只记**本节点**的 Escrow / Staking / startBlock 三项；换批时三项同批更新，不要手改单个地址。部署前必须是真实地址，空值或 `startBlock=0` 会被脚本拒绝。

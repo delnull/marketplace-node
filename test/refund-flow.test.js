@@ -48,7 +48,7 @@ const { applyEvent } = await import('../src/escrowWatcher.js');
 const { setChainOrderFetcher } = await import('../src/chainOrder.js');
 setChainOrderFetcher(async (orderIdHex) => {
   const row = await db.get(
-    `SELECT buyer, seller, amount_wei, refund_status, commission_quoted_to, commission_quoted_bps, timeout_blocks
+    `SELECT buyer, seller, amount_wei, refund_status, timeout_blocks
        FROM v_orders WHERE escrow_order_id = ?`,
     String(orderIdHex || '').toLowerCase()
   );
@@ -62,12 +62,6 @@ setChainOrderFetcher(async (orderIdHex) => {
     seller: row.seller,
     amount: row.amount_wei,
     timeoutBlocks: Number(row.timeout_blocks),
-    // 订单身份的一部分（顶层）：交付闸的 chainParamsMatch 读它，桩必须与真实读取器同形
-    commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
-    commissionTerms: {
-      commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
-      commissionBps: Number(row.commission_quoted_bps) || 0,
-    },
   };
 });
 

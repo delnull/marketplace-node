@@ -46,7 +46,7 @@ test('公开节点信息：初始没有谈信地址', async () => {
   const res = await request(app).get('/api/shop').expect(200);
   assertOk(res);
   assert.equal(res.body.data.tanxinAddress, null);
-  const registry = await request(app).get('/api/shop/registry-info').expect(200);
+  const registry = await request(app).get('/api/shop/node-identity').expect(200);
   assertOk(registry);
   assert.equal(registry.body.data.tanxinAddress, null);
 });
@@ -64,7 +64,7 @@ test('节点主写入 0x 地址：公开读取、设置读取、节点运营读�
   const pub = await request(app).get('/api/shop').expect(200);
   assert.equal(pub.body.data.tanxinAddress, EVM_CHECKSUM);
 
-  const registry = await request(app).get('/api/shop/registry-info').expect(200);
+  const registry = await request(app).get('/api/shop/node-identity').expect(200);
   assert.equal(registry.body.data.tanxinAddress, EVM_CHECKSUM);
 
   const admin = await request(app)

@@ -9,11 +9,12 @@
  *  - 只有买家能开案，且每个单同时只能有一个在途案件（`afterSaleOpenedAtBlock != 0` ⇒ 再开 revert
  *    `AfterSaleAlreadyOpen`）；**结案是终态**（`afterSaleClosedAtBlock` 不可清除，再开 revert
  *    `AfterSaleCaseClosed`），所以本地 `closed` 不能被任何事件/回填改回 `open`；
- *  - 买家撤诉走 `closeAfterSale(orderId, note)`；仲裁人结案走委员会票决 `voteAfterSale(orderId, 0)`，
- *    票决事件不带文本（`note` 只存在于买家撤诉事件里）；
- *  - 它**不动托管资金**（那笔钱早已结清），补偿只能来自卖家保证金 `Staking.penalize` 或卖家线下转账；
- *    也因此**不阻塞卖家出金**（出金下限只读 `Escrow.sellerOpenExposure` = 退款待决 + 争议中的
- *    Σ amount，售后案件不计入）。
+ *  - 买家撤诉走 `closeAfterSale(orderId, note)`；仲裁人结案走委员会票决
+ *    `voteAfterSale(orderId, penaltyWei)`（`penaltyWei` 可以大于 0；优先从 Escrow 留存的卖家货款
+ *    退买家，不足部分才由 `Staking.penalize` 罚没；票决事件不带文本）；
+ *  - 确认收货后卖家货款先进入 Escrow 的售后留存期；案件在途时 `releaseSellerFunds` 被
+ *    `PendingCaseOpen` 挡住，结案并过解锁区块后才能释放。案件仍不计入 `sellerOpenExposure`，
+ *    因此**不阻塞卖家在 Staking 里的出金**；但留存货款本身在案件在途时不能动。
  *
  * ## 案件的列住在 `order_chain` 那一行（链上镜像表，watcher 独占写）
  *
@@ -25,7 +26,7 @@
  * 链上 `Escrow.Order.status` 在售后案件全程都停在 `Settled` —— 案件是**叠加在终局之上的第二层**。
  * 本地 `orders.status` 是"这笔钱现在到哪一步"的口径，它同时喂着收款流水/看板 GMV 窗口
  * （`INCOME_STATUS`）、库存占位释放（`stockHold`）、发货与退款闸、（`/api/arbitration/pending` 的）
- * 争议队列。把有案件的单改写成 `disputed` 就等于把一笔**已经结清**的钱重新拉回在途：
+ * 争议队列。把有案件的单改写成 `disputed` 就等于把一笔**仍在售后留存期**的货款重新拉回在途：
  * 金额会在两个窗口里各记一次、占位/流水/徽标全部跟着错位，而且链上根本没有对应的 `DisputeRequested`
  * 事件可以自证。所以售后案件只写本模块管的这几列，`orders.status` 一个字节都不动——
  * 同理也**不碰 `orders.updated_at`**（它是入账窗口与列表排序的锚点）。旧形状下这两条靠纪律，

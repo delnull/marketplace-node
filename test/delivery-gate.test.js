@@ -59,7 +59,7 @@ const codeStats = async (productId) =>
 const chainSays = (over = {}) =>
   setChainOrderFetcher(async (orderIdHex) => {
     const row = await db.get(
-      `SELECT buyer, seller, amount_wei, commission_quoted_to, commission_quoted_bps, timeout_blocks
+      `SELECT buyer, seller, amount_wei, timeout_blocks
          FROM v_orders WHERE escrow_order_id = ?`,
       String(orderIdHex || '').toLowerCase()
     );
@@ -74,12 +74,6 @@ const chainSays = (over = {}) =>
       amount: row.amount_wei,
       // 交付闸会核对报价条款（默认"链上与本地报价一致"）
       timeoutBlocks: Number(row.timeout_blocks),
-      // 订单身份的一部分（顶层）：chainParamsMatch 读它，桩必须与真实读取器同形
-      commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
-      commissionTerms: {
-        commissionTo: String(row.commission_quoted_to ?? '').toLowerCase(),
-        commissionBps: Number(row.commission_quoted_bps) || 0,
-      },
       ...over,
     };
   });

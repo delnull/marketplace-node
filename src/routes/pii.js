@@ -84,7 +84,10 @@ router.post('/orders/:orderNo/erase-pii', ownerOnly, erasePiiLimiter, wrap(async
   // ⚠️ 判据是结果方给的 `code`（'not_found' / 'not_terminal' = **什么也没擦**），
   // 不是"有没有 error 字段"：删盘失败（**擦了一半**）也带 error，用字段存在性判会把两种结论
   // 混成一支，那一支不下发读数——界面恰好在这一刻读不到"盘上还剩几个文件"。
-  if (r.code) return fail(res, r.message || '个人信息擦除失败', 1, r.code === 'not_found' ? 404 : 200);
+  if (r.code) {
+    const status = r.code === 'not_found' ? 404 : r.code === 'case_open' ? 409 : 200;
+    return fail(res, r.message || '个人信息擦除失败', 1, status);
+  }
   /*
     ── 成功与"擦了一半"必须**同一个形状** ────────────────────────────
     此前删盘失败走的是业务错误分支（`fail(res, …, 1)`），那个分支**不下发读数**——
@@ -138,7 +141,7 @@ router.post('/orders/:orderNo/erase-pii', ownerOnly, erasePiiLimiter, wrap(async
     actor: req.auth?.address,
     // 角色取**这家店里的**身份（漏传店铺编号会得到 'user'，而 logAudit 对 'user' 直接返回——
     // 审计行会静默消失，责任人查无此人）
-    actorRole: await roleOf(req.auth?.address || '', req.shop.code),
+    actorRole: req.shopRole && req.shopRole !== 'user' ? req.shopRole : await roleOf(req.auth?.address || '', req.shop.code),
     // 擦除的是**本店这一单**（上面 findOrderInShop 已校验归属），所以这一行归本店
     shopCode: req.shop.code,
     action: 'order.erase_pii',

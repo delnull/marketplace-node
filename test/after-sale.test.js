@@ -58,25 +58,21 @@ function handleRpc(j) {
           chainCase.buyer,
           chainCase.seller,
           BigInt(chainCase.amount),
-          0n,
-          120960n,
-          7n,
-          false,
-          false,
+          120960n, // timeoutBlocks
+          7n, // createdAtBlock
+          false, // refundRequested
+          false, // refundRejected
           chainCase.status === 'Refunded' ? BigInt(chainCase.amount) : 0n,
           STATUS_INDEX[chainCase.status],
-          '0x' + '0'.repeat(40),
           true, // buyerConfirmed：售后案件正是"买家确认过之后"的救济路径
         ]),
       };
     }
-    /*
-      创建时抽成条款：host 取链上订单的 seller（与夹具的报价列一致）。
-      它是订单身份的一部分——桩若省略这一项，`fetchOnchainOrder` 会给空 host，
-      `/sync` 的售后回填会按"跨店/诱饵单"正确拒绝，用例就测不到回填本身了。
-    */
-    if (selector === iface.getFunction('commissionTermsAtCreate').selector) {
-      return { result: iface.encodeFunctionResult('commissionTermsAtCreate', [chainCase.seller, 0]) };
+    if (selector === iface.getFunction('orderToken').selector) {
+      // 这些夹具都是原生单；ERC20 身份由 chain-amounts.test 专门覆盖
+      return {
+        result: iface.encodeFunctionResult('orderToken', ['0x0000000000000000000000000000000000000000']),
+      };
     }
     if (selector === iface.getFunction('acceptedPartialRefund').selector) {
       return { result: iface.encodeFunctionResult('acceptedPartialRefund', [0n]) };
@@ -442,7 +438,7 @@ test('仲裁台售后案件队列：只列在途案件 + 待办计数 + 最久�
   assert.equal(row.afterSaleOpenedBlock, 100);
   assert.equal(row.afterSaleNote, null);
   // 字段风格与争议队列一致（共用同一个行映射）：金额拆分/双方地址/事件史一个不少
-  for (const k of ['escrowOrderId', 'buyer', 'seller', 'usdtMicro', 'goodsUsdtMicro', 'amountWei', 'refundedAmountWei', 'delivered', 'evidenceCount', 'onchainEvents', 'feeChargeable']) {
+  for (const k of ['escrowOrderId', 'buyer', 'seller', 'usdtMicro', 'goodsUsdtMicro', 'amountWei', 'refundedAmountWei', 'delivered', 'evidenceCount', 'onchainEvents']) {
     assert.ok(k in row, `售后案件条目缺字段 ${k}（必须与 /pending 同口径）`);
   }
   assert.equal(row.delivered, true, '已交付事实按 shipped_at/tracking_no/交付行三要素判');

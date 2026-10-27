@@ -64,6 +64,8 @@ import config, { PII_RETENTION_DAYS } from './config.js';
 import { getDb, withTransaction, abortTx, serverCapabilities } from './db.js';
 import { logAudit } from './audit.js';
 import { orderAttachDir, removeOrderAttachments } from './evidenceFiles.js';
+import { clearReviewImages } from './reviews.js';
+import { removeMediaByUrl } from './productMedia.js';
 // 节点主地址（`node.owner`）：保留期扫描的审计主体
 import { nodeOwner } from './shops.js';
 // 状态集合的唯一出处（见下方再导出说明）：本文件内部要用，所以先 import 再 export
@@ -125,6 +127,29 @@ function notTerminal(status) {
 /** 「订单不存在」（读不到那一行；**不猜**、不建行） */
 function notFound() {
   return { code: 'not_found', error: 'not_found', message: '订单不存在' };
+}
+
+/** 提货声明仍在履约中：claim 那份收货信息与 order_shipping 同级，不能只擦订单那一份。 */
+function claimOpen() {
+  return {
+    code: 'claim_open',
+    error: 'claim_open',
+    message: '该订单还有在途的 NFT 提货声明：claim 里的收货信息正在用于履约，需先完成/驳回/取消声明后再擦除',
+  };
+}
+
+/**
+ * 售后案件在途：双方陈述与附件是仲裁人裁决的唯一证据；店主（本路由的 ownerOnly 主体）
+ * 正是可能被罚的一方，不能让他用删除请求把证据先擦掉。结案后再走正常擦除。
+ */
+function afterSaleCaseOpen() {
+  return {
+    code: 'case_open',
+    error: 'case_open',
+    message:
+      '该订单有在途售后案件：双方陈述与附件是委员会裁决证据，案件结案前不能擦除；' +
+      '结案后再提交删除请求（收货信息也会保留到案件结束，退货/换货仍需要它）',
+  };
 }
 
 /**
@@ -240,8 +265,8 @@ function removeAttachmentsFromDisk(orderId) {
  * @returns {{ok:boolean, error?:string, orderNo:string, status:string, changed:boolean,
  *            attachmentFilesRemoved:boolean|null, attachmentFilesRemaining:number,
  *            cleanupPending:boolean, residual:object, counts:object}
- *          | {code:'not_found'|'not_terminal', error:string, message:string}}
- *  counts = { shippingRows, evidenceContents, attachmentRows, attachmentFiles }（只有计数，
+ *          | {code:'not_found'|'not_terminal'|'claim_open', error:string, message:string}}
+ *  counts = { shippingRows, claimPii, evidenceContents, attachmentRows, attachmentFiles }（只有计数，
  *  不含任何被擦除的内容——审计与响应都不应把 PII 再抄一份出来）。
  *  residual = 「库服务器侧还剩什么」的如实读数（见 residualReport）。
  */
@@ -263,7 +288,8 @@ export async function eraseOrderPii(orderNo) {
   const orderId = Number(order.order_id);
   // 预检（给人看的原因）。它**不是**判据：判据在擦除语句自己的状态谓词上（见下）。
   if (!PII_ERASABLE_STATUS.includes(String(order.status))) return notTerminal(String(order.status));
-  const counts = { shippingRows: 0, evidenceContents: 0, attachmentRows: 0, attachmentFiles: 0 };
+  const counts = { shippingRows: 0, claimPii: 0, evidenceContents: 0, attachmentRows: 0, attachmentFiles: 0, reviewImages: 0 };
+  let reviewImageUrls = [];
   /*
     ── 擦除语句自带状态谓词（修一条**真实的数据破坏路径**）──────────────────────────
     上面那次 JS 读与下面的事务之间隔着一段时间，而状态可以被并发推进：`cancelled` 的单
@@ -275,6 +301,27 @@ export async function eraseOrderPii(orderNo) {
     预检保留的理由见上：它给人看的原因需要那次读。
   */
   const refusal = await withTransaction(async () => {
+    /*
+      提货声明（nft_claims）的收货人/电话/地址/备注是同一份个人信息，但住在另一张表。
+      这里先把该单的 claim 行锁住再判断：否则擦除事务删完 order_shipping 后，
+      并发的 claim approve/ship 可能把一份仍在履约的地址变成“已擦除”的假象。
+      只有终局 claim 才清 PII；在途 claim 拒绝整单擦除（与订单在途同一方向）。
+    */
+    const claims = await db.all('SELECT id, status FROM nft_claims WHERE order_id = ? FOR UPDATE', orderId);
+    if (claims.some((c) => ['requested', 'approved', 'shipped'].includes(String(c.status)))) {
+      return abortTx(claimOpen());
+    }
+    /*
+      在途售后案件：陈述/附件是委员会裁决证据，而本入口的主体正是店主（可能被罚的一方）。
+      这条判断此前只在保留期扫描的候选 SQL 里——手动 erase-pii 绕过它，店主可以在买家
+      开案后把双方证据一起墓碑化。判据必须在本内核里，任何调用方都绕不过。
+      `FOR UPDATE` 与 watcher 的 applyAfterSaleOpened 争同一行：开案先提交则这里看见
+      open；擦除先提交则案件是在“无陈述”之后才开，不会销毁既有证据。
+    */
+    const chain = await db.get('SELECT after_sale_status FROM order_chain WHERE order_id = ? FOR UPDATE', orderId);
+    if (String(chain?.after_sale_status || 'none') === 'open') {
+      return abortTx(afterSaleCaseOpen());
+    }
     const ship = await db.get('SELECT 1 AS hit FROM order_shipping WHERE order_id = ?', orderId);
     if (ship) {
       /*
@@ -302,6 +349,14 @@ export async function eraseOrderPii(orderNo) {
       每一轮都白跑一次事务。
     */
     await db.run('UPDATE orders SET pii_erased_at = ? WHERE id = ?', new Date(), orderId);
+    // 已终结的提货声明：清掉收货人与备注；claim_no/金额/链上争议结论保留为账目事实。
+    counts.claimPii = (await db.run(
+      `UPDATE nft_claims
+          SET shipping_name = '', shipping_phone = '', shipping_address = '', note = '', reject_reason = ''
+        WHERE order_id = ? AND status IN ('fulfilled','rejected','cancelled','expired')
+          AND (shipping_name <> '' OR shipping_phone <> '' OR shipping_address <> '' OR note <> '' OR reject_reason <> '')`,
+      orderId
+    )).changes;
     // 陈述正文 → 墓碑：只改正文，行/角色/阶段/时刻保留（时间线仍是完整的事实记录）
     counts.evidenceContents = (await db.run('UPDATE dispute_evidence SET content = ? WHERE order_id = ? AND content != ?', PII_TOMBSTONE, orderId, PII_TOMBSTONE)).changes;
     // 附件索引行删除（文件随 order_id 级联语义一并删；显式按 order_id 删除不依赖级联开关）
@@ -315,6 +370,13 @@ export async function eraseOrderPii(orderNo) {
     */
     await db.run('UPDATE dispute_evidence SET file_count = 0, file_bytes = 0 WHERE order_id = ? AND (file_count != 0 OR file_bytes != 0)', orderId);
     await db.run('UPDATE orders SET evidence_bytes = 0 WHERE id = ? AND evidence_bytes != 0', orderId);
+    /*
+      评价图同样可能是个人信息（人像/住址/聊天截图）。正文按既有口径保留，
+      图片 URL 从评价行移除并在提交后删盘；先落库再删文件，避免回滚后只剩悬空 URL。
+    */
+    const reviewImages = await clearReviewImages(orderId);
+    reviewImageUrls = reviewImages.urls;
+    counts.reviewImages = reviewImageUrls.length;
     return null; // 事务里该做的都做了：下面的磁盘删除必须在 COMMIT 之后
   });
   if (refusal) return refusal;
@@ -325,6 +387,8 @@ export async function eraseOrderPii(orderNo) {
   */
   const attachmentFiles = removeAttachmentsFromDisk(orderId);
   counts.attachmentFiles = attachmentFiles.removed;
+  // 评价图在事务里已清 URL；文件删除放在提交后，删不掉的孤儿由媒体清扫兜底。
+  counts.reviewImages = reviewImageUrls.filter((u) => removeMediaByUrl(u)).length;
   /*
     ── 附件删盘失败**不算擦干净**（2026-10-14 审计修订：旧判据是死代码）──────────────
     旧实现把判据写成 `!attachmentFiles.ok && attachmentFiles.failed > 0`，而
@@ -368,7 +432,9 @@ export async function eraseOrderPii(orderNo) {
     status: order.status,
     // 磁盘上的附件文件也算"本次真的擦掉了东西"：DB 行早前已删、只剩孤儿文件的情形同样是一次
     // 有意义的删除（否则响应会报"无变更"，让人以为没删干净/白跑一趟）
-    changed: counts.shippingRows + counts.evidenceContents + counts.attachmentRows + counts.attachmentFiles > 0,
+    changed:
+      counts.shippingRows + counts.claimPii + counts.evidenceContents + counts.attachmentRows + counts.attachmentFiles + counts.reviewImages >
+      0,
     // 三态（与响应里的其它读数同款）：true 确认删净 / false 确认没删净 / null 读不到 ⇒ 不敢说
     attachmentFilesRemoved: attachmentFiles.remaining < 0 ? null : attachmentFiles.remaining === 0,
     attachmentFilesRemaining: attachmentFiles.remaining,
@@ -410,7 +476,7 @@ export async function eraseOrderPii(orderNo) {
  *            cleanupPending:number, orderNos:string[], truncated:boolean, counts:object}>}
  *
  * 候选面还额外排除**有在途售后案件**（after_sale_status='open'）的单：案件未了结时不销毁证据
- * （理由与边界见下方候选查询处的说明；显式删除请求不受此限）。
+ * （判据在 `eraseOrderPii` 内核；显式删除请求同样被拒，见 `afterSaleCaseOpen`）。
  */
 export async function runPiiRetention({ days = config.pii.retentionDays, now = Date.now(), limit = RETENTION_MAX_PER_RUN } = {}) {
   /*
@@ -428,11 +494,11 @@ export async function runPiiRetention({ days = config.pii.retentionDays, now = D
 
 async function runPiiRetentionInner({ days, now, limit }) {
   const n = Number(days);
-  const empty = { shippingRows: 0, evidenceContents: 0, attachmentRows: 0, attachmentFiles: 0 };
+  const empty = { shippingRows: 0, claimPii: 0, evidenceContents: 0, attachmentRows: 0, attachmentFiles: 0, reviewImages: 0 };
   if (!Number.isFinite(n) || n < 0) {
     throw new Error('PII 保留期天数无效（需 ≥ 0 的整数；0 = 关闭自动擦除）');
   }
-  // 0 = 关闭（默认值来自 MK_PII_RETENTION_DAYS）：不扫描、不擦除，但显式删除请求不受影响
+  // 0 = 关闭自动扫描（默认值来自 MK_PII_RETENTION_DAYS）；显式删除仍受案件/claim 内核闸约束
   if (n === 0) return { days: 0, disabled: true, candidates: 0, erased: 0, diskFailed: 0, cleanupPending: 0, orderNos: [], truncated: false, counts: empty };
   const cutoff = new Date(Number(now) - Math.floor(n) * 86_400_000);
   const db = getDb();
@@ -445,9 +511,9 @@ async function runPiiRetentionInner({ days, now, limit }) {
     可擦集之外是同一条理由：争议/救济未了结时不销毁证据。
 
     边界（刻意的，别顺手改）：
-      · 只挡**自动**保留期扫描。显式删除请求（POST /api/shop/orders/:orderNo/erase-pii）仍照旧执行
-        ——那是数据主体本人/店主明确要求删除，节点不该以"有案件"为由拒绝（要拒绝也该在业务层
-        说明理由，而不是让保留期定时器替他们决定）；
+      · 自动保留期扫描与显式删除请求**都**让路：后者的主体是店主，而店主正是售后案件里可能
+        被罚的一方；让他在开案后擦掉双方陈述/附件，等于先销毁裁决证据。拒绝发生在内核
+        （`eraseOrderPii` 的 `after_sale_status='open'` 检查），不是某个调用点；
       · 案件结案（closed）后这行立刻回到候选面，到期即擦，不改变保留期的最终效果。
 
     候选读的是**读模型视图 v_orders**：`after_sale_status` 住在 `order_chain`、`status` 住在
@@ -474,10 +540,16 @@ async function runPiiRetentionInner({ days, now, limit }) {
   let diskFailed = 0;
   let cleanupPending = 0;
   const AGE_SQL = 'GREATEST(COALESCE(pii_erased_at, updated_at), updated_at)';
+  /*
+    在途提货声明同样让路：claim 的收货信息正在用于履约，擦订单那一行不是“擦干净”。
+    显式删除请求仍可在 claim 终局后执行；这里只挡自动保留期，避免每轮白跑。
+  */
+  const ACTIVE_CLAIM_SQL =
+    "NOT EXISTS (SELECT 1 FROM nft_claims nc WHERE nc.order_id = o.order_id AND nc.status IN ('requested','approved','shipped'))";
   while (examined < limit) {
     const rows = await db.all(
-      `SELECT order_no, shop_code FROM v_orders WHERE status IN (${ERASABLE_MARKS}) AND ${AFTER_SALE_NOT_OPEN_SQL} ` +
-        `AND (${AGE_SQL} <= ? OR pii_cleanup_pending = 1) ` +
+      `SELECT order_no, shop_code FROM v_orders o WHERE status IN (${ERASABLE_MARKS}) AND ${AFTER_SALE_NOT_OPEN_SQL} ` +
+        `AND ${ACTIVE_CLAIM_SQL} AND (${AGE_SQL} <= ? OR pii_cleanup_pending = 1) ` +
         `ORDER BY (pii_cleanup_pending = 1) DESC, ${AGE_SQL} ASC LIMIT ?`,
       ...PII_ERASABLE_STATUS,
       cutoff,
@@ -583,7 +655,7 @@ export function piiRetentionStatus() {
 export function startPiiRetentionSweep() {
   if (!(PII_RETENTION_DAYS > 0)) {
     retentionStatus.enabled = false;
-    console.log('[pii] MK_PII_RETENTION_DAYS=0：保留期自动擦除已关闭（显式删除请求仍可用 POST /api/shop/orders/:orderNo/erase-pii）');
+    console.log('[pii] MK_PII_RETENTION_DAYS=0：保留期自动擦除已关闭（显式删除请求仍可用，但在途售后的陈述/附件不可擦）');
     return null;
   }
   retentionStatus.enabled = true;

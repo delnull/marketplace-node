@@ -38,6 +38,9 @@ import {
 
 export { UPLOAD_URL_PREFIX };
 
+/** 评价图：只收图片（同一条字节判定白名单），不允许视频。 */
+export const REVIEW_IMAGE_MIMES = PRODUCT_MEDIA_MIMES.filter((m) => MEDIA[m].kind === 'image');
+
 /** 上传失败的业务错误（路由层按"用户可修"处理，别冒成 500） */
 export class MediaUploadError extends Error {
   constructor(code, message) {
@@ -94,17 +97,26 @@ function tempPath(dir) {
  * 校验并落盘一个已写满的临时文件。
  * @returns {{ url: string, kind: 'image'|'video', mime: string, size: number, sha256: string }}
  */
-function finalize({ dir, tmp, size, sha256 }) {
+function finalize({
+  dir,
+  tmp,
+  size,
+  sha256,
+  allowedMimes = PRODUCT_MEDIA_MIMES,
+  label = '主图区',
+}) {
   if (!size) {
     discard(tmp);
     throw new MediaUploadError('empty', '上传内容为空');
   }
   const mime = sniffMediaMime(readHead(tmp));
-  if (!mime || !PRODUCT_MEDIA_MIMES.includes(mime)) {
+  if (!mime || !allowedMimes.includes(mime)) {
     discard(tmp);
+    const hasVideo = allowedMimes.some((m) => MEDIA[m].kind === 'video');
     throw new MediaUploadError(
       'unsupported',
-      '无法识别的文件内容：主图区只收 png / jpeg / webp / gif 图片，或 mp4 / webm 视频'
+      `无法识别的文件内容：${label}只收 png / jpeg / webp / gif 图片` +
+        (hasVideo ? '，或 mp4 / webm 视频' : '')
     );
   }
   const spec = MEDIA[mime];
@@ -139,7 +151,12 @@ function discard(disk) {
  * @param {import('node:stream').Readable} stream 请求体（req）
  * @returns {Promise<{url:string,kind:string,mime:string,size:number,sha256:string}>}
  */
-export function storeMediaStream(stream) {
+export function storeMediaStream(stream, opts = {}) {
+  const {
+    allowedMimes = PRODUCT_MEDIA_MIMES,
+    maxUploadBytes = MAX_UPLOAD_BYTES,
+    label = '主图区',
+  } = opts;
   return new Promise((resolve, reject) => {
     const dir = uploadsDir();
     fs.mkdirSync(dir, { recursive: true });
@@ -162,8 +179,8 @@ export function storeMediaStream(stream) {
     stream.on('data', (chunk) => {
       if (settled) return;
       size += chunk.length;
-      if (size > MAX_UPLOAD_BYTES) {
-        fail(new MediaUploadError('too_large', `上传内容超过 ${MB(MAX_UPLOAD_BYTES)}MB 上限`));
+      if (size > maxUploadBytes) {
+        fail(new MediaUploadError('too_large', `上传内容超过 ${MB(maxUploadBytes)}MB 上限`));
         return;
       }
       hash.update(chunk);
@@ -185,7 +202,7 @@ export function storeMediaStream(stream) {
         if (settled) return;
         settled = true;
         try {
-          resolve(finalize({ dir, tmp, size, sha256: hash.digest('hex') }));
+          resolve(finalize({ dir, tmp, size, sha256: hash.digest('hex'), allowedMimes, label }));
         } catch (e) {
           reject(e);
         }
@@ -227,6 +244,23 @@ export function findMedia(name) {
   const mime = PRODUCT_MEDIA_MIMES.find((m) => mediaExt(m) === ext);
   if (!mime) return null;
   return { disk, mime, kind: MEDIA[mime].kind };
+}
+
+/**
+ * 删除一个本节点上传文件（按对外 URL）。只接受 `/api/uploads/<uuid>.<ext>` 形状，
+ * 与 findMedia 同一白名单；不存在返回 false（重复删除幂等）。
+ */
+export function removeMediaByUrl(url) {
+  const m = /^\/api\/uploads\/([^/]+)$/.exec(String(url || ''));
+  if (!m) return false;
+  const hit = findMedia(m[1]);
+  if (!hit) return false;
+  try {
+    fs.unlinkSync(hit.disk);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

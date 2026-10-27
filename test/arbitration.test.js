@@ -205,42 +205,6 @@ test('待仲裁列表：仅 disputed 入列，摘要含裁决要素但不含交�
   assert.ok(r3.disputedAt >= d3.createdAt);
 });
 
-/**
- * 平台费三态（源码评审 2026-09，P2）：`fee_bps` 列是 `INTEGER NOT NULL DEFAULT 0`，而它与
- * `fee_collector_at_create` 由同一条 UPDATE 成对补录 ⇒ "快照为空"意味着**两列都没补录过**。
- * 此时若把 `feeBps` 当成 0 下发，仲裁台就会印出"本单费率 0%"（一个链上并不成立的结论），
- * 而链上是按创建时快照扣费的。旧实现 `o.fee_bps || 0` 正是这样把三态压成了两态。
- */
-test('待仲裁列表的平台费三态：快照缺失 ⇒ feeBps=null（不是 0）；有快照 ⇒ 如实给数', async () => {
-  const { db } = ctx;
-  // ① 模拟"补录失败/未补录"的行：收费方列为 NULL（三态里的"从未补录"）
-  await db.run('UPDATE orders SET fee_bps = 0, fee_collector_at_create = NULL WHERE order_no = ?', d1.id);
-  const data1 = await pending();
-  const row1 = data1.disputes.find((r) => r.orderNo === d1.id);
-  assert.equal(row1.feeBps, null, '快照缺失时必须是 null（读不到 ≠ 不扣费）');
-  assert.equal(row1.feeCollectorAtCreate, null);
-  // 兜底判定仍按**保守**口径给 true（"快照缺失 ⇒ 按全局口径假定会扣"是 fees.js 的既定语义），
-  // 于是前端拿到的是 (feeBps=null, feeChargeable=true) 这个组合：没数、但按会扣提示 —— 三态齐。
-  assert.equal(row1.feeChargeable, true, '快照缺失 ⇒ 保守假定会扣（fees.js 的既定兜底）');
-
-  // ② 有快照（正常行）：如实给数（含"确实是 0 费率"这种合法情况）
-  await db.run("UPDATE orders SET fee_bps = 500, fee_collector_at_create = ? WHERE order_no = ?", '0x' + 'ab'.repeat(20),
-    d2.id);
-  const data2 = await pending();
-  const row2 = data2.disputes.find((r) => r.orderNo === d2.id);
-  assert.equal(row2.feeBps, 500);
-  assert.equal(row2.feeCollectorAtCreate, '0x' + 'ab'.repeat(20));
-  assert.equal(row2.feeChargeable, true);
-
-  // ③ 有快照但费率确实是 0：给 0（而不是 null）——"确实不扣"与"读不到"必须分得开
-  await db.run("UPDATE orders SET fee_bps = 0, fee_collector_at_create = ? WHERE order_no = ?", '0x' + 'ab'.repeat(20),
-    d3.id);
-  const data3 = await pending();
-  const row3 = data3.disputes.find((r) => r.orderNo === d3.id);
-  assert.equal(row3.feeBps, 0, '快照在、费率确实是 0 ⇒ 给 0');
-  assert.equal(row3.feeChargeable, true, '收取方非零地址 ⇒ 链上会按 0‰ 扣费（金额为 0，但口径是"会扣"）');
-});
-
 test('待仲裁列表分页：倒序分页且 total 恒定', async () => {
   const page1 = await pending(1, 2);
   assert.equal(page1.disputes.length, 2);

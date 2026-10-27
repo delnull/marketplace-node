@@ -40,31 +40,26 @@ const rpcServer = http.createServer((req, res) => {
       if (j?.method === 'eth_getLogs') return { error: { code: -32000, message: 'unit-test: RPC 读不到日志' } };
       if (j?.method === 'eth_call') {
         const sel = String(j.params?.[0]?.data || '').slice(0, 10);
+        if (sel === iface.getFunction('orderToken').selector) {
+          return {
+            result: iface.encodeFunctionResult('orderToken', ['0x0000000000000000000000000000000000000000']),
+          };
+        }
         if (sel === iface.getFunction('getOrder').selector) {
           return {
             result: iface.encodeFunctionResult('getOrder', [
               buyer.address,
               owner.address,
               BigInt(AMOUNT),
-              0n,
-              120960n,
-              2n,
+              120960n, // timeoutBlocks
+              2n, // createdAtBlock
               false,
               false,
               0n,
               STATUS_INDEX.Created,
-              FC,
               false,
             ]),
           };
-        }
-        if (sel === iface.getFunction('commissionTermsAtCreate').selector) {
-          /*
-            抽成条款的 payee 就是店铺 host，是订单身份的一部分：夹具的报价列 = 节点主（owner），
-            所以链上真值必须回同一份。回零地址会让 `/sync` 正确地判成"另一家店/读不到条款"，
-            本用例要测的三处补录（凭证/授权额/售后案件）就根本走不到。
-          */
-          return { result: iface.encodeFunctionResult('commissionTermsAtCreate', [owner.address, 0]) };
         }
         // acceptedPartialRefund / afterSaleOpen / afterSaleOpenedAtBlock：本用例模拟"这三个读不到"
         return { error: { code: -32000, message: 'unit-test: RPC 读不到这一项' } };

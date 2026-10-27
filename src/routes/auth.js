@@ -21,8 +21,7 @@
  * 与任何店铺都对不上的值（那正是本次要删掉的那类假话）。
  */
 import { Router } from 'express';
-import { issueSiwe, verifySiwe, issueToken, roleOf, isHost, operatedShopCodes } from '../auth.js';
-import { isNodeStaffOf } from '../chain.js';
+import { issueSiwe, verifySiwe, issueToken, roleOf, isHost, operatedShopCodes, isNodeStaffOf } from '../auth.js';
 import { isAddress } from '../chain.js';
 import { shopDto, shopRowByCode, nodeOwner } from '../shops.js';
 import config from '../config.js';
@@ -150,7 +149,7 @@ router.post('/login', rateLimit('/login'), originProtocolGuard, wrap(async (req,
   */
   const addr = recovered.toLowerCase();
   const nodeAddr = await nodeOwner();
-  const nodeStaff = nodeAddr ? await isNodeStaffOf(addr, nodeAddr) : false;
+  const nodeStaff = await isNodeStaffOf(addr);
   const shops = [];
   for (const code of await operatedShopCodes(addr)) {
     const row = await shopRowByCode(code);

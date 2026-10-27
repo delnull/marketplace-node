@@ -46,7 +46,7 @@ const deliveryOnPaid = async (order) => await tryAutoDeliverByEscrowOrder(order.
 const chainSaysOpen = async (orderIdHex) => {
   // 交付闸要核对报价条款：默认桩按本地行回"链上与报价一致"（抽成收款人/比例 + 验货窗口）
   const row = await db.get(
-    `SELECT commission_quoted_to, commission_quoted_bps, timeout_blocks
+    `SELECT timeout_blocks
        FROM v_orders WHERE escrow_order_id = ?`,
     String(orderIdHex || '').toLowerCase()
   );
@@ -56,12 +56,6 @@ const chainSaysOpen = async (orderIdHex) => {
     refundRejected: false,
     refundedAmount: '0',
     timeoutBlocks: Number(row?.timeout_blocks),
-    // 订单身份的一部分（顶层）：chainParamsMatch 读它，桩必须与真实读取器同形
-    commissionTo: String(row?.commission_quoted_to ?? '0x0000000000000000000000000000000000000000').toLowerCase(),
-    commissionTerms: {
-      commissionTo: String(row?.commission_quoted_to ?? '0x0000000000000000000000000000000000000000').toLowerCase(),
-      commissionBps: Number(row?.commission_quoted_bps) || 0,
-    },
   };
 };
 

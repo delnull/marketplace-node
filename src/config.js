@@ -1,10 +1,13 @@
 /**
  * 节点配置：全部经环境变量注入（.env / docker env），并提供默认值。
  *
- * 店铺模型（2026-10 多店）：一个节点实例 = **一库多店**。`node.owner`（由 MK_SHOP_OWNER
- * 种入 `node` 单例行）是**节点主**——提供基础设施、收抽成、做节点级治理；店铺是独立租户行
- * （`shops.seller` 才是店主，一个地址在本节点至多一家）。商品上架/发货等写操作由
- * `roleOf(address, shopCode)` 判"他在**这家店**里是什么角色"，不再与一个全局常量比。
+ * 店铺模型：一个节点实例 = **一库多店**。`node.owner`（由 MK_SHOP_OWNER 种入 `node` 单例行）
+ * 是**节点 operator**——本节点 Escrow/Staking 的 owner；店铺是独立租户行
+ * （`shops.seller` 才是店主），**由本节点审批创建**，全部在链下。
+ * 节点不读取任何 Registry；目录登记由 operator 钱包在客户端按目标目录完成。
+ * 商品上架/发货等写操作由 `roleOf(address, shopCode)` 判"他在**这家店**里是什么角色"。
+ *
+ * 零费模型：没有平台费、没有节点抽成；托管结算只有买家/卖家两条腿。
  *
  * 环境变量注入：启动时经 `node --env-file-if-exists=.env` 加载（见 package.json scripts）。
  */
@@ -79,6 +82,8 @@ function trustProxyOf(raw) {
     .filter(Boolean);
   if (!parts.length) return false;
   for (const p of parts) {
+    // Express 的 trust proxy 数组同时接受 'loopback' 和 CIDR；混合写法是默认部署拓扑。
+    if (p === 'loopback') continue;
     const pieces = p.split('/');
     if (pieces.length > 2 || !pieces[0] || !isIP(pieces[0])) {
       throw new Error(
@@ -102,7 +107,7 @@ function trustProxyOf(raw) {
 /**
  * 配置层的**版本唯一真相**：`node/package.json` 的 `version`。
  *
- * `/healthz`、`/api/shop`、`/api/shop/registry-info` 都读 `config.version`，
+ * `/healthz`、`/api/shop`、`/api/shop/node-identity` 都读 `config.version`，
  * 不在各接口里抄字面量——抄三份的结果是版本一升，某一个接口继续报旧版本（静默假话）。
  */
 const PKG_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -198,31 +203,36 @@ const config = {
   shutdownDrainMs: SHUTDOWN_DRAIN_MS,
 
   shop: {
-    // 店主钱包地址（0x...），必填——卖家身份锚点（SIWE 鉴权/收款人）。
-    // 唯一不可网页改的身份项：换店主=节点易主，走链上 transferNode 或关店重开。
+    // 节点 operator 钱包地址（0x...），必填——Escrow/Staking 的 owner，
+    // 也是节点级鉴权（isHost）的唯一锚点。节点不向任何 Registry 自报身份；
+    // 换 operator = 换一台机器（重新部署 + 各目录自行登记）。
     owner: process.env.MK_SHOP_OWNER || '',
     // 店名/公告/店员名单/通知 webhook 等经营参数一律是库里的列/行，
     // 在卖家面板「店铺设置」网页维护，不在配置文件出现。
+  },
+
+  /**
+   * 开店申请准入。免费 SIWE 的写入口：限流按 IP 挡不住"多 IP、多钱包"，
+   * 待审批队列必须有一个节点级容量上限，否则审核面会被灌到不可用。
+   * `0` = 不设上限（只建议在受控测试环境使用）。
+   */
+  applications: {
+    maxPending: intEnvAllowZero('MK_MAX_PENDING_APPLICATIONS', 500),
   },
 
   chain: {
     rpcUrl: process.env.MK_RPC_URL || 'https://mainnet.bityuan.com/eth',
     chainId: intEnv('MK_CHAIN_ID', 2999),
     // 托管/注册合约地址：代码不写死任何默认地址，由部署方经 .env 注入
-    // （当前主网批次的五项见 node/deploy-constants.json；部署与登记见 docs/DEPLOY_NODE.md §4）；
+    // （本节点只读自己的 Escrow/Staking；不读 Registry，目录登记由 operator 钱包在客户端完成）；
     // 留空 = 未接入对应能力（无 escrow 时仅浏览展示，不可下单）
-    // 支付币种全局约定为原生 BTY（2026-09 收敛：BTY 主网无 USDT/USDC 稳定币、
-    // WBTY 同名合约泛滥，不再支持 ERC20 支付配置，消除假币/approve 攻击面）
+    // 托管地址；支付资产是原生 BTY + 由节点库 payment_tokens / Escrow.supportedToken 双重准入的 ERC20
     escrowAddress: chainAddressOf('MK_ESCROW_ADDRESS', process.env.MK_ESCROW_ADDRESS),
-    registryAddress: chainAddressOf('MK_REGISTRY_ADDRESS', process.env.MK_REGISTRY_ADDRESS),
     /*
-      链上黑名单合约（`Blocklist`，owner 维护、全网共享；2026-10 多店批新增的第四个合约）。
-      留空 = 本节点不读链上名单（**不是**"名单为空"）：节点的下单闸与公开列表过滤里的
-      地址类/商品类判据随之整体不生效，而店铺类条目**仍然生效**——那一条在链上
-      `MarketplaceRegistry.shopListed` 里，节点通过既有的 `shops.listed` 镜像就能拿到。
-      代价如实写明：不配它，节点就**不能替买家拦下"全网已冻结的地址"**（只剩前端界面那一层）。
+      本节点的保证金合约（节点部署，与 escrow 一对一）。留空 = 未接入保证金层：
+      卖家不能质押，罚没/提货赔付路径不可用；节点仍可下单（托管本身不依赖 staking）。
     */
-    blocklistAddress: chainAddressOf('MK_BLOCKLIST_ADDRESS', process.env.MK_BLOCKLIST_ADDRESS),
+    stakingAddress: chainAddressOf('MK_STAKING_ADDRESS', process.env.MK_STAKING_ADDRESS),
     /*
       2026-10-18：删掉 `MK_ARBITER_ADDRESS`。仲裁人是**链上当前届委员会**（多个地址 + 阈值），
       节点侧只读 `Escrow.arbiters()`（见 chain.getCommittee）；留一份本地配置就是第二份真相——
@@ -444,7 +454,7 @@ const config = {
   /*
     证据附件的落盘根目录。旧实现默认"取数据库文件所在目录"，
     而 MySQL 没有库文件——留空时由 evidenceFiles.js 回落到进程工作目录下的 attachments/，
-    容器部署请用 MK_ATTACH_DIR 显式指向挂载卷（见 deploy/README.md）。
+    容器部署必须用 MK_ATTACH_DIR 显式指向挂载卷。
   */
   get attachDir() { return process.env.MK_ATTACH_DIR || ''; },
 

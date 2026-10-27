@@ -56,8 +56,20 @@ export async function logAudit({ req, actor, actorRole, action, targetType, targ
     );
   }
   const shop = shopCode === null ? null : String(shopCode);
+  /*
+    角色判定失败时 `roleOf` 会返回 'user'（链上员工白名单读不到），但**鉴权中间件在动作前
+    已经成功判定过角色**并把结果挂在 `req.shopRole`。这里优先使用那次判据：动作已经发生，
+    不能因为动作之后的一次 RPC 抖动把审计行静默丢掉。仅 'user' 兜底，不覆盖显式传入的
+    host/owner/staff——那才是调用方对本店事实的断言。
+  */
+  const roleHint = actorRole === 'user'
+    && req?.shopRole
+    && req.shopRole !== 'user'
+    && (shopCode === null || req.shop?.code === shopCode)
+    ? req.shopRole
+    : actorRole;
   // 仅店主/店员的管理动作入审计（买家动作不进——资金/退款由链上事件史与证据覆盖）
-  if (actorRole === 'user') return;
+  if (roleHint === 'user') return;
   /*
     角色**逐字落库**（host/owner/staff），不再把非 owner 一律折成 operator。
     多店之后"以什么身份动的手"是审计要回答的核心问题之一：同一个地址可以是
@@ -66,9 +78,9 @@ export async function logAudit({ req, actor, actorRole, action, targetType, targ
     一个角色字段写不进去就整条丢掉，但也不能静默地把一次身份不明的动作说成正常。
     （列是 ENUM('host','owner','staff')：给一个枚举外的值，MySQL STRICT 模式会直接拒绝整行。）
   */
-  const role = ['host', 'owner', 'staff'].includes(String(actorRole)) ? String(actorRole) : '';
+  const role = ['host', 'owner', 'staff'].includes(String(roleHint)) ? String(roleHint) : '';
   if (!role) {
-    console.warn(`[audit] 调用方未给出合法 actorRole（${actorRole}），本次按 owner 落库：${action}`);
+    console.warn(`[audit] 调用方未给出合法 actorRole（${roleHint}），本次按 owner 落库：${action}`);
   }
   try {
     const db = getDb();
@@ -150,8 +162,68 @@ export async function logAudit({ req, actor, actorRole, action, targetType, targ
   }
 }
 
+/** 审计行 → 对外 DTO（**唯一一份**：列表与 CSV 导出共用；不含 prev_hash/entry_hash，见下） */
+function auditRowDto(r) {
+  return {
+    id: r.id,
+    // `at` 是 DATETIME(3) → `Date`：对外 JSON 自动是 ISO-8601（与全仓时间口径一致）
+    at: r.at,
+    actor: r.actor,
+    actorRole: r.actor_role,
+    action: r.action,
+    targetType: r.target_type,
+    targetId: r.target_id,
+    // JSON 列由驱动解成对象（db.js 的 baseConnectionOptions 没开 jsonStrings）。
+    // 旧实现这里 JSON.parse 一次——那是 detail 还是 TEXT 时的形状；换成 JSON 列之后
+    // 再 parse 一个对象会抛，而抛在这里等于整个审计列表 500。
+    detail: r.detail ?? {},
+    ip: r.ip,
+  };
+}
+
 /**
- * 审计**列表**查询（按店铺维度过滤；分页倒序；action/actor 可选过滤）。
+ * 列表/导出的 WHERE 与参数（**唯一一份**：两处各拼一次必然在加过滤条件时漂移）。
+ *
+ * `targetShop`（仅节点级查询）只出**指向某家店**的节点级动作。归属不在 `shop_code`
+ * （这些行 `shop_code` 为 NULL，留给节点主看），而在 target/detail：
+ *   · 店铺暂停/恢复：`target_type='shop' AND target_id=code`；
+ *   · 商品强制下架/恢复：`target_type='product' AND detail.shopCode=code`；
+ *   · 开店审批通过：`target_type='shop_application' AND detail.code=code`。
+ * 只对 `shopCode: null` 有意义；与本店查询组合没有语义，直接抛错。
+ */
+function auditWhere({ action, actor, shopCode, targetShop }) {
+  if (shopCode === undefined) {
+    throw new TypeError(
+      'queryAudit/exportAudit 缺少 shopCode：本店审计传店铺编号，节点级审计**显式**传 null。' +
+        '漏给等于把整个节点的审计行读出来——这正是这次要消灭的那个洞。'
+    );
+  }
+  const where = [shopCode === null ? 'shop_code IS NULL' : 'shop_code = ?'];
+  const params = shopCode === null ? [] : [String(shopCode)];
+  if (action) {
+    where.push('action = ?');
+    params.push(String(action));
+  }
+  if (actor) {
+    where.push('actor = ?');
+    params.push(String(actor).toLowerCase());
+  }
+  if (targetShop) {
+    if (shopCode !== null) {
+      throw new TypeError('targetShop 只用于节点级审计查询（shopCode 必须显式传 null）');
+    }
+    where.push(`(
+      (target_type = 'shop' AND target_id = ?)
+      OR (target_type = 'shop_application' AND detail->>'$.code' = ?)
+      OR (target_type = 'product' AND detail->>'$.shopCode' = ?)
+    )`);
+    params.push(String(targetShop), String(targetShop), String(targetShop));
+  }
+  return { whereSql: 'WHERE ' + where.join(' AND '), params };
+}
+
+/**
+ * 审计**列表**查询（按店铺维度过滤；分页倒序；action/actor/targetShop 可选过滤）。
  *
  * @param {string|null} shopCode **必填**（与 logAudit 同一口径）：9 位编号 = 那家店的审计行；
  *   `null` = **节点级**行（不属于任何店）。`undefined` 抛错——"忘了给"不等于"节点级"：
@@ -174,45 +246,28 @@ export async function logAudit({ req, actor, actorRole, action, targetType, targ
  * 编号是同一事实的第二份副本（而且它会诱使前端按行再筛一次——那正是"渲染层当安全边界"的形状，
  * 本仓在订单列表那里已经明确否掉过）。
  */
-export async function queryAudit({ page = 1, pageSize = 30, action, actor, shopCode }) {
-  if (shopCode === undefined) {
-    throw new TypeError(
-      'queryAudit 缺少 shopCode：本店审计传店铺编号，节点级审计**显式**传 null。' +
-        '漏给等于把整个节点的审计行读出来——这正是这次要消灭的那个洞。'
-    );
-  }
-  const where = [shopCode === null ? 'shop_code IS NULL' : 'shop_code = ?'];
-  const params = shopCode === null ? [] : [String(shopCode)];
-  if (action) {
-    where.push('action = ?');
-    params.push(String(action));
-  }
-  if (actor) {
-    where.push('actor = ?');
-    params.push(String(actor).toLowerCase());
-  }
+export async function queryAudit({ page = 1, pageSize = 30, action, actor, shopCode, targetShop }) {
+  const { whereSql, params } = auditWhere({ action, actor, shopCode, targetShop });
   const db = getDb();
-  const whereSql = 'WHERE ' + where.join(' AND ');
   const total = Number((await db.get(`SELECT COUNT(*) AS c FROM audit_logs ${whereSql}`, ...params)).c);
   const rows = await db.all(`SELECT * FROM audit_logs ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`, ...params, pageSize, (page - 1) * pageSize);
   return {
     total,
     page,
     pageSize,
-    items: rows.map((r) => ({
-      id: r.id,
-      // `at` 是 DATETIME(3) → `Date`：对外 JSON 自动是 ISO-8601（与全仓时间口径一致）
-      at: r.at,
-      actor: r.actor,
-      actorRole: r.actor_role,
-      action: r.action,
-      targetType: r.target_type,
-      targetId: r.target_id,
-      // JSON 列由驱动解成对象（db.js 的 baseConnectionOptions 没开 jsonStrings）。
-      // 旧实现这里 JSON.parse 一次——那是 detail 还是 TEXT 时的形状；换成 JSON 列之后
-      // 再 parse 一个对象会抛，而抛在这里等于整个审计列表 500。
-      detail: r.detail ?? {},
-      ip: r.ip,
-    })),
+    items: rows.map(auditRowDto),
   };
+}
+
+/**
+ * 审计行**全量**（CSV 导出用，不分页）。`shopCode` 必填（与 queryAudit 同一归属纪律）。
+ *
+ * 不返回 `prev_hash` / `entry_hash`：节点级导出只是整条哈希链上的一个**子集**
+ * （各店的行被过滤掉了），把哈希带进文件会让读者把"相邻两行接不上"读成"链条断了"。
+ * 导出是给人看/对账的，链校验仍只有 `verifyAuditChain` 一处。
+ */
+export async function exportAudit({ action, actor, shopCode }) {
+  const { whereSql, params } = auditWhere({ action, actor, shopCode });
+  const rows = await getDb().all(`SELECT * FROM audit_logs ${whereSql} ORDER BY id ASC`, ...params);
+  return rows.map(auditRowDto);
 }

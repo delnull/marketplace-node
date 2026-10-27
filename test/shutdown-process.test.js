@@ -62,7 +62,6 @@ function startNode(extraEnv = {}) {
       MK_SHOP_OWNER: '0x' + '11'.repeat(20),
       // 不接链：本用例测退出路径，链上部分只拖慢启动并引入外部依赖
       MK_ESCROW_ADDRESS: '',
-      MK_REGISTRY_ADDRESS: '',
       MK_PII_RETENTION_DAYS: '0',
       MK_SHUTDOWN_DRAIN_MS: '5000',
       MK_SHUTDOWN_ON_STDIN_EOF: '1',

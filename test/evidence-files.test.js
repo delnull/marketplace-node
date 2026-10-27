@@ -275,6 +275,12 @@ test('配额：单条 ≤6 个、订单累计 ≤20MB', async () => {
   await submitEvidence(order.id, { phase: 'refund_request', content: '配额' }, buyerToken);
   const evId = await latestEvidenceId(order.id);
 
+  // 单请求 7 个：必须在写盘前按条数拒绝（不能先写 7 个再回滚）
+  const seven = Array.from({ length: 7 }, (_, i) => ({ name: `bad${i}.png`, mime: 'image/png', dataB64: b64(pngBytes(i + 1, 64)) }));
+  let tooMany = await uploadFiles(order.id, evId, seven, buyerToken);
+  assert.notEqual(tooMany.body.code, 0);
+  assert.match(tooMany.body.message || '', /6 个附件/);
+
   const six = Array.from({ length: 6 }, (_, i) => ({ name: `f${i}.png`, mime: 'image/png', dataB64: b64(pngBytes(i + 1, 64)) }));
   assertOk(await uploadFiles(order.id, evId, six, buyerToken));
   // 第 7 个（同一 evidence）→ 条数上限

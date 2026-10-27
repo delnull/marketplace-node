@@ -309,10 +309,12 @@ export async function releaseRefundedEscrow(escrowOrderId) {
 
 /**
  * 恢复占位（sync/watcher 将 cancelled 恢复为 escrowed 前调用）：
- *  - 从未占位（hold_qty=0，不限量期下单）→ 无需恢复，成功；
- *  - 商品已改为不限量 → 旧占位作废（与释放守卫同口径），标记已释放并成功；
+ *  - 从未占位（hold_qty=0）且当前组合仍不限量（含池式商品）→ 无需恢复，成功；
+ *  - 从未占位、但组合在取消后被改为限量 → **按当前容量补占位**（不补就是 committed 少记 ⇒ 超卖）；
+ *  - 商品/SKU 已不存在 → 不能把"没有库存行"当成功（那会让调用方静默放过一次无法履行的付款）；
  *  - 商品仍限量 → 条件占位 hold_qty 件，容量不足（取消期间被卖完）返回 false，由调用方告警。
- * 恢复成功后清空 released_at（该行回到占用态，将来可再次正常释放）。
+ * 恢复成功后清空 released_at（该行回到占用态，将来可再次正常释放）；从未占位的行没有
+ * released_at 可清，靠 `hold_qty = 0 → quantity` 的条件更新做原子认领。
  *
  * @param {number} orderId 订单**内部键**（`orders.id` / `v_orders.order_id`）
  */
@@ -322,14 +324,36 @@ export async function restockOrder(orderId) {
   // 事务外读到的是别人也能改的快照（取消期与恢复期并发的两条路径都会走这里）。
   return await withTransaction(async () => {
     const db = getDb();
-    const row = await db.get('SELECT id, product_id, sku_key, quantity, hold_qty, released_at FROM orders WHERE id = ?', id);
-    if (!row || row.product_id == null) return true; // 商品已删：无库存可占，视为成功
+    // FOR UPDATE：同一单的两个恢复入口（watcher / sync / 对账）必须串行，否则 hold_qty=0 的
+    // 补占位会各加一次 committed（幻影占额，和漏占一样是账目错误）。
+    const row = await db.get(
+      'SELECT id, product_id, sku_key, quantity, hold_qty, released_at FROM orders WHERE id = ? FOR UPDATE',
+      id
+    );
+    if (!row || row.product_id == null) return false; // 商品已删：没有可占的库存行，由调用方告警
     const hold = row.hold_qty || 0;
-    if (hold <= 0) return true; // 从未占位（不限量期下单），无可恢复
-    if (row.released_at == null) return true; // 未释放过（未被取消流程回补），无需恢复
+    if (hold > 0 && row.released_at == null) return true; // 未释放过（未被取消流程回补），无需恢复
     const skuKey = String(row.sku_key ?? '');
     const p = await db.get('SELECT capacity FROM product_skus WHERE product_id = ? AND sku_key = ?', row.product_id, skuKey);
-    if (!p) return true; // 组合已不存在（商品被改规格/删除）：无可占库存，视为成功
+    if (!p) return false; // 组合已不存在：不能静默当成“没库存可占”
+    if (hold <= 0) {
+      /*
+        从未占位（下单时该组合不限量）→ 取消/恢复期间卖家把它改成了限量。
+        此刻必须按**当前**容量补占位；否则 committed 少记，后续同组合还能再卖，形成超卖。
+        池式商品（码/NFT）的 capacity 恒 NULL，走下面的“不限量”分支，不在这里占。
+      */
+      if (p.capacity === null) return true;
+      const qty = Number(row.quantity) || 0;
+      if (qty <= 0) return false;
+      const held = await db.run(
+        'UPDATE product_skus SET committed = committed + ? WHERE product_id = ? AND sku_key = ? AND capacity IS NOT NULL AND committed + ? <= capacity',
+        qty, row.product_id, skuKey, qty
+      );
+      if (held.changes !== 1) return abortTx(false);
+      const marked = await db.run('UPDATE orders SET hold_qty = ?, released_at = NULL WHERE id = ? AND hold_qty = 0', qty, row.id);
+      if (marked.changes !== 1) return abortTx(false);
+      return true;
+    }
     if (p.capacity === null) {
       // 该组合已改为不限量：旧占位作废，标记该行无需再恢复（仍保持 released 语义）
       await db.run('UPDATE orders SET hold_qty = 0 WHERE id = ?', row.id);

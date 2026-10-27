@@ -34,7 +34,6 @@
 #      -Bind 0.0.0.0           监听地址（配了本机 TLS 默认 127.0.0.1；证书在别处时默认 0.0.0.0）
 #      -Dir C:\marketplace-node   代码/配置/数据/日志所在目录
 #      -Service marketplace-node  计划任务名与数据目录名（同机开第二家店必须换）
-#      -NoRegister             跳过链上登记（稍后到前端「开店向导」补）
 #      -NodeVersion 24.21.0    没有 Node 时要装的版本（默认取常量里的 24 线）
 #      -Mirror https://npmmirror.com/mirrors/node   国内下载 Node 的镜像（默认走官方 nodejs.org）
 # =============================================================================
@@ -48,7 +47,6 @@ param(
   [switch]$Purge,
   [switch]$Help,
   [switch]$Yes,
-  [switch]$NoRegister,
 
   [string]$Owner = '',
   [string]$Domain = '',
@@ -102,16 +100,15 @@ $FrontendOrigin = Get-Const 'network.frontendOrigin' 'network.frontendOrigin'
 $RpcUrl         = Get-Const 'network.rpcUrl'         'network.rpcUrl'
 $ChainId        = Get-Const 'network.chainId'        'network.chainId'
 $Escrow         = Get-Const 'contracts.escrow'       'contracts.escrow'
-$Registry       = Get-Const 'contracts.registry'     'contracts.registry'
-$Blocklist      = Get-Const 'contracts.blocklist'    'contracts.blocklist'
+$Staking        = Get-Const 'contracts.staking'      'contracts.staking'
 $StartBlock     = Get-Const 'contracts.startBlock'   'contracts.startBlock'
 $ContainerPort  = Get-Const 'runtime.containerPort'  'runtime.containerPort'
 $DefaultService = Get-Const 'runtime.serviceName'    'runtime.serviceName'
 
 # 结构性门禁（与 deploy.sh 同一判据）：「是不是上一批已弃用的那个合法地址」脚本无法判断，
 # 只能由部署者按发布检查表核对；这里挡住的是"形状就不对"。
-if ($Escrow -notmatch '^0x[0-9a-fA-F]{40}$' -or $Registry -notmatch '^0x[0-9a-fA-F]{40}$' -or $Blocklist -notmatch '^0x[0-9a-fA-F]{40}$' -or [int]$StartBlock -le 0) {
-  Die "deploy-constants.json 的合约常量不合法：escrow=$Escrow registry=$Registry blocklist=$Blocklist startBlock=$StartBlock（起始块不能是 0：0 = 从最新块开始 ⇒ 漏扫历史事件且不报错；Blocklist 是 Registry 的 immutable，必须与 Registry 同批）"
+if ($Escrow -notmatch '^0x[0-9a-fA-F]{40}$' -or $Staking -notmatch '^0x[0-9a-fA-F]{40}$' -or [int]$StartBlock -le 0) {
+  Die "deploy-constants.json 的合约常量不合法：escrow=$Escrow staking=$Staking startBlock=$StartBlock（起始块不能是 0：0 = 从最新块开始 ⇒ 漏扫历史事件且不报错；Escrow/Staking 必须由本节点部署、互相回指、owner=本节点 operator）"
 }
 
 # ── 模式 ──
@@ -314,8 +311,8 @@ function Write-EnvFile {
   param([string]$OwnerAddr, [string]$DomainName, [string]$Secret)
 
   $MANAGED = @(
-    'MK_PORT', 'MK_SHOP_OWNER', 'MK_RPC_URL', 'MK_CHAIN_ID', 'MK_ESCROW_ADDRESS', 'MK_REGISTRY_ADDRESS',
-    'MK_BLOCKLIST_ADDRESS', 'MK_ESCROW_START_BLOCK', 'MK_ESCROW_TIMEOUT_BLOCKS', 'MK_ESCROW_FINALITY_BLOCKS', 'MK_ESCROW_POLL_MS',
+    'MK_PORT', 'MK_SHOP_OWNER', 'MK_RPC_URL', 'MK_CHAIN_ID', 'MK_ESCROW_ADDRESS',
+    'MK_STAKING_ADDRESS', 'MK_ESCROW_START_BLOCK', 'MK_ESCROW_TIMEOUT_BLOCKS', 'MK_ESCROW_FINALITY_BLOCKS', 'MK_ESCROW_POLL_MS',
     'MK_CHAIN_RECONCILE_MS', 'MK_CORS_ORIGIN', 'MK_CORS_ALLOW_ALL', 'MK_ATTACH_DIR',
     'MK_AUTO_DELIVER', 'MK_PII_RETENTION_DAYS', 'MK_BTY_TTL_MS', 'MK_DRAFT_TTL_MINUTES', 'MK_REVIEW_TTL_DAYS',
     'MK_TOKEN_TTL', 'MK_SIWE_TTL', 'MK_TOKEN_SECRET', 'MK_SIWE_DOMAIN'
@@ -349,8 +346,7 @@ function Write-EnvFile {
     "MK_RPC_URL=$RpcUrl"
     "MK_CHAIN_ID=$ChainId"
     "MK_ESCROW_ADDRESS=$Escrow"
-    "MK_REGISTRY_ADDRESS=$Registry"
-    "MK_BLOCKLIST_ADDRESS=$Blocklist"
+    "MK_STAKING_ADDRESS=$Staking"
     "MK_ESCROW_START_BLOCK=$StartBlock"
     "MK_ESCROW_TIMEOUT_BLOCKS=$($C.appDefaults.MK_ESCROW_TIMEOUT_BLOCKS)"
     "MK_ESCROW_FINALITY_BLOCKS=$($C.appDefaults.MK_ESCROW_FINALITY_BLOCKS)"
@@ -587,7 +583,7 @@ Write-Log ''
 Write-Info "店主地址：$Owner"
 Write-Info "对外域名：$(if ($Domain) { "https://$Domain" } else { '（未指定，节点不会被买家发现）' })"
 Write-Info "HTTPS   ：$TlsMode"
-Write-Info "合约：Escrow=$Escrow  Registry=$Registry  Blocklist=$Blocklist（自 deploy-constants.json）"
+Write-Info "合约：Escrow=$Escrow  Staking=$Staking（自 deploy-constants.json）"
 
 # =============================================================================
 # ④ 写配置
@@ -647,7 +643,7 @@ if (-not $healthy) {
 }
 $hh = Test-Health
 Write-Ok "探活通过：code=0"
-Write-Info "  escrowAddress=$($hh.Raw.data.escrowAddress)  owner=$($hh.Raw.data.owner)"
+Write-Info "  escrowAddress=$($hh.Raw.data.escrowAddress)  host=$($hh.Raw.data.host)"
 $w = $hh.Raw.data.watcher
 Write-Info "  watcher: cursor=$($w.cursor) latest=$($w.latest) lag=$($w.lagBlocks) lastError=$($w.lastError)"
 if ($hh.Raw.data.escrowAddress -and $hh.Raw.data.escrowAddress.ToLower() -ne $Escrow.ToLower()) {
@@ -709,7 +705,7 @@ Write-Ok "状态已记录：$STATE_FILE"
 # =============================================================================
 # ⑨ 链上登记（可选）
 # =============================================================================
-if (-not $NoRegister -and $Domain -and $MODE -ne 'update') {
+if ($Domain -and $MODE -ne 'update') {
   Write-Log ''
   Write-Info "还差一步买家才能发现你：到 $FrontendOrigin 的「开店/登记我的节点」用钱包完成链上登记"
   Write-Info "  （登记 endpoint = https://$Domain；未登记时前端聚合列表里不会有这家店）"

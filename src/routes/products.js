@@ -1,8 +1,12 @@
 /**
- * 商品路由（本节点 = 一家店，商品由店主维护）。
+ * 商品路由（本节点可有多家店，商品由各店店主/店员维护；节点管理员只做可见性治理）。
  *
  *  GET    /api/products            公开分页列表（附汇率快照，供前端换算展示）
- *  GET    /api/products/:slug      公开详情（含快照字段，买家可本地校验 snapshotHash；已下架商品匿名 404，仅 staff 登录可预览）
+ *  GET    /api/products/:slug      公开详情（含快照字段，买家可本地校验 snapshotHash；已下架/被节点隐藏的商品匿名 404，仅本店 staff 可预览）
+ *  GET    /api/products/admin/all              节点管理员（nodeAdmin）：本节点全部店铺的商品（含草稿/店主下架/节点隐藏）
+ *  GET    /api/products/admin/:slug            节点管理员：预览任意商品（含已隐藏/草稿，只读）
+ *  PATCH  /api/products/admin/moderation       节点管理员：批量强制下架/恢复展示 {slugs, hidden, reason}
+ *  PATCH  /api/products/admin/:slug/moderation 节点管理员：强制下架/恢复展示 {hidden, reason}
  *  POST   /api/products            店主/操作员（staff）上架（SIWE Bearer）
  *  PATCH  /api/products/:slug      店主/操作员（staff）更新/上下架
  *  POST   /api/products/:slug/codes        店主/操作员导入兑换码池 {codes: string[]}（staff，数字商品）
@@ -56,12 +60,23 @@ import config from '../config.js';
 import { getDb, withTransaction, abortTx } from '../db.js';
 import { getRates } from '../rates.js';
 import { verifyToken } from '../auth.js';
-import { isAddress, isZeroAddress, blockedProductSlugs } from '../chain.js';
+import { isAddress, isZeroAddress } from '../chain.js';
 import { ok, fail, wrap, makeAuthMiddleware, bearerToken, listedShopScope } from '../http.js';import { productReviews, productReviewSummary } from '../reviews.js';
 import { logAudit } from '../audit.js';
-import { roleOf, isStaff } from '../auth.js';
-// 店铺判据（"能不能卖"的唯一实现与唯一文案）：上架/改价/导池的闸都接它
-import { sellableError, notSellableReason, shopRowByCode } from '../shops.js';
+import { notifyRaw } from '../webhook.js';
+import { roleOf, isStaff, isHost } from '../auth.js';
+// 店铺判据（"能不能卖"的唯一实现与唯一文案）：上架/改价/导池的闸都接它；
+// 商品公开可见性的 SQL 判据也在这里（productPublicSql），公开列表/分面/建单共用同一份
+import {
+  sellableError,
+  notSellableReason,
+  shopRowByCode,
+  shopDisplayName,
+  shopDto,
+  nodeOwner,
+  isShopCodeShape,
+  productPublicSql,
+} from '../shops.js';
 import { newProductSlug } from '../ids.js';
 import { normalizeBlocks, deriveDescription, parseBlocks } from '../describeBlocks.js';
 import { tryAutoDeliverPendingForProduct } from '../autoDeliver.js';
@@ -132,7 +147,7 @@ const audit = async (req, action, targetType, targetId, detail) =>
     actor: req.auth?.address,
     // 角色取**这家店**里的角色：多店之后同一地址在不同店里身份可以不同，
     // 而"他在哪家店、以什么身份上架/改价"正是审计要回答的问题
-    actorRole: await roleOf(req.auth?.address || '', req.shop.code),
+    actorRole: req.shopRole && req.shopRole !== 'user' ? req.shopRole : await roleOf(req.auth?.address || '', req.shop.code),
     shopCode: req.shop.code,
     action,
     targetType,
@@ -140,9 +155,88 @@ const audit = async (req, action, targetType, targetId, detail) =>
     detail,
   });
 
+/**
+ * **节点级**商品处置的审计（节点主 ∪ 员工）。
+ *
+ * `shop_code: null` 与开店审批同一口径：这是节点治理动作，行必须留在节点主的审计视野里；
+ * 目标店写在 detail 里。店主看得到结果（`node_hidden_reason`），但不该从自己店的审计页
+ * 读到"节点主在处置别家店"的动作。
+ */
+const nodeAudit = async (req, action, targetType, targetId, detail) =>
+  logAudit({
+    req,
+    actor: req.auth?.address,
+    actorRole: (await isHost(req.auth?.address)) ? 'host' : 'staff',
+    shopCode: null,
+    action,
+    targetType,
+    targetId,
+    detail,
+  });
+
+/**
+ * **节点商品处置的唯一内核**：单品与批量都走这里。
+ *
+ * 一次事务里锁行、判状态、写状态；事务提交后逐件写节点级审计并推卖家 webhook。
+ * 这样"单品"与"批量"不可能在状态条件、时间戳清空、审计字段或通知上漂移——
+ * 新增第三个入口时只要调用它，就自动具备同一套语义。
+ *
+ * 返回 `{ missing }` = 有 slug 不存在（**整批不写**）；否则返回 `{ changed }`
+ * （只含真正从目标状态反转的行；已在目标状态的行不重复写、不重复通知）。
+ */
+async function moderateNodeProducts({ req, slugs, hidden, reason, batch = false }) {
+  const db = getDb();
+  const out = await withTransaction(async () => {
+    const marks = slugs.map(() => '?').join(',');
+    /*
+      行锁把"读现有状态 → 判断要不要写"锁在同一事务里：两个节点管理员同时点批量下架时，
+      后到的那一批看到的是已下架状态，只会记 unchanged，不会写出第二条审计/通知。
+    */
+    const rows = await db.all(
+      `SELECT id, slug, title, shop_code, node_hidden, node_hidden_reason, node_hidden_at
+         FROM products WHERE slug IN (${marks}) FOR UPDATE`,
+      ...slugs
+    );
+    const found = new Set(rows.map((r) => String(r.slug)));
+    const missing = slugs.filter((s) => !found.has(s));
+    if (missing.length) return { missing };
+    const changed = rows.filter((r) => (Number(r.node_hidden) === 1) !== hidden);
+    for (const r of changed) {
+      await db.run(
+        'UPDATE products SET node_hidden = ?, node_hidden_reason = ?, node_hidden_at = IF(?, CURRENT_TIMESTAMP(3), NULL) WHERE id = ?',
+        hidden ? 1 : 0,
+        hidden ? reason : '',
+        hidden ? 1 : 0,
+        r.id
+      );
+    }
+    return { changed };
+  });
+
+  if (out.missing) return out;
+  for (const r of out.changed) {
+    await nodeAudit(req, hidden ? 'product.node_hide' : 'product.node_restore', 'product', r.slug, {
+      shopCode: r.shop_code,
+      title: r.title,
+      reason: hidden ? reason : '',
+      ...(batch ? { batch: true, batchSize: out.changed.length } : {}),
+    });
+    // 店主应该立刻知道自己的商品被强制下架/恢复（而不是下次打开面板才发现）。
+    // fire-and-forget：未配置 webhook 时零开销；投递失败由 webhook 自己留痕，不回滚治理动作。
+    void notifyRaw(hidden ? 'product.node_hide' : 'product.node_restore', {
+      shopCode: r.shop_code,
+      slug: r.slug,
+      title: r.title,
+      reason: hidden ? reason : '',
+    });
+  }
+  return out;
+}
+
 const router = Router();
 const staffOnly = makeAuthMiddleware(verifyToken, { staffOnly: true }); // P1-⑤：商品经营面=店主+店员
 const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true }); // 池清空/敏感资源批量作废=仅店主
+const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true }); // 节点侧强制下架/恢复（节点主∪员工）
 
 /**
  * 卖家面按 slug 取商品行 —— **唯一入口**（取行 + 归属校验 + 写动作的"能不能卖"闸一起做）。
@@ -489,6 +583,29 @@ export async function loadSkus(productId) {
   return await getDb().all('SELECT * FROM product_skus WHERE product_id = ? ORDER BY sku_key', productId);
 }
 
+/**
+ * 列表页一次读回所有 SKU 并按 product_id 分组（防 N+1：20 个商品原来 20 条
+ * `SELECT ... WHERE product_id = ?`，在共享 MySQL 上就是 20 次网络往返）。
+ * 返回**新行对象**并挂 `skus`，与 withSkus 的形状一致；只给确实有 id 的行挂。
+ */
+async function withSkusBatch(rows) {
+  if (!rows.length) return rows;
+  const ids = rows.map((r) => r.id).filter((id) => id != null);
+  if (!ids.length) return rows;
+  const marks = ids.map(() => '?').join(',');
+  const all = await getDb().all(
+    `SELECT * FROM product_skus WHERE product_id IN (${marks}) ORDER BY product_id, sku_key`,
+    ...ids
+  );
+  const by = new Map();
+  for (const s of all) {
+    const list = by.get(s.product_id) || [];
+    list.push(s);
+    by.set(s.product_id, list);
+  }
+  return rows.map((r) => (Array.isArray(r.skus) ? r : { ...r, skus: by.get(r.id) || [] }));
+}
+
 /** 给商品行挂上 skus（快照与 DTO 都要用；已挂则直接返回）。
  *  async：读的是异步数据层，返回 Promise——调用方**必须 await**（漏了的话快照里的 skus/sku_images
  *  会是空数组，买家侧立刻报假的「商品内容已被修改」）。 */
@@ -598,6 +715,15 @@ async function rowToPublic(row) {
      */
     nftContract: r.nft_contract,
     nftStandard: r.nft_standard,
+    /*
+      提货兑付政策（NFT 商品；**节点链下**，不进快照）：持有人据 claimInstructions 知道怎么提货，
+      claimWindowDays 告诉他提货窗口还剩多久（null = 不限期）。claimable=0 时其余三项没有意义，
+      但照实下发（前端不必按 claimable 决定字读不读它）。
+    */
+    claimable: Number(r.claimable) === 1,
+    claimType: r.claim_type,
+    claimWindowDays: r.claim_window_days ?? null,
+    claimInstructions: r.claim_instructions || '',
     specs: parseSpecsColumn(r),
     /**
      * 商品标签（类目）：**恒为数组**，空数组 = 无标签（**不是 null**——标签本来就是可选项，
@@ -635,6 +761,13 @@ async function rowToPublic(row) {
     committed,
     outOfStock: skus.length > 0 && skus.every((s) => !s.active || (s.capacity !== null && s.available <= 0)),
     active: !!r.active,
+    /**
+     * **节点侧强制下架**（与 active 正交）：店主改不动；恢复只能由节点管理员操作。
+     * 公开面读不到被隐藏的商品，只有本店经营人员能从 `/all` 与详情页看到这一档（含原因）。
+     */
+    nodeHidden: Number(r.node_hidden) === 1,
+    nodeHiddenReason: Number(r.node_hidden) === 1 ? String(r.node_hidden_reason || '') : '',
+    nodeHiddenAt: Number(r.node_hidden) === 1 ? (r.node_hidden_at ?? null) : null,
     /**
      * 首次上架时刻（ISO-8601 字符串，`Date.prototype.toJSON()`；`null` = **从未发布过**）。
      * 它不是状态：可见性只看 `active`；这一列只让界面把"未上架"分成两档——
@@ -680,6 +813,10 @@ const PRODUCT_WRITE_KEYS = new Set([
   'autoDeliver',
   'stockAlertAt',
   'active',
+  'claimable',
+  'claimType',
+  'claimWindowDays',
+  'claimInstructions',
 ]);
 
 /** 批量修改的 patch 键（同一道门的第二个入口；集合不同——批量不展开规格明细） */
@@ -805,7 +942,12 @@ function validateProduct(v) {
     }
     if (stockAlertAt === 0) stockAlertAt = null;
   }
-  const active = v.active === false || v.active === 0 ? 0 : 1;
+  let active = 1;
+  if (v.active !== undefined && v.active !== null) {
+    // 只接受布尔/0/1：字符串 "false" 曾被默认成 1，店主以为下架、实际仍在卖。
+    if (![true, false, 0, 1].includes(v.active)) errors.push('active 需为布尔值（true/false 或 1/0）');
+    else active = v.active === true || v.active === 1 ? 1 : 0;
+  }
   /*
     运费（实物，按单收取一次，微 USDT）：
      - 非负整数，上限 1e9 微 = 1000 USDT（比价上限还高一个量级即为误填/攻击面，明确拒绝而不是截断）；
@@ -873,6 +1015,36 @@ function validateProduct(v) {
   } catch (e) {
     errors.push(e.message);
   }
+  /*
+    提货声明（NFT 商品的**链下兑付政策**，见 src/nftClaim.js）：
+      · claimable 只有 kind='nft' 可为 1（其它类型带 1 是参数错误，不是静默归零）；
+      · claimType 是兑付形态（physical/digital/service），只在开提货时有意义；
+      · claimWindowDays：NULL = 不限期，>0 = 自交付订单终局起 N 天（上限 3650 天）；
+      · claimInstructions 是给持有人的兑付说明（纯文本 ≤500 字）。
+    这四项**不入商品快照**：改它们不该让已成交订单的快照哈希失效。
+  */
+  let claimable = 0;
+  if (v.claimable !== undefined && v.claimable !== null && v.claimable !== '') {
+    if (![true, false, 0, 1].includes(v.claimable)) {
+      errors.push('claimable 需为布尔值（true/false 或 1/0）');
+    } else if (v.claimable === true || v.claimable === 1) {
+      if (kind !== 'nft') errors.push('只有 NFT 商品可以开启提货兑付（claimable）');
+      else claimable = 1;
+    }
+  }
+  let claimType = 'physical';
+  if (v.claimType !== undefined && v.claimType !== null && v.claimType !== '') {
+    const ct = String(v.claimType).trim().toLowerCase();
+    if (!['physical', 'digital', 'service'].includes(ct)) errors.push('claimType 需为 physical / digital / service');
+    else claimType = ct;
+  }
+  let claimWindowDays = null;
+  if (v.claimWindowDays !== undefined && v.claimWindowDays !== null && v.claimWindowDays !== '') {
+    const d = Number(v.claimWindowDays);
+    if (!Number.isInteger(d) || d <= 0 || d > 3650) errors.push('claimWindowDays 需为 1..3650 的整数（留空 = 不限期）');
+    else claimWindowDays = d;
+  }
+  const claimInstructions = String(v.claimInstructions ?? '').trim().slice(0, 500);
   return {
     errors,
     value: {
@@ -886,6 +1058,10 @@ function validateProduct(v) {
       ageRestricted,
       nftContract,
       nftStandard,
+      claimable,
+      claimType,
+      claimWindowDays,
+      claimInstructions,
       specs,
       skus,
       tags,
@@ -1025,16 +1201,15 @@ router.get('/', listedShopScope, wrap(async (req, res) => {
 
   const db = getDb();
   /*
-    公开聚合列表的**两个正交判据**（缺一不可，不是替换关系）：
-      · `active = 1` —— 商品自己有没有上架（既有的判据，店主/店员在商品管理里控制）；
-      · `shops.listed = 1` —— **所属店铺**现在能不能接单（链上 `shopListed` 的镜像，
-        由 termsReconciler 写入；暂停接单的店铺，它的商品不进聚合）。
-    两条各自回答不同的问题：一件"已上架"的商品完全可能属于一家"已暂停接单"的店
-    （佣金条款谈崩就是这种情况），那时买家不该再看到它——否则点进去也下不了单。
-    **不在这里判店铺黑名单**：链上 `shopListed` 已经把黑名单算进去了（合约侧唯一判据），
-    再判一次就是第二处判据。
+    公开聚合列表的**三个正交判据**（缺一不可，不是替换关系）：
+      · `active = 1` —— 商品自己有没有上架（店主/店员在商品管理里控制）；
+      · `node_hidden = 0` —— 本节点有没有强制下架（节点管理员控制，店主改不动）；
+      · `shops.listed = 1` —— **所属店铺**现在能不能接单（节点主/员工暂停）。
+    三条各自回答不同的问题：一件"店主已上架"的商品完全可能被节点下架，也可能属于一家
+    "已暂停接单"的店，那时买家都不该再看到它——否则点进去也下不了单。
+    唯一拼法是 shops.js 的 `productPublicSql()`，列表/分面/建单闸共用，避免新增一个入口就漏一条。
   */
-  const where = ['active = 1', "shop_code IN (SELECT code FROM shops WHERE listed = 1)"];
+  const where = [productPublicSql()];
   const args = [];
   // 店铺作用域：带了 X-Mk-Shop 就只出这一家店的商品（listedShopScope 已保证该店可售）。
   if (req.shop) {
@@ -1088,56 +1263,13 @@ router.get('/', listedShopScope, wrap(async (req, res) => {
     where.push(`kind IN (${kinds.map(() => '?').join(',')})`);
     args.push(...kinds);
   }
-  /*
-    **链上名单的商品类条目**（`Blocklist` 的 `Product` 类，2026-10）。
-
-    为什么过滤必须落在 SQL 而不是取回来再筛：列表是**游标分页**（`LIMIT pageSize + 1`），
-    在内存里丢掉几行会让这一页少几件、`nextCursor` 仍指向正确位置，但"这一页有几件"与
-    "还有没有下一页"就开始互相矛盾（满页到底会多一次空请求、而少件会让买家以为卖完了）。
-    放进 `where` 之后，分页与计数仍然由数据库回答，与 `active`/`listed` 两个判据同一层。
-
-    三态纪律（与 `chain.blockPlacard` 的其它读法一致）：未配置合约 ⇒ 这道闸整体不生效（不查、不报错）；
-    配置了但读不到 ⇒ **拒绝返回列表**（fail-closed，理由可读）——"读不到名单"与"名单里没有它"是两件事，
-    把前者当后者就是让被冻结的商品照常出现在聚合页上。
-
-    条数上限：`Blocklist.MAX_BATCH` 是单次批量写的上限（100），而名单总量由 owner 控制。
-    这里对"单次查询能带的参数个数"设一个显式上限（500）：超了就有界失败并说清怎么办，
-    而不是让驱动在某个不可预期的条数上抛参数上限错误（那种失败发生在最不该出错的读路径上）。
-  */
-  if (config.chain.blocklistAddress) {
-    let blockedSlugs;
-    try {
-      blockedSlugs = await blockedProductSlugs();
-    } catch (e) {
-      return fail(
-        res,
-        `读不到链上黑名单（${e?.message || e}）：无法确认哪些商品已被全网冻结，本次按 fail-closed 不返回列表。` +
-          `请稍后重试；若确实不读链上名单，清空 MK_BLOCKLIST_ADDRESS（留空即关闭这道过滤）`,
-        503,
-        503
-      );
-    }
-    if (blockedSlugs.size > 500) {
-      return fail(
-        res,
-        `链上黑名单的商品类条目有 ${blockedSlugs.size} 条，超过本节点单次过滤上限（500 条）——` +
-          `请在治理侧收敛名单，或先清空 MK_BLOCKLIST_ADDRESS（那会让商品类过滤整体不生效，如实告知）`,
-        503,
-        503
-      );
-    }
-    if (blockedSlugs.size > 0) {
-      where.push(`slug NOT IN (${[...blockedSlugs].map(() => '?').join(',')})`);
-      args.push(...blockedSlugs);
-    }
-  }
 
   // 多取一行用于「是否还有下一页」的精确判定（避免满页到底时多一次空请求）
   const raw = await db.all(`SELECT * FROM products WHERE ${where.join(' AND ')} ORDER BY id ${order === 'desc' ? 'DESC' : 'ASC'} LIMIT ?`, ...args, pageSize + 1);
   const hasMore = raw.length > pageSize;
   const rows = hasMore ? raw.slice(0, pageSize) : raw;
 
-  const products = await Promise.all(rows.map((row) => rowToPublic(row)));
+  const products = await Promise.all((await withSkusBatch(rows)).map((row) => rowToPublic(row)));
   // 商品卡社会信号（P 评审 B12）：列表批量附评价聚合（一次 GROUP BY；avg/count 供卡片展示）
   if (rows.length) {
     const marks = rows.map(() => '?').join(',');
@@ -1262,8 +1394,7 @@ router.get('/tags', listedShopScope, wrap(async (req, res) => {
   const rows = await db.all(`WITH active AS (
          SELECT jt.k AS tag_key, jt.display AS tag_display
            FROM ${TAGS_FACET_FROM}
-          WHERE p.active = 1 AND jt.k IS NOT NULL
-            AND p.shop_code IN (SELECT code FROM shops WHERE listed = 1)${shopSql}
+          WHERE ${productPublicSql('p')} AND jt.k IS NOT NULL${shopSql}
        ),
        counts AS (
          SELECT tag_key, tag_display, COUNT(*) AS c FROM active GROUP BY tag_key, tag_display
@@ -1286,7 +1417,7 @@ router.get('/tags', listedShopScope, wrap(async (req, res) => {
   // total 只在被截断时才需要（未截断时 total === tags.length），避免每次请求都多一次聚合。
   // COUNT(DISTINCT) 跟着列声明的 utf8mb4_bin 走 ⇒ 与"键"的粒度一致（不会被大小写/全角合并）。
   const total = truncated
-    ? Number((await db.get(`SELECT COUNT(DISTINCT jt.k) AS c FROM ${TAGS_FACET_FROM} WHERE p.active = 1 AND jt.k IS NOT NULL AND p.shop_code IN (SELECT code FROM shops WHERE listed = 1)${shopSql}`, ...shopArgs)).c)
+    ? Number((await db.get(`SELECT COUNT(DISTINCT jt.k) AS c FROM ${TAGS_FACET_FROM} WHERE ${productPublicSql('p')} AND jt.k IS NOT NULL${shopSql}`, ...shopArgs)).c)
     : tags.length;
   ok(res, { tags, total, truncated });
 }));
@@ -1339,8 +1470,7 @@ router.get('/attributes', listedShopScope, wrap(async (req, res) => {
          SELECT SUBSTRING_INDEX(jt.pair, CHAR(0), 1) AS name_key, jt.name AS name_display,
                 SUBSTRING_INDEX(jt.pair, CHAR(0), -1) AS value_key, jt.value AS value_display
            FROM ${ATTRS_FACET_FROM}
-          WHERE p.active = 1 AND jt.pair IS NOT NULL
-              AND p.shop_code IN (SELECT code FROM shops WHERE listed = 1)${shopSql}
+          WHERE ${productPublicSql('p')} AND jt.pair IS NOT NULL${shopSql}
        ),
        counts AS (
          SELECT name_key, name_display, value_key, value_display, COUNT(*) AS c
@@ -1376,8 +1506,7 @@ router.get('/attributes', listedShopScope, wrap(async (req, res) => {
       Number((await db.get(`SELECT COUNT(*) AS c FROM (
              SELECT SUBSTRING_INDEX(jt.pair, CHAR(0), 1) AS name_key, SUBSTRING_INDEX(jt.pair, CHAR(0), -1) AS value_key
                FROM ${ATTRS_FACET_FROM}
-              WHERE p.active = 1 AND jt.pair IS NOT NULL
-              AND p.shop_code IN (SELECT code FROM shops WHERE listed = 1)${shopSql} GROUP BY name_key, value_key) AS pairs`, ...shopArgs)).c)
+              WHERE ${productPublicSql('p')} AND jt.pair IS NOT NULL${shopSql} GROUP BY name_key, value_key) AS pairs`, ...shopArgs)).c)
     : attributes.length;
   ok(res, { attributes, total, truncated });
 }));
@@ -1498,7 +1627,7 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
     }
   }
   // 池口径：poolBuilt=已建池资源总数（0=未建池，手动交付型）；poolUnused=未用数（0 且已建池=池空）
-  const products = await Promise.all(rows.map(async (r) => {
+  const products = await Promise.all((await withSkusBatch(rows)).map(async (r) => {
     const base = await rowToPublic(r);
     const alert = r.stock_alert_at;
     // 低库存：**任一组合**余量 ≤ 阈值即算（价格与库存逐组合不同，只看商品级汇总
@@ -1531,38 +1660,211 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
 }));
 
 /**
+ * 节点管理员：本节点**全部店铺**的商品（含草稿、店主下架、节点强制下架）。
+ *
+ * 为什么必须独立一条 `nodeAdmin` 路由，而不是给公开 `/` 加参数：
+ * 公开面的可见性由 `productPublicSql()` 一处决定（active + node_hidden + shop listed），
+ * 商品被节点下架后商店主和买家都看不到；节点管理员要恢复它，必须有一条**不受公开判据约束**
+ * 的读入口。参数只在这里生效，公开面无从绕过。
+ *
+ * 过滤：`q`（标题/标识/店铺名）、`shop`（店铺编号）、`hidden=1|0`（节点处置状态）、
+ * `sort=recent`（按上架倒序；店铺详情看"最近商品"用）。
+ * 游标分页与卖家 `/all` 同款：默认 `p.id > cursor` 升序；`sort=recent` 时 `p.id < cursor` 降序。
+ */
+router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
+  const q = String(req.query.q ?? '').trim().slice(0, 60);
+  const shop = String(req.query.shop ?? '').trim().toUpperCase();
+  if (shop && !isShopCodeShape(shop)) return fail(res, 'shop 需为 9 位店铺编号', 400, 400);
+  const hidden = String(req.query.hidden ?? '');
+  if (hidden !== '' && hidden !== '0' && hidden !== '1') return fail(res, 'hidden 只能是 1（只看已强制下架）或 0（只看未强制下架）', 400, 400);
+  const sort = String(req.query.sort ?? '');
+  if (sort && sort !== 'recent') return fail(res, 'sort 只能是 recent（或留空）', 400, 400);
+
+  const where = [];
+  const args = [];
+  if (sort === 'recent') {
+    const cursorRaw = String(req.query.cursor ?? '').trim();
+    if (cursorRaw) {
+      where.push('p.id < ?');
+      args.push(Math.max(0, parseInt(cursorRaw, 10) || 0));
+    }
+  } else {
+    const cursor = Math.max(0, parseInt(req.query.cursor, 10) || 0);
+    where.push('p.id > ?');
+    args.push(cursor);
+  }
+  if (shop) {
+    where.push('p.shop_code = ?');
+    args.push(shop);
+  }
+  if (hidden === '1') where.push('p.node_hidden = 1');
+  if (hidden === '0') where.push('p.node_hidden = 0');
+  if (q) {
+    // 与卖家 /all 同一套 LIKE 转义与大小写口径（库级 as_cs；搜索语义是大小写不敏感）
+    const like = `%${q.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
+    where.push(
+      "(p.title COLLATE utf8mb4_0900_ai_ci LIKE ? ESCAPE '\\\\'" +
+        " OR p.slug COLLATE utf8mb4_0900_ai_ci LIKE ? ESCAPE '\\\\'" +
+        " OR s.name COLLATE utf8mb4_0900_ai_ci LIKE ? ESCAPE '\\\\')"
+    );
+    args.push(like, like, like);
+  }
+  const rows = await getDb().all(
+    `SELECT p.id, p.slug, p.title, p.kind, p.active, p.node_hidden, p.node_hidden_reason,
+            p.node_hidden_at, p.updated_at, p.shop_code, s.name AS shop_name, s.listed AS shop_listed,
+            (SELECT MIN(k.price_usdt_micro) FROM product_skus k WHERE k.product_id = p.id) AS min_price
+       FROM products p JOIN shops s ON s.code = p.shop_code
+      WHERE ${where.length ? where.join(' AND ') : '1 = 1'}
+      ORDER BY p.id ${sort === 'recent' ? 'DESC' : 'ASC'} LIMIT ?`,
+    ...args,
+    pageSize + 1
+  );
+  const hasMore = rows.length > pageSize;
+  const page = hasMore ? rows.slice(0, pageSize) : rows;
+  ok(res, {
+    products: page.map((r) => ({
+      slug: r.slug,
+      title: r.title,
+      kind: r.kind,
+      shopCode: r.shop_code,
+      shopName: shopDisplayName({ name: r.shop_name }),
+      shopListed: Number(r.shop_listed) === 1,
+      active: !!r.active,
+      nodeHidden: Number(r.node_hidden) === 1,
+      nodeHiddenReason: String(r.node_hidden_reason || ''),
+      nodeHiddenAt: r.node_hidden_at ?? null,
+      priceUsdtMicro: r.min_price === null ? null : Number(r.min_price),
+      priceUsdt: r.min_price === null ? null : usdtOf(r.min_price),
+      updatedAt: r.updated_at,
+    })),
+    nextCursor: hasMore && page.length ? page[page.length - 1].id : null,
+  });
+}));
+
+/**
+ * 节点管理员：**预览任意一件商品**（含草稿、店主下架、节点强制下架）。
+ *
+ * 公开详情对这三类商品按 404 处理，而节点管理员在处置/复核时必须看得到内容本身
+ * （标题、描述、主图、参数、价格与店铺状态）——否则只能凭商品列表的一行字判断。
+ * 本端点只读，不改变任何状态；返回的是公开 DTO（不含码池/收货信息等卖家私域数据）。
+ */
+router.get('/admin/:slug', nodeAdmin, wrap(async (req, res) => {
+  const slug = String(req.params.slug || '').trim();
+  const row = await getDb().get('SELECT * FROM products WHERE slug = ?', slug);
+  if (!row) return fail(res, '商品不存在', 404, 404);
+  const shop = await shopRowByCode(row.shop_code);
+  if (!shop) return fail(res, '商品所属店铺不存在', 404, 404);
+  ok(res, {
+    product: await rowToPublic(row),
+    shop: shopDto(shop, await nodeOwner()),
+  });
+}));
+
+/**
+ * 节点管理员：**批量**强制下架 / 恢复（`PATCH /admin/moderation`）。
+ *
+ * 与单品处置同一套状态与审计，只是把「一次请求 N 件」收成一个事务：
+ *   · 全部 slug 必须存在（缺一件就整批拒绝，不出现"成功 7 件、失败 3 件"的模糊结果）；
+ *   · 已在目标状态的行计入 `unchanged`，不重复写、不重复通知；
+ *   · 下架必填原因，恢复清空原因与处置时刻；
+ *   · 每个真正变化的商品各留一条节点级审计（批量动作可逐件追溯），并各推一条卖家 webhook。
+ *
+ * 上限 100 与卖家批量接口同口径：超过就明确拒绝，不静默截断。
+ */
+router.patch('/admin/moderation', nodeAdmin, wrap(async (req, res) => {
+  const raw = req.body?.slugs;
+  if (!Array.isArray(raw)) return fail(res, 'slugs 需为商品标识数组（1..100）', 400, 400);
+  const slugs = [...new Set(raw.map((s) => String(s ?? '').trim()).filter(Boolean))];
+  if (!slugs.length) return fail(res, 'slugs 需为非空数组（1..100）', 400, 400);
+  if (slugs.length > 100) return fail(res, `批量处置单次上限 100 件（实际 ${slugs.length} 件）——请分批操作`, 400, 400);
+  const hidden = req.body?.hidden;
+  if (typeof hidden !== 'boolean') return fail(res, 'hidden 需为布尔值（true=强制下架，false=恢复展示）', 400, 400);
+  const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
+  if (hidden && !reason) return fail(res, '强制下架必须填写原因（≤200 字，店主会在商品管理页看到）', 400, 400);
+
+  const out = await moderateNodeProducts({ req, slugs, hidden, reason, batch: true });
+  if (out.missing) {
+    const shown = out.missing.slice(0, 10).join('、');
+    return fail(res, `这些商品不存在（整批未执行）：${shown}${out.missing.length > 10 ? ' …' : ''}`, 404, 404);
+  }
+  const changed = out.changed || [];
+  ok(
+    res,
+    {
+      hidden,
+      updated: changed.map((r) => r.slug),
+      unchanged: slugs.length - changed.length,
+    },
+    changed.length
+      ? `${hidden ? '已强制下架' : '已恢复'} ${changed.length} 件商品${slugs.length > changed.length ? `（${slugs.length - changed.length} 件已在目标状态）` : ''}`
+      : '所选商品都已在目标状态，无需操作'
+  );
+}));
+
+/**
+ * 节点管理员：强制下架 / 恢复一件商品（`PATCH /admin/:slug/moderation`）。
+ *
+ * 请求体：`{hidden: boolean, reason?: string}`。
+ *   · `hidden=true` 必须给原因：店主在商品管理页看到它，才知道该改什么、找谁；
+ *   · `hidden=false` 清空原因（商品已恢复，旧原因不该继续挂着）。
+ *
+ * 为什么状态落在 `products.node_hidden` 而不是复用 `active`：`active` 是**店主**的意愿，
+ * 会被店主的 PATCH / 批量上下架改写；复用它等于"节点下架"一刷新就被店主上架。
+ * 两个判据正交，公开可见性由 `productSellableSql()` 同时要求两者，谁都不能单独绕过。
+ */
+router.patch('/admin/:slug/moderation', nodeAdmin, wrap(async (req, res) => {
+  const slug = String(req.params.slug || '').trim();
+  const hidden = req.body?.hidden;
+  if (typeof hidden !== 'boolean') return fail(res, 'hidden 需为布尔值（true=强制下架，false=恢复展示）', 400, 400);
+  const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
+  if (hidden && !reason) return fail(res, '强制下架必须填写原因（≤200 字，店主会在商品管理页看到）', 400, 400);
+
+  const out = await moderateNodeProducts({ req, slugs: [slug], hidden, reason });
+  if (out.missing) return fail(res, '商品不存在', 404, 404);
+  const fresh = await getDb().get('SELECT * FROM products WHERE slug = ?', slug);
+  const shop = await shopRowByCode(fresh.shop_code);
+  if (!out.changed.length) {
+    return ok(
+      res,
+      {
+        slug,
+        nodeHidden: Number(fresh.node_hidden) === 1,
+        nodeHiddenReason: String(fresh.node_hidden_reason || ''),
+        nodeHiddenAt: fresh.node_hidden_at ?? null,
+      },
+      hidden ? '该商品已被节点强制下架，无需重复操作' : '该商品未被节点强制下架，无需恢复'
+    );
+  }
+  ok(
+    res,
+    {
+      slug,
+      nodeHidden: Number(fresh.node_hidden) === 1,
+      nodeHiddenReason: String(fresh.node_hidden_reason || ''),
+      nodeHiddenAt: fresh.node_hidden_at ?? null,
+    },
+    hidden
+      ? `已强制下架「${fresh.title}」：${reason}`
+      : `已恢复「${fresh.title}」（店铺${shop && Number(shop.listed) === 1 ? '在售，商品重新进入聚合面' : '仍暂停接单，恢复接单后商品才会重新进入聚合面'}）`
+  );
+}));
+
+/**
  * 公开读的可见性判据（**商品详情与评价列表共用**，2026-10-22 复审）。
  *
- * 商品从公开视野消失有三条独立路径：店主下架（`active = 0`）、协议侧链上冻结
- * （Blocklist 的 Product 类）、所属店铺暂停/退出（`shops.listed != 1`）。
- * 详情页三条都查，而评价列表此前只查"这一行存在"⇒ 下架/冻结商品的评价仍能被匿名读取，
+ * 商品从公开视野消失有三条独立路径：店主下架（`active = 0`）、节点强制下架
+ * （`node_hidden = 1`）与所属店铺暂停/退出（`shops.listed != 1`）。
+ * 详情页两条都查，而评价列表此前只查"这一行存在"⇒ 下架商品的评价仍能被匿名读取，
  * 且 200/404 的差别成了一个"这件商品存在过"的 oracle。
  *
  * 返回 `null` = 可见；否则返回给调用方的拒绝描述。`mine`（本店经营人员）只有详情页会传：
- * 店主必须看得见自己被冻结/下架的商品；评价列表是匿名读，没有这个豁免。
+ * 店主必须看得见自己被下架的商品；评价列表是匿名读，没有这个豁免。
  */
 async function publicProductGate(row, { mine = false } = {}) {
   if (!row.active && !mine) return { status: 404, code: 404, message: '商品不存在或已下架' };
+  if (Number(row.node_hidden) === 1 && !mine) return { status: 404, code: 404, message: '商品不存在或已下架' };
   if (mine) return null;
-  /*
-    链上名单的商品类条目（**详情页同样要查**，2026-10 自审补）：
-    只在列表里过滤 = 半个过滤——列表看不到、直链进来照样能下单，
-    而被冻结的正是"要通过直链传播"的那类商品。判据与列表共用同一份名单与同一段读法。
-    读不到名单 ⇒ 与列表同一条纪律：**拒绝**，不按"名单里没有它"放行。
-  */
-  if (config.chain.blocklistAddress) {
-    let hit;
-    try {
-      hit = (await blockedProductSlugs()).has(String(row.slug));
-    } catch (e) {
-      return {
-        status: 404,
-        code: 404,
-        message: `读不到链上黑名单（${e?.message || e}）：无法确认这件商品是否已被全网冻结，本次按 fail-closed 不返回内容`,
-      };
-    }
-    if (hit) return { status: 404, code: 404, message: '该商品已被全网冻结，不再展示' };
-  }
   const shop = await shopRowByCode(row.shop_code);
   if (!shop || Number(shop.listed) !== 1) {
     return { status: 200, code: 200, message: notSellableReason(shop) };
@@ -1571,7 +1873,7 @@ async function publicProductGate(row, { mine = false } = {}) {
 }
 
 /**
- * 商品详情（公开；已下架商品仅本店店主/店员登录可见——匿名与第三人 404，防下架内容被探测/收录）。
+ * 商品详情（公开；已下架或被节点隐藏的商品仅本店店主/店员登录可见——匿名与第三人 404，防下架内容被探测/收录）。
  *
  * ⚠️ 这是**公开**端点，所以**不能**用 `requireShopProduct`（那个按请求解析出的店铺上下文判归属）：
  * 匿名请求根本没有店铺上下文。归属在这里是另一件事——"这件商品属于哪家店"由 `row.shop_code`
@@ -1656,12 +1958,13 @@ router.post('/', staffOnly, wrap(async (req, res) => {
   await withTransaction(async () => {
     const ins = await db.run(
       'INSERT INTO products (slug, shop_code, title, description, description_blocks, media, kind, ' +
-        'shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, specs, attributes, terms, tags, ' +
-        `snapshot_hash, auto_deliver, stock_alert_at, active, published_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${PUBLISHED_AT_FIRST})`,
+        'shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, claimable, claim_type, claim_window_days, claim_instructions, specs, attributes, terms, tags, ' +
+        `snapshot_hash, auto_deliver, stock_alert_at, active, published_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${PUBLISHED_AT_FIRST})`,
       slug,
       String(req.shop.code),
       value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.media),
       value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard,
+      value.claimable, value.claimType, value.claimWindowDays, value.claimInstructions,
       JSON.stringify(value.specs), JSON.stringify(value.attributes), JSON.stringify(value.terms),
       JSON.stringify(value.tags),
       // 占位：真哈希由下面这句按**读回值**算出并覆盖（见 refreshSnapshotHash 的说明）
@@ -1833,6 +2136,11 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
       // 校验层再按 kind 决定最终写什么（非 NFT 一律写回 NULL）
       nftContract: b.nftContract !== undefined ? b.nftContract : row.nft_contract,
       nftStandard: b.nftStandard !== undefined ? b.nftStandard : row.nft_standard,
+      // 提货政策（节点链下；不入快照）：三态与其它经营开关同款——未提交=沿用现值
+      claimable: b.claimable !== undefined ? b.claimable : row.claimable,
+      claimType: b.claimType !== undefined ? b.claimType : row.claim_type,
+      claimWindowDays: b.claimWindowDays !== undefined ? b.claimWindowDays : row.claim_window_days,
+      claimInstructions: b.claimInstructions !== undefined ? b.claimInstructions : row.claim_instructions,
       // 规格与 SKU：未提交则沿用现有（DB 行 → API 形状）
       specs: b.specs !== undefined ? b.specs : parseSpecsColumn(row),
       // SKU 支持**部分更新**：只提交要改的组合即可（按 key 覆盖到现有列表上）；
@@ -2049,11 +2357,13 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     */
     await db.run(
       'UPDATE products SET title = ?, description = ?, description_blocks = ?, media = ?, kind = ?, ' +
-        'shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, specs = ?, ' +
+        'shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, ' +
+        'claimable = ?, claim_type = ?, claim_window_days = ?, claim_instructions = ?, specs = ?, ' +
         `attributes = ?, terms = ?, tags = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, published_at = ${PUBLISHED_AT_KEEP}, updated_at = CURRENT_TIMESTAMP(3) ` +
         'WHERE id = ?',
       value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.media), value.kind,
-      value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard, JSON.stringify(value.specs),
+      value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard,
+      value.claimable, value.claimType, value.claimWindowDays, value.claimInstructions, JSON.stringify(value.specs),
       JSON.stringify(value.attributes), JSON.stringify(value.terms), JSON.stringify(value.tags),
       value.autoDeliver, value.stockAlertAt, value.active, value.active, row.id
     );

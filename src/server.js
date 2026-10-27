@@ -2,14 +2,15 @@
  * 节点服务入口：初始化 DB → 启动链上事件轮询（若已配置托管合约）→ 监听 HTTP。
  * 环境变量经 `node --env-file-if-exists=.env` 注入（见 package.json scripts）。
  */
+import { ethers } from 'ethers';
 import config from './config.js';
 import { initDb } from './db.js';
 import { startWatcher } from './escrowWatcher.js';
 import { startChainReconcile } from './chainReconcile.js';
-import { startTermsReconciler } from './termsReconciler.js';
 import { startOrderSweeper } from './orderSweeper.js';
 import { startPiiRetentionSweep } from './piiErase.js';
 import { cleanupExpiredSiwe } from './auth.js';
+import { sweepOrphanUploads } from './mediaSweep.js';
 // 优雅关闭的库那一侧（关池 + 放实例锁）：唯一实现在 db.js，理由见那里的说明
 import { closeDb } from './db.js';
 // 退出路径内核（纯模块，可单测；理由见那里的文件头）
@@ -40,12 +41,29 @@ import { applyEscrowAnchor } from './chainAnchor.js';
 await initDb();
 
 /*
+  支付资产配置在**启动期**校验，不能等第一笔结账才 500：
+  · 库里的 payment_tokens 形状非法直接退出（页面写入也走同一套归一化）；
+  · 配了 token 却没有 Escrow ⇒ 这些资产根本不可能收款，退出让运维先接托管；
+  · 有 Escrow 时再逐个读链上 decimals()，配置写错 6/18 会让报价放大 1e12 倍。
+  配置本身在「节点管理 → ERC20 支付资产」网页维护，改完即生效；这里只做启动自检。
+*/
+const { validatePaymentTokens, validatePaymentTokensOnChain } = await import('./paymentTokens.js');
+let configuredPaymentTokens = [];
+try {
+  configuredPaymentTokens = await validatePaymentTokens();
+  if (configuredPaymentTokens.length && !config.chain.escrowAddress) {
+    throw new Error('payment_tokens 里已配置支付资产，但 MK_ESCROW_ADDRESS 为空：没有托管合约就收不了 ERC20');
+  }
+} catch (e) {
+  console.error(`[server] 支付资产配置非法：${e?.message || e}`);
+  process.exit(1);
+}
+
+/*
   **暖 `node` 行的同步投影**（唯一的暖机点）。
   `node`（owner/合约锚/游标/隔离事件/节点资料）是单例行，由 `initDb()` 种入；
-  而 `shops.js` 的 `hostOperator()` 是 `node.owner` 的**同步**投影（`src/shopCode.js` 必须在
-  同步上下文里拿它做 `codeOf` 的缓存键）——它在任何一次读那一行之前是空串。
-  空串的后果不是"少一个字段"：`shopDto`/`orderTermsOf` 在"要抽成却读不到收款人"时**抛错**
-  （刻意的响亮失败，见那里的说明），所以这里先读一次，让第一批请求拿到真实身份。
+  而 `shops.js` 的 `hostOperator()` 是 `node.owner` 的**同步**投影——它在任何一次读那一行
+  之前是空串。所以这里先读一次，让第一批请求（以及启动日志）拿到真实身份。
 */
 await nodeRow();
 
@@ -71,6 +89,21 @@ const siweTimer = setInterval(() => {
   cleanupExpiredSiwe().catch((e) => console.error('[auth] 过期 nonce 清理失败（下轮重试）:', e?.message || e));
 }, 10 * 60_000);
 if (typeof siweTimer.unref === 'function') siweTimer.unref();
+
+/*
+  孤儿媒体清扫：每天一次，只删超过 7 天且全库无引用的文件。
+  异常只告警，不影响节点主流程；hostOnly 手动端点仍可即时触发。
+*/
+const orphanMediaTimer = setInterval(() => {
+  sweepOrphanUploads({ olderThanMs: 7 * 24 * 3600 * 1000 })
+    .then((r) => {
+      if (r.removed || r.failed || r.unreadable) {
+        console.log(`[media] 孤儿清扫：removed=${r.removed} failed=${r.failed}${r.unreadable ? ' unreadable' : ''}`);
+      }
+    })
+    .catch((e) => console.error('[media] 孤儿清扫失败（下轮重试）:', e?.message || e));
+}, 24 * 3600 * 1000);
+if (typeof orphanMediaTimer.unref === 'function') orphanMediaTimer.unref();
 
 if (config.chain.escrowAddress) {
   /*
@@ -109,7 +142,7 @@ if (config.chain.escrowAddress) {
     下单最小超时窗口与释放静置期缺席），而日志里一个字都不会说。
     逃生口 MK_CONTRACT_GEN_ACK=1：显式声明"我知道它是旧实例，仍要以只读方式接"。
   */
-  const { assertEscrowGeneration, assertRegistryGeneration } = await import('./chain.js');
+  const { assertEscrowGeneration } = await import('./chain.js');
   const gen = await assertEscrowGeneration();
   if (!gen.ok) {
     const why =
@@ -118,8 +151,8 @@ if (config.chain.escrowAddress) {
       `  这说明它是一个**更早一代**的实例。旧实例缺 2026-10 的全部加固（确认收货后的售后案件、\n` +
       `  拒绝退款后的释放静置期、下单最小超时窗口、三个资金出口参数的可调与按单快照），\n` +
       `  节点照常跑起来只会把这些能力静默降级。\n` +
-      `  处置：把 MK_ESCROW_ADDRESS / MK_REGISTRY_ADDRESS / MK_ESCROW_START_BLOCK 三个值同批换成\n` +
-      `  当前这一批（见 deploy/README.md §1.3），然后**重建容器**（改 .env 后 docker restart 读不到）；\n` +
+      `  处置：把 MK_ESCROW_ADDRESS / MK_ESCROW_START_BLOCK 两个值同批换成\n` +
+      `  当前这一批（见 docs/DEPLOY_NODE.md），然后**重建容器**（改 .env 后 docker restart 读不到）；\n` +
       `  若确实要以只读方式接旧实例，设 MK_CONTRACT_GEN_ACK=1 显式声明。`;
     if (String(process.env.MK_CONTRACT_GEN_ACK || '') !== '1') {
       console.error(`[server] 托管合约代次自检未通过：\n  ${why}`);
@@ -130,29 +163,57 @@ if (config.chain.escrowAddress) {
     console.log('[marketplace-node] 托管合约代次自检通过（2026-10 加固的入口齐全）');
   }
   /*
-    **Registry 代次自检**（与 Escrow 自检同批）：节点还会读 Registry 的 `ShopInfo` 元组、
-    员工名单（`staffNode` / `nodeStaff`）与按编号的在售判据（`shopListed`）。接上更早一代
-    Registry 时节点照样启动，然后店铺对账每轮解码失败、员工永远鉴权失败，日志里只有"读不到"。
-    判据见 chain.assertRegistryGeneration；未配置 Registry 时返回 skipped（纯浏览节点）。
+    资金方身份自检（Registry 的 owner 校验不等于节点自己的部署自检）：
+    Escrow.owner 与 Escrow.staking().owner 必须都等于本节点 operator（MK_SHOP_OWNER）。
+    否则“目录 operator”与“罚没/出金控制人”可以是两个地址——买家看到的是 A，实际控制人是 B。
+    这里读的是 Escrow 自己接线的 Staking，而不是只信 MK_STAKING_ADDRESS。
   */
-  const regGen = await assertRegistryGeneration();
-  if (!regGen.skipped && !regGen.ok) {
-    const why =
-      `链上店铺登记合约（${config.chain.registryAddress}）缺少本版本代码需要的入口：\n` +
-      `    - ${regGen.missing.join('\n    - ')}\n` +
-      `  这说明 Registry 是更早/更晚的一代（或地址指错了实例）。节点照常跑起来只会让\n` +
-      `  店铺对账与节点员工鉴权静默失效。\n` +
-      `  处置：把 MK_REGISTRY_ADDRESS / MK_ESCROW_ADDRESS / MK_ESCROW_START_BLOCK 同批换成当前\n` +
-      `  这一批并**重建容器**；若确实要以只读方式接旧实例，设 MK_CONTRACT_GEN_ACK=1 显式声明。`;
-    if (String(process.env.MK_CONTRACT_GEN_ACK || '') !== '1') {
-      console.error(`[server] Registry 代次自检未通过：\n  ${why}`);
+  if (config.shop.owner) {
+    const { getEscrow, getProvider } = await import('./chain.js');
+    try {
+      const escrow = getEscrow();
+      const [escrowOwner, stakingAddress] = await Promise.all([escrow.owner(), escrow.staking()]);
+      const want = String(config.shop.owner).toLowerCase();
+      if (String(escrowOwner).toLowerCase() !== want) {
+        throw new Error(`Escrow.owner=${String(escrowOwner).toLowerCase()} 不等于 operator=${want}`);
+      }
+      const stakingAddr = String(stakingAddress).toLowerCase();
+      const stakingConfigured = /^0x[0-9a-f]{40}$/.test(stakingAddr) && !/^0x0{40}$/.test(stakingAddr);
+      if (!stakingConfigured) {
+        if (config.chain.stakingAddress) {
+          throw new Error(
+            `Escrow.staking() 未接线，但 MK_STAKING_ADDRESS=${String(config.chain.stakingAddress).toLowerCase()} 已配置`
+          );
+        }
+        // 纯浏览/只读节点：没有 Staking 就没有第二层资金，也没有 Staking.owner 可核对
+        console.warn('[marketplace-node] Escrow 未接线 Staking：跳过 Staking.owner 自检（本节点只能浏览，不能接单）');
+      } else {
+        if (
+          config.chain.stakingAddress
+          && stakingAddr !== String(config.chain.stakingAddress).toLowerCase()
+        ) {
+          throw new Error(
+            `Escrow.staking()=${stakingAddr} 与 MK_STAKING_ADDRESS=${String(config.chain.stakingAddress).toLowerCase()} 不一致`
+          );
+        }
+        const staking = new ethers.Contract(
+          stakingAddr,
+          ['function owner() view returns (address)'],
+          getProvider()
+        );
+        const stakingOwner = await staking.owner();
+        if (String(stakingOwner).toLowerCase() !== want) {
+          throw new Error(`Staking.owner=${String(stakingOwner).toLowerCase()} 不等于 operator=${want}`);
+        }
+        console.log('[marketplace-node] Escrow/Staking owner 与节点 operator 一致');
+      }
+    } catch (e) {
+      console.error(
+        `[server] 无法核对 Escrow/Staking 的 owner（${e?.message || e}）：拒绝启动，避免资金方身份不明。\n` +
+          '  目录不负责资金方背书；请把两个合约的 Ownable 转给 operator（两步接受）后重启，或改 MK_SHOP_OWNER 与之一致。'
+      );
       process.exit(1);
     }
-    console.warn(`[server] Registry 代次自检未通过（MK_CONTRACT_GEN_ACK=1 已显式放行）：\n  ${why}`);
-  } else if (!regGen.skipped) {
-    console.log(`[marketplace-node] Registry 代次自检通过（${regGen.probed} 个读法齐全）`);
-  } else {
-    console.log('[marketplace-node] 未配置 MK_REGISTRY_ADDRESS：跳过 Registry 代次自检（纯浏览模式）');
   }
   /*
     启动期**下单超时窗口自检**（2026-10-14，见 chain.checkOrderTimeoutBounds）：
@@ -193,11 +254,16 @@ if (config.chain.escrowAddress) {
   } else {
     console.log(`[marketplace-node] 下单超时窗口自检通过（${bounds.message}）`);
   }
+  if (configuredPaymentTokens.length) {
+    try {
+      await validatePaymentTokensOnChain();
+      console.log(`[marketplace-node] ERC20 支付资产精度自检通过（${configuredPaymentTokens.length} 个）`);
+    } catch (e) {
+      console.error(`[server] 支付资产链上精度自检未通过：${e?.message || e}`);
+      process.exit(1);
+    }
+  }
   startWatcher();
-  // 佣金条款/在售状态对账（多店改造）：把链上 `shopListed` 与当前 `commissionBps` 抄回本地镜像。
-  // 费率由节点主链上单方调整，节点只读链、不索引事件——不轮询就永远不知道本地那一份已经过期。
-  // 不启动时 /healthz 的 terms.enabled=false，运维看得见。
-  startTermsReconciler();
   // 链上状态对账（兜底）：watcher 只正向回放、从不回滚，事件漏扫一次就会让订单永久停在
   // 非终态（链上早已终局）——本扫描按 MK_CHAIN_RECONCILE_MS（默认 10 分钟）复查滞留住
   // 并复用 watcher 的映射修复；MK_ESCROW_ADDRESS 未配置时不启动（本分支即该条件）
@@ -208,11 +274,10 @@ if (config.chain.escrowAddress) {
 if (!config.shop.owner) {
   /*
     节点主地址是这台机器的**身份接线**（`node.owner`，与 `MK_DB_HOST` 同级）：
-    它既决定"谁能做节点级动作"，也是抽成收款人（`commissionTo`）的唯一答案。
-    缺失时 db.js 的建行那一步会如实拒绝启动；这里再喊一句是为了让"我还没配身份"
-    在日志里一眼可见，而不是只看到一句来自库层的报错。
+    它是本节点 Escrow/Staking 的 owner，也是"谁能做节点级动作"的唯一判据。
+    节点不读取 Registry；目录登记是 operator 钱包在外部的独立动作。
   */
-  console.warn('[server] MK_SHOP_OWNER 未配置：本节点没有身份（node.owner）——节点级动作与抽成收款人都无从判定');
+  console.warn('[server] MK_SHOP_OWNER 未配置：本节点没有 operator 身份（node.owner）——节点级动作无从判定');
 }
 // 仓库公开的占位/默认密钥一律拒绝启动（默认值 + .env.example 示例值，均可在仓库内查到——
 // 任何人都能用它们离线伪造店主令牌；弱密钥同样拒绝）
@@ -258,8 +323,6 @@ if (orderGateError) {
 
 // 配置极简升级提示：已删除的经营键若仍残留在 .env，节点静默忽略会让运维误以为"配置生效"
 //（实际店名回默认常量、店员名单清空、通知停发、登记 endpoint 失效）——启动时显式告警。
-// 注意 `MK_NOTARY_ADDRESS` 属**部署脚本**用键（scripts/deploy-mainnet.cjs 用它做 ReviewNotary
-// 幂等跳过），节点自身已不读取——所以告警文案对它要说清作用域，免得运维以为整条链路都不用它。
 const LEGACY_ENV_KEYS = [
   'MK_SHOP_NAME',
   'MK_SHOP_NOTICE',
@@ -269,13 +332,21 @@ const LEGACY_ENV_KEYS = [
   'MK_WEBHOOK_URL',
   'MK_WEBHOOK_SECRET',
   'MK_NOTARY_ADDRESS',
+  'MK_BLOCKLIST_ADDRESS',
   'MK_PAY_TOKEN',
   'MK_PAY_TOKEN_DECIMALS',
 ];
 for (const k of LEGACY_ENV_KEYS) {
   if (process.env[k] !== undefined && process.env[k] !== '') {
-    console.warn(`[server] .env 含已废弃键 ${k}（配置极简后**节点**不再读取）：店名/公告/店员/通知请在卖家面板「店铺设置」网页维护，登记 endpoint 在开店向导填写${k === 'MK_NOTARY_ADDRESS' ? '；该键仍被部署脚本（scripts/deploy-mainnet.cjs）用于 ReviewNotary 的幂等跳过，若你不用部署脚本可以删掉这一行' : '——请删除该行，或运行 node scripts/deploy.mjs 重新生成 .env'}`);
+    console.warn(`[server] .env 含已废弃键 ${k}（节点不再读取）：店名/公告/店员/通知请在卖家面板「店铺设置」网页维护，登记 endpoint 在登记向导填写——请删除该行`);
   }
+}
+// 支付资产配置已整体移到节点库（节点管理页面），环境变量不再读取：残留时单独告警，
+// 否则运维会以为改 env 生效、实际页面配置才是唯一真相。
+if (process.env.MK_PAYMENT_TOKENS !== undefined && process.env.MK_PAYMENT_TOKENS !== '') {
+  console.warn(
+    '[server] .env 含已删除键 MK_PAYMENT_TOKENS（节点不再读取）：ERC20 支付资产请在节点管理「ERC20 支付资产」页面配置并由节点主钱包启用链上 supportedToken——请删除该行'
+  );
 }
 
 /*
@@ -300,7 +371,12 @@ const server = app.listen(config.port, async () => {
   const node = await nodeRow();
   console.log(`[marketplace-node] 联邦商城节点已启动 http://0.0.0.0:${config.port}`);
   console.log(`[marketplace-node] 节点主=${nodeOwnerOf(node) || '(未配置)'} 节点名=${await nodeNameOf()}`);
-  console.log(`[marketplace-node] 托管合约=${config.chain.escrowAddress || '(未配置)'} 支付币种=原生 BTY`);
+  console.log(
+    `[marketplace-node] 托管合约=${config.chain.escrowAddress || '(未配置)'} 支付资产=原生 BTY${
+      configuredPaymentTokens.length ? ` + ERC20(${configuredPaymentTokens.length})` : ''
+    }`
+  );
+  console.log(`[marketplace-node] 保证金合约=${config.chain.stakingAddress || '(未配置)'}（节点不依赖任何 Registry）`);
   /*
     反向代理信任边界：默认关闭。反代之后（本机 Caddy/nginx 是默认拓扑）不配置它，
     所有匿名客户端会共用代理那一个限流桶，audit_logs.ip 也恒为代理地址——

@@ -24,10 +24,53 @@
  */
 import { getDb } from './db.js';
 import config from './config.js';
+import { findMedia, removeMediaByUrl } from './productMedia.js';
 import { INCOME_STATUS as ORDER_INCOME_STATUS } from './orderStatus.js';
 
 /** 可评价（成交）状态：与收款流水 INCOME_STATUS 同口径 */
 export const REVIEWABLE_STATUS = ORDER_INCOME_STATUS; // 与入账口径同源：钱到卖家手里才可评价
+
+/** 一条评价最多几张图（首次评价与追评各自独立计数） */
+export const REVIEW_MAX_IMAGES = 3;
+
+/** 节点本地上传的图片 URL（文件名是随机 UUID；与 productMedia 的落盘形状同源） */
+const REVIEW_IMAGE_URL_RE =
+  /^\/api\/uploads\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:png|jpe?g|webp|gif))$/i;
+
+/** JSON 列 → 图片 URL 数组（只保留字符串；DB 里的形状由写入端保证） */
+export function parseReviewImages(value) {
+  return Array.isArray(value)
+    ? value.filter((v) => typeof v === 'string' && v).slice(0, REVIEW_MAX_IMAGES)
+    : [];
+}
+
+/**
+ * 校验评价图（**唯一实现**：首次评价与追评共用）。
+ *
+ * 只收本节点 `/api/uploads/` 下的图片：外链会让"评价图"与节点上的字节脱钩（对方图床
+ * 换图/挂掉，评价就变成了另一个东西）；视频不在评价图白名单里。
+ * 返回 `{images}` 或 `{error}`——调用方把错误转成 fail，不静默丢图。
+ */
+function normalizeReviewImages(input) {
+  if (input === undefined || input === null) return { images: [] };
+  if (!Array.isArray(input)) return { error: 'images 需为数组' };
+  const images = [];
+  for (const raw of input) {
+    const url = String(raw ?? '').trim();
+    if (!url) continue;
+    const m = REVIEW_IMAGE_URL_RE.exec(url);
+    if (!m) return { error: '评价图必须是本节点上传的 /api/uploads/… 图片 URL' };
+    if (images.includes(url)) continue;
+    if (images.length >= REVIEW_MAX_IMAGES) {
+      return { error: `评价图最多 ${REVIEW_MAX_IMAGES} 张` };
+    }
+    const hit = findMedia(m[1]);
+    if (!hit) return { error: '评价图不存在（请重新上传）' };
+    if (hit.kind !== 'image') return { error: '评价图只能是图片' };
+    images.push(url);
+  }
+  return { images };
+}
 
 /** 买家短地址展示（0x1234…abcd） */
 export function shortBuyer(address) {
@@ -58,13 +101,15 @@ export async function findReviewByOrder(orderId) {
 
 /**
  * 买家提交评价。返回 {ok, error?} 语义（错误信息由调用方转 fail）。
- * @param {{order: object, buyer: string, rating: number|string, content?: string}} p
+ * @param {{order: object, buyer: string, rating: number|string, content?: string, images?: string[]}} p
  */
-export async function submitReview({ order, buyer, rating, content }) {
+export async function submitReview({ order, buyer, rating, content, images }) {
   const r = Number(rating);
   if (!Number.isInteger(r) || r < 1 || r > 5) return { error: 'rating 需为 1..5 的整数' };
   const text = String(content ?? '').trim();
   if (text.length > 1000) return { error: '评价内容不能超过 1000 字' };
+  const imgs = normalizeReviewImages(images);
+  if (imgs.error) return { error: imgs.error };
   if (String(order.buyer || '').toLowerCase() !== String(buyer || '').toLowerCase()) {
     return { error: '仅买家本人可评价该订单', forbidden: true };
   }
@@ -75,7 +120,15 @@ export async function submitReview({ order, buyer, rating, content }) {
   const db = getDb();
   try {
     // created_at / updated_at 不传：由列的 DEFAULT CURRENT_TIMESTAMP(3) 盖章
-    await db.run('INSERT INTO reviews (order_id, product_id, buyer, rating, content) VALUES (?, ?, ?, ?, ?)', order.order_id, order.product_id, String(buyer).toLowerCase(), r, text);
+    await db.run(
+      'INSERT INTO reviews (order_id, product_id, buyer, rating, content, images) VALUES (?, ?, ?, ?, ?, ?)',
+      order.order_id,
+      order.product_id,
+      String(buyer).toLowerCase(),
+      r,
+      text,
+      JSON.stringify(imgs.images)
+    );
   } catch (e) {
     // 唯一键冲突（MySQL：ER_DUP_ENTRY）折成"一单一评"的业务结论；其它错误原样上抛
     if (e && (e.code === 'ER_DUP_ENTRY' || /Duplicate entry/i.test(String(e.message || '')))) {
@@ -83,6 +136,35 @@ export async function submitReview({ order, buyer, rating, content }) {
     }
     throw e;
   }
+  return { ok: true };
+}
+
+/**
+ * 买家追加评价（**一次**；可只写文字、只发图，或两者都给）。
+ *
+ * 追评不改变星级与首评内容（聚合/筛选仍按首评），只多一段"用了一段时间之后"的信息。
+ * 条件写进 UPDATE（`followup_at IS NULL`）：并发两次追评只有一个能落。
+ */
+export async function followupReview({ order, buyer, content, images }) {
+  if (String(order.buyer || '').toLowerCase() !== String(buyer || '').toLowerCase()) {
+    return { error: '仅买家本人可追评该订单', forbidden: true };
+  }
+  const text = String(content ?? '').trim();
+  if (text.length > 1000) return { error: '追评内容不能超过 1000 字' };
+  const imgs = normalizeReviewImages(images);
+  if (imgs.error) return { error: imgs.error };
+  if (!text && imgs.images.length === 0) return { error: '追评内容与图片至少给一项' };
+  const changed = (
+    await getDb().run(
+      `UPDATE reviews SET followup_content = ?, followup_images = ?,
+         followup_at = CURRENT_TIMESTAMP(3), updated_at = CURRENT_TIMESTAMP(3)
+       WHERE order_id = ? AND followup_at IS NULL`,
+      text,
+      JSON.stringify(imgs.images),
+      order.order_id
+    )
+  ).changes;
+  if (changed === 0) return { error: '该评价已追评过（一次），或还没有评价' };
   return { ok: true };
 }
 
@@ -108,15 +190,63 @@ export async function replyReview({ order, content }) {
 
 /** 公开单条评价（匿名短地址；不含买家完整地址与订单金额） */
 export function reviewToPublic(row) {
+  const images = parseReviewImages(row.images);
   return {
     id: row.id,
     rating: row.rating,
     content: row.content || null,
+    /** 评价图（节点相对 URL） */
+    images,
     buyerShort: shortBuyer(row.buyer),
     reply: row.reply_content || null,
     replyAt: row.reply_at || null,
+    /** 追评（一次；未追评为 null） */
+    followup: row.followup_at
+      ? {
+          content: row.followup_content || null,
+          images: parseReviewImages(row.followup_images),
+          at: row.followup_at,
+        }
+      : null,
     createdAt: row.created_at,
   };
+}
+
+/**
+ * 清空一条评价的两组图片 URL（PII 擦除用；行与文字保留）。
+ * 返回被清掉的 URL，供调用方在事务提交后删盘。
+ */
+export async function clearReviewImages(orderId) {
+  const db = getDb();
+  const row = await db.get('SELECT id, images, followup_images FROM reviews WHERE order_id = ? FOR UPDATE', orderId);
+  if (!row) return { urls: [] };
+  const urls = [...parseReviewImages(row.images), ...parseReviewImages(row.followup_images)];
+  if (urls.length) {
+    await db.run(
+      "UPDATE reviews SET images = '[]', followup_images = '[]', updated_at = CURRENT_TIMESTAMP(3) WHERE id = ?",
+      row.id
+    );
+  }
+  return { urls };
+}
+
+/**
+ * 逐图下架（节点管理员）：只按 URL 删除一次，JSON 里同步移除，随后删盘。
+ * 返回 `remaining` 便于界面刷新；重复删除是 404 语义（图片已不在该评价里）。
+ */
+export async function removeReviewImage({ orderId, kind, url }) {
+  const col = kind === 'followup' ? 'followup_images' : kind === 'review' ? 'images' : null;
+  if (!col) return { error: 'kind 需为 review / followup' };
+  const db = getDb();
+  const row = await db.get(`SELECT id, ${col} AS raw FROM reviews WHERE order_id = ?`, orderId);
+  if (!row) return { error: '该订单还没有评价' };
+  const images = parseReviewImages(row.raw);
+  const target = String(url || '').trim();
+  if (!images.includes(target)) return { error: '该图片不在这条评价里（可能已被下架）', notFound: true };
+  const next = images.filter((u) => u !== target);
+  await db.run(`UPDATE reviews SET ${col} = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ?`, JSON.stringify(next), row.id);
+  removeMediaByUrl(target);
+  return { ok: true, remaining: next.length };
 }
 
 /**

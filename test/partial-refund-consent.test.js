@@ -72,8 +72,8 @@ function mustEvent(name) {
   return e;
 }
 const SEL_GET_ORDER = mustFunction('getOrder').selector;
+const SEL_ORDER_TOKEN = mustFunction('orderToken').selector;
 const SEL_ACCEPTED = mustFunction('acceptedPartialRefund').selector;
-const SEL_COMMISSION_TERMS = mustFunction('commissionTermsAtCreate').selector;
 const TOPIC_PARTIAL = mustEvent('PartialRefundAccepted').topicHash.toLowerCase();
 
 /** 当前用例的链上真值：getOrder 元组（/sync 与 watcher 预取都读它） */
@@ -97,6 +97,11 @@ function handleRpc(j) {
         }
         return { result: iface.encodeFunctionResult('acceptedPartialRefund', [BigInt(acceptedRefund)]) };
       }
+      if (selector === SEL_ORDER_TOKEN) {
+        return {
+          result: iface.encodeFunctionResult('orderToken', ['0x0000000000000000000000000000000000000000']),
+        };
+      }
       if (selector === SEL_GET_ORDER && chainOrder) {
         const o = chainOrder;
         return {
@@ -104,25 +109,15 @@ function handleRpc(j) {
             o.buyer,
             o.seller,
             BigInt(o.amount),
-            BigInt(o.feeBps || 0),
-            120960n,
+            120960n, // timeoutBlocks
             BigInt(o.createdAtBlock || 900),
             !!o.refundRequested,
             !!o.refundRejected,
             BigInt(o.refundedAmount || '0'),
             STATUS_INDEX[o.status],
-            o.feeCollectorAtCreate || '0x' + '0'.repeat(40),
-            false,
+            false, // buyerConfirmed
           ]),
         };
-      }
-      /*
-        非 OrderCreated 事件的防伪预取还会读 `commissionTermsAtCreate`（订单绑定的节点 host）。
-        本地默认报价 host = seller；不回答它会让 `fetchOnchainOrder` 的条款读空，host 校验
-        按 fail-closed 拒绝事件（测试会假红）。
-      */
-      if (selector === SEL_COMMISSION_TERMS && chainOrder) {
-        return { result: iface.encodeFunctionResult('commissionTermsAtCreate', [SELLER, 0]) };
       }
       return { error: { code: -32601, message: `unit-test: 未预期的 eth_call selector ${selector}` } };
     }
@@ -213,7 +208,6 @@ const chainTruth = (status = 'Created') => ({
   seller: SELLER,
   amount: AMOUNT,
   // 店铺节点是订单身份的一部分：chainParamsMatch 现在要求它必须读得到且相等
-  commissionTo: SELLER,
   refundedAmount: '0',
   createdAtBlock: 900,
   status,
@@ -249,6 +243,17 @@ test('事件声明/视图/写函数都在生产 ABI 里，且 PartialRefundAccep
 });
 
 // ── ② 事件路径：授权额落订单行 + 事件史，且不改订单状态；重放不重复记账 ──
+
+test('RefundRejected 必须清掉本地过期授权额（与合约 reject 的 delete 同口径）', async () => {
+  const o = await insertOrder({ status: 'escrowed', accepted: ACCEPTED });
+  assert.equal(
+    await applyEvent('RefundRejected', { orderId: o.escrowOrderId }, { txHash: '0x' + '2'.repeat(64), block: 56 }),
+    1
+  );
+  const row = await rowOf(o.orderId);
+  assert.equal(String(row.accepted_partial_refund_wei), '0', '拒绝后卖家不能再按旧授权额调 approveRefund');
+  assert.equal(row.refund_status, 'rejected');
+});
 
 test('PartialRefundAccepted：写授权额与事件史、不动 status；同值重放幂等、改授权额覆盖并再留痕', async () => {
   const o = await insertOrder({ status: 'escrowed' });

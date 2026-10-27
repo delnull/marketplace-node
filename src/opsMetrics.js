@@ -12,23 +12,20 @@
  *     运营读数要的是同一件事（待办几单 + 最久等了多久）。同一读数两处实现必然给出两个答案，
  *     故移到这里，仲裁路由改为 import。
  *  3. **链上读数不新起真相源**：对账读数取 `chainReconcile.js` 的只读快照（`chainReconcileStatus()`，
- *     由路由取好后传进来，见 reconcileReading 的说明）；收费方地址取 `fees.js` 的唯一实现
- *     （60s 缓存；**读不到就是读不到**——`known=false` / `feeCollector=null`，绝不拿上次成功
- *     读数冒充当前值），不配第二个环境变量。
+ *     由路由取好后传进来，见 reconcileReading 的说明）。
  *
  * 三态纪律（本仓硬要求：读不到 ≠ 0 ≠ 缺失）——本模块把三类"读不到"分别表达：
  *  · 链上读不到（RPC 不可达/合约未升级）：`available:false` + `reason`，**数值字段一律 null**，
  *    并且把"本地本来就知道的候选数"照给（那是本地事实，与链上读数分开）；
  *  · 单笔读不到：计入 `unknown` 而不是"未超时"（`checked + unknown = 候选数`是恒等式）；
- *  · 挂账余额按地址计：读不到主体（未配店主地址 / 收费方未知）就说清"没有可读的主体"，
+ *  · 挂账余额按地址计：读不到主体（未配店主地址）就说清"没有可读的主体"，
  *    绝不下发一个看起来像 0 的数字。
  */
 import { getDb } from './db.js';
 import config from './config.js';
-import { getEscrow, getProvider, isZeroAddress, weiToDecimal } from './chain.js';
+import { getEscrow, getProvider, weiToDecimal } from './chain.js';
 import { ACTIVE_IN, ESCROW_RELEASABLE_IN, INCOME_IN, ORDER_STATUS } from './orderStatus.js';
 import { AFTER_SALE_OPEN_SQL } from './afterSaleSql.js';
-import { refreshFeeCollector, feeStatus } from './fees.js';
 // `timeMs`：时间列的毫秒读数（唯一实现）。库里的 DATETIME(3) 读出来是 `Date`，
 // 而这一层的队列等待、SLA 耗时都在毫秒域里算（见 reputation.js 的说明）。
 import { reputationSummary, DELIVERY_MIN_SAMPLES, parseOnchainEvents, escrowedAtOf, percentile, shipLatencySpan, timeMs } from './reputation.js';
@@ -162,7 +159,7 @@ export async function sellerTodoCounts(seller) {
   const pendingDispute = byStatus.disputed || 0;
   /*
     在途**售后案件**（确认收货后开案）计数：与 disputed 并列进店主徽标。
-    为什么必须给：案件在途意味着"这笔已结清的钱可能被仲裁人从保证金里罚没给买家"，
+    为什么必须给：案件在途意味着"这笔仍在售后留存期的货款可能被判给买家，或从保证金补足"，
     而订单状态仍是终局（settled/confirmed/expired）——只按 status 分组的徽标永远看不见它，
     店主会一直以为这单已经了结。判据与仲裁队列/退货门控同一处（afterSale.js）。
   */
@@ -413,38 +410,23 @@ export async function escrowOverdueReading({ wantItems = false, limit = 0, now =
 const accruedSlot = (reason = null) => ({ available: false, reason, address: null, wei: null, decimal: null });
 
 /**
- * 挂账余额（`Escrow.accruedPayouts` / `accruedFees`）：`_settle` 派发失败时钱会记在收款方名下，
- * 由其自行 `withdrawPayout()` / `withdrawFees()` 领走——**挂在链上、没人提醒**，所以要有读数。
+ * 挂账余额（`Escrow.accruedPayouts`）：`_settle` 派发失败时钱会记在收款方名下，
+ * 由其自行 `withdrawPayout()` 领走——**挂在链上、没人提醒**，所以要有读数。
  *
- * 两处**按地址**读，主体各不相同，因此各自独立降级（一项读不到不影响另一项）：
- *  · payouts 读**店主地址**（MK_SHOP_OWNER）：托管金派发给卖家时挂的账；
- *  · fees    读**当前全局 feeCollector**：平台费挂的账。地址走 `fees.js` 的唯一实现
- *    （60s 缓存；读不到时 `known=false`、地址为 null，**不沿用上次成功读数**——否则一次 RPC
- *    抖动就能把"读不到"说成"确证是那个地址"），不另配环境变量（配错就是第二个真相源）。
- *    已知边界（如实写）：合约按**每单创建时快照**的收取方扣费，历史收取方名下的挂账
- *    不在这两个读数里——本读数只回答"现在的收款主体有多少可领"。
+ * 零费模型下**只有卖家这一条腿**（没有平台费/节点抽成可挂）：主体就是该店店主地址，
+ * 读不到时给 available:false 而不用 0 冒充"没有挂账"。
  */
 export async function accruedReading(seller) {
   if (seller === undefined) {
     throw new Error('accruedReading 需要显式的 seller（null = 全部在售店铺）；漏传会静默读错主体的挂账');
   }
-  const note =
-    '挂账是**按地址**计的余额：这里只读该店店主地址与当前全局 feeCollector 名下的挂账；' +
-    '合约按每单创建时快照的收取方扣费，历史收取方名下的挂账不在本读数内。';
+  const note = '挂账是**按地址**计的余额：这里只读该店店主地址名下的挂账（托管派发失败时由合约记下）。';
   if (!config.chain.escrowAddress) {
     const reason = '未配置 MK_ESCROW_ADDRESS：读不到链上挂账余额';
-    return { payouts: accruedSlot(reason), fees: accruedSlot(reason), note };
+    return { payouts: accruedSlot(reason), note };
   }
-  // 收费方地址：唯一实现在 fees.js（读不到时它给出 known=false / addr=null，不猜、不沿用旧值）
-  await refreshFeeCollector();
-  const st = feeStatus();
   const sellerAddr = seller === null ? '' : String(seller || '').toLowerCase();
-  const collector = String(st.feeCollector || '').toLowerCase();
   const escrow = getEscrow();
-  /*
-    两个主体各自独立 try/catch：payouts 与 fees 是**两个不同的映射**，
-    一个读失败不代表另一个没有挂账（也不代表它是 0）。
-  */
   const readPayouts = async () => {
     if (!/^0x[0-9a-f]{40}$/.test(sellerAddr)) {
       return accruedSlot('本店的店主地址未知：挂账按收款地址计，没有主体就没有读数');
@@ -453,25 +435,11 @@ export async function accruedReading(seller) {
       const wei = BigInt(await escrow.accruedPayouts(sellerAddr)).toString();
       return { available: true, reason: null, address: sellerAddr, wei, decimal: weiToDecimal(wei) };
     } catch (e) {
-      return accruedSlot(`链上读取失败（RPC 不可达或合约未升级到含 accruedPayouts 的版本）：${chainErrText(e)}`);
+      return accruedSlot(`链上读取失败（RPC 不可达或合约代次不符）：${chainErrText(e)}`);
     }
   };
-  const readFees = async () => {
-    if (!st.feeCollectorKnown) {
-      return accruedSlot('读不到链上平台费收取方（feeCollector()：RPC 不可达或合约已移除该函数）：挂账按地址计，主体未知就没有读数');
-    }
-    if (!collector || isZeroAddress(collector)) {
-      return accruedSlot('本店合约未配置平台费收取方（feeCollector 为零地址）：没有可读的挂账主体');
-    }
-    try {
-      const wei = BigInt(await escrow.accruedFees(collector)).toString();
-      return { available: true, reason: null, address: collector, wei, decimal: weiToDecimal(wei) };
-    } catch (e) {
-      return accruedSlot(`链上读取失败（RPC 不可达或合约未升级到含 accruedFees 的版本）：${chainErrText(e)}`);
-    }
-  };
-  const [payouts, fees] = await Promise.all([readPayouts(), readFees()]);
-  return { payouts, fees, note };
+  const payouts = await readPayouts();
+  return { payouts, note };
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -482,7 +450,7 @@ export async function accruedReading(seller) {
  * 运营指标（`GET /api/shop/metrics`，ownerOnly 只读）。
  *
  * 全部读数都来自**已有的唯一实现**：待办谓词与徽标同源、队列读数走 queueWait、
- * 对账走 `chainReconcileStatus()` 的快照（调用方传入）、收费方走 fees.js、托管超时走
+ * 对账走 `chainReconcileStatus()` 的快照（调用方传入）、托管超时走
  * escrowOverdueReading——本函数只做组装与三态标注，不新建任何账本。
  *
  * 响应形状的另一端（前端）：`frontend/src/types.ts` 的 `ShopMetrics` 与
@@ -540,7 +508,6 @@ export async function opsMetrics({ now = Date.now(), reconcile, seller } = {}) {
     reconcileLastRunAt: rec.lastRunAt,
     reconcileMismatches: rec.differences, // 读不到 = null（不是 0 处）
     accruedPayoutsWei: accrued.payouts.available ? accrued.payouts.wei : null,
-    accruedFeesWei: accrued.fees.available ? accrued.fees.wei : null,
     ordersByStatus: byStatus,
     escrowedCount: escrow.activeOrders, // 在途托管（escrowed/shipped/disputed，本地口径，恒可读）
     overdueCount: escrow.overdue, // 链上判据：读不到 = null（不是 0 单）
@@ -554,13 +521,12 @@ export async function opsMetrics({ now = Date.now(), reconcile, seller } = {}) {
     reconcileReason: rec.reason,
     reconcileFailed: rec.failed, // 读不到（异常）的单数，不计入差异数
     accruedPayoutsReason: accrued.payouts.available ? null : accrued.payouts.reason,
-    accruedFeesReason: accrued.fees.available ? null : accrued.fees.reason,
     accruedNote: accrued.note,
     note:
       '口径与来源：待办计数与 /api/orders/seller/status-counts 徽标同一实现（谓词只有一份）；' +
       '对账读数取 chainReconcile 的运行状态快照（/healthz 同源），差异数 = 修复 + 链上缺失，' +
       '读不到（failed）单列不计入；托管超时以合约 releaseNotBeforeBlock 为准（不按块时间估算）；' +
-      '挂账余额按地址读（店主地址 / 当前 feeCollector）。读不到一律 null + reason。',
+      '挂账余额按地址读（该店店主地址）。读不到一律 null + reason。',
   };
 }
 

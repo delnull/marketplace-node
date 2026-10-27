@@ -10,6 +10,7 @@ import { test, before } from 'node:test';
 /** 全额退款事件参数（Escrow.RefundApproved 现带 refundWei）：测试内订单金额恒为 1e18 */
 const FULL_REFUND = '1000000000000000000';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { Wallet } from 'ethers';
 import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
@@ -142,6 +143,12 @@ test('watcher 迁移触发通知（order.escrowed→refund.requested→refund.ap
   for (const s of sent) {
     assert.equal(s.url, 'https://93.184.216.34/hook/order');
     assert.match(s.headers['x-mk-signature'], /^[0-9a-f]{64}$/, '带 HMAC 签名');
+    assert.match(s.headers['x-mk-timestamp'], /^\d{10}$/, '带秒级时间戳，接收方可拒绝重放');
+    const expectSig = crypto
+      .createHmac('sha256', HOOK_SECRET)
+      .update(`${s.headers['x-mk-timestamp']}.${JSON.stringify(s.body)}`)
+      .digest('hex');
+    assert.equal(s.headers['x-mk-signature'], expectSig, '签名覆盖 timestamp.body');
     for (const k of noPrivacyKeys) assert.ok(!(k in s.body), `payload 不应含 ${k}`);
     assert.ok(s.body.orderId && s.body.amountWei && s.body.at);
   }
@@ -267,7 +274,7 @@ test('失败重试：首次失败后按退避重试成功；未配置 URL 零调
 
 test('SSRF 防护：webhook 指向内网/回环/链路本地地址被拒绝投递（2026-09 修复）', async () => {
   const order = await createDraft((await listProduct(productPayload({ kind: 'digital', title: 'SSRF 防护商品' }))).slug);
-  for (const bad of ['http://127.0.0.1:8545/', 'http://169.254.169.254/latest/meta-data/', 'http://192.168.1.1/hook', 'http://[::1]:8080/']) {
+  for (const bad of ['https://127.0.0.1:8545/', 'https://169.254.169.254/latest/meta-data/', 'https://192.168.1.1/hook', 'https://[::1]:8080/']) {
     sent.length = 0;
     await setWebhookConfig(shopRef.value, { url: bad, secret: HOOK_SECRET });
     // await 结算 = 覆盖完整的重试窗口（被 SSRF 拦下也会重试到耗尽），不需要再猜时长
@@ -292,7 +299,7 @@ test('自动交付路径事件顺序：order.escrowed 先于 order.shipped（wat
   // 链上桩：仍在托管、未申请退款 ⇒ 允许自动交付；交付本身是异步的（先读链上真值），故轮询等落定。
   setChainOrderFetcher(async (orderIdHex) => {
     const row = await db.get(
-      `SELECT commission_quoted_to, commission_quoted_bps, timeout_blocks
+      `SELECT timeout_blocks
          FROM v_orders WHERE escrow_order_id = ?`,
       String(orderIdHex || '').toLowerCase()
     );
@@ -302,12 +309,6 @@ test('自动交付路径事件顺序：order.escrowed 先于 order.shipped（wat
       refundRejected: false,
       refundedAmount: '0',
       timeoutBlocks: Number(row?.timeout_blocks),
-      // 订单身份的一部分（顶层）：交付闸的 chainParamsMatch 读它，桩必须与真实读取器同形
-      commissionTo: String(row?.commission_quoted_to ?? '').toLowerCase(),
-      commissionTerms: {
-        commissionTo: String(row?.commission_quoted_to ?? '').toLowerCase(),
-        commissionBps: Number(row?.commission_quoted_bps) || 0,
-      },
     };
   });
   assert.equal(await applyEvent('OrderCreated', { orderId: order.escrowOrderId }, { txHash: payHash(), block: 3 }), 1);
@@ -369,6 +370,16 @@ test('GET /orders/seller/status-counts 徽标口径', async () => {
  *  2. 「发送测试事件」同步返回结果，失败原因可读；
  *  3. 这两个接口都是 ownerOnly。
  */
+test('保存 webhook 时拒绝 http：投递端只支持 https，不能保存一个注定投不出去的地址', async () => {
+  const res = await request(app)
+    .put('/api/shop/webhook')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ url: 'http://93.184.216.34/hook/plain' })
+    .expect(200);
+  assert.notEqual(res.body.code, 0);
+  assert.match(String(res.body.message), /https:\/\//);
+});
+
 test('webhook-status / webhook-test：投递留痕与测试事件', async () => {
   const { resetWebhookStatus } = await import('../src/webhook.js');
   resetWebhookStatus();

@@ -26,6 +26,9 @@ docker exec -e MYSQL_PWD="$(cat .mysql-root)" marketplace-node-mysql \
   | gzip > "node-db-$(date +%F).sql.gz"
 ```
 
+`bash deploy.sh --update` 在重建容器前也会对内置 MySQL 自动落一份
+`db-backup-<UTC 时间>.sql.gz`（备份失败会明确告警，不假装备份成功）。外部 MySQL 仍按下文手动备份。
+
 外部 MySQL：
 
 ```bash
@@ -95,7 +98,7 @@ bash deploy.sh --update
 
 - `.env` 和 `.mysql-root` 权限保持 `0600`，不要进 Git、不要贴聊天。
 - MySQL 只允许节点容器访问，不要对公网开放 3306。
-- 公网只暴露 HTTPS；反向代理后设置 `MK_TRUST_PROXY=1`，否则来源 IP 会记成代理地址。
+- 公网只暴露 HTTPS；反向代理后按拓扑设置 `MK_TRUST_PROXY`：宿主 nginx 用 `loopback`，Caddy/Docker 反代用代理所在网段（如 `172.16.0.0/12`）。**不要填 `1`**——配置层只接受空、`loopback` 或 IP/CIDR，填 1 会拒绝启动。
 - `MK_CORS_ORIGIN` 只填实际前端域名；不要在生产用 `*`。
 - 节点主私钥只用于钱包签名，不写入服务器。
 

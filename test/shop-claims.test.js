@@ -17,10 +17,9 @@
  *  ⑥ **公开面纪律**：只出有效声明、原样带 message/signature、**不含**任何"已认证/官方"字段，
  *     鉴权（未登录 401 / 店员 403）与审计留痕。
  */
-import { test, before, after } from 'node:test';
+import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
-import { Interface, Wallet, verifyMessage } from 'ethers';
+import { Wallet, Interface, verifyMessage } from 'ethers';
 import { makeCtx, login, assertOk, shopRef, TEST_SHOP_CODE } from './setup.mjs';
 
 const ctx = await makeCtx();
@@ -28,66 +27,22 @@ const { app, request, owner, buyer, db } = ctx;
 
 const { CLAIM_KINDS, CLAIM_VALUE_MAX, buildClaimMessage, parseClaimMessage, checkClaimValue, verifyClaim } =
   await import('../src/claims.js');
-const { resetShopCodeCache } = await import('../src/shopCode.js');
-const config = (await import('../src/config.js')).default;
 
-const REGISTRY = '0x' + 'aa'.repeat(20);
 const CODE = TEST_SHOP_CODE; // 与 fixture 落的那一行**同一个编号**（句柄 = 它，见 setup.mjs 的说明）
+const OTHER_CODE = '0000OTHR1';
 const OP = owner.address.toLowerCase();
-const OTHER_CODE = '00000009';
 
 let ownerToken;
 let staffWallet;
 let staffToken;
 
-// ── 假 JSON-RPC：只回答 Registry.codeOf(operator)（既有只读路径就是它，见 src/shopCode.js）──
-const REGISTRY_ABI = new Interface(['function codeOf(address operator) view returns (string)']);
-let chain = { code: CODE, fail: false, asked: [] };
-
-function handleRpc(j) {
-  if (j.method !== 'eth_call') return { error: { code: -32601, message: `unit-test: ${j.method}` } };
-  const to = String(j.params?.[0]?.to || '').toLowerCase();
-  const data = String(j.params?.[0]?.data || '');
-  if (to !== REGISTRY.toLowerCase() || data.slice(0, 10) !== REGISTRY_ABI.getFunction('codeOf').selector) {
-    return { error: { code: -32601, message: `unit-test: 未预期的调用 ${to} ${data.slice(0, 10)}` } };
-  }
-  const [operator] = REGISTRY_ABI.decodeFunctionData('codeOf', data);
-  chain.asked.push(operator.toLowerCase());
-  if (chain.fail) return { error: { code: -32000, message: 'unit-test: codeOf 读取失败' } };
-  return { result: REGISTRY_ABI.encodeFunctionResult('codeOf', [chain.code]) };
-}
-
-const rpcServer = http.createServer((req, res) => {
-  let body = '';
-  req.on('data', (c) => (body += c));
-  req.on('end', () => {
-    const parsed = JSON.parse(body || '{}');
-    const out = Array.isArray(parsed)
-      ? parsed.map((j) => ({ jsonrpc: '2.0', id: j?.id ?? 1, ...handleRpc(j) }))
-      : { jsonrpc: '2.0', id: parsed?.id ?? 1, ...handleRpc(parsed) };
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify(out));
-  });
-});
-
 /*
-  链上接线与登录都放在**一个 before** 里：node:test 的多个顶层 before 会交错，
-  而 rpcUrl/registryAddress 必须在任何一次链上读取之前接好（见 staking-risk.test.js 的注释）。
+  声明提交完全在链下（店铺编号是本节点铸造的 `shops.code`），所以这里不需要任何链上桩，
+  只需要登录态与一名非店主店员（证明两个写入口都是 ownerOnly，而不是"登录即可"）。
 */
 before(async () => {
-  await new Promise((r) => rpcServer.listen(0, '127.0.0.1', r));
-  config.chain.rpcUrl = `http://127.0.0.1:${rpcServer.address().port}`;
-  config.chain.registryAddress = REGISTRY;
-  resetShopCodeCache();
-  /*
-    本组用例要验的是"编号已对账落库之后"的正常路径（一行店铺只在链上登记之后才存在），
-    所以这里按对账的产物把编号写进本地店铺行（生产中由 termsReconciler 写，见 src/shops.js
-    的 applyChainShop）。**不是**改判据：判据仍然读 `shops.code`，只是让前置状态就位。
-  */
-  // 编号由 fixture 落好（不再需要在这里改写：改了它就得同时改 shopRef.value）
   ownerToken = (await login(ctx, owner)).token;
   assert.ok(ownerToken);
-  // 店员（非店主）：用来证明两个写入口都是 ownerOnly，而不是"登录即可"
   staffWallet = Wallet.createRandom();
   const add = await request(app)
     .put('/api/shop/staff')
@@ -97,7 +52,6 @@ before(async () => {
   assertOk(add);
   staffToken = (await login(ctx, staffWallet)).token;
 });
-after(() => rpcServer.close());
 
 /** 店主应签的那条规范消息（与节点端同一实现：唯一实现就是 src/claims.js） */
 const claimMessage = (over = {}) =>
@@ -473,29 +427,17 @@ test('verifyClaim：合约账户走标准 1271 / Safe legacy，不再要求 EOA 
   assert.equal((await verifyClaim({ message: msg, signature: sig, expectedOperator: contract, provider: bad })).ok, false);
 });
 
-// ── ④ 编号取不到 ⇒ 如实报，绝不放行 ──
+// ── ④ 声明提交不依赖链：店铺编号是本节点铸造的本地事实 ──
 /*
-  多店改造后"本店编号"的**来源变了**（这是这组用例改写的原因，不是放宽）：
-  编号不再在每次提交声明时向 Registry 实时读 `codeOf(operator)`，而是读本地的 `shops.code`
-  ——那一列是链上 `ShopInfo.code` 的镜像，由 `termsReconciler` / 开店流程的
-  `/verify-onchain` 对账写入。于是"核验不了"的那一档来自**本店行缺失或店主地址非法**
-  （"还没在链上登记"那种状态已经不可表达：一行店铺只在链上登记之后才存在，编号由链上铸造），
-  而链不可达不再影响声明提交（链路只在**对账那一刻**需要，读不到时本地行保持原值、不写假数据）。
-  判据仍然是"核验不了就拒绝、绝不先存着"。
+  "本店编号"的来源是本地 `shops.code`（本节点审批开店时铸造）。提交声明**不读链**：
+  所以这里只验正常路径（核验用的 operator 也来自本地店铺行的 seller）。
 */
-
-
-test('编号已对账落库 ⇒ 核验通过（链路只在**对账那一刻**需要，不在提交声明时）', async () => {
+test('编号是本地事实 ⇒ 核验通过（提交声明不依赖链上读取）', async () => {
   const before = (await claimRows()).length;
-  chain.fail = true; // 链不可达也不影响：编号已经是本地事实（读不到链时绝不改写它）
-  try {
-    const body = await signedBody({ kind: 'x', value: 'mirroredcode' });
-    const res = await claim({ kind: body.kind, value: body.value, issued: body.issued, signature: body.signature });
-    assertOk(res);
-    assert.equal((await claimRows()).length, before + 1);
-  } finally {
-    chain.fail = false;
-  }
+  const body = await signedBody({ kind: 'x', value: 'mirroredcode' });
+  const res = await claim({ kind: body.kind, value: body.value, issued: body.issued, signature: body.signature });
+  assertOk(res);
+  assert.equal((await claimRows()).length, before + 1);
 });
 
 // ── ⑤ 幂等与撤销 ──

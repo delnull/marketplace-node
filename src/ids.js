@@ -1,5 +1,5 @@
 /**
- * 标识符（订单号 / 商品标识）——**统一格式，去掉连字符**。
+ * 标识符（订单号 / 商品标识 / 店铺编号 / 提货声明号）——**统一格式，去掉连字符**。
  *
  * 为什么不用 UUID：`ae9c128c-6a90-4989-87e5-7dd7c5b57482` 是对机器友好、对人极不友好的字符串——
  * 36 个字符、4 个连字符、大小写混排，用户在聊天里报单号、客服在电话里核单号时，
@@ -15,24 +15,33 @@
  *     日志里一眼能看出先后，也便于按前缀做区间检索；
  *   · 后 10 位是 50 bit 随机 → 订单是半敏感资源（拿单号能看到收货信息等），
  *     必须不可枚举：50 bit ≈ 1.1e15，同一毫秒内碰撞概率可忽略；
- *   · 插入冲突（唯一键）时由调用方重试，见 `newOrderId` 的 retry 注释。
  *   例：`B0V3K7QW3M9P2TZ8N5VW1Y`
  *
+ * 提货声明号 `C` + 时间(10) + 随机(10) = **21 字符**：与订单号同一套理由（持有人要能口头报它）。
+ *
  * 商品标识 `P` + 随机(10) = **11 字符**（例：`P7QW3M4X9T2`）：
- *   · 商品是公开可枚举的资源，不需要时间前缀（那反而会泄露"何时上架"的弱信息给无关的人，
- *     也让同一批上架的商品前缀雷同、更难区分）；
+ *   · 商品是公开可枚举的资源，不需要时间前缀（那反而会泄露"何时上架"的弱信息给无关的人）；
  *   · 10 位随机 ≈ 1e15 组合，跨店全局唯一足够。
  *
- * 新项目只有这一种格式：`newOrderId` / `newProductSlug` 是**唯一生成器**，
+ * 店铺编号 = 8 位随机数据 + 1 位**加权校验** = **9 字符**（`newShopCode`）：
+ *   · 店铺是**节点链下**的事实（平台目录只登记节点），编号由本节点铸造、写入 `shops.code`；
+ *   · 校验位的形状契约在 `shared/shopCode.js`（前端在解析 `/shop/<code>` 前用它校验，
+ *     单测 `test/shopCode.test.js` 会拿本函数生成的编号去过那份实现）。本文件只负责**铸造**，
+ *     读路径从不解析编号里的任何含义——存在性只有库能回答。
+ *
+ * 新项目只有这一套格式：这里的生成器是**唯一生成器**，
  * `isNewOrderId` / `isNewProductSlug` 只服务展示层判断，**不用于校验/拒绝**——
- * 读路径不得假设"标识一定是这个形状"（形状校验只在这两个生成器的输出上成立）。
+ * 读路径不得假设"标识一定是这个形状"（形状校验只在这些生成器的输出上成立）。
  */
 import crypto from 'node:crypto';
 
 /** Crockford Base32（无 I L O U，避免与 1 0 看混） */
 const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+/** 校验位的扩展符号（与 shared/shopCode.js 的 SHOP_CODE_EXT 逐字一致） */
+const SHOP_CODE_EXT = '-._~,';
 const RE_ORDER = /^B[0-9A-HJKMNP-TV-Z]{20}$/;
 const RE_SLUG = /^P[0-9A-HJKMNP-TV-Z]{10}$/;
+const RE_CLAIM = /^C[0-9A-HJKMNP-TV-Z]{20}$/;
 
 /** 无偏 random 整数（拒绝采样，避免取模引入偏差） */
 function randomInt(max) {
@@ -71,6 +80,26 @@ export function newProductSlug() {
   return `P${randomChars(10)}`;
 }
 
+/** 新提货声明号：`C` + 10 位时间 + 10 位随机（与订单号同一套理由：持有人要能口头报它） */
+export function newClaimNo(now = Date.now()) {
+  return `C${encode(now, 10)}${randomChars(10)}`;
+}
+
+/**
+ * 新店铺编号：8 位随机数据 + 1 位**加权校验**（`Σ 值×位权(1..8) mod 37`）。
+ *
+ * 店铺是节点链下的事实，编号由本节点铸造（平台 Registry 不认识"店"）。校验位的算法契约见
+ * `shared/shopCode.js`：前端解析 `/shop/<code>` 前要过它，所以本函数**必须产出能通过那份校验**
+ * 的编号——`test/shopCode.test.js` 拿它生成的编号过 shared 的 `verifyShopCode` 守住这条。
+ */
+export function newShopCode() {
+  const data = randomChars(8);
+  let sum = 0;
+  for (let i = 0; i < 8; i += 1) sum += ALPHABET.indexOf(data[i]) * (i + 1);
+  const c = sum % 37;
+  return data + (c < 32 ? ALPHABET[c] : SHOP_CODE_EXT[c - 32]);
+}
+
 /** 是否新式订单号（仅用于展示层"这是新格式"的判断，不用于校验/拒绝） */
 export function isNewOrderId(v) {
   return RE_ORDER.test(String(v || ''));
@@ -79,6 +108,11 @@ export function isNewOrderId(v) {
 /** 是否新式商品标识 */
 export function isNewProductSlug(v) {
   return RE_SLUG.test(String(v || ''));
+}
+
+/** 是否新式提货声明号（仅展示层判断） */
+export function isNewClaimNo(v) {
+  return RE_CLAIM.test(String(v || ''));
 }
 
 /**

@@ -88,7 +88,7 @@ export function validateFileMeta({ name, mime, size }) {
 /**
  * 附件落盘根目录（**唯一实现**；证据附件与商品媒体都从它派生，见 productMedia.uploadsDir）。
  *
- * 只有一个旋钮：`MK_ATTACH_DIR`（容器部署指向挂载卷，见 deploy/README.md）；未配置时回落到
+ * 只有一个旋钮：`MK_ATTACH_DIR`（容器部署必须指向挂载卷）；未配置时回落到
  * **进程工作目录**下的 `attachments/`。
  *
  * 为什么不再"跟随数据库文件位置"（旧形状）：MySQL 没有库文件，`config.db.file` 已不存在——
@@ -174,7 +174,10 @@ export async function storeFiles({ orderId, evidence, files }) {
   if (Number(evidence?.order_id) !== orderKey) {
     throw userError('证据记录不属于该订单：附件只能追加到本单的陈述上');
   }
-  // 阶段一：全量预检（meta + 魔数），失败即整体拒绝（此阶段不碰磁盘、不碰库）
+  // 阶段一：全量预检（条数 + meta + 魔数），失败即整体拒绝（此阶段不碰磁盘、不碰库）
+  if (!Array.isArray(files) || files.length > MAX_FILES_PER_EVIDENCE) {
+    throw userError(`单条陈述至多 ${MAX_FILES_PER_EVIDENCE} 个附件`);
+  }
   const prepared = files.map((f) => {
     const data = Buffer.from(f.dataB64, 'base64');
     const meta = validateFileMeta({ name: f.name, mime: f.mime, size: data.length });
@@ -185,6 +188,28 @@ export async function storeFiles({ orderId, evidence, files }) {
     return { data, meta };
   });
   if (!prepared.length) throw userError('files 需为非空数组 [{name, mime, dataB64}]');
+  /*
+    落盘前的**只读预检**：配额权威判据仍是下面事务里的两条条件 UPDATE（并发下只有它们算数）；
+    这里读一次只是避免“明知已满还先写 6×2MB 再回滚删除”。读与写之间的窗口由事务判据兜住，
+    所以这段不改变安全性，只改变失败路径的代价。
+  */
+  const addCountPreview = prepared.length;
+  const addBytesPreview = prepared.reduce((a, p) => a + p.data.length, 0);
+  const evNow = await db.get('SELECT file_count, file_bytes FROM dispute_evidence WHERE id = ?', evidenceKey);
+  const orderNow = await db.get('SELECT evidence_bytes FROM orders WHERE id = ?', orderKey);
+  if (
+    evNow &&
+    (Number(evNow.file_count) + addCountPreview > MAX_FILES_PER_EVIDENCE ||
+      Number(evNow.file_bytes) + addBytesPreview > MAX_BYTES_PER_ORDER)
+  ) {
+    throw userError(
+      `该陈述的附件配额已满（单条陈述至多 ${MAX_FILES_PER_EVIDENCE} 个、累计 ${Math.round(MAX_BYTES_PER_ORDER / 1024 / 1024)}MB）：` +
+        '请先删除/压缩后重试，或把材料分成多条陈述提交'
+    );
+  }
+  if (orderNow && Number(orderNow.evidence_bytes) + addBytesPreview > MAX_BYTES_PER_ORDER) {
+    throw userError(`该订单证据附件累计超过 ${Math.round(MAX_BYTES_PER_ORDER / 1024 / 1024)}MB 上限`);
+  }
 
   const dir = orderAttachDir(orderKey);
   fs.mkdirSync(dir, { recursive: true });

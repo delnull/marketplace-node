@@ -20,16 +20,9 @@ import { Router } from 'express';
 import { getDb } from '../db.js';
 import { verifyToken, roleOf } from '../auth.js';
 import { fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
+import { refundUsdtMicroOfRow } from '../stats.js';
 import { sendCsv } from '../csv.js';
 import { logAudit } from '../audit.js';
-import {
-  refreshFeeCollector,
-  commissionTermsReadOf,
-  feeSnapshotReadOf,
-  feeChargeableForOrder,
-  feeBasisOf,
-  settlementReadOf,
-} from '../fees.js';
 // 入账口径与订单状态集合的唯一出处（与流水页/看板/可评价同源，见 src/orderStatus.js）
 import { INCOME_STATUS as ORDER_INCOME_STATUS } from '../orderStatus.js';
 import { sellerOrderFilters } from '../sellerOrderFilters.js';
@@ -61,33 +54,27 @@ function timeParamOf(raw, name) {
 }
 
 /**
- * 一行的「平台费口径三件套」——**唯一实现**（ledger.csv 与 orders.csv 共用，两处必须逐字同源）。
+ * 一行的金额两腿读数（零费模型：**毛额 − 已退买家 = 净额**）。
  *
- * 为什么要把判据本身也导出来：只给 `fee_wei` / `net_wei` 时，店主拿它对账**无法自证**这个费是怎么来的
- * ——按本单快照扣的？还是因为快照缺失、按全局保守口径折算的？两者在同一个文件里长得一模一样，
- * 而后者**可能**与链上实际扣费相反（见 src/fees.js 文件头的两个方向）。所以把 `fee_bps`（费率快照）、
- * `fee_chargeable`（这一单判不判扣费）、`fee_basis`（判据来源：snapshot / fallback）
- * 一并落盘：任何一行都能在 Excel 里手算复核 net = amount − refunded − fee − commission。
- *
- * **三态**：`fee_bps` 那一列是 `NOT NULL DEFAULT 0`，"没补录过"与"快照就是 0"分不开
- * （判据见 src/fees.js 的 feeSnapshotReadOf）。快照未回填时这一行的费与净额**算不出来**
- * ——三个金额单元格一律留**空**（Excel 里是"没有值"），`fee_basis` 那列写 `fallback` 说明原因。
- * 写 0 等于在月结文件里替链上宣布"这单不扣费"。
- * @returns {{bps:number|'', chargeable:0|1, basis:'snapshot'|'fallback'}}
+ * `refunded_amount_wei` 来自 `order_chain`（LEFT JOIN 可能为 NULL）："这一单还没有链上镜像行"
+ * 与"'0' = 确证没退过款"在月结文件里必须长得不一样——NULL 单元格留空，不折成 0。
+ * 净额算不出来（任一读数缺失）时同样留空：写 0 等于在月结文件里替链上宣布"这单没退过"。
  */
-function feeCellsOf(o) {
-  const snap = feeSnapshotReadOf(o);
+function moneyCellsOf(o) {
+  const refunded = o.refunded_amount_wei === null || o.refunded_amount_wei === undefined ? null : BigInt(o.refunded_amount_wei);
+  const amount = o.amount_wei === null || o.amount_wei === undefined ? null : BigInt(o.amount_wei);
+  const net = refunded === null || amount === null ? null : amount - refunded;
   return {
-    bps: snap.known ? snap.feeBps : '',
-    chargeable: feeChargeableForOrder(o.fee_collector_at_create) ? 1 : 0,
-    basis: feeBasisOf(o.fee_collector_at_create),
+    refundedWei: refunded === null ? '' : refunded.toString(),
+    netWei: net === null ? '' : net.toString(),
+    netUsdtMicro: refunded === null ? '' : (BigInt(o.usdt_micro || '0') - refundUsdtMicroOfRow(o)).toString(),
   };
 }
 
 /**
  * 导出限流（四路 CSV 共用一把窗口）：
  * 导出是最重的读路径——orders/ledger/products 都是**全表** SELECT（不带分页）并在 JS 侧
- * 逐行折算，codes.csv 还会把码原文整体吐出；`await refreshFeeCollector()` 另有一次链上读。
+ * 逐行折算，codes.csv 还会把码原文整体吐出。
  * 数值依据：真实用法是月结/盘点时点几下（一次会话 1~4 个文件），20 次/分已远超需要；
  * 重导出给得比其它只读端点紧，正是因为它单次成本高一个量级。
  * 四路共用同一实例 = 共享额度（"总导出量"才是要挡的东西，逐路径各给 20 会放大 4 倍）。
@@ -104,7 +91,7 @@ const auditExport = async (req, action, targetId, detail) =>
     req,
     actor: req.auth?.address,
     // 角色按**本店**算：漏传店铺编号会得到 'user'，而 logAudit 对 'user' 直接返回——导出审计静默消失
-    actorRole: await roleOf(req.auth?.address || '', req.shop.code),
+    actorRole: req.shopRole && req.shopRole !== 'user' ? req.shopRole : await roleOf(req.auth?.address || '', req.shop.code),
     // 四条 CSV 全是 ownerOnly + 本店作用域（查询里 `WHERE shop_code = ?`，见下方说明）：归属恒为本店
     shopCode: req.shop.code,
     action,
@@ -115,40 +102,24 @@ const auditExport = async (req, action, targetId, detail) =>
 
 /**
  * 订单全量导出列。
- * 金额块：只给 `amount_net_wei` 时店主算不回它（只能回去翻页面）。补齐
- * refunded/fee/commission/费率/判据来源后，一行即可自证
- * `amount_net_wei = amount_wei − refunded_wei − fee_wei − commission_wei`
- * （且可知每条腿是按快照还是兜底算的）。
- * `accepted_partial_refund_wei` 同 ledger.csv 的理由：分辨"部分退款是仲裁拆分还是买家授权"。
+ * 金额块：`amount_wei − refunded_wei = amount_net_wei` 必须在同一行内自洽（零费模型只有两条腿），
+ * 另加 `accepted_partial_refund_wei` 分辨"部分退款是仲裁拆分还是买家授权"。
  */
 const ORDER_COLUMNS = [
-  'order_no', 'product_slug', 'status', 'quantity', 'amount_wei', 'refunded_wei', 'fee_wei', 'commission_wei',
-  'amount_net_wei',
-  'fee_bps', 'fee_chargeable', 'fee_basis', 'commission_bps', 'commission_basis',
+  'order_no', 'product_slug', 'status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
+  'payment_rate_source', 'payment_rate_stale', 'payment_rate_quoted_at',
+  'amount_wei', 'refunded_wei', 'amount_net_wei', 'net_usdt_micro',
   'accepted_partial_refund_wei',
   'usdt_micro', 'shipping_fee_usdt_micro', 'invoice_needed',
   'buyer', 'shipping_name', 'shipping_phone', 'shipping_address', 'shipping_edited', 'note', 'escrow_order_id',
   'paid_tx_hash', 'refund_status', 'tracking_no', 'carrier', 'created_at', 'updated_at',
 ];
 
-/**
- * 抽成判据三件套（与 `feeCellsOf` 对称）：`basis` 说明这一行的抽成是**按本单成交条款快照**
- * 算的还是**根本没补录**（`missing`）。三态与 `src/fees.js` 的 `commissionTermsReadOf` 同款：
- * 空串 = 从未补录 = 未知（那时抽成与净额两列留空，**不写 0**）。
- */
-function commissionCellsOf(o) {
-  const snap = commissionTermsReadOf(o);
-  return { bps: snap.known ? snap.bps : '', basis: snap.known ? 'snapshot' : 'missing' };
-}
-
 /** 收款流水导出（ownerOnly；入账口径与流水页一致 = 订单 updated_at 末次迁移时刻；
- *  列含 **毛额 / 已退买家 / 平台费 / 节点抽成 / 净额** 五列——月结对账免逐页人工加总；
- *  另有**按单的判据三件套**与**买家已授权的部分退款额**；`?from=&to=` 为 ISO-8601） */
+ *  列含 **毛额 / 已退买家 / 净额** 三列——月结对账免逐页人工加总；
+ *  另有**买家已授权的部分退款额**；`?from=&to=` 为 ISO-8601） */
 router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const db = getDb();
-  // 平台费**按单**判定（创建时收费方快照，见 src/fees.js）；这里刷新全局口径只为
-  // "本单没有快照"的兜底行与披露字段（feeCollectorKnown），保持与流水页同源。
-  await refreshFeeCollector();
   const marks = INCOME_STATUS.map(() => '?').join(',');
   /*
     ⚠️ **店铺维度是这条查询的安全边界**（四条 CSV 同批）：`ownerOnly` 只回答
@@ -174,42 +145,34 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const rows = await db.all(`SELECT * FROM v_orders WHERE shop_code = ? AND status IN (${marks})${range.length ? ` AND ${range.join(' AND ')}` : ''} ORDER BY updated_at DESC`, ...params);
   /*
     列口径：
-      · 钱流五列（amount/refunded/fee/commission/net）必须在**同一行内自洽**，月结时能在 Excel 里手算复核；
-      · `fee_*` / `commission_*` = 各腿的判据三件套，缺一列店主就无法自证那些钱是按本单快照算的
-        还是按全局兜底折算的（两者可能相反，见 src/fees.js 文件头）；
+      · 钱流三列（amount/refunded/net）必须在**同一行内自洽**，月结时能在 Excel 里手算复核
+        （零费模型：没有平台费、没有节点抽成，`net = amount − refunded`）；
       · `accepted_partial_refund_wei` = 买家在链上**授权过**的部分退款额。
         契约起 `approveRefund` 只接受「全额」或「买家精确授权过的那个数」，于是「这单退给买家 X」
         在链上有两个来源——仲裁拆分（无需同意）与双方谈拢（买家授权）。只导 refunded_wei 时，
         店主对着一笔部分退款无法分辨是哪一种，也就无从复核"这笔结算有没有买家点头"。
   */
   const headers = [
-    'order_no', 'product_slug', 'income_status', 'quantity', 'amount_wei', 'refunded_wei', 'fee_wei',
-    'commission_wei', 'net_wei',
-    'fee_bps', 'fee_chargeable', 'fee_basis', 'commission_bps', 'commission_basis',
+    'order_no', 'product_slug', 'income_status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
+    'payment_rate_source', 'payment_rate_stale', 'payment_rate_quoted_at',
+    'amount_wei', 'refunded_wei', 'net_wei', 'net_usdt_micro',
     'accepted_partial_refund_wei',
     'usdt_micro', 'income_at', 'buyer', 'escrow_order_id', 'paid_tx_hash',
   ];
   const csvRows = rows.map((o) => {
-    /*
-      四腿口径（与 `Escrow._settle` 逐字同源，算术只有 `src/fees.js` 一处实现）：
-        净额 = 毛额 − 已退买家 − 平台费 − **节点抽成**
-      平台费按**该单的创建时收取方快照**判定（合约只读快照；全局 feeCollector() 事后可改，
-      用它会让导出与链上在途单的口径相反）；抽成按**该单的成交条款快照**。
-      任一条腿的快照未回填 ⇒ 该腿与净额三列一律留空（判据列 `*_basis` 说明原因），
-      **绝不写 0**：那会让月结对账把"算不出来"当成"没扣/没抽"。
-    */
-    const rd = settlementReadOf(o);
-    const fc = feeCellsOf(o);
-    const cc = commissionCellsOf(o);
+    const money = moneyCellsOf(o);
     return [
-      o.order_no, o.product_slug, o.status, o.quantity || 1, o.amount_wei,
+      o.order_no, o.product_slug, o.status, o.quantity || 1,
+      o.payment_token || '0x0000000000000000000000000000000000000000',
+      o.payment_symbol || 'BTY', o.payment_decimals ?? 18,
+      o.payment_rate_source || 'bty', o.payment_rate_stale ? 1 : 0, isoCell(o.payment_rate_quoted_at),
+      o.amount_wei,
       // 链上镜像列来自 LEFT JOIN：NULL = **这一单还没有链上镜像行**（尚未托管），
       // 而 '0' = 确证没退过款。两者在月结里必须长得不一样，所以 NULL 留空、不折成 0。
-      o.refunded_amount_wei ?? '',
-      !rd.ok || rd.feeWei === null ? '' : rd.feeWei,
-      !rd.ok || rd.commissionWei === null ? '' : rd.commissionWei,
-      !rd.ok || rd.netWei === null ? '' : rd.netWei,
-      fc.bps, fc.chargeable, fc.basis, cc.bps, cc.basis, o.accepted_partial_refund_wei ?? '',
+      money.refundedWei,
+      money.netWei,
+      money.netUsdtMicro,
+      o.accepted_partial_refund_wei ?? '',
       o.usdt_micro, isoCell(o.updated_at), o.buyer, o.escrow_order_id || '', o.paid_tx_hash || '',
     ];
   });
@@ -219,14 +182,6 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
 
 router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const db = getDb();
-  /*
-    平台费口径必须与 ledger.csv **逐字同源**：`fees.js` 的**全局** feeCollector 缓存是进程级的、
-    只由请求触发，而这里原先没有 `refreshFeeCollector()`。于是节点刚起来、**先**导 orders.csv 时
-    `cache.known === false` ⇒ 兜底口径判为"会扣费" ⇒ 按订单级 feeBps 扣费；随后导 ledger.csv
-    （它 await 了刷新）才读到全局 `feeCollector == 0` ⇒ 兜底不扣。同一单在两个 CSV 里的
-    `amount_net_wei` / `net_wei` 相差一个费额，店主的月结对账对不上。
-  */
-  await refreshFeeCollector();
   /*
     店铺维度**直接写进语句**（而不是塞进下面那个动态拼接的 `where` 数组）：
     动态数组里的第一个条件很容易在某次重构中被改掉/挪走，而这条过滤是**安全边界**不是筛选条件。
@@ -265,17 +220,18 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     ...rangeParams
   );
   const csvRows = rows.map((o) => {
-    /* 与 ledger.csv 同一口径（五腿、按单快照判定；两处必须逐字同源） */
-    const rd = settlementReadOf(o);
-    const fc = feeCellsOf(o);
-    const cc = commissionCellsOf(o);
+    /* 与 ledger.csv 同一口径（毛额 − 已退买家 = 净额；两处必须逐字同源） */
+    const money = moneyCellsOf(o);
     return [
-      o.order_no, o.product_slug, o.status, o.quantity || 1, o.amount_wei,
-      o.refunded_amount_wei ?? '',
-      !rd.ok || rd.feeWei === null ? '' : rd.feeWei,
-      !rd.ok || rd.commissionWei === null ? '' : rd.commissionWei,
-      !rd.ok || rd.netWei === null ? '' : rd.netWei,
-      fc.bps, fc.chargeable, fc.basis, cc.bps, cc.basis, o.accepted_partial_refund_wei ?? '',
+      o.order_no, o.product_slug, o.status, o.quantity || 1,
+      o.payment_token || '0x0000000000000000000000000000000000000000',
+      o.payment_symbol || 'BTY', o.payment_decimals ?? 18,
+      o.payment_rate_source || 'bty', o.payment_rate_stale ? 1 : 0, isoCell(o.payment_rate_quoted_at),
+      o.amount_wei,
+      money.refundedWei,
+      money.netWei,
+      money.netUsdtMicro,
+      o.accepted_partial_refund_wei ?? '',
       o.usdt_micro, o.shipping_fee_usdt_micro ?? 0, o.invoice_needed ? 1 : 0,
       o.buyer, o.shipping_name, o.shipping_phone, o.shipping_address, o.shipping_edit_count ? '1' : '0', o.note || '',
       o.escrow_order_id || '', o.paid_tx_hash || '', o.refund_status || 'none',

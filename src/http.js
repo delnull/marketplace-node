@@ -279,12 +279,10 @@ export function makeAuthMiddleware(
     }
     try {
       /*
-        写请求默认 `force`：角色判定里唯一有缓存的是链上员工/治理/强制关闭读数（15s），而
-        "链上刚撤掉一个员工"与"他还能写"之间不能有 15 秒窗口。读请求继续吃缓存——列表/详情是
-        高频路径，且撤权后最多 15s 收敛；真正泄露 PII 的读路径（仲裁详情/证据下载）另行 force
-        （见 routes/orders.js 与 routes/evidenceFiles.js 的 `as='arbiter'` 判定）。
+        节点/店铺角色（node.owner、node_staff、shops.seller、shop_operators）全部住本节点库，
+        每次请求现读，没有"撤权后 15 秒仍可写"的窗口；仍走链上缓存的仲裁人判定在
+        routes/orders.js 与 routes/evidenceFiles.js 的 `as='arbiter'` 分支单独 force。
       */
-      const forceAuth = !['GET', 'HEAD', 'OPTIONS'].includes(String(req.method || '').toUpperCase());
       const addr = String(payload.address || '').toLowerCase();
 
       if (nodeScope) {
@@ -294,7 +292,7 @@ export function makeAuthMiddleware(
           **PII 保留期擦除与节点审计不在此列**：前者跨租户且不可逆，后者含全节点 IP/操作者，
           这两件只有节点主能做（hostOnly）。
         */
-        const allowed = hostOnly ? await isHost(addr, { force: true }) : await isNodeAdmin(addr, { force: forceAuth });
+        const allowed = hostOnly ? await isHost(addr) : await isNodeAdmin(addr);
         if (!allowed) {
           fail(res, hostOnly ? '需要节点主权限' : '需要节点主或节点员工权限', 403, 403);
           return;
@@ -311,7 +309,7 @@ export function makeAuthMiddleware(
         if (!ctx.unresolved) hinted = ctx.shop;
         req.auth = payload;
         attachShopContext(req, hinted);
-        req.shopRole = hinted ? await roleOf(addr, hinted.code, { force: forceAuth }) : 'user';
+        req.shopRole = hinted ? await roleOf(addr, hinted.code) : 'user';
         next();
         return;
       }
@@ -328,9 +326,9 @@ export function makeAuthMiddleware(
 
       if (sellerScope) {
         // 没带范围提示时的唯一候选：这个地址**恰好**经营一家店 ⇒ 就是它（多于一家 ⇒ 400）
-        const shop = hinted || (await soleOperatedShop(addr, res, denyMessage, { force: forceAuth }));
+        const shop = hinted || (await soleOperatedShop(addr, res, denyMessage));
         if (!shop) return; // soleOperatedShop 失败时已经把响应写出去
-        const role = await roleOf(addr, shop.code, { force: forceAuth });
+        const role = await roleOf(addr, shop.code);
         if (ownerOnly && role !== 'owner') {
           fail(res, denyMessage, 403, 403);
           return;
@@ -348,7 +346,7 @@ export function makeAuthMiddleware(
 
       req.auth = payload;
       attachShopContext(req, hinted);
-      req.shopRole = hinted ? await roleOf(addr, hinted.code, { force: forceAuth }) : 'user';
+      req.shopRole = hinted ? await roleOf(addr, hinted.code) : 'user';
       next();
     } catch (e) {
       /*

@@ -5,7 +5,7 @@
  * 验证「合约 ↔ 联邦节点 ↔ 主网事件轮询」全链路：
  *   店主登录 → 上架数字商品 + 码池 → 买家登录下单（quantity）→ 链上 createOrder 真实托管
  *   → POST /paid 四要素校验 → 自动发码置 shipped → 买家 confirmReceipt → watcher 回写 confirmed
- *   → 卖家流水入账 →（可选）Registry 登记（四字段签名 endpoint+escrowAddress+chainId+registryAddress）并验证 getNode 在册。
+ *   → 卖家流水入账。目录登记不在此脚本里：由 operator 在浏览器钱包完成，节点不持私钥。
  *
  * 前置：
  *   1) 一个连到目标 Escrow 的节点实例已在运行（MK_PORT 等由你配置），店主=下方 owner；
@@ -13,18 +13,10 @@
  *   3) 买家钱包由脚本自动生成并从 owner 转入小额测试资金（--fund-wei，默认 0.05 BTY，
  *      足够 2 单固定支付/多单汇率支付；用完即弃——测试资金不回收，余额极小）。
  *
- * 用法（示例：node 起在 18080、注册 Registry）：
- *   node scripts/e2e-mainnet.mjs [--node http://127.0.0.1:18080] [--register] [--quantity 2] [--price-usdt-micro 100000000]
+ * 用法（示例：node 起在 18080）：
+ *   node scripts/e2e-mainnet.mjs [--node http://127.0.0.1:18080] [--quantity 2] [--price-usdt-micro 100000000]
  *   （--price-usdt-micro 是**微 USDT**：1 USDT = 1e6，默认 1e8 = 100 USDT）
- *   环境变量：MK_RPC_URL / MK_ESCROW_ADDRESS / MK_REGISTRY_ADDRESS（**后两者必填**：源码审计 2026-09 已
- *             移除内置的 v2 联调默认地址——那组地址是三段含 metaJson 签名的旧版 Registry，与当前
- *             ABI/签名规则不兼容，按默认值跑只会回滚；请指向上线重部署版地址，
- *             见 README「部署状态」与 docs/DEPLOY_NODE.md §4.2）
- *   --register：把本店登记到 MK_REGISTRY_ADDRESS（四字段签名
- *                abi.encode(endpoint, escrowAddress, chainId, registryAddress) + EIP-191，且本脚本
- *                ABI 无 metaJson——**仅适用于"上线重部署版"Registry（NodeInfo 无 metaJson）**；
- *                v2 联调合约（0x8a59d7…7138）仍为三段含 metaJson 签名，勿与 --register 混用）
- *   --deregister：对 Registry 执行 deregisterNode（仅 operator 本人；同样需新版 Registry）
+ *   环境变量：MK_RPC_URL / MK_ESCROW_ADDRESS / MK_STAKING_ADDRESS（**后三者必填**）
  *   --fund-wei N：给新买家转账金额（默认 5e15）
  *   --skip-buyer-fund：不转账（买家余额已足够时）
  *   exit code：0=通过；1=失败（错误会打印到 stderr）
@@ -34,7 +26,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Wallet, JsonRpcProvider, Contract, keccak256, AbiCoder, getBytes, formatEther, encodeBytes32String } from 'ethers';
+import { Wallet, JsonRpcProvider, Contract, formatEther } from 'ethers';
 
 /* ── 参数 ── */
 const args = process.argv.slice(2);
@@ -43,29 +35,18 @@ const argVal = (name, fb = null) => {
   return i >= 0 && args[i + 1] !== undefined ? args[i + 1] : fb;
 };
 const NODE_URL = argVal('--node', 'http://127.0.0.1:18080');
-const DO_REGISTER = args.includes('--register');
-const DO_DEREGISTER = args.includes('--deregister');
-const ENDPOINT = (argVal('--endpoint', '') || NODE_URL).replace(/\/+$/, '');
 const QUANTITY = Number(argVal('--quantity', '2'));
 const PRICE_MICRO = Number(argVal('--price-usdt-micro', '100000000')); // 1e8 微 = 100 USDT
 const FUND_WEI = args.includes('--skip-buyer-fund') ? 0n : BigInt(argVal('--fund-wei', '50000000000000000'));
 // 默认 0.05 BTY：BTY 主网要求余额 ≥ 10×gas 费，托管 0.001 + createOrder/confirm 两笔 tx 的 10 倍费 ≈ 0.027 BTY
 
 const RPC = process.env.MK_RPC_URL || 'https://mainnet.bityuan.com/eth';
-/*
-  托管/注册地址**必须显式提供**（源码审计 2026-09 修复）：此前这里默认填 v2 联调地址
-  （Escrow 0x3a22… / Registry 0x8a59…）。那组地址的 Registry 用「含 metaJson 的三段签名」，
-  与当前代码的两段/四字段签名 ABI 不兼容——按默认值跑 `npm run e2e -- --register` 必然回滚，
-  而 docs/DEPLOY_NODE.md 又明令「勿填 v2 联调地址」，文档与脚本互为矛盾。
-  宁可缺参数直接报错（下方有可读提示），也不要让人以为"默认就能跑通"。
-*/
-const ESCROW = process.env.MK_ESCROW_ADDRESS || '';
-const REGISTRY = process.env.MK_REGISTRY_ADDRESS || '';
 // 缺参数即 fail-fast（可读提示，而不是拿空地址去打 RPC 得到晦涩报错）
-if (!/^0x[0-9a-fA-F]{40}$/.test(ESCROW) || !/^0x[0-9a-fA-F]{40}$/.test(REGISTRY)) {
-  console.error('缺少/非法 MK_ESCROW_ADDRESS 或 MK_REGISTRY_ADDRESS（须为 0x+40 hex）。');
-  console.error('  例：MK_ESCROW_ADDRESS=0x… MK_REGISTRY_ADDRESS=0x… npm run e2e -- --register');
-  console.error('  注意：不要填 v2 联调地址（三段含 metaJson 签名的旧版 Registry，与当前 ABI/签名不兼容）。');
+const ESCROW = process.env.MK_ESCROW_ADDRESS || '';
+const STAKING = process.env.MK_STAKING_ADDRESS || '';
+if (!/^0x[0-9a-fA-F]{40}$/.test(ESCROW) || !/^0x[0-9a-fA-F]{40}$/.test(STAKING)) {
+  console.error('缺少/非法 MK_ESCROW_ADDRESS / MK_STAKING_ADDRESS（须为 0x+40 hex）。');
+  console.error('  例：MK_ESCROW_ADDRESS=0x… MK_STAKING_ADDRESS=0x… npm run e2e');
   process.exit(1);
 }
 
@@ -137,19 +118,9 @@ const login = async (wallet) => {
 const step = (s) => console.log(`\n== ${s} ==`);
 
 const ESCROW_ABI = [
-  'function createOrder(bytes32 orderId, address seller, uint256 amount, uint64 timeoutBlocks, tuple(address commissionTo, uint16 commissionBps, bytes32 shopCode) terms) payable',
+  'function createOrder(bytes32 orderId, address seller, uint256 amount, uint64 timeoutBlocks) payable',
   'function confirmReceipt(bytes32 orderId)',
 ];
-const REGISTRY_ABI = [
-  'function registerNode(address operator, string endpoint, address escrowAddress, bytes signature)',
-  'function deregisterNode()',
-  // getNode 的 tuple 必须与 contracts/src/MarketplaceRegistry.sol 的 NodeInfo 逐字对应：
-  // 末尾的 string code（店铺编号，8 位 Crockford Base32）不可省——ABI 字段数不符时 ethers
-  // 解码结果整体错位（code 会读成空/报错），"注销后本店不应在册"的判定随之失真。
-  // 2026-10-21：不再读 `getActiveNodes()`（已改分页）；本脚本只关心自己这一行，`getNode` 是精确读法。
-  'function getNode(address operator) view returns (tuple(address operator, string endpoint, address escrowAddress, uint64 registeredAtBlock, uint64 updatedAtBlock, bool active, bool suspended, string code))',
-];
-
 async function waitOrderStatus(id, token, targets, tries = 20, intervalMs = 4000) {
   let order = null;
   for (let i = 0; i < tries; i++) {
@@ -162,17 +133,6 @@ async function waitOrderStatus(id, token, targets, tries = 20, intervalMs = 4000
 }
 
 async function main() {
-  // --deregister：仅注销本店登记，不跑交易链路
-  if (DO_DEREGISTER) {
-    step('注销 Registry 登记');
-    const registry = new Contract(REGISTRY, REGISTRY_ABI, owner);
-    await broadcast(registry.deregisterNode(), 'deregisterNode');
-    const row = await registry.getNode(owner.address);
-    if (row.active) throw new Error(`注销后仍在册（active=true，registeredAtBlock=${row.registeredAtBlock}）`);
-    console.log(`注销后本店 active=${row.active}（registeredAtBlock=${row.registeredAtBlock} 保留）`);
-    return;
-  }
-
   const tag = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
   const buyer = Wallet.createRandom().connect(provider);
   const health = await api('GET', '/healthz');
@@ -209,24 +169,11 @@ async function main() {
   const escrow = new Contract(ESCROW, ESCROW_ABI, buyer);
   const amount = BigInt(draft.amountWei);
   /*
-    `createOrder` 的第 5 个参数是**本单的抽成条款**（多店模型起）。草稿 DTO 的 `commission`
-    就是节点向买家报的那一份；缺它时不能拿 0 抽成去签（那会让节点主的分账静默归零），
-    直接中止并给出可读原因。
+    零费模型：`createOrder(orderId, seller, amount, timeoutBlocks)` 只有四个参数——
+    没有店铺条款、没有抽成收款人。店铺/商品/订单明细全在节点链下。
   */
-  const quoted = draft.commission;
-  if (!quoted || !quoted.to) {
-    throw new Error('草稿缺少抽成条款（draft.commission.to）——当前合约 createOrder 是 5 参，不能按 4 参签');
-  }
-  if (!draft.shopCode) {
-    throw new Error('草稿缺少店铺编号（draft.shopCode）——新的下单闸按编号绑定店铺，拒绝按旧形状签单');
-  }
-  const terms = {
-    commissionTo: quoted.to,
-    commissionBps: Number(quoted.bps) || 0,
-    shopCode: encodeBytes32String(String(draft.shopCode)),
-  };
   await broadcast(
-    escrow.createOrder(draft.escrowOrderId, draft.seller, amount, BigInt(draft.timeoutBlocks ?? 0), terms, { value: amount }),
+    escrow.createOrder(draft.escrowOrderId, draft.seller, amount, BigInt(draft.timeoutBlocks ?? 0), { value: amount }),
     'createOrder'
   );
 
@@ -251,46 +198,21 @@ async function main() {
   console.log(`流水: 单数=${ledger.total} 净额=${ledger.summary.amountWeiNet} wei`);
   if (ledger.total < 1) throw new Error('流水未入账');
   /*
-    净额断言（源码审计 2026-09 复审修复，P2）：原先是 `if (net < amount) throw new Error('流水净额异常')`
-    —— 这在**任何真的会扣平台费的部署上必然误报**：账本口径是 `net = amount − refunded − fee`
-    （与合约 `_settle` 的 `sellerNet = (amount − refundWei) − fee` 逐字同源），
-    所以只要创建订单时 `feeBps > 0` 且 `feeCollectorAtCreate ≠ 0`，net 就**必然小于** amount。
-    而这是文档指定的主网验收流程（`PRODUCT_BOUNDARIES.md` §6），运维会拿到一个假失败，
-    进而把"平台费按单快照生效"误诊成账目错误——正好怀疑刚上线的那套按单费口径。
-
-    改成断言"净额落在应然区间"：上界 = amount（未扣费时），下界 = amount − amount×费率上限
-    （`MAX_FEE_BPS = 1000` = 10%，链上强制；比逐单读链上费率更稳，也不必额外打 RPC）。
-    再多断一条自洽：净额 = 毛额 − 已退 − 平台费（三个数都在同一份 summary 里）。
+    净额断言（零费模型）：这笔单没有退款 ⇒ **净额必须逐字等于毛额**。
+    合约的结算只有退款 + 卖家两条腿，任何差额都说明账本口径错了。
   */
   const net = BigInt(ledger.summary.amountWeiNet);
   const gross = BigInt(ledger.summary.amountWei);
-  const fee = BigInt(ledger.summary.feeWei ?? '0');
   const refunded = BigInt(ledger.summary.refundedWei ?? '0');
-  const minNet = amount - (amount * 1000n) / 10000n; // 扣满 10% 的下界（MAX_FEE_BPS）
-  if (net > amount) throw new Error(`流水净额异常：${net} > 毛托管额 ${amount}（净额不可能超过毛额）`);
-  if (net < minNet) throw new Error(`流水净额异常：${net} < 下界 ${minNet}（最大费率 10% 也扣不到这么多）`);
-  if (gross - refunded - fee !== net) {
-    throw new Error(`流水口径不自洽：毛额 ${gross} − 已退 ${refunded} − 平台费 ${fee} ≠ 净额 ${net}`);
+  if (refunded !== 0n) throw new Error(`验收单不该有退款（refunded=${refunded}）`);
+  if (net !== gross || net !== amount) {
+    throw new Error(`流水净额异常：净额 ${net} / 毛额 ${gross} / 托管 ${amount} 应当三者相等`);
   }
 
   step('7. 事件史完整性（OrderCreated/ReceiptConfirmed 已在详情时间线）');
   const events = (finalOrder.onchainEvents || []).map((e) => e.name);
   console.log(`事件史: ${events.join(' → ')}`);
   if (!events.includes('OrderCreated') || !events.includes('ReceiptConfirmed')) throw new Error('事件史缺关键里程碑');
-
-  if (DO_REGISTER) {
-    step('8. Registry 注册（绑定消息签名：endpoint+escrow+chainId+registry；注意 signMessage 须 getBytes）');
-    const chainId = parseInt(await rpc('eth_chainId', []), 16);
-    const digest = keccak256(AbiCoder.defaultAbiCoder().encode(['string', 'address', 'uint256', 'address'], [ENDPOINT, ESCROW, chainId, REGISTRY]));
-    const sig = await owner.signMessage(getBytes(digest));
-    const registry = new Contract(REGISTRY, REGISTRY_ABI, owner);
-    await broadcast(registry.registerNode(owner.address, ENDPOINT, ESCROW, sig), 'registerNode');
-    const row = await registry.getNode(owner.address);
-    if (!row.active || row.suspended || row.escrowAddress.toLowerCase() !== ESCROW.toLowerCase()) {
-      throw new Error('Registry 登记验证失败（未在册 / 被停用 / 托管地址不符）');
-    }
-    console.log(`已登记: endpoint=${row.endpoint} escrow=${row.escrowAddress} registeredAtBlock=${row.registeredAtBlock}`);
-  }
 
   console.log('\n✅ E2E 验收通过（合约 ↔ 节点 ↔ 主网事件轮询全链路）');
   console.log(JSON.stringify({

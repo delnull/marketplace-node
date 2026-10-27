@@ -38,6 +38,9 @@
  * 缺货判据要同时看到订单状态、数量、商品快照与链上单号，视图一次给全。
  */
 import { getDb } from './db.js';
+// 池可用量的**唯一实现**（unused/reserved）。本模块原来自写一条 COUNT(unused)，
+// 把在途订单已经预留的份数当成可交付 ⇒ reserved > unused 时仍报"够"，缺货告警静默消失。
+import { poolAvailability } from './poolQuota.js';
 import { notifyRaw } from './webhook.js';
 import { alertOnceDelivered } from './alertAck.js';
 
@@ -101,8 +104,16 @@ export async function poolShortfallOf(order) {
     need = Math.max(0, qty - delivered);
     if (need === 0) return { poolBacked: true, kind: 'nft', need: 0, available: 0, short: false };
   }
-  const table = snap.kind === 'digital' ? 'product_codes' : 'product_nft_tokens';
-  const available = (await getDb().get(`SELECT COUNT(*) AS c FROM ${table} WHERE product_id = ? AND status = 'unused'`, order.product_id)).c;
+  /*
+    可用量必须扣掉**其他在途订单**的预留：unused 是池里还没被发出去的份数，reserved 是
+    所有在途订单尚未交付的需求（含本单的 need）。对本单而言可用 = unused − (reserved − need)；
+    旧实现只看 unused，于是池未建时先放进来的多单、或删码造成 reserved > unused 时，
+    每个订单都看到"够"，`poolEmpty` 与 `order.pool_empty` 告警一起静默消失。
+  */
+  const avail = await poolAvailability(order.product_id, snap.kind);
+  const unused = Number(avail?.unused ?? 0);
+  const reserved = Number(avail?.reserved ?? 0);
+  const available = Math.max(0, unused - Math.max(0, reserved - need));
   return { poolBacked: true, kind: snap.kind, need, available, short: available < need };
 }
 

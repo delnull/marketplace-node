@@ -23,9 +23,14 @@ const { pollOnce } = await import('../src/escrowWatcher.js');
 const config = (await import('../src/config.js')).default;
 
 const EVENT_IFACE = new Interface([
-  'event OrderCreated(bytes32 indexed orderId, address indexed buyer, address indexed seller, address host, uint256 amount)',
+  'event OrderCreated(bytes32 indexed orderId, address indexed buyer, address indexed seller, uint256 amount)',
 ]);
 const createdEvent = EVENT_IFACE.getEvent('OrderCreated');
+/** watcher 的 OrderCreated 预取会读 getOrder + orderToken（原生单） */
+const CHAIN_IFACE = new Interface([
+  'function getOrder(bytes32) view returns (address buyer, address seller, uint256 amount, uint64 timeoutBlocks, uint64 createdAtBlock, bool refundRequested, bool refundRejected, uint256 refundedAmount, uint8 status, bool buyerConfirmed)',
+  'function orderToken(bytes32) view returns (address)',
+]);
 
 const HEAD = 100;
 const FINALITY = Number(config.escrow.finalityBlocks || 0);
@@ -47,6 +52,32 @@ const rpcServer = http.createServer((req, res) => {
           return { result: `0x${Number(config.chain.chainId).toString(16)}` };
         case 'eth_blockNumber':
           return { result: `0x${HEAD.toString(16)}` };
+        case 'eth_call': {
+          const data = String(j.params?.[0]?.data || '');
+          const sel = data.slice(0, 10);
+          if (sel === CHAIN_IFACE.getFunction('orderToken').selector) {
+            return {
+              result: CHAIN_IFACE.encodeFunctionResult('orderToken', ['0x0000000000000000000000000000000000000000']),
+            };
+          }
+          if (sel === CHAIN_IFACE.getFunction('getOrder').selector) {
+            return {
+              result: CHAIN_IFACE.encodeFunctionResult('getOrder', [
+                buyer.address,
+                owner.address,
+                BigInt(AMOUNT),
+                120960n,
+                2n,
+                false,
+                false,
+                0n,
+                1, // Created
+                false,
+              ]),
+            };
+          }
+          return { error: { code: -32601, message: `unit-test: 未预期的 eth_call selector ${sel}` } };
+        }
         case 'eth_getBlockByNumber': {
           const n = Number(BigInt(j.params?.[0] ?? '0x0'));
           // 游标块 5 的链上哈希与库里记的（aa…）不一致 ⇒ 重组；其余块给一个稳定哈希
@@ -61,7 +92,6 @@ const rpcServer = http.createServer((req, res) => {
           const log = EVENT_IFACE.encodeEventLog(createdEvent, [
             escrowOrderId,
             buyer.address,
-            owner.address,
             owner.address,
             BigInt(AMOUNT),
           ]);
@@ -163,4 +193,21 @@ test('"没有游标"（NULL）与"游标在 0"仍然是两件事：只有 NULL �
     logRanges.every((x) => x.from === LATEST && x.to === LATEST),
     `首启仍按原口径从链头开始（实际 ${JSON.stringify(logRanges)}）`
   );
+});
+
+test('追平链头后隔一轮重扫游标块：head 刚可见的日志不会因游标已推进而永久丢失', async () => {
+  await db.run(
+    'UPDATE node SET watcher_block = ?, watcher_hash = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = 1',
+    LATEST,
+    `0x${'dd'.repeat(32)}`
+  );
+  logRanges.length = 0;
+  const first = await pollOnce();
+  assert.equal(first.upToDate, true, '第一轮只标记待重扫，不应把游标块当成新块');
+  assert.equal(logRanges.length, 0, '追平后的第一轮不重复扫块');
+
+  const second = await pollOnce();
+  assert.ok(!second.upToDate, '第二轮应重扫游标块（表现为落后 1 块）');
+  assert.equal(second.scanned.from, LATEST, '第二轮必须重扫最新块');
+  assert.equal(second.scanned.to, LATEST, '第二轮重扫范围只到链头');
 });

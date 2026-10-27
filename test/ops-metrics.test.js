@@ -8,7 +8,7 @@
  *  2. 托管超时：链上阈值取自合约 `releaseNotBeforeBlock`（不是本地按块时间估算），
  *     边界是 `latestBlock > 阈值`；单笔阈值读失败进 `unknown`（**不是**"未超时"）；
  *     `refund_status='requested'` 的单被合约永久拒绝释放，既不算超时也不占链上读；
- *  3. 挂账余额：payouts 读店主地址、fees 读当前 feeCollector（**读不到时字段为 null 而不是 '0'**）；
+ *  3. 挂账余额：payouts 只读店主地址（零费模型下没有平台费可挂；**读不到时字段为 null 而不是 '0'**）；
  *  4. 订单各状态计数（含 0）；
  *  5. SLA 未发货超期清单（最久的在前、limit 生效、带 orderId 与 ageMs）。
  *
@@ -27,22 +27,18 @@ const { app, request, db, owner, buyer } = ctx;
 
 const { ESCROW_ABI } = await import('../src/chain.js');
 const { reconcileReading, queueWait, sellerTodoCounts, escrowOverdueReading, promiseSlaReading, PENDING_REFUND_SQL } = await import('../src/opsMetrics.js');
-const { resetFeeCache } = await import('../src/fees.js');
 const config = (await import('../src/config.js')).default;
 
 const SELLER = owner.address.toLowerCase();
-const COLLECTOR = '0x' + 'cc'.repeat(20);
 const ZERO = '0x' + '0'.repeat(40);
 
-// ── 假 JSON-RPC：块高 + 逐单释放阈值 + 两个挂账映射 + feeCollector ──
+// ── 假 JSON-RPC：块高 + 逐单释放阈值 + 挂账映射 ──
 const iface = new Interface(ESCROW_ABI);
 /** 当前链上状态（各用例自行改写；thresholds 里没有的 escrowOrderId = 读失败） */
 const chain = {
   blockNumber: 1000n,
   thresholds: new Map(), // escrowOrderId(小写) → bigint
   payouts: '0',
-  fees: '0',
-  feeCollector: COLLECTOR,
 };
 
 function handleRpc(j) {
@@ -62,16 +58,11 @@ function handleRpc(j) {
       return { result: iface.encodeFunctionResult('releaseNotBeforeBlock', [chain.thresholds.get(key)]) };
     }
     if (selector === fn('accruedPayouts')) {
+      if (chain.payouts === null) return { error: { code: -32000, message: 'unit-test: 挂账读取失败' } };
       const [addr] = iface.decodeFunctionData('accruedPayouts', data);
       const v = String(addr).toLowerCase() === SELLER ? chain.payouts : '0';
       return { result: iface.encodeFunctionResult('accruedPayouts', [BigInt(v)]) };
     }
-    if (selector === fn('accruedFees')) {
-      const [addr] = iface.decodeFunctionData('accruedFees', data);
-      const v = String(addr).toLowerCase() === COLLECTOR ? chain.fees : '0';
-      return { result: iface.encodeFunctionResult('accruedFees', [BigInt(v)]) };
-    }
-    if (selector === fn('feeCollector')) return { result: iface.encodeFunctionResult('feeCollector', [chain.feeCollector]) };
     if (selector === fn('arbiter')) return { result: iface.encodeFunctionResult('arbiter', [ZERO]) };
     return { error: { code: -32601, message: `unit-test: 未预期的 selector ${selector}` } };
   } catch (e) {
@@ -152,7 +143,6 @@ async function insertOrder({
 before(async () => {
   await new Promise((r) => rpcServer.listen(0, '127.0.0.1', r));
   config.chain.rpcUrl = `http://127.0.0.1:${rpcServer.address().port}`;
-  resetFeeCache();
   ownerToken = (await login(ctx, owner)).token;
   buyerToken = (await login(ctx, buyer)).token;
 
@@ -337,27 +327,19 @@ test('SLA limit 参数：0/负数/超上限/非整数一律明确拒绝（不静
   assert.equal(asBuyer.body.code, 403, 'SLA 是经营面读数：买家令牌不得读');
 });
 
-test('挂账余额：payouts 读店主地址、fees 读当前 feeCollector；读不到时字段是 null 而不是 0', async () => {
+test('挂账余额：payouts 只读店主地址；读不到时字段是 null 而不是 0', async () => {
   chain.payouts = '1234567890000000000';
-  chain.fees = '777000';
-  chain.feeCollector = COLLECTOR;
-  resetFeeCache();
   const d = (await metrics()).body.data;
   assert.equal(d.accruedPayoutsWei, '1234567890000000000');
-  assert.equal(d.accruedFeesWei, '777000');
   assert.equal(d.accruedPayoutsReason, null);
-  assert.match(d.accruedNote, /\*\*按地址\*\*计/, '口径说明随响应下发（按地址读、历史收取方不在读数内）');
-  assert.match(d.accruedNote, /历史收取方/, '已知边界如实写明');
+  assert.match(d.accruedNote, /\*\*按地址\*\*计/, '口径说明随响应下发（挂账按收款地址读）');
 
-  // 收费方为零地址：没有可读主体 ⇒ 该字段 null + 可读原因（不是 '0'）
-  chain.feeCollector = ZERO;
-  resetFeeCache();
-  const zero = (await metrics()).body.data;
-  assert.equal(zero.accruedFeesWei, null, '读不到 ≠ 0：绝不写 "0" 让界面印成"合约里没钱"');
-  assert.match(zero.accruedFeesReason, /零地址/);
-  assert.equal(zero.accruedPayoutsWei, '1234567890000000000', '两个映射互相独立：收费方缺失不影响店主挂账读数');
-  chain.feeCollector = COLLECTOR;
-  resetFeeCache();
+  // 读不到（RPC 对该 selector 回错）⇒ 字段 null + 可读原因，绝不写 '0'
+  chain.payouts = null;
+  const bad = (await metrics()).body.data;
+  assert.equal(bad.accruedPayoutsWei, null, '读不到 ≠ 0：绝不写 "0" 让界面印成"合约里没钱"');
+  assert.match(bad.accruedPayoutsReason, /读取失败/);
+  chain.payouts = '0';
 });
 
 test('对账读数：未跑完一轮时差异数为 null + reason；跑过则差异数 = 修复 + 链上缺失', async () => {

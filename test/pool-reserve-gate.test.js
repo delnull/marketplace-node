@@ -181,6 +181,21 @@ test('池未建（一个资源行都没有）时不拦：卖家手动交付那�
   assert.equal(await reservedOf(p.productId), await pendingTruth(p.productId));
 });
 
+test('取消后直接进入 disputed（链上支付晚到/OrderCreated 漏扫）必须把池占位补回来', async () => {
+  const p = await insertPoolProduct({ kind: 'digital', title: '取消后争议复活' });
+  await fillPool(p.productId, 1);
+  const buyer = Wallet.createRandom().address.toLowerCase();
+  assert.equal(await attemptDraft(buyer, p, 1), 'ok');
+  const row = await db.get('SELECT id FROM orders WHERE product_id = ? ORDER BY id DESC LIMIT 1', p.productId);
+
+  await db.run("UPDATE orders SET status = 'cancelled' WHERE id = ?", row.id);
+  assert.equal(await reservedOf(p.productId), 0, '取消必须释放池占位');
+
+  await db.run("UPDATE orders SET status = 'disputed' WHERE id = ?", row.id);
+  assert.equal(await reservedOf(p.productId), 1, '取消后被链上争议复活必须重新占位，否则会超卖');
+  assert.equal(await reservedOf(p.productId), await pendingTruth(p.productId));
+});
+
 test('NFT 池同理：3 并发对 2 枚 → 恰好 2；取消一枚即还回一枚', async () => {
   const p = await insertPoolProduct({
     kind: 'nft',

@@ -87,7 +87,7 @@ router.post(
       actor,
       // 角色按**本店**算（`staffOnly` 已保证 req.shop 存在）：漏传店铺编号会得到 'user'，
       // 而 logAudit 对 'user' 直接返回——上传审计会静默消失（谁把什么放上了盘就查不到了）
-      actorRole: await roleOf(actor, req.shop.code),
+      actorRole: req.shopRole && req.shopRole !== 'user' ? req.shopRole : await roleOf(actor, req.shop.code),
       // 这一行归**这家店**：上传是店铺经营面的动作，别家店主不该看到它
       shopCode: req.shop.code,
       action: 'product.media.upload',

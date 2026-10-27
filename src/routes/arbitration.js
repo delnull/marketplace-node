@@ -13,8 +13,8 @@
  *
  * **为什么售后案件是独立路由而不是并进 /pending 的一个 `kind`**：
  *  1. 两者是**不同的钱、不同的链上动作、不同的收口**：争议单资金还锁在托管里，裁决走
- *     `Escrow.voteSettlement` 票决；售后案件的托管额早已结清（订单是终局），补偿只能走卖家保证金
- *     `Staking.penalize`，收口走 `closeAfterSale`。合成一个列表后每个调用点都得按 kind 再分叉一次
+ *     `Escrow.voteSettlement` 票决；售后案件优先从 Escrow 留存的卖家货款退款、不足走
+ *     `Staking.penalize`，收口走 `voteAfterSale`/`closeAfterSale`。合成一个列表后每个调用点都得按 kind 再分叉一次
  *     ——那正是本仓反对的"在调用点补判据"。
  *  2. 队列语义也不同：/pending 的候选是 `status='disputed'`（本地在途状态），
  *     /after-sales 的候选是 `after_sale_status='open'`（**叠加在终局之上的第二层**，见 afterSale.js）。
@@ -46,8 +46,6 @@ import { weiToDecimal, isArbiterForOrder } from '../chain.js';
 import { goodsMicroOf, usdtOf } from '../money.js';
 // 「已交付事实」的唯一实现（shipped_at / tracking_no / 交付行三要素）——不要在本文件重写判据
 import { hasDelivered } from '../returns.js';
-// 平台费**按单**判据的唯一实现（创建时收取方快照；见 src/fees.js）
-import { feeChargeableForOrder, feeSnapshotReadOf } from '../fees.js';
 // 事件史对外的唯一折算点（库里的 at 是毫秒，出口一律 ISO；见 src/reputation.js）
 import { eventsForDto } from '../reputation.js';
 // 确认收货后的售后案件：在途判据与 DTO 字段的唯一实现（见 src/afterSale.js）
@@ -116,13 +114,6 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null } = {}) {
     "没有链上事件史"在这里是可达状态（不是防御性分支），所以默认给空数组。
   */
   const onchainEvents = eventsForDto(o.onchain_events);
-  /*
-    本单费率快照的**唯一判据**（`fees.feeSnapshotReadOf`）：`fee_bps` 那一列是
-    `NOT NULL DEFAULT 0`，分不开"没补录过"与"快照就是 0"；能分开它们的是
-    `fee_collector_at_create`（两列由同一条 UPDATE 成对写）。下面的 feeBps / feeCollectorAtCreate
-    两个字段都从它取。
-  */
-  const feeSnap = feeSnapshotReadOf(o);
   return {
     // 判别位：同一份字段口径下的两类待办（'dispute'=争议中，'after_sale'=确认收货后的售后案件）
     kind,
@@ -140,7 +131,7 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null } = {}) {
       代价如实写明：匿名轮询仍能拿到金额/双方地址（链上公开），但拿不到可探测的句柄；
       未登录的仲裁台看不到详情链接，需要先按本节点登录（前端 tokenOf(origin) 已有）。
     */
-    orderNo: actor && o.escrow_order_id && (await isArbiterForOrder(actor, o.escrow_order_id, { force: true })) ? o.order_no : null,
+    orderNo: actor && o.escrow_order_id && (await isArbiterForOrder(actor, o.escrow_order_id)) ? o.order_no : null,
     escrowOrderId: o.escrow_order_id,
     /*
       订单身份的另一半：**快照哈希**。仲裁动作要在本地复算
@@ -176,7 +167,10 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null } = {}) {
     // 金额列是 `DECIMAL(38,0)` → 驱动给**字符串**（见 db.js：38 位 wei 过不了 JS number）；
     // 展示用的十进制同样由 chain.weiToDecimal 从字符串算，不经过 number
     amountWei: o.amount_wei,
-    amountDecimal: weiToDecimal(o.amount_wei),
+    paymentToken: o.payment_token || null,
+    paymentSymbol: o.payment_symbol || null,
+    paymentDecimals: o.payment_decimals ?? 18,
+    amountDecimal: weiToDecimal(o.amount_wei, o.payment_decimals ?? 18),
     /*
       已退买家（链上真值镜像）。**必须给**：`Staking.penalize` 的罚没上限基准是
       `min(amount − refundedAmount, escrow.sellerNetAtSettle(orderId))`——**毛额那一腿**由这里给，
@@ -195,7 +189,9 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null } = {}) {
       与同一对象里的 refundedAmountWei 同级（链上事件本来就公开可查），不新增泄露面。
     */
     acceptedPartialRefundWei: o.accepted_partial_refund_wei ?? null,
-    acceptedPartialRefundDecimal: weiToDecimal(o.accepted_partial_refund_wei ?? '0'),
+    // 与 refundedAmountWei 同口径：null = 读不到，'0' = 确证未授权；且必须按支付资产精度换算
+    // （ERC20 6 位精度的单用默认 18 位会放大 1e12，仲裁人看到的授权额将完全错误）。
+    acceptedPartialRefundDecimal: weiToDecimal(o.accepted_partial_refund_wei, o.payment_decimals ?? 18),
     buyer: o.buyer,
     seller: o.seller,
     /*
@@ -219,20 +215,9 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null } = {}) {
     refundRequestedAt: o.refund_requested_at || null,
     refundRejectedAt: o.refund_rejected_at || null,
     /*
-      平台费**按单**口径（与 orders.js 的 orderToPublic 同款，缺一不可）：
-      合约按创建订单时快照的收取方（feeCollectorAtCreate）决定这单扣不扣费，全局 feeCollector()
-      事后可改、不代表本单。仲裁人在算"本单可罚没上限/该退多少"时要能看出这笔钱里有没有平台费，
-      所以把快照与按单判定一并下发。
-
-      ⚠ `feeBps` 必须与快照**同生共死**：`fee_bps` 列是 `NOT NULL DEFAULT 0`，而它与
-      `fee_collector_at_create` 由**同一条 UPDATE** 补录。所以"快照为空"就意味着"两列都没补录过"，
-      此时把 `fee_bps` 当成 0 下发是**把"不知道"说成"不扣费"**：仲裁台会印出"本单费率 0%"，
-      而链上实际按快照扣——前端为此专门区分 `null`（读不到）与 `0`（确实是 0）。
-      判据不在这里手写：与订单详情/流水/看板/CSV 共用 `fees.feeSnapshotReadOf`。
+      零费模型：订单上没有平台费/节点抽成的费率快照可下发——仲裁人按
+      "毛额 − 已退买家"与卖家的在途敞口/保证金读数判断可罚没上限与应退金额。
     */
-    feeBps: feeSnap.known ? feeSnap.feeBps : null,
-    feeCollectorAtCreate: feeSnap.known ? feeSnap.feeCollectorAtCreate : null,
-    feeChargeable: feeChargeableForOrder(o.fee_collector_at_create),
     // 子表用**内部订单键**（dispute_evidence.order_id 是它的外键）
     evidenceCount: Number((await getDb().get('SELECT COUNT(*) AS c FROM dispute_evidence WHERE order_id = ?', o.order_id)).c),
     // 进入争议时刻 = 最近一次状态迁移时间（watcher 回写 disputed 时更新）

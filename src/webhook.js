@@ -91,6 +91,13 @@ async function buildPayload(type, ref) {
     productSlug: row.product_slug,
     quantity: row.quantity || 1,
     amountWei: row.amount_wei,
+    paymentToken: row.payment_token || null,
+    paymentSymbol: row.payment_symbol || null,
+    paymentDecimals: row.payment_decimals ?? null,
+    paymentRateSource: row.payment_rate_source || null,
+    paymentRateStale: !!row.payment_rate_stale,
+    tokenUsdtMicroPerToken: row.token_usdt_micro_per_token ?? null,
+    paymentRateQuotedAt: row.payment_rate_quoted_at || null,
     status: row.status,
     refundStatus: row.refund_status || 'none',
     at: new Date(),
@@ -119,10 +126,21 @@ export function pinnedSender(url, init) {
 
 async function sendOnce(url, payload, shopCode) {
   const body = JSON.stringify(payload);
+  /*
+    只投 https：HMAC 能防篡改，但防不了明文链路上的窃听/重放组合；公开 http 端点让
+    “签名正确”变成一句在攻击者面前成立的话。测试里的回环 http 会在下面 SSRF 前就失败。
+  */
+  if (new URL(url).protocol !== 'https:') throw new Error('webhook 只支持 https 目标');
   const headers = { 'content-type': 'application/json' };
   const { secret } = await webhookConfig(shopCode);
   if (secret) {
-    headers['x-mk-signature'] = crypto.createHmac('sha256', secret).update(body).digest('hex');
+    /*
+      时间戳进入签名原文（`timestamp.body`）。只签 body 时，攻击者拿到一条合法请求可以
+      原样重放任意次；接收方用 `X-Mk-Timestamp` 做窗口校验（±5 分钟）即可拒绝旧包。
+    */
+    const ts = String(Math.floor(Date.now() / 1000));
+    headers['x-mk-timestamp'] = ts;
+    headers['x-mk-signature'] = crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
   }
   // SSRF 防护（2026-09 修复）：URL 是店主随时可改的经营参数（`shop_webhook.url`），
   // 必须在每次投递前校验目标
@@ -396,10 +414,11 @@ export async function notifyRaw(type, data = {}) {
  * 读不到金额（amount 缺失/畸形）⇒ **null = 不猜、不通知**：一个错误的类型比一条迟到的通知更糟。
  */
 function refundSplitEventType(refundWeiArg, amountWeiArg) {
+  if (refundWeiArg === undefined || refundWeiArg === null) return null;
   let refundWei;
   let amount;
   try {
-    refundWei = BigInt(refundWeiArg ?? 0);
+    refundWei = BigInt(refundWeiArg);
   } catch {
     return null;
   }
@@ -442,8 +461,8 @@ export function typeForChainEvent(name, args = {}, { amountWei } = {}) {
       return 'refund.rejected';
     /*
       确认收货后的售后案件（契约 2026-10 第二批）：**必须通知店主**——它不是"什么都没发生"的事件。
-      买家在确认收货之后开案，意味着这笔已结清的钱可能被仲裁人从**卖家保证金**里罚没给买家
-      （Staking.penalize 的资格门槛正是"本案在链上处于开启状态"），店主需要知道并去处理
+      买家在确认收货之后开案，意味着这笔仍在售后留存期的货款可能被判给买家，不足部分还可能
+      从**卖家保证金**补足（Staking.penalize 的资格门槛正是"本案在链上处于开启状态"），店主需要知道并去处理
       （线下换货/转账和解，或等仲裁）。与 PartialRefundAccepted 的区别正在于此：那个只是挂一个
       可选数字，这个改变的是"店主必须处理的事"。
       结案同样通知：案件从"可能被罚没"变成"已了结"，店主面板上的待办要能收敛。

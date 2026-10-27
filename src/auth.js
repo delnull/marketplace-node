@@ -1,7 +1,7 @@
 /**
  * SIWE (EIP-4361) 签名认证 + 轻量 HMAC 会话令牌。
  *
- * SIWE（EIP-4361）流程（BTY 主网 chainId 2999 取硬编码常量，不信任客户端声明），
+ * SIWE（EIP-4361）流程（chainId 取节点配置 `MK_CHAIN_ID`，不信任客户端声明），
  * 差异：nonce 落库（`siwe` 表，无 Redis 依赖）；登录成功签发 HMAC 令牌，
  * 供商品上架/发货等写操作鉴权（Bearer header）。
  *
@@ -34,7 +34,41 @@ import { getDb } from './db.js';
 import config, { resolveNodeDomain } from './config.js';
 // 店铺行的唯一读入口（本文件不直接碰 shops 表：租户事实源只有 src/shops.js 一处）
 import { shopRowByCode, nodeOwner, nodeRow, hostOperator } from './shops.js';
-import { isNodeStaffOf, isProtocolGovernanceAddress, isForceClosedAddress, isValidContractSignature } from './chain.js';
+import { isValidContractSignature } from './chain.js';
+
+// ── 节点员工（`node_staff`：**一行一人**，节点链下事实）──
+/*
+  平台 Registry 没有"节点员工"这个概念（它只登记节点 operator），节点也没有任何链上动作需要
+  员工签名——开店审批、店铺停用都是**本节点链下**的动作。所以员工名单住在节点自己的库里：
+   · 一行一人 ⇒ 增删各是一条语句，丢更新在形状上不可表达；
+   · 权限方向 fail-closed：任何一次读不到（库故障）都按"不是员工"处理；
+   · 节点不读 Registry：目录的 forceClose/suspend 是目录状态，不是本节点后台权限的事实源；
+     员工权限只由本节点 `node_staff` 决定。
+*/
+
+/** 某地址是否本节点员工（读库；表里没有 ⇒ false） */
+export async function isNodeStaffOf(address) {
+  const a = String(address || '').toLowerCase();
+  if (!a) return false;
+  const row = await getDb().get('SELECT address FROM node_staff WHERE address = ?', a);
+  return !!row;
+}
+
+/** 节点员工名单（小写地址数组；节点级只读端点用） */
+export async function nodeStaffList() {
+  const rows = await getDb().all('SELECT address FROM node_staff ORDER BY added_at ASC, address ASC');
+  return rows.map((r) => String(r.address).toLowerCase());
+}
+
+/** 加一名节点员工（幂等：已在名单里时那条语句什么都不改） */
+export async function addNodeStaff(address) {
+  await getDb().run('INSERT INTO node_staff (address) VALUES (?) ON DUPLICATE KEY UPDATE address = address', String(address).toLowerCase());
+}
+
+/** 移除一名节点员工（返回是否真的删掉了一行） */
+export async function removeNodeStaff(address) {
+  return (await getDb().run('DELETE FROM node_staff WHERE address = ?', String(address).toLowerCase())).changes > 0;
+}
 
 // ── 店员白名单（`shop_operators`：**一行一人**）──
 /*
@@ -87,8 +121,9 @@ export async function removeShopOperator(shopCode, address) {
   return changes === 1;
 }
 
-// SIWE 消息中的 Chain ID：谈信 H5 钱包 / BTY 主网固定 2999（EIP-4361 语义）
-const SIWE_CHAIN_ID = 2999;
+// SIWE 消息中的 Chain ID：必须与节点实际连接的链一致（MK_CHAIN_ID）。
+// 硬编码 2999 会让测试网/私链部署在钱包弹窗里对用户说一条它并没有用的链。
+const SIWE_CHAIN_ID = config.chain.chainId;
 
 /**
  * 节点 SIWE 身份解析（2026-09 修复：登录签名原文不再硬编码 marketplace.local/http://localhost——
@@ -103,7 +138,7 @@ const SIWE_CHAIN_ID = 2999;
  * 每请求动态读取（env 变更即生效，测试可注入）。
  *
  * （2026-10-16 删掉"纯浏览模式节点回退 marketplace.local"那一档：`node.owner` 是 NOT NULL 的
- * 节点身份接线，缺它节点根本起不来（见 server.js 的启动门禁），所以"没有身份锚"不可达。
+ * 节点身份接线，缺它节点根本起不来（见 db.js 的 ensureNodeRow 启动门禁），所以"没有身份锚"不可达。
  * 留着那个占位常量只会让两个节点在钱包里显示成同一个域名。）
  */
 export function resolveSiweIdentity() {
@@ -257,7 +292,7 @@ export async function cleanupExpiredSiwe(now = new Date()) {
  * 是否节点主本人（`node.owner`）——**独立判据**，不是"角色之一"。
  *
  * 为什么必须与 `roleOf` 分开：两种身份可以**同时**成立——节点主在自己那家店里既是节点主、
- * 又是那家店的店主（"自己那家店"与其他店在数据上没有区别，只是抽成被合约钉成 0；
+ * 又是那家店的店主（"自己那家店"与其他店在数据上没有区别；
  * 他甚至可能一家店都没有，而节点级动作照样要能做）。把两者塞进一个枚举里，就必然要选一个：
  *   · 短路成 host ⇒ 他在自己的店里被 `ownerOnly` 403（管不了自己的流水与设置）；
  *   · 短路成 owner ⇒ `hostOnly` 的节点级动作（开店申请队列）把他自己挡在门外。
@@ -269,15 +304,7 @@ export async function cleanupExpiredSiwe(now = new Date()) {
 export async function isHost(address, { force = false } = {}) {
   const addr = String(address || '').toLowerCase();
   const owner = await nodeOwner();
-  if (!owner || addr !== owner) return false;
-  /*
-    forceCloseNode 后节点主本人也失去 host 权限：node.owner 是启动时从 env 载入的，
-    不会随链上治理自动刷新；只比对字符串会让被撤销的节点主继续调用 hostOnly 的
-    节点级 PII/审计入口。未接入 Registry 时 isForceClosedAddress 返回 false（能力未接入），
-    配了但读不到返回 null —— 这里只认 false，读不到一律 fail-closed。
-  */
-  const closed = await isForceClosedAddress(owner, { force });
-  return closed === false;
+  return !!owner && addr === owner;
 }
 
 /**
@@ -290,13 +317,12 @@ export async function isHost(address, { force = false } = {}) {
  * ⚠️ **节点主不在这里返回特权角色**：他拥有这台机器，但不因此拥有别家店的经营数据
  * （租户店铺的流水/订单/导出/擦除只有该店 seller 能读，见 http.js 的说明）。
  * 他在**自己那家店**里的身份就是 `owner`（那家店的 seller 正是他），不需要额外分支——
- * "节点主给自己开的那家店"与其他店在数据上没有任何区别，只是抽成被合约钉成 0。
+ * "节点主给自己开的那家店"与其他店在数据上没有任何区别。
  * 节点级动作用 `isHost` 单独判。
  *
  * `shopCode` 缺省（'' ）= 无店铺上下文 ⇒ 恒 `user`（调用方按"还没有店铺上下文"处理）。
  *
- * @param {{force?: boolean}} [opts] `force=true` 让**链上员工名单**跳过缓存重读（写请求与
- *   读 PII 的路径用）。店铺店主/店员那两层本来每次查库，没有缓存可绕。
+ * @param {{force?: boolean}} [opts] 本地名单每次查库；此参数不影响结果，仅保留调用形状。
  */
 export async function roleOf(address, shopCode = '', { force = false } = {}) {
   const addr = String(address || '').toLowerCase();
@@ -306,21 +332,9 @@ export async function roleOf(address, shopCode = '', { force = false } = {}) {
   if (addr === String(row.seller || '').toLowerCase()) return 'owner';
   if (await isShopOperator(code, addr)) {
     /*
-      **店员名单是链下事实，链上角色互斥看不到它**——所以这里每请求补一次链上判据：
-        · `isProtocolGovernance`：当前届仲裁人、四个治理 owner（Escrow/Registry/Blocklist/Staking）
-          都不能是店铺员工；
-        · `isForceClosed`：被节点主**永久强制关闭**的员工同样不能继续经营（`_forceClose` 只清链上
-          `staffNode`，清不到 `shop_operators`）。`isProtocolGovernance` 对被强制关闭的仲裁人
-          已返回 false，所以不能拿它代替这一条。
-      只在 `shop_operators` 命中时才多打 RPC（普通用户/店主路径不付这个成本）；
-      写请求用 `force` 绕过 15s 缓存，读请求最多 15s 收敛。任一读不到（`null`）按 `user` 处理：
-      宁可让店员重试，也不让一个无法确认身份的人拿到店员权限。
+      **店员名单是节点链下事实**：节点合约不读 Registry，节点鉴权也不读目录/平台治理。
+      名单命中即 staff；被移出名单后由店铺管理员重新维护，不由平台合约代判。
     */
-    const [gov, forceClosed] = await Promise.all([
-      isProtocolGovernanceAddress(addr, { force }),
-      isForceClosedAddress(addr, { force }),
-    ]);
-    if (gov !== false || forceClosed !== false) return 'user';
     return 'staff';
   }
   /*
@@ -334,53 +348,36 @@ export async function roleOf(address, shopCode = '', { force = false } = {}) {
     节点主的**店主专属**权限（资金/设置/导出/擦除）也不在这里授予：员工拿到的只是 staff 档。
   */
   const owner = await nodeOwner();
-  if (owner && String(row.seller || '').toLowerCase() === owner && (await isNodeStaffOf(addr, owner, { force }))) {
+  if (owner && String(row.seller || '').toLowerCase() === owner && (await isNodeStaffOf(addr))) {
     /*
-      与店铺员工同一道纵深：链上员工名单命中也必须再问一次治理身份**与强制关闭状态**。
-      合约 setNodeStaff 已拒绝 current arbiter/owner，这里防的是缓存/链上状态被打破后
-      "节点员工在自营店又拿到 staff 档"；`_forceClose` 清的是链上的 `staffNode` 行，但
-      forceclose 之后到缓存失效前、或本地库另有残留时，这条路径仍可能命中旧读数——
-      所以强制关闭必须**独立**再判一次。任一读不到 ⇒ user（fail-closed）。
+      节点员工同样是节点自己的链下名单；节点不依赖 Registry，平台的目录停用/关闭
+      不会在这里改变本节点的员工权限。员工权限由节点主在本地增删。
     */
-    const [gov, forceClosed] = await Promise.all([
-      isProtocolGovernanceAddress(addr, { force }),
-      isForceClosedAddress(addr, { force }),
-    ]);
-    return gov === false && forceClosed === false ? 'staff' : 'user';
+    return 'staff';
   }
   return 'user';
 }
 
 /**
- * 是否**节点管理员**（节点主 ∪ 节点员工）：节点级端点（开店审批、节点资料、节点审计、
- * 保留期扫描、佣金对账）的唯一鉴权判据。员工与节点主同权限见 `chain.isNodeStaffOf`。
+ * 是否**节点管理员**（节点主 ∪ 节点员工）：节点级端点（开店审批、节点资料、停用店铺、
+ * 节点级读数）的唯一鉴权判据。
  *
- * 为什么员工名单不落库：员工要在**链上**签开店票据、停用店铺，链下名单授权不了那些交易；
- * 两份名单必然漂移（`staffNode` 是唯一事实源，节点只读、带 15s 缓存）。
+ * 员工名单住在**本节点库**（`node_staff`）：节点级动作全是链下动作，没有任何链上交易需要
+ * 员工签名，所以名单不需要也不该由平台合约维护。目录的 forceClose/suspend 只影响目录展示，
+ * 不改变本节点后台权限——节点独立于 Registry 运行。
  *
- * @param {{force?: boolean}} [opts] 写请求传 `force:true`：链上刚移除的员工不能靠缓存里的
- *   `true` 继续通过节点级鉴权。
+ * @param {{force?: boolean}} [opts] 本地名单每次查库；此参数不影响结果，仅保留调用形状。
  */
 export async function isNodeAdmin(address, { force = false } = {}) {
   const addr = String(address || '').toLowerCase();
   const owner = await nodeOwner();
   if (!owner) return false;
-  /*
-    **节点主被强制关闭 ⇒ 整台节点的节点级权限失效**（fail-closed）：这是"这台机器不再被
-    网络承认"在鉴权层的镜像；读不到也按否处理。节点主本人只在"未被关闭且确证"时才通过。
-  */
-  const hostForceClosed = await isForceClosedAddress(owner, { force });
-  if (hostForceClosed !== false) return false;
   if (addr === owner) return true;
   /*
-    员工：链上 `staffNode` 命中**还不够**——`_forceClose` 的语义是"这个人被强制解除"，
-    而节点侧可能是缓存里的旧名单（15s）或本地库残留。被关闭/读不到一律不是管理员。
+    员工权限 = 本节点 `node_staff` 的链下名单。节点不读 Registry，也不让目录的
+    forceClose/suspend 改变本节点后台权限；平台目录只做展示，节点自己决定员工。
   */
-  const [staff, staffForceClosed] = await Promise.all([
-    isNodeStaffOf(addr, owner, { force }),
-    isForceClosedAddress(addr, { force }),
-  ]);
-  return staff && staffForceClosed === false;
+  return await isNodeStaffOf(addr);
 }
 
 /**
@@ -435,16 +432,14 @@ export async function operatedShopCodes(address, { force = false } = {}) {
   );
   const codes = rows.map((r) => String(r.code));
   /*
-    节点员工 ↔ 自营店：员工名单的唯一事实源在链上（`Registry.staffNode`，15s 缓存），
-    而"自营店"= `shops.seller == node.owner` 的那一行。读不到员工名单按"不是员工"处理
-    （权限方向 fail-closed，见 `isNodeStaffOf`）。
-    先查"节点主有没有开自营店"再问链：没有那家店时这个推断不可能改变结果，省掉每次
-    卖家面请求的一次链上读（员工名单 15s 缓存之外的那一下）。
+    节点员工 ↔ 自营店：员工名单住本节点库（`node_staff`），
+    而"自营店"= `shops.seller == node.owner` 的那一行。
+    先查"节点主有没有开自营店"再读名单：没有那家店时这个推断不可能改变结果，省掉一次查询。
   */
   const owner = await nodeOwner();
   if (owner) {
     const own = await getDb().get('SELECT code FROM shops WHERE seller = ?', owner);
-    if (own && (await isNodeStaffOf(addr, owner, { force }))) {
+    if (own && (await isNodeStaffOf(addr))) {
       const code = String(own.code);
       if (!codes.includes(code)) {
         codes.push(code);

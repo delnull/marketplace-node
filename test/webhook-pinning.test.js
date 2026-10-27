@@ -91,11 +91,11 @@ test('解析到内网地址时一个连接都不许发出（服务器侧零连�
   const port = server.address().port;
   try {
     /*
-      URL 主机名用 `localhost`：它**真的**解析到 127.0.0.1（不依赖任何注入点），若校验被绕过或
-      被挪到连接之后，这里就会实打实地连上服务器——"零连接"才是内容为真的断言。
+      URL 主机名用 `localhost`（https，先过协议门）：它**真的**解析到 127.0.0.1（不依赖任何注入点），
+      若 SSRF 校验被绕过或被挪到连接之后，这里就会实打实地连上服务器——"零连接"才是内容为真的断言。
     */
     const o = await insertOrder(); // 夹具在 try 内：写坏了要快速失败，不能让监听中的 socket 泄漏
-    await setWebhookConfig(shopRef.value, { url: `http://localhost:${port}/hook` });
+    await setWebhookConfig(shopRef.value, { url: `https://localhost:${port}/hook` });
     setWebhookSender(null); // 默认路径：真实 socket
     notify('order.escrowed', o.orderNo); // fire-and-forget（忽略返回的 Promise）
     await sleep(250); // 覆盖 2 次重试窗口（retryBase=20ms）
@@ -108,7 +108,7 @@ test('解析到内网地址时一个连接都不许发出（服务器侧零连�
       called.push(url);
       return { ok: true, status: 200 };
     });
-    await setWebhookConfig(shopRef.value, { url: 'http://169.254.169.254/latest/meta-data/' });
+    await setWebhookConfig(shopRef.value, { url: 'https://169.254.169.254/latest/meta-data/' });
     notify('order.escrowed', o.orderNo);
     await sleep(250);
     assert.equal(called.length, 0, '云元数据地址：注入的发送器零调用（校验先于发送）');

@@ -20,7 +20,7 @@
  * 无同 id 多份的库存/账目概念）。
  */
 import { ethers } from 'ethers';
-import { getProvider } from './chain.js';
+import { getProvider, finalizedBlockTag } from './chain.js';
 
 /** ERC721 Transfer 事件（indexed from/to/tokenId 三段 topic） */
 export const ERC721_ABI = ['event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)'];
@@ -148,5 +148,17 @@ export async function verifyNftTransfersTx(txHash, nftContract, expected) {
     return { ok: false, reason: '链上查询失败，请稍后重试' };
   }
   if (!receipt) return { ok: false, reason: '链上暂未检索到该交易，请确认转账已打包上链' };
+  /*
+    确认深度：图省一次比较就在 latest 落交付，短重组后本地已 shipped、链上 Transfer 却消失，
+    订单随后还能超时结算给卖家——买家钱货两空。与 /paid、watcher 同一个 finality 口径：
+    未达终局不落交付，让卖家等几块再确认（交易若真被重组，会被明确拒绝而不是静默记账）。
+  */
+  const finalized = await finalizedBlockTag().catch(() => null);
+  if (typeof finalized === 'number' && Number(receipt.blockNumber) > finalized) {
+    return {
+      ok: false,
+      reason: `该交易所在区块（${receipt.blockNumber}）尚未达到确认深度（当前终局块 ${finalized}）：请稍后重试`,
+    };
+  }
   return matchNftTransfers(receipt.logs, nftContract, expected);
 }

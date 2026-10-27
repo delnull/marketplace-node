@@ -29,7 +29,7 @@ const { logAudit, queryAudit } = await import('../src/audit.js');
 const OTHER_SHOP_CODE = '0000TEST2';
 const otherOwner = Wallet.createRandom();
 await db.run(
-  `INSERT INTO shops (code, seller, name, notice, listed, commission_bps) VALUES (?, ?, '', '', 1, 0)
+  `INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, '', '', 1)
    ON DUPLICATE KEY UPDATE seller = seller`,
   OTHER_SHOP_CODE, otherOwner.address.toLowerCase()
 );

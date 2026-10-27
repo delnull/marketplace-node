@@ -184,9 +184,11 @@ test('erase-pii：在途单拒绝；终局擦除（含附件行与磁盘文件�
   */
   assert.deepEqual(res.body.data.erased, {
     shippingRows: 1,
+    claimPii: 0,
     evidenceContents: 1,
     attachmentRows: 1,
     attachmentFiles: 1,
+    reviewImages: 0,
   });
   // 响应只给计数，不给被擦除的内容（否则等于把 PII 又发了一遍）
   assert.ok(!JSON.stringify(res.body).includes('张三'), '响应不得回显被擦除的内容');
@@ -238,11 +240,74 @@ test('erase-pii：在途单拒绝；终局擦除（含附件行与磁盘文件�
   assert.equal(again.body.data.alreadyErased, true);
   assert.deepEqual(again.body.data.erased, {
     shippingRows: 0,
+    claimPii: 0,
     evidenceContents: 0,
     attachmentRows: 0,
     attachmentFiles: 0,
+    reviewImages: 0,
   });
   assert.equal((await evidenceRows(order.id))[0].content, PII_TOMBSTONE);
+});
+
+test('erase-pii：终局 NFT 提货声明的收货信息同事务清空；在途声明拒绝整单擦除', async () => {
+  const p = await listProduct(productPayload({ kind: 'physical', title: 'PII 提货声明商品' }));
+  const order = await createDraft(p.slug, { shipping: { name: '张三', phone: '13800000000', address: '北京市朝阳区某路 1 号' } });
+  await escrowed(order);
+  assert.equal(await applyEvent('ReceiptConfirmed', { orderId: order.escrowOrderId }, { txHash: payHash(), block: 9 }), 1);
+  const internalId = await orderIdOfNo(order.id);
+  const insertClaim = async (claimNo, tokenId, status) => {
+    await db.run(
+      `INSERT INTO nft_claims
+        (claim_no, shop_code, product_id, product_slug, order_id, order_no, seller,
+         token_contract, token_id, claimant, status, shipping_name, shipping_phone, shipping_address, note)
+       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, '张三', '13800000000', '北京市朝阳区某路 1 号', '放门口')`,
+      claimNo,
+      order.shopCode,
+      order.productSlug,
+      internalId,
+      order.id,
+      order.seller.toLowerCase(),
+      '0x' + 'ab'.repeat(20),
+      String(tokenId),
+      order.buyer.toLowerCase(),
+      status
+    );
+  };
+
+  await insertClaim('C' + '1'.repeat(20), '1', 'fulfilled');
+  const term = await eraseViaApi(order.id);
+  assertOk(term);
+  assert.equal(term.body.data.erased.claimPii, 1);
+  const claim = await db.get("SELECT * FROM nft_claims WHERE claim_no = ?", 'C' + '1'.repeat(20));
+  assert.equal(claim.shipping_name, '');
+  assert.equal(claim.shipping_phone, '');
+  assert.equal(claim.shipping_address, '');
+  assert.equal(claim.note, '');
+  assert.equal(claim.reject_reason, '');
+
+  // 另一单：在途 claim 的地址正在用于履约，不能把订单那一行删掉后报“已擦干净”
+  const order2 = await createDraft(p.slug, { shipping: { name: '李四', phone: '13900000000', address: '上海市某路 2 号' } });
+  await escrowed(order2);
+  assert.equal(await applyEvent('ReceiptConfirmed', { orderId: order2.escrowOrderId }, { txHash: payHash(), block: 10 }), 1);
+  await db.run(
+    `INSERT INTO nft_claims
+      (claim_no, shop_code, product_id, product_slug, order_id, order_no, seller,
+       token_contract, token_id, claimant, status, shipping_name, shipping_phone, shipping_address, note)
+     VALUES (?, ?, NULL, ?, ?, ?, ?, ?, '2', ?, 'requested', '李四', '13900000000', '上海市某路 2 号', '')`,
+    'C' + '2'.repeat(20),
+    order2.shopCode,
+    order2.productSlug,
+    await orderIdOfNo(order2.id),
+    order2.id,
+    order2.seller.toLowerCase(),
+    '0x' + 'cd'.repeat(20),
+    order2.buyer.toLowerCase()
+  );
+  const blocked = await eraseViaApi(order2.id);
+  assert.notEqual(blocked.body.code, 0);
+  assert.match(blocked.body.message, /在途的 NFT 提货声明/);
+  assert.equal((await rowOf(order2.id)).shipping_name, '李四', '在途 claim 的地址不能只删订单副本');
+  assert.equal((await db.get("SELECT * FROM nft_claims WHERE claim_no = ?", 'C' + '2'.repeat(20))).shipping_name, '李四');
 });
 
 test('erase-pii：附件行已删但磁盘残留孤儿文件时，重复调用仍会清掉目录（幂等自愈）', async () => {
@@ -382,7 +447,7 @@ test('POST /api/shop/retention/run：hostOnly；缺省用配置阈值；可显�
   */
   const nonHostOwner = Wallet.createRandom();
   await db.run(
-    `INSERT INTO shops (code, seller, name, notice, listed, commission_bps) VALUES (?, ?, '', '', 1, 0)
+    `INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, '', '', 1)
      ON DUPLICATE KEY UPDATE seller = seller`,
     NON_HOST_SHOP_CODE,
     nonHostOwner.address.toLowerCase()
@@ -576,7 +641,8 @@ test('保留期让路：有在途售后案件的终局单不自动擦除（证�
     售后案件只存在于**终局**单上（链上要求 Settled），而终局单正是保留期扫描的候选面——
     案件又往往在成交很久之后才被开出来（窗口上限 360 天），所以"到期就擦"会把双方刚提交的
     after_sale 陈述正文、证据附件与收货信息一起销毁，而仲裁人还要靠它们裁决。
-    显式删除请求（erase-pii）不受影响：那是数据主体本人/店主明确要求删除（见 piiErase 的说明）。
+    显式删除请求（erase-pii）同样必须让路：它由店主发起，而店主正是售后案件可能被罚的一方；
+    让店主在开案后擦掉双方陈述/附件，等于把裁决证据先销毁。结案后才回到正常擦除。
   */
   const p = await listProduct(productPayload({ kind: 'physical', title: 'PII 案件让路商品' }));
   const o = await createDraft(p.slug, { shipping: { name: '孙十二', phone: '13900000000', address: '成都市某路 10 号' }, note: '售后案件中' });
@@ -592,10 +658,13 @@ test('保留期让路：有在途售后案件的终局单不自动擦除（证�
   assert.equal((await rowOf(o.id)).note, '售后案件中');
   assert.equal((await rowOf(o.id)).pii_erased_at, null, '没擦过就不该有擦除锚点');
 
-  // 显式删除请求不受这条让路约束：数据主体的删除要求照旧执行
+  // 在途案件也不接受店主的显式删除：陈述/附件是裁决证据，且店主正是可能被罚的一方
   const manual = await eraseViaApi(o.id);
-  assertOk(manual);
-  assert.equal((await rowOf(o.id)).shipping_name, null, '显式请求仍然擦除（案件不该被当成拒绝删除的理由）');
+  assert.equal(manual.status, 409, 'case_open 必须是 409，不能静默擦');
+  assert.notEqual(manual.body.code, 0);
+  assert.match(String(manual.body.message), /售后案件/);
+  assert.equal((await rowOf(o.id)).shipping_name, '孙十二', '案件在途时收货信息也必须留到结案');
+  assert.equal((await rowOf(o.id)).pii_erased_at, null, '拒绝时不得写擦除锚点');
 
   // 结案后回到正常保留期语义：到期即擦
   const o2 = await createDraft(p.slug, { shipping: { name: '周十三', phone: '13800000000', address: '武汉市某路 11 号' } });
@@ -797,22 +866,22 @@ test('擦除只动 PII：保留清单里的每一类都逐项验一遍（不是�
   const before = await rowOf(o.id);
   // 逐项铺上"保留清单"里的数据（都走真实写入路径能写到的列/表）
   const keepId = await orderIdOfNo(o.id);
-  await db.run(`UPDATE orders SET tracking_no = ?, carrier = ?, shipping_fee_usdt_micro = 0, fee_bps = 250, shipped_at = ?
+  await db.run(`UPDATE orders SET tracking_no = ?, carrier = ?, shipping_fee_usdt_micro = 0, shipped_at = ?
       WHERE order_no = ?`, 'SF1234567890', '顺丰', new Date(), o.id);
   await db.run('UPDATE order_chain SET after_sale_note = ? WHERE order_id = ?', '结案说明：双方已协商一致（链上公开文本）', keepId);
   await db.run(`INSERT INTO order_returns (order_id, status, address, note, tracking_no, carrier)
      VALUES (?, 'shipped', '退货地址-保留', '退货说明-保留', 'RTN998877', '中通')`, keepId);
   await db.run(`INSERT INTO order_delivery_items (order_id, kind, value) VALUES (?, 'code', 'CODE-KEEP-1')`, keepId);
 
-const kept = await db.get(`SELECT tracking_no, carrier, invoice_needed, fee_bps, after_sale_note, shipped_at,
+const kept = await db.get(`SELECT tracking_no, carrier, invoice_needed, after_sale_note, shipped_at,
               amount_wei, escrow_order_id, paid_tx_hash FROM v_orders WHERE order_no = ?`, o.id);
   assertOk(await eraseViaApi(o.id));
 
-const after = await db.get(`SELECT tracking_no, carrier, invoice_needed, fee_bps, after_sale_note, shipped_at,
+const after = await db.get(`SELECT tracking_no, carrier, invoice_needed, after_sale_note, shipped_at,
               amount_wei, escrow_order_id, paid_tx_hash, shipping_name FROM v_orders WHERE order_no = ?`, o.id);
   // 擦除 = 删掉 order_shipping 那一行 ⇒ LEFT JOIN 读不到 ⇒ NULL（旧形状是"把六列都改成空串"）
   assert.equal(after.shipping_name, null, '前置：PII 确实被擦了（否则下面的"保留"是空转）');
-  for (const col of ['tracking_no', 'carrier', 'fee_bps', 'after_sale_note', 'shipped_at', 'amount_wei', 'escrow_order_id', 'paid_tx_hash']) {
+  for (const col of ['tracking_no', 'carrier', 'after_sale_note', 'shipped_at', 'amount_wei', 'escrow_order_id', 'paid_tx_hash']) {
     assert.deepEqual(after[col], kept[col], `${col} 属于"刻意保留"，擦除不许碰它`);
   }
   /*

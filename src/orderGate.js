@@ -46,7 +46,6 @@ import crypto from 'node:crypto';
 import config from './config.js';
 import { assertPublicHttpTarget } from './netguard.js';
 import { postPinned } from './pinnedRequest.js';
-import { addressBlocked } from './chain.js';
 
 let _sender = null; // 测试注入；null = 默认钉住发送器（与 webhook.setWebhookSender 同款注入点）
 export function setOrderGateSender(fn) {
@@ -88,11 +87,11 @@ export function resetOrderGate() {
  * 的入口——非空但非法的 URL 会让 `checkOrderGate` 直接放行每一单。URL 是否**可用**由
  * `orderGateStartupError()` 在启动期判定（非法即拒绝启动），运行期则由 `checkOrderGate`
  * 的 fail-closed 兜住（校验不过 ⇒ 拒单）。
- * 两个方向都只有"开启"与"明确拒单"，**不存在"配置了却没生效却当成没配"这条路径**。
+ * 节点侧没有"全网地址黑名单"这一类旁路（平台 Registry 不封地址），所以这道闸只有店主自己
+ * 配的那一个目标：非空即开，留空即关。
  */
 export function orderGateEnabled() {
-  // 两道闸任一配好就算"开着"：只配链上名单也是开着（见 checkOrderGate 的两段）
-  return !!config.orderGate.url || !!config.chain.blocklistAddress;
+  return !!config.orderGate.url;
 }
 
 /**
@@ -157,15 +156,8 @@ export async function checkOrderGate({
   note,
 } = {}) {
   /*
-    ── 两道闸，一个出口（2026-10 多店批把链上名单接了进来）─────────────────────
-    ① **链上名单**（`Blocklist` 的 `Address` 类，owner 维护、全网共享）：命中即拒单。
-       它先于店主自己的风控服务跑——那是一条**全网的**决定，不该被某一家的配置绕过。
-       名单读不到 ⇒ **拒单**（fail-closed）：与"风控服务不可达即拒单"同一条纪律，
-       因为"读不到"与"名单里没有他"是两件不同的事，把前者当后者就是静默放行。
-    ② **店主自配的风控服务**（`MK_ORDER_GATE_URL`）：原有行为一字未改。
-
-    未配置 `MK_BLOCKLIST_ADDRESS` 且未配置 URL ⇒ 完全没有闸，直接放行（默认部署行为不变）。
-    只配了名单 ⇒ 只跑①；只配了 URL ⇒ 只跑②。`orderGateEnabled()` 对这两种情况都为真。
+    只有**店主自配的风控服务**（`MK_ORDER_GATE_URL`）一道门。
+    未配置 ⇒ 完全没有闸，直接放行（默认部署行为）；配置了则 fail-closed（见文件头）。
   */
   if (!orderGateEnabled()) return { ok: true };
   /*
@@ -180,26 +172,6 @@ export async function checkOrderGate({
     console.warn(`[orderGate] 下单被风控拒绝 productSlug=${slug || '?'} reason=${reason}`);
     return { ok: false, reason };
   };
-  // ① 链上名单（地址类）。只在配了合约地址时才查；未配置 = 本节点不读链上名单（见 config 注释）
-  if (config.chain.blocklistAddress) {
-    let blocked;
-    try {
-      blocked = await addressBlocked(buyer);
-    } catch (e) {
-      return deny(
-        `读不到链上黑名单（${e?.message || e}）：无法确认该买家是否在全网冻结名单里，按 fail-closed 拒绝本次下单。` +
-          `若是 RPC 故障请稍后重试；若确实不读链上名单，清空 MK_BLOCKLIST_ADDRESS（留空即关闭这一道闸）`
-      );
-    }
-    if (blocked) {
-      return deny(
-        '该钱包地址已被列入全网冻结名单：本店不接受该地址下单。' +
-          '（这是**界面与节点侧**的限制，不是链上强制——同一个人换一个钱包即可再次下单，`Address` 类条目不对托管层设限）'
-      );
-    }
-  }
-  // ② 未配置店主风控服务 ⇒ 只剩①，跑完即放行
-  if (!config.orderGate.url) return { ok: true };
   const url = config.orderGate.url;
   /*
     交易要素白名单（不是"展开整个订单对象"）：收货人姓名/电话/地址、买家备注、发票抬头/税号
@@ -222,7 +194,10 @@ export async function checkOrderGate({
   const headers = { 'content-type': 'application/json' };
   const secret = config.orderGate.secret;
   if (secret) {
-    headers['x-mk-signature'] = crypto.createHmac('sha256', secret).update(body).digest('hex');
+    // 与 webhook 同一签名方案：timestamp.body，接收方用 x-mk-timestamp 做重放窗口。
+    const ts = String(Math.floor(Date.now() / 1000));
+    headers['x-mk-timestamp'] = ts;
+    headers['x-mk-signature'] = crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
   }
   const sender = _sender || pinnedGateSender;
   const timeoutMs = config.orderGate.timeoutMs;

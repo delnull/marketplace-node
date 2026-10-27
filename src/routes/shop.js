@@ -1,12 +1,12 @@
 /**
  * 店铺信息与管理路由（经营参数全部网页化：**店名/公告是 `shops` 的列**，店员/通知各有自己的表）。
  *
- * 配置文件只保留"身份与接线"（节点主钱包/escrow/registry/端口等）；
+ * 配置文件只保留"身份与接线"（节点主钱包/escrow/staking/端口等）；节点不读取任何 Registry。
  * 店名/公告/店员名单/通知 webhook 均在卖家面板「店铺设置」维护（即改即生效，无需重启）。
  * 节点自己的对外资料（名称/公告）是 `node` **单例行**的两列——它不是"某家店的名字"。
  *
  *  GET  /                节点信息（+ 带 X-Mk-Shop 时附该店信息）——买家页面与下单核验用
- *  GET  /registry-info   节点登记信息（host/escrow/registry；endpoint 由开店向导网页填写）
+ *  GET  /node-identity   节点身份参数（owner/escrow/staking/chainId；endpoint 由登记工具填写）
  *  GET  /node            节点级只读运营读数（nodeAdmin；**不含任何店铺经营明细**）
  *  PUT  /node            编辑**节点资料**（nodeAdmin：名称/公告/谈信地址）
  *  PUT  /                编辑店铺资料 {name?, notice?, tanxinAddress?}（staffOnly；入审计）
@@ -14,7 +14,7 @@
  *  PUT  /staff           店员管理 {action:'add'|'remove', address}（ownerOnly；入审计）
  *  PUT  /webhook         通知配置 {url, secret}（ownerOnly；secret 不回显，仅布尔状态）
  *  GET  /reputation      履约画像聚合统计（公开只读；带 X-Mk-Shop 时按该店限定）
- *  GET  /staking         质押跌破注册门槛的店主清单（治理只读；口径见 src/stakingRisk.js）
+ *  GET  /staking         本节点保证金状况（治理只读；口径见 src/stakingRisk.js）
  *  GET  /reviews/stats   店铺买家评价聚合（公开只读）
  *  GET  /buyer-signal    买家履约信号（ownerOnly；**本店视角**，口径见 src/buyerSignal.js）
  *  POST /claims          提交一条身份声明 {kind,value,issued,signature}（ownerOnly；签名核验见 src/claims.js）
@@ -36,26 +36,30 @@ import {
   getShopOperators,
   addShopOperator,
   removeShopOperator,
+  nodeStaffList,
+  addNodeStaff,
+  removeNodeStaff,
 } from '../auth.js';
 import { getDb, withTransaction, abortTx } from '../db.js';
 import { logAudit } from '../audit.js';
+import { isAddress, isZeroAddress } from '../chain.js';
+import { assertPublicHttpTarget } from '../netguard.js';
+import { sweepOrphanUploads } from '../mediaSweep.js';
+import { getRates, usdtMicroToPayWei, isPayableAmount } from '../rates.js';
 import {
-  isAddress,
-  isZeroAddress,
-  isProtocolGovernanceAddress,
-  isForceClosedAddress,
-  nodeStaffList,
-  invalidateNodeStaffCache,
-} from '../chain.js';
-// 节点编号（链上 codeOf(host)）与店铺编号是**两条独立序列**：前者标识机器，后者标识店。
-// 公开端点只读**同步缓存**（app.js 启动时预热一次）：`nodeCode()` 是 async，漏掉 await 会把
-// Promise 序列化成 `{}`，而为了一个展示字段让公开首页等一次 RPC 也不划算。
-import { cachedShopCode } from '../shopCode.js';
+  listPaymentMethods,
+  tokenSupportedOnChain,
+  listPaymentTokenConfigs,
+  normalizePaymentToken,
+  upsertPaymentToken,
+  deletePaymentToken,
+  assertTokenDecimals,
+} from '../paymentTokens.js';
 // 店铺（租户）事实源 + 节点单例（owner/节点资料）的唯一读入口：都从这里取，不在本文件另算一份
 // `shopDisplayName/Notice`（店铺）与 `nodeDisplayName`（节点）是展示形的**唯一实现**：
 // 店铺没有默认名（写入口拒绝空名），节点在 `''` 时回退对外域名/中性占位——见各自的说明
 import {
-  listActiveShopRows,
+  listShopRows,
   listListedShopRows,
   shopDto,
   shopDisplayName,
@@ -65,10 +69,9 @@ import {
   nodeOwnerOf,
   nodeRow,
 } from '../shops.js';
-// 节点级运营读数（nodeAdmin）：只出"这台机器有没有在干活"与抽成收入，不出任何店铺经营明细
+// 节点级运营读数（nodeAdmin）：只出"这台机器有没有在干活"，不出任何店铺经营明细
 import { escrowWatcherStatus } from '../escrowWatcher.js';
 import { chainReconcileStatus } from '../chainReconcile.js';
-import { termsReconcileStatus } from '../termsReconciler.js';
 // 店铺身份声明的唯一判据层：规范消息构造（**逐字**使用请求字段）/ 声明值校验（**拒绝**而非变换）/
 // 签名核验（见 src/claims.js 文件头——那里写清了铁律"签名的字节就是提交的字节"，
 // 以及"它证明什么、不证明什么"：对外口径必须是"店主签过这句话"，不是"官方认证"）
@@ -79,8 +82,7 @@ import { shopReviewStats } from '../reviews.js';
 import { parseTanxinAddress, tanxinAddressOf } from '../tanxin.js';
 import { webhookStatus, sendTestEvent, webhookConfig, setWebhookConfig } from '../webhook.js';
 import { overviewStats, trendStats, productStats, normalizeStatsDays } from '../stats.js';
-import { refreshFeeCollector, feeStatus } from '../fees.js';
-// 质押跌破注册门槛的读数（治理只读；事实源与取舍见 src/stakingRisk.js）
+// 本节点保证金状况的读数（治理只读；事实源与取舍见 src/stakingRisk.js）
 import { stakingShortfall } from '../stakingRisk.js';
 // 买家履约信号（本店视角；口径、隐私边界与文案纪律见 src/buyerSignal.js 文件头）
 import { buyerSignal } from '../buyerSignal.js';
@@ -95,6 +97,8 @@ const staffOnly = makeAuthMiddleware(verifyToken, { staffOnly: true });
 // 节点级：节点主 ∪ 节点员工（nodeAdmin；员工与节点主同权限的日常运营动作）。
 // 注意 PII 保留期与节点审计**不在这里**：那两件是 hostOnly（仅节点主，见 routes/pii.js / audit.js）。
 const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true });
+// 增删节点员工是权限授予本身：只允许节点主，避免员工自行扩权/互授。
+const hostOnly = makeAuthMiddleware(verifyToken, { hostOnly: true });
 
 /* ── 节点资料（`node` 单例行的 name/notice）──
  *
@@ -209,13 +213,12 @@ const reviewsStatsLimiter = simpleRateLimit({ windowMs: 60_000, max: 120, messag
 /**
  * 节点信息（公开只读；买家店铺页/下单核验用）。
  *
- * **这是节点级读数**：`host` 是节点主地址（`node.owner`），`nodeCode` 是**节点编号**
- * （链上 `codeOf(host)`），店铺列表在 `/api/shops`。带 `X-Mk-Shop` 时附带该店的信息——
- * 前端一次请求就能同时拿到"这台机器是谁"与"我要看的是哪家店"，不必两跳。
+ * **这是节点级读数**：`owner` 是节点 operator（`node.owner`），店铺列表在 `/api/shops`。
+ * 带 `X-Mk-Shop` 时附带该店的信息——前端一次请求就能同时拿到"这台机器是谁"与
+ * "我要看的是哪家店"，不必两跳。
  *
- * ⚠️ 节点编号与店铺编号是**两条独立的链上序列**（见合约 `_mintNodeCode`/`_mintShopCode`）：
- * 前者标识"这台机器在目录里的位置"，后者标识"这家店"。两者都是 9 位 Crockford Base32，
- * 长得一样但不可互换——混用会让链接指向一个不存在的店（或别人的店）。
+ * 平台目录可以用 **endpoint**（不是编号）标识一台机器：节点只暴露自己的身份参数，
+ * 登记由 operator 钱包在客户端按目标 Registry 签名，节点不读取也不依赖任何 Registry。
  */
 router.get('/', optionalShop, wrap(async (req, res) => {
   // 节点资料三列同住 node 单例行：读一次，别为 name/notice/tanxin 各查一遍
@@ -229,13 +232,8 @@ router.get('/', optionalShop, wrap(async (req, res) => {
   const shop = req.shopNotSellable ? null : req.shop;
   const listed = await listListedShopRows();
   ok(res, {
+    /* 节点 operator：链上 Registry 登记的主体，也是 Escrow/Staking 的 owner；唯一的字段名。 */
     host: owner || null,
-    /*
-      兼容字段名 owner：它是"这台机器的登记人"（节点主），不是订单卖家。
-      `shops` 表已无 host 列，节点主的唯一家是 `node.owner`——两个字段因此是同一个值，
-      保留两个名字是因为前端的联邦目录按两种拼写都读过它。
-    */
-    owner: owner || null,
     /*
       **节点自己的名字/公告**（不是某家店的名字）：开节点与开店铺是两个独立动作，
       一个节点可以一家店都没有，但它仍然要在目录里显示一个名字。
@@ -244,10 +242,9 @@ router.get('/', optionalShop, wrap(async (req, res) => {
     notice: shopDisplayNotice(node),
     /** 节点自己的谈信地址（公开客服联系方式）；null = 没设置过 */
     tanxinAddress: tanxinAddressOf(node),
-    nodeCode: cachedShopCode() || null,
     chainId: config.chain.chainId,
     escrowAddress: config.chain.escrowAddress || null,
-    registryAddress: config.chain.registryAddress || null,
+    stakingAddress: config.chain.stakingAddress || null,
     timeoutBlocks: config.escrow.timeoutBlocks,
     shops: listed.map((r) => shopDto(r, owner)),
     ...(shop ? { shop: shopDto(shop, owner) } : {}),
@@ -256,23 +253,24 @@ router.get('/', optionalShop, wrap(async (req, res) => {
 }));
 
 /**
- * 节点登记信息（公开只读）：前端「添加节点成为卖家」据此自动填充与**一致性校验**——
- * 节点 escrow/registry 必须与登记前端同网络（VITE_*），否则拒绝登记。
- * 注意：endpoint 不在节点预置——由开店向导网页填写（本节点可被任一前端访问时域名即 endpoint）。
+ * 节点身份（公开只读）：客户端/登记工具据此组 `registerNode` 参数。
+ *
+ * 只暴露节点自己的事实：operator、Escrow/Staking 地址、chainId、endpoint 由调用方提供。
+ * Registry 列表不在节点配置里，节点也不反向读取任何目录；同一份身份可由 operator
+ * 分别登记到任意多个 Registry。
  */
-router.get('/registry-info', wrap(async (req, res) => {
+router.get('/node-identity', wrap(async (req, res) => {
   const node = await nodeRow();
   const owner = nodeOwnerOf(node);
   ok(res, {
-    host: owner || null,
     owner: owner || null,
     name: nodeDisplayName(node),
     notice: shopDisplayNotice(node),
     tanxinAddress: tanxinAddressOf(node),
     chainId: config.chain.chainId,
     escrowAddress: config.chain.escrowAddress || null,
-    registryAddress: config.chain.registryAddress || null,
-    canRegister: !!(owner && config.chain.escrowAddress && config.chain.registryAddress),
+    stakingAddress: config.chain.stakingAddress || null,
+    canRegister: !!(owner && config.chain.escrowAddress && config.chain.stakingAddress),
     version: config.version,
   });
 }));
@@ -281,16 +279,127 @@ router.get('/registry-info', wrap(async (req, res) => {
  * 节点级只读运营读数（nodeAdmin）——**节点主必须能判断自己的服务是否正常**，
  * 而不是"节点主可以看别人的生意"。
  *
- * 因此这里的每一行都只回答"这台机器/这份服务怎么样"：
- *   · 后台任务活性（watcher / 链上对账 / 佣金条款对账 / PII 保留期）；
- *   · 名下有几家店、几家在售；
- *   · 各店的**抽成收入**（= Σ 链上 `Escrow.commissionAtSettle`，本就是公开事件，
- *     节点主自己扫链也能算出来，放进来不新增泄露）。
- * **不含**订单、买家、金额、商品等任何店铺经营明细——那些只有该店店主能通过店铺级端点读到。
+ * 因此这里的每一行都只回答"这台机器/这份服务怎么样"：后台任务活性、名下有几家店、
+ * 几家在售、节点员工名单。**不含**订单、买家、金额、商品等任何店铺经营明细——
+ * 那些只有该店店主能通过店铺级端点读到。
  */
+router.get('/payment-methods', wrap(async (req, res) => {
+  const raw = String(req.query.usdtMicro ?? '').trim();
+  let total = null;
+  if (raw) {
+    if (!/^\d+$/.test(raw) || BigInt(raw) <= 0n) return fail(res, 'usdtMicro 需为正整数（微 USDT）');
+    total = raw;
+  }
+  const rates = await getRates();
+  const nativeAmount = total ? usdtMicroToPayWei(total, rates) : null;
+  const tokens = await listPaymentMethods(total);
+  /*
+    公开支付方式必须与链上 `supportedToken` 一致：只列环境变量里“配置了”的 token，
+    买家会先建草稿、占库存，到签名前才被 Escrow 拒绝。supported=false 直接剔除；
+    RPC 读不到则保留但标记 unavailable（前端置灰），不把“读不到”当成可用。
+  */
+  let filtered = tokens;
+  if (tokens.length) {
+    try {
+      if (!config.chain.escrowAddress) {
+        filtered = tokens.map((t) => ({ ...t, supported: false, unavailable: '节点未接入托管合约' }));
+      } else {
+        const flags = await Promise.all(tokens.map((t) => tokenSupportedOnChain(t.token)));
+        filtered = tokens
+          .map((t, i) => ({ ...t, supported: !!flags[i] }))
+          .filter((t) => t.supported);
+      }
+    } catch (e) {
+      filtered = tokens.map((t) => ({ ...t, supported: null, unavailable: `无法核验链上白名单：${e?.message || e}` }));
+    }
+  }
+  ok(res, {
+    native: {
+      token: 'native',
+      symbol: 'BTY',
+      decimals: 18,
+      usdtMicroPerToken: null,
+      amountWei: nativeAmount,
+      payable: nativeAmount === null ? null : isPayableAmount(nativeAmount),
+    },
+    tokens: filtered,
+  });
+}));
+
+/**
+ * 节点级 ERC20 支付资产（**只有节点主**）：配置存库、页面维护；链上 `Escrow.supportedToken`
+ * 仍是"能不能收"的唯一授权。租户店主不是节点主，不能决定这台机器收哪些币。
+ */
+router.get('/payment-tokens', hostOnly, wrap(async (req, res) => {
+  const methods = await listPaymentMethods(null);
+  const configs = await listPaymentTokenConfigs();
+  const cfgBy = new Map(configs.map((c) => [c.address, c]));
+  let escrow = null;
+  let supported = {};
+  try {
+    escrow = config.chain.escrowAddress || null;
+    const flags = await Promise.all(methods.map((m) => tokenSupportedOnChain(m.token)));
+    supported = Object.fromEntries(methods.map((m, i) => [m.token, !!flags[i]]));
+  } catch {
+    /* 未部署 Escrow / RPC 不可达：supported 保持空对象，前端显示"未核验" */
+  }
+  ok(res, {
+    escrow,
+    tokens: methods.map((m) => {
+      const c = cfgBy.get(m.token);
+      return {
+        ...m,
+        fixedUsdtMicroPerToken: c?.fixed ?? null,
+        priceUrl: c?.priceUrl ?? null,
+        supported: supported[m.token] ?? null,
+      };
+    }),
+  });
+}));
+
+/** 新增/更新一条支付资产配置（节点主；保存不代替链上启用）。 */
+router.post('/payment-tokens', hostOnly, wrap(async (req, res) => {
+  let token;
+  try {
+    token = normalizePaymentToken(req.body);
+  } catch (e) {
+    return fail(res, e.message);
+  }
+  if (!config.chain.escrowAddress) {
+    return fail(res, '本节点未接入托管合约（MK_ESCROW_ADDRESS 为空）：先接 Escrow，否则配了也收不了 ERC20');
+  }
+  if (token.mode === 'oracle') {
+    const target = await assertPublicHttpTarget(token.priceUrl);
+    if (!target.ok) return fail(res, `行情源校验未通过：${target.message}`);
+  }
+  try {
+    await assertTokenDecimals(token.address, token.decimals);
+  } catch (e) {
+    return fail(res, e.message, 1, 503);
+  }
+  await upsertPaymentToken(token);
+  await audit(req, 'payment_token.save', 'node', token.address, {
+    symbol: token.symbol,
+    decimals: token.decimals,
+    mode: token.mode,
+    fixedUsdtMicroPerToken: token.fixed,
+    priceUrl: token.priceUrl || null,
+  }, null);
+  ok(res, { token }, '已保存；还需节点主钱包在链上启用 supportedToken，买家才能用它付款');
+}));
+
+/** 删除一条配置（只停止未来报价；已托管订单仍按快照里的支付资产结算）。 */
+router.delete('/payment-tokens/:address', hostOnly, wrap(async (req, res) => {
+  const address = String(req.params.address || '').trim().toLowerCase();
+  if (!isAddress(address)) return fail(res, '支付资产地址非法');
+  const deleted = await deletePaymentToken(address);
+  if (!deleted) return fail(res, '该支付资产配置不存在', 404, 404);
+  await audit(req, 'payment_token.delete', 'node', address, {}, null);
+  ok(res, { address }, '已删除配置（链上 supportedToken 仍由节点主自行关停）');
+}));
+
 router.get('/node', nodeAdmin, wrap(async (req, res) => {
-  // **名下店铺**只数在营的：已退出（墓碑）的行不是"现在还挂在名下的店"
-  const rows = await listActiveShopRows();
+  const rows = await listShopRows();
   const node = await nodeRow();
   const owner = nodeOwnerOf(node);
   ok(res, {
@@ -304,38 +413,55 @@ router.get('/node', nodeAdmin, wrap(async (req, res) => {
       shops: rows.length,
       listed: rows.filter((r) => Number(r.listed) === 1).length,
     },
-    // 节点员工（2026-10-18）：名单来自链上（唯一事实源）；增删用节点主钱包发 Registry.setNodeStaff
-    staff: await nodeStaffList(owner),
+    // 节点员工是**节点链下名单**（node_staff）：节点级动作没有链上交易，名单住本节点库
+    staff: await nodeStaffList(),
     tasks: {
       watcher: await escrowWatcherStatus(),
       reconcile: chainReconcileStatus(),
-      // 佣金条款对账：把链上 shopListed 与当前 commissionBps 抄回本地（节点只读链、不索引事件）
-      terms: termsReconcileStatus(),
     },
   });
 }));
 
 /**
- * 节点员工名单（nodeAdmin）：链上 `Registry.nodeStaff(host)` 的只读镜像。
+ * 节点员工名单（nodeAdmin）：本节点 `node_staff` 表的只读视图。
  *
- * 为什么没有"加/删员工"的写接口：员工的授权必须落在**链上**（他们要签开店票据、
- * 停用店铺，链下名单授权不了那些交易），唯一入口是节点主钱包发
- * `Registry.setNodeStaff(staff, true/false)`。本端点只读，另给一个"刷新鉴权缓存"的入口。
+ * 为什么没有链上入口：平台 Registry 只登记节点 operator，没有"节点员工"这个概念；
+ * 节点级动作（审批开店、停用店铺）全在本节点库里完成，不需要任何员工签名。
  */
 router.get('/node-staff', nodeAdmin, wrap(async (req, res) => {
   const hostAddr = await nodeOwner();
-  const list = await nodeStaffList(hostAddr);
-  if (list === null) return fail(res, '读不到链上员工名单（RPC 不可用），请稍后重试', 503, 503);
-  ok(res, { host: hostAddr, staff: list });
+  ok(res, { host: hostAddr || null, staff: await nodeStaffList() });
 }));
 
-/** 让员工鉴权缓存立即失效（nodeAdmin）：刚用节点主钱包在链上增删完员工、紧接着刷新页面时调用 */
-router.post('/node-staff/refresh', nodeAdmin, wrap(async (req, res) => {
-  invalidateNodeStaffCache();
-  ok(res, { refreshed: true }, '员工鉴权缓存已清空（下一次请求重新读链）');
+/**
+ * 增删节点员工（hostOnly；入审计）。员工名单只是本节点的一张本地表，不读任何 Registry；
+ * 但"授予员工权限"本身只能由节点主做，员工不能互授/扩权。
+ */
+router.put('/node-staff', hostOnly, wrap(async (req, res) => {
+  const action = String(req.body?.action || '');
+  const address = String(req.body?.address || '').trim().toLowerCase();
+  if (!['add', 'remove'].includes(action)) return fail(res, 'action 需为 add / remove');
+  if (!isAddress(address) || isZeroAddress(address)) return fail(res, 'address 需为 0x 开头的以太坊地址（零地址不可加入）');
+  const owner = await nodeOwner();
+  if (owner && address === owner) return fail(res, '节点主无需加入员工名单（节点主权限恒高于员工）');
+  if (action === 'add') {
+    await addNodeStaff(address);
+  } else {
+    await removeNodeStaff(address);
+  }
+  const next = await nodeStaffList();
+  await audit(req, 'node.staff.' + action, 'node', address, { staff: next.length }, null);
+  ok(res, { staff: next }, action === 'add' ? '已加入节点员工名单（节点级动作可用）' : '已移出节点员工名单（下一次请求即失效）');
 }));
 
-/** 节点主编辑**节点资料**（名称/公告；入审计）。与"某家店的资料"是两件事，行也分开。 */router.put('/node', nodeAdmin, wrap(async (req, res) => {
+/**
+ * 节点主编辑**节点资料**（名称/公告/谈信客服地址；入审计）。
+ *
+ * 这些是**节点对外的身份**，不是运营动作：员工能改店名/公告/客服地址，就能在节点自己的
+ * 品牌下把买家导流到攻击者客服。节点员工只做日常运营（审批/停用/下架），身份写入留 hostOnly。
+ * 与"某家店的资料"是两件事，行也分开。
+ */
+router.put('/node', hostOnly, wrap(async (req, res) => {
   const { name, notice, tanxinAddress } = req.body || {};
   const node = await nodeRow();
   // 合并用**原始列值**（不是展示形）：只改公告时不能把默认店名顺手写进库里——
@@ -367,10 +493,17 @@ router.post('/node-staff/refresh', nodeAdmin, wrap(async (req, res) => {
   );
 }));
 
-/** 店主/店员编辑店铺资料（name/notice；入审计；无需改 .env 重启） */
+/** 店主/店员编辑店铺资料：公告店员可改，店名/谈信客服地址仅店主（身份字段，入审计） */
 router.put('/', staffOnly, wrap(async (req, res) => {
   const shop = req.shop;
   const { name, notice, tanxinAddress } = req.body || {};
+  /*
+    店名与谈信客服地址是**买家看到的身份/客服入口**，不是运营文案；店员改它就能把买家
+    导流到自己的客服。公告可以由店员维护，身份字段只认店主。
+  */
+  if (req.shopRole !== 'owner' && (name !== undefined || tanxinAddress !== undefined)) {
+    return fail(res, '仅店主可修改店铺名与谈信客服地址（店员只能改公告）', 403, 403);
+  }
   // 同上：合并用原始列值，只改一项时另一项保持原样（'' 仍然是"没设置过"）
   const curName = String(shop.name || '');
   const curNotice = String(shop.notice || '');
@@ -400,6 +533,61 @@ router.put('/', staffOnly, wrap(async (req, res) => {
   );
 }));
 
+/**
+ * 店主自助歇业/复业。
+ *
+ * 与节点管理员 `PATCH /api/shops/admin/:code/listing` 是两件事：
+ *  · 店主只能暂停**自己**的店，且只有自己暂停的店能自己恢复；
+ *  · 节点管理员暂停的店（listed_reason 没有 `店主歇业：` 前缀）店主不能绕过恢复。
+ * 这是一致性约束，不是“信任店主”：管理员暂停通常有平台侧原因。
+ */
+router.patch('/listing', ownerOnly, wrap(async (req, res) => {
+  const shop = req.shop;
+  const listed = req.body?.listed;
+  if (typeof listed !== 'boolean') return fail(res, 'listed 需为布尔值（true=复业，false=歇业）', 400, 400);
+  const reason = String(req.body?.reason ?? '').trim().slice(0, 120);
+  const currentlyListed = Number(shop.listed) === 1;
+  if (listed === currentlyListed) {
+    return fail(res, listed ? '店铺已在营业，无需恢复' : '店铺已歇业，无需重复操作', 409, 409);
+  }
+  const db = getDb();
+  if (!listed) {
+    const pauseReason = `店主歇业：${reason || '店主自主歇业'}`.slice(0, 200);
+    const paused = await db.run(
+      'UPDATE shops SET listed = 0, listed_reason = ?, listed_at = CURRENT_TIMESTAMP(3) WHERE code = ? AND seller = ? AND listed = 1',
+      pauseReason,
+      shop.code,
+      shop.seller
+    );
+    if (paused.changes !== 1) return fail(res, '店铺状态已变化，请刷新后重试', 409, 409);
+    await audit(req, 'shop.self_suspend', 'shop', shop.code, { reason: pauseReason }, shop.code);
+    return ok(res, { listed: false, listedReason: pauseReason }, '已歇业：店铺不再接新订单，在途订单/退款/售后照常');
+  }
+  if (!String(shop.listed_reason || '').startsWith('店主歇业：')) {
+    return fail(res, '该店由节点管理员暂停，需联系节点管理员恢复', 403, 403);
+  }
+  const resumed = await db.run(
+    "UPDATE shops SET listed = 1, listed_reason = '', listed_at = CURRENT_TIMESTAMP(3) WHERE code = ? AND seller = ? AND listed = 0 AND listed_reason LIKE '店主歇业：%'",
+    shop.code,
+    shop.seller
+  );
+  if (resumed.changes !== 1) return fail(res, '店铺状态已变化，请刷新后重试', 409, 409);
+  await audit(req, 'shop.self_resume', 'shop', shop.code, {}, shop.code);
+  ok(res, { listed: true, listedReason: '' }, '已复业：商品重新进入店铺聚合面');
+}));
+
+
+/** 节点主清理孤儿媒体：只删全库无引用且超过 TTL 的文件；商品/订单快照/评价引用都保护。 */
+router.post('/media/sweep-orphans', hostOnly, wrap(async (req, res) => {
+  const days = req.body?.olderThanDays === undefined ? 7 : Number(req.body.olderThanDays);
+  if (!Number.isFinite(days) || days < 1 || days > 365) {
+    return fail(res, 'olderThanDays 需为 1..365 的整数', 400, 400);
+  }
+  const r = await sweepOrphanUploads({ olderThanMs: Math.floor(days) * 86_400_000 });
+  await audit(req, 'media.orphan_sweep', 'node', 'uploads', { days: Math.floor(days), ...r }, null);
+  ok(res, r, `孤儿媒体清扫：删除 ${r.removed} 个文件${r.failed ? `，${r.failed} 个删除失败` : ''}`);
+}));
+
 /** 店铺设置读取（ownerOnly）：当前资料/店员列表/webhook 状态（secret 不回显） */
 router.get('/settings', ownerOnly, wrap(async (req, res) => {
   const shop = req.shop;
@@ -410,9 +598,9 @@ router.get('/settings', ownerOnly, wrap(async (req, res) => {
     name: shopDisplayName(shop),
     notice: shopDisplayNotice(shop),
     tanxinAddress: tanxinAddressOf(shop),
-    commissionTo: dto.commissionTo,
-    commissionBps: dto.commissionBps,
     listed: dto.listed,
+    listedReason: dto.listedReason,
+    listedAt: dto.listedAt,
     // 店员名单一行一人（`shop_operators`）：读的是一份真名单，不是一段 JSON
     operators: await getShopOperators(shop.code),
     /*
@@ -439,35 +627,6 @@ router.put('/staff', ownerOnly, wrap(async (req, res) => {
   if (!['add', 'remove'].includes(action)) return fail(res, 'action 需为 add / remove');
   if (!isAddress(address) || isZeroAddress(address)) return fail(res, 'address 需为 0x 开头的以太坊地址（零地址不可加入）');
   if (address === String(shop.seller || '').toLowerCase()) return fail(res, '店主无需加入店员名单（店主权限恒高于店员）');
-  if (action === 'add') {
-    /*
-      角色互斥（2026-10-18）：**任一治理 owner**（Escrow/Registry/Blocklist/Staking）与
-      当前届仲裁人都只能当那一个角色，不能当店铺员工。权威事实源只有链上
-      `Escrow.isProtocolGovernance` 一处；这里把同一条规则也用在链下名单 `shop_operators` 上。
-      读不到时**拒绝登记**（不是放行）：无法确认身份的人不应拿到店员权限。
-    */
-    const [gov, forceClosed] = await Promise.all([
-      isProtocolGovernanceAddress(address, { force: true }),
-      isForceClosedAddress(address, { force: true }),
-    ]);
-    if (gov === null) {
-      return fail(res, '链上治理身份读不到（RPC 故障），暂不能确认该地址不是 owner/仲裁人；请稍后重试');
-    }
-    if (gov) {
-      return fail(res, '治理 owner 或当前届仲裁人不能当店铺员工（角色互斥：owner/仲裁人只能当那一个角色）');
-    }
-    /*
-      被节点主永久强制关闭的地址不能当员工：`_forceClose` 清的是链上 `staffNode` 行，
-      而 `shop_operators` 是**链下**名单，链上动作碰不到它。读不到同样拒绝（fail-closed）：
-      "无法确认他是不是被强制关闭"不等于"他没被关闭"。
-    */
-    if (forceClosed === null) {
-      return fail(res, '链上强制关闭状态读不到（RPC 故障），暂不能确认该地址未被强制关闭；请稍后重试');
-    }
-    if (forceClosed) {
-      return fail(res, '该地址已被节点主强制关闭，不能加入店员名单');
-    }
-  }
   let removed = false;
   if (action === 'add') {
     // 幂等：已在名单里时那条语句自己什么都不改（撞主键即"已经在了"）
@@ -506,7 +665,7 @@ router.put('/webhook', ownerOnly, wrap(async (req, res) => {
     const cur = await webhookConfig(shop.code);
     const nextUrl = url !== undefined ? String(url).trim().slice(0, 500) : cur.url;
     const nextSecret = secret !== undefined ? String(secret).trim().slice(0, 200) : cur.secret;
-    if (nextUrl && !/^https?:\/\//i.test(nextUrl)) return abortTx({ error: 'webhook url 需为 http(s):// 开头' });
+    if (nextUrl && !/^https:\/\//i.test(nextUrl)) return abortTx({ error: 'webhook url 需为 https:// 开头（投递端只接受加密目标）' });
     await setWebhookConfig(shop.code, { url: nextUrl, secret: nextSecret });
     return { url: nextUrl, secret: nextSecret };
   });
@@ -777,17 +936,20 @@ router.get('/reputation', listedShopScope, reputationLimiter, wrap(async (req, r
 }));
 
 /**
- * 质押跌破注册门槛的店主清单（公开只读；口径、事实源与取舍见 src/stakingRisk.js 文件头）。
+ * 本节点保证金状况（公开只读；口径、事实源与取舍见 src/stakingRisk.js 文件头）。
  *
- * 为什么是公开只读：数据全部来自链上公开状态（Registry 的活跃店主集合 + Staking.poolOf +
- * 门槛值），任何第三方扫链都能复算；把它藏起来只会让"这家店还够不够赔"变成只有平台知道的事。
- * 限流与缓存：端点自身走 stakingRisk 的 30s 记忆化（一轮 RPC 覆盖 30 秒内的所有请求），
- * 再加一层比 /reputation 更紧的限流——它每次读都是"1 + N"次链上调用（N = 全网活跃店数），
- * 比全表统计更贵。
+ * 数据全部来自链上公开状态（Registry 的在册节点集合 + 本节点 Staking 的 poolOf/payoutFloors），
+ * 任何第三方扫链都能复算。它回答的是"本节点池子够不够覆盖自己的出金下限"——零费模型下
+ * 平台没有注册门槛，低于下限时出金会被链上拒绝，而节点日志里一个字都不会说。
+ * 限流与缓存：端点自身走 stakingRisk 的 30s 记忆化（一轮 RPC 覆盖 30 秒内的所有请求）。
  */
-const stakingLimiter = simpleRateLimit({ windowMs: 60_000, max: 30, message: '质押门槛读数查询过于频繁，请稍后再试' });
+const stakingLimiter = simpleRateLimit({ windowMs: 60_000, max: 30, message: '保证金读数查询过于频繁，请稍后再试' });
 router.get('/staking', stakingLimiter, wrap(async (req, res) => {
-  ok(res, await stakingShortfall({ force: String(req.query.refresh || '') === '1' }));
+  ok(res, await stakingShortfall({ force: false }));
+}));
+/** 强制刷新只对节点管理员开放：公开端点不允许用 query 绕过 30s 记忆化放大 RPC。 */
+router.get('/staking/refresh', nodeAdmin, wrap(async (req, res) => {
+  ok(res, await stakingShortfall({ force: true }));
 }));
 
 /** 店铺买家评价聚合（公开只读：count/avg——与履约画像互补的主观质量信号）
@@ -855,8 +1017,7 @@ router.get('/sla', ownerOnly, slaLimiter, wrap(async (req, res) => {
 router.get('/stats/overview', ownerOnly, wrap(async (req, res) => {
   const days = normalizeStatsDays(req.query.days, 30);
   if (days === null) return fail(res, 'days 无效（需非负整数；0=全量；上限 366 天）');
-  await refreshFeeCollector(); // 净额按每单的创建时收费方快照判定；全局口径只作兜底与披露（见 src/fees.js）
-  ok(res, { ...(await overviewStats(days, req.shop.seller)), ...feeStatus() });
+  ok(res, await overviewStats(days, req.shop.seller));
 }));
 
 /** 最近 N 天趋势（缺省 14，补零；D6 自然日对齐见 stats.trendStats） */
@@ -864,7 +1025,6 @@ router.get('/stats/trend', ownerOnly, wrap(async (req, res) => {
   const days = normalizeStatsDays(req.query.days, 14);
   if (days === null) return fail(res, 'days 无效（需正整数；上限 366 天）');
   if (days === 0) return fail(res, 'trend 需正整数天数（不支持全量）');
-  await refreshFeeCollector();
   ok(res, { days, items: await trendStats(days, req.shop.seller) });
 }));
 
@@ -874,7 +1034,6 @@ router.get('/stats/products', ownerOnly, wrap(async (req, res) => {
   if (days === null) return fail(res, 'days 无效（需非负整数；0=全量；上限 366 天）');
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
-  await refreshFeeCollector();
   ok(res, await productStats(days, String(req.query.sort || 'gmv'), page, pageSize, req.shop.seller));
 }));
 

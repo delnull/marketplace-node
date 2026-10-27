@@ -24,6 +24,7 @@ import {
   findFileById,
   evidencePhaseError,
   MAX_BYTES_PER_ORDER,
+  MAX_FILES_PER_EVIDENCE,
 } from '../evidenceFiles.js';
 
 const router = Router();
@@ -103,6 +104,15 @@ router.post(
 
   const raw = Array.isArray(req.body?.files) ? req.body.files : [];
   if (!raw.length) return fail(res, 'files 需为非空数组 [{name, mime, dataB64}]');
+  /*
+    **条数闸必须在 I/O 之前**：20MB body 上限只约束字节，不约束 JSON entry 数量。
+    一个最小 PNG entry 约 56 字节，单个 20MB 请求可带约 30 万条；全部同步写盘后
+    再被 `file_count + n <= 6` 拒掉，再同步删 30 万个文件——事件循环被占住，
+    watcher/healthz 一起停。这里先按同一常量拒掉，和 storeFiles 的配额读取同一个上限。
+  */
+  if (raw.length > MAX_FILES_PER_EVIDENCE) {
+    return fail(res, `单条陈述至多 ${MAX_FILES_PER_EVIDENCE} 个附件（本次 ${raw.length} 个）——请在客户端先裁剪`);
+  }
   /*
     配额（单条陈述 ≤6 个 / ≤20MB、单订单累计 ≤20MB）**只在 `storeFiles` 里判一次**：
     那两处判据分别是 `dispute_evidence` 上的条件 UPDATE（越界在语句自己身上失败）与一次

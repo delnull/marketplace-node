@@ -20,12 +20,12 @@ async function expectWei(usdtMicro) {
 test('店铺信息与健康检查公开可读', async () => {
   const shop = await request(app).get('/api/shop').expect(200);
   assertOk(shop);
-  assert.equal(shop.body.data.owner.toLowerCase(), owner.address.toLowerCase());
+  assert.equal(shop.body.data.host.toLowerCase(), owner.address.toLowerCase());
   assert.ok(shop.body.data.escrowAddress);
 
   const health = await request(app).get('/healthz').expect(200);
   assertOk(health);
-  assert.equal(health.body.data.owner.toLowerCase(), owner.address.toLowerCase());
+  assert.equal(health.body.data.host.toLowerCase(), owner.address.toLowerCase());
 });
 
 // ── SIWE 认证 ──

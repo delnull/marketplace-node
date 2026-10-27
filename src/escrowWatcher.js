@@ -31,8 +31,8 @@
  * 两级售后为链上强制流程（合约状态机），本地 refund_status 仅为其镜像：
  * 迁移失败（changes=0）的事件不记录事件史，幂等重复扫描不重复记账。
  *
- * 售后案件（AfterSaleOpened/Closed）同样只是**叠加在终局之上的第二层**镜像：它不动托管资金
- * （那笔钱早已结清）、不阻塞卖家撤资，补偿只能来自卖家保证金 Staking.penalize 或线下转账。
+ * 售后案件（AfterSaleOpened/Closed）同样只是**叠加在终局之上的第二层**镜像：确认收货后货款先进入
+ * Escrow 售后留存期；案件在途时不释放留存货款，赔付优先从留存出、不足才由 Staking 罚没。
  * 因此这两个分支刻意**不碰 orders.status**（见 src/afterSale.js 文件头的完整理由）；
  * 人工 /sync 与后台对账按链上 afterSaleOpen/afterSaleOpenedAtBlock 回填同几列，判据同源。
  *
@@ -83,7 +83,7 @@ import { nodeRow } from './shops.js';
 // fetchOnchainOrder：非 OrderCreated 事件的「链上真值预取」（防诱饵单，见 pollOnce 头部说明）——
 // **必漏不可**：少了它，pollOnce 里那句 await 会抛 ReferenceError 被当成"链上真值未取到"，
 // 于是**所有**退款/争议/仲裁类事件每轮失败、回退重扫 3 次后被隔离，链上镜像静默停摆。
-import { getEscrow, getProvider, fetchOnchainOrder, invalidateCommitteeCache, invalidateProtocolGovernanceCache } from './chain.js';
+import { getEscrow, getProvider, fetchOnchainOrder, invalidateCommitteeCache } from './chain.js';
 // `chainParamsMatch` 住在 chainOrder.js——那里是「链上真值 → 要不要动钱/发货」这类判据的
 // 唯一实现地；本文件的轮询与 chainReconcile、三个交付入口共用同一份（见 chainOrder.js 的说明）
 import { chainParamsMatch } from './chainOrder.js';
@@ -95,8 +95,6 @@ import { notify, notifyRaw, typeForChainEvent } from './webhook.js';
 import { alertPoolEmptyForOrder } from './poolAlert.js';
 // 一次性告警的「投递成功才留下幂等标记」（唯一实现；见 alertAck.js）
 import { alertOnceDelivered } from './alertAck.js';
-// 费率/创建时收取方快照的三态判据与**唯一写入点**（见 src/fees.js）
-import { feeSnapshotOf, commissionSnapshotOf, writeFeeSnapshot } from './fees.js';
 // 确认收货后的售后案件：本地镜像的**唯一写入口/判据**（事件路径、/sync、后台对账三者同源）
 import { applyAfterSaleOpened, applyAfterSaleClosed } from './afterSale.js';
 
@@ -171,7 +169,7 @@ const FAILED_EVENTS_MAX = 50;
 /**
  * 原始 JSON-RPC 只读调用（块哈希读取专用）：BTY 主网区块含系统交易（to=0x16 的奖励交易
  * nonce≈6e18），ethers v6 的 getBlock 解析会因 nonce 溢出崩溃——凡涉及区块对象的读取
- * 一律走原始 JSON-RPC（与 scripts/deploy-mainnet.cjs 同策略）。
+ * 一律走原始 JSON-RPC：ethers 的区块解析会拒绝 BTY 主网的系统交易字段。
  * 2026-09 复核：显式 15s 超时——RPC 挂起（TCP 黑洞/节点无响应）时若无超时，轮询器将
  * 永久卡在重组检测上，订单状态回写与自动交付全部停摆（fetch 默认无超时）。
  */
@@ -219,6 +217,9 @@ export const watcherStatus = {
   quarantined: 0,
 };
 
+/** 追平链头后隔一轮重扫游标块（见 pollOnce 的链头分支）；进程级即可，重启后第一次追平仍会重扫。 */
+let headRescanPending = false;
+
 /** 只读快照（/healthz 与运维脚本用）。async：隔离清单现在是 `node.quarantined_events`
  *  这个真 JSON 列，读它要走库——同步实现会让这一格永远显示 0，
  *  而它正是"有多少条链上事件被隔离、需人工介入"的唯一读数（见 MAX_EVENT_RETRIES）。 */
@@ -261,13 +262,28 @@ export const EVENTS = [
   // **漏挂即静默**：卖家面板永远看不到买家授权额，只能拿 RefundAmountNotAccepted 的 revert 试错
   'PartialRefundAccepted',
   'RefundApproved',
+  /*
+    结算后的售后退款 / 仲裁售后赔付都只发 SellerRefunded（且不改 getOrder.refundedAmount 之外的列）。
+    漏挂它，本地净额、流水、看板、CSV 会永远按“未退款”算；/sync 读 getOrder 也补不到。
+    refundedTotal 是含本次在内的累计值，按绝对值落库，重放不会重复加。
+  */
+  'SellerRefunded',
   // 确认收货后的**售后案件**（契约 2026-10 第二批，本地镜像见 src/afterSale.js）：
   // 开案/结案只写售后案件那几列，**不改 orders.status**（订单仍是 confirmed/settled/expired 终局——
-  // 链上 Escrow.Order.status 全程停在 Settled，理由是那笔托管钱早已结清；改成本地 disputed
-  // 会把已结清的钱重新算进在途窗口，见 afterSale.js 文件头）。
+  // 链上 Escrow.Order.status 全程停在 Settled，货款仍在售后留存期；改成本地 disputed
+  // 会把仍在留存的货款重新算进在途窗口，见 afterSale.js 文件头）。
   // **漏挂即静默**：买家开了案、仲裁台队列里却没有这一单，而店主/仲裁人完全无从知道。
   'AfterSaleOpened',
   'AfterSaleClosed',
+  /*
+    提货争议（**不是订单状态事件**）：只把链上 `ClaimCase` 的结论写回 `nft_claims` 的
+    dispute_* 列（开案/结案/撤销）。漏挂的代价是节点自己的提货声明永远停在"处理中"，
+    而链上早已结案——店主/持有人都看不到结果。
+  */
+  'ClaimDisputeOpened',
+  'ClaimVoted',
+  'ClaimClosed',
+  'ClaimDisputeCancelled',
   /*
     委员会治理事件（**不是订单事件**）：只让委员会缓存立即失效，不进 `applyEvent`。
     漏挂的代价是撤权/换届后旧名单继续通过仲裁人鉴权（读 PII 的详情与附件下载），
@@ -322,8 +338,7 @@ async function localRowOf(db, escrowOrderId) {
   */
   return await db.get(
     `SELECT o.id AS order_id, o.order_no, o.status, o.buyer, o.seller, o.shop_code, o.amount_wei, o.timeout_blocks,
-            o.commission_quoted_to,
-            c.paid_tx_hash, c.refund_status
+            o.payment_token, c.paid_tx_hash, c.refund_status, c.refunded_amount_wei, c.accepted_partial_refund_wei
        FROM order_chain c JOIN orders o ON o.id = c.order_id
       WHERE c.escrow_order_id = ?`,
     String(escrowOrderId).toLowerCase()
@@ -345,7 +360,12 @@ async function localRowOf(db, escrowOrderId) {
  */
 async function recordEvent(escrowOrderId, ev) {
   const db = getDb();
-  const row = await db.get('SELECT order_id, events FROM order_chain WHERE escrow_order_id = ?', escrowOrderId);
+  // FOR UPDATE：普通 SELECT 在 REPEATABLE READ 下看不到并发事务刚提交的事件；
+  // 只把 UPDATE 关进事务并不能阻止两个写者用旧数组互相覆盖。
+  const row = await db.get(
+    'SELECT order_id, events FROM order_chain WHERE escrow_order_id = ? FOR UPDATE',
+    escrowOrderId
+  );
   if (!row) return;
   const list = Array.isArray(row.events) ? row.events.slice() : [];
   list.push(ev);
@@ -459,7 +479,7 @@ export function mapChainTerminal(chainStatus, refundedAmountWei, amountWei) {
  *   refundWei == amount → 状态 Refunded（全额退款）
  *   refundWei <  amount → 状态 Settled（拆分：部分退款 + 部分结算，含 refundWei=0 全额判卖家）
  * 本地镜像必须与之一致：全额退 → 'refunded'；拆分/判卖家 → 'settled'。两者都记
- * `refunded_amount_wei`（账本净额 = amount − refunded − 已扣平台费；UI 据此展示拆分）。
+ * `refunded_amount_wei`（净额 = amount − refunded；零费模型下没有第三腿，UI 据此展示拆分）。
  *
  * 两列分住两张表（状态在 `orders`、金额与退款标记在 `order_chain`）：先写状态
  * （`changes` 精确 0/1，幂等守卫与"钱的下落"判定都挂在它上面），确认迁移发生后再写镜像列
@@ -641,7 +661,70 @@ export async function applyAcceptedPartialRefund(orderIdHex, acceptedWei) {
   )).changes;
 }
 
+/**
+ * 应用一条链上提货争议事件到 `nft_claims`（**唯一写入点**）。
+ *
+ * 只按 `dispute_claim_id` 匹配：节点在 `/api/claims/:id/dispute` 里把"这次开案用的是哪个
+ * claimId"记进那一行（开案交易由节点主钱包发，节点不持私钥）。链上发生但本地没有对应行
+ * （不是本节点开的案）⇒ 0，不建行、不猜。
+ *
+ * `ClaimVoted` 刻意不落库：nft_claims 没有逐票镜像，票数属于链上读法（`claimTallyOf`）；
+ * 本地要的是**结论**（ClaimClosed / ClaimDisputeCancelled）。
+ */
+async function applyClaimChainEvent(name, args) {
+  const claimId = String(args?.claimId || '').toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(claimId)) return 0;
+  const db = getDb();
+  if (name === 'ClaimVoted') return 0;
+  if (name === 'ClaimDisputeOpened') {
+    return (await db.run(
+      "UPDATE nft_claims SET dispute_state = 'opened', dispute_opened_at = CURRENT_TIMESTAMP(3) WHERE dispute_claim_id = ? AND dispute_state = 'none'",
+      claimId
+    )).changes;
+  }
+  if (name === 'ClaimClosed') {
+    const rawAmount = args?.amountWei;
+    const amount = rawAmount === undefined || rawAmount === null ? null : String(rawAmount);
+    if (amount === null || !/^\d+$/.test(amount)) return 0;
+    /*
+      争议结案必须同时推进**链下声明状态**：requested/approved/shipped 仍占着
+      `uq_claims_active_token` 的唯一槽位，只改 dispute_state 会让这枚 token 之后
+      再也无法被新持有人声明。赔偿 >0 ⇒ fulfilled（已兑付，继续占位防二次赔付）；
+      判卖家无责 ⇒ rejected（让位给后续持有人）。`claim_amount_wei` 有 CHECK >0，
+      无法用 0 表示"没有赔付"，所以零赔付写 NULL。
+    */
+    const terminalStatus = amount === '0' ? 'rejected' : 'fulfilled';
+    const claimAmount = amount === '0' ? null : amount;
+    return (await db.run(
+      `UPDATE nft_claims
+          SET status = ?,
+              dispute_state = 'closed',
+              dispute_closed_at = CURRENT_TIMESTAMP(3),
+              claim_amount_wei = ?
+        WHERE dispute_claim_id = ? AND dispute_state <> 'closed'`,
+      terminalStatus,
+      claimAmount,
+      claimId
+    )).changes;
+  }
+  if (name === 'ClaimDisputeCancelled') {
+    return (await db.run(
+      `UPDATE nft_claims
+          SET status = 'cancelled',
+              dispute_state = 'cancelled',
+              dispute_closed_at = CURRENT_TIMESTAMP(3),
+              claim_amount_wei = NULL
+        WHERE dispute_claim_id = ? AND dispute_state <> 'closed'`,
+      claimId
+    )).changes;
+  }
+  return 0;
+}
+
 async function applyEventCore(name, args, meta = {}) {
+  // Claim* 事件没有普通订单的 orderId；先把它们路由到唯一的 claim 处理器，避免在下面
+  // `String(args.orderId)` 处被当成 undefined 订单静默丢弃。
+  if (String(name).startsWith('Claim')) return applyClaimChainEvent(name, args);
   const orderId = String(args.orderId).toLowerCase();
   const db = getDb();
   /*
@@ -666,18 +749,17 @@ async function applyEventCore(name, args, meta = {}) {
   */
   if (name !== 'OrderCreated' && meta.chainParams && !chainParamsMatch(local, meta.chainParams)) {
     console.warn(
-      `[escrowWatcher] 忽略与链上真值不符的事件: ${name} orderId=${orderId} 买家/卖家/金额/店铺节点与本地订单锁定不一致（疑似他人对同一 orderId 的诱饵单）`
+      `[escrowWatcher] 忽略与链上真值不符的事件: ${name} orderId=${orderId} 买家/卖家/金额/验货窗口与本地订单锁定不一致（疑似他人对同一 orderId 的诱饵单）`
     );
     return 0;
   }
   let changed;
   switch (name) {
     case 'OrderCreated': {
-      // 防伪托管（与 paid/sync 同规则）：Escrow 仅接受原生 BTY 入金（2026-09 收敛，
-      // 不再支持任意 ERC20），但攻击者仍可用 0 金额/错误卖家直调 createOrder 制造
-      // 「已托管」假象——仅按 orderId 推进会被骗过而自动发码。事件里的金额/卖家/买家必须
-      // 与本地订单锁定值一致（买家比对防「他人钱包代付」锁死资金/误触发交付）；
-      // 字段缺失（单测直调/兼容旧调用）时跳过比对——真实链上事件经 ABI 解码必然字段齐全。
+      // 防伪托管（与 paid/sync 同规则）：事件里的金额/卖家/买家必须与本地锁定值一致，
+      // 且 chainParams 里的 token 必须等于本地 payment_token——ERC20 单的金额是 token
+      // 最小单位，只比数字会让同数字的原生灰尘单顶替。字段缺失（单测直调）时跳过事件字段比对，
+      // 但真实路径的 chainParams 已由 pollOnce 预取并逐项校验。
       let match = true;
       if (args.seller !== undefined && args.amount !== undefined && args.buyer !== undefined) {
         const sellerOk = String(args.seller).toLowerCase() === String(local.seller || '').toLowerCase();
@@ -689,22 +771,12 @@ async function applyEventCore(name, args, meta = {}) {
           amountOk = false;
         }
         match = sellerOk && buyerOk && amountOk;
-        /*
-          店铺节点也必须对上（2026-10-21 订单绑定）：同一卖家可以在多个节点下各有一家店，
-          `(seller, host)` 才唯一确定一家店。只比买卖双方+金额时，买家可以拿这个卖家的
-          **另一家店**的编号下单（host 不同），事件仍会被当成"本单已托管"。
-          `commission_quoted_to` 读不到（老行/测试桩）时跳过——不拿 seller 猜 host。
-        */
-        const wantHost = String(local.commission_quoted_to || '').toLowerCase();
-        const gotHost = String(args.host || '').toLowerCase();
-        // 本地有报价时 host 必须读得到且相等；事件字段缺失只出现在单测直调，按旧口径跳过
-        if (wantHost && args.host !== undefined && wantHost !== gotHost) match = false;
       }
       // 兜底：事件字段缺失（ABI 漂移）时用 pollOnce 预取的链上真值再比一遍
       if (match && meta.chainParams) match = chainParamsMatch(local, meta.chainParams);
       if (!match) {
         console.warn(
-          `[escrowWatcher] 忽略疑似伪造托管事件: orderId=${orderId} 金额/卖家/买家/店铺节点与本地订单锁定不符`
+          `[escrowWatcher] 忽略疑似伪造托管事件: orderId=${orderId} 金额/卖家/买家/验货窗口与本地订单锁定不符`
         );
         return 0; // 不推进、不记录事件史、不触发自动交付
       }
@@ -864,7 +936,11 @@ async function applyEventCore(name, args, meta = {}) {
       changed = 0;
       if (local.status === 'escrowed' || local.status === 'shipped') {
         const n = (await db.run(
-          "UPDATE order_chain SET refund_status = 'rejected', refund_rejected_at = CURRENT_TIMESTAMP(3) WHERE order_id = ? AND refund_status <> 'rejected'",
+          `UPDATE order_chain
+              SET refund_status = 'rejected', refund_rejected_at = CURRENT_TIMESTAMP(3),
+                  accepted_partial_refund_wei = 0
+            WHERE order_id = ?
+              AND (refund_status <> 'rejected' OR accepted_partial_refund_wei <> 0)`,
           local.order_id
         )).changes;
         if (n > 0) {
@@ -936,6 +1012,32 @@ async function applyEventCore(name, args, meta = {}) {
       // 由前端按纯文本渲染（节点不做 HTML 拼接/半吊子转义，见 afterSale.js 的 XSS 说明）
       changed = await applyAfterSaleClosed(orderId, { note: args?.note ?? null });
       break;
+    case 'SellerRefunded': {
+      /*
+        refundedTotal 由合约在**所有**买家已收路径（结算退款 + sellerPending 退款 + 售后质押赔付）
+        累加后下发。节点按绝对值写，不做 `+= amount`：事件重放/游标回退不会重复记账。
+      */
+      const total = String(args?.refundedTotal ?? '').trim();
+      if (!/^\d+$/.test(total)) {
+        throw new Error(`SellerRefunded 缺少合法的 refundedTotal（${String(args?.refundedTotal)}）`);
+      }
+      const totalBig = BigInt(total);
+      if (totalBig > BigInt(local.amount_wei)) {
+        throw new Error(`SellerRefunded 的 refundedTotal=${total} 超过托管额 ${local.amount_wei}`);
+      }
+      if (local.refunded_amount_wei != null && totalBig < BigInt(local.refunded_amount_wei)) {
+        throw new Error(
+          `SellerRefunded 的 refundedTotal=${total} 小于本地已记账 ${local.refunded_amount_wei}（链上退款额不应回退）`
+        );
+      }
+      changed = (await db.run(
+        'UPDATE order_chain SET refunded_amount_wei = ? WHERE order_id = ? AND refunded_amount_wei <> ?',
+        total,
+        local.order_id,
+        total
+      )).changes;
+      break;
+    }
     case 'Arbitrated':
       // 仲裁裁决（争议可能带着 requested/rejected 镜像进入）：refundWei 同口径拆分结算；
       // 占位回补（全额退款 = 未交付行口径 / 拆分与判卖家 = D1 退货已回收口径）由 settleByRefundSplit 内部处理
@@ -1111,16 +1213,33 @@ export async function pollOnce() {
         console.warn(`[escrowWatcher] 追赶收尾冲刷失败：${e?.message || e}（标记保留，下一轮追平重试）`);
       }
     }
-    Object.assign(watcherStatus, {
-      cursor: from,
-      latest,
-      lagBlocks: 0,
-      upToDate: true,
-      lastOkAt: Date.now(),
-      lastError: null,
-    });
-    return { upToDate: true, from, latest };
+    /*
+      已追平链头时**隔一轮重扫游标所在块**：链头刚出现的日志可能在 RPC 返回 head 之后才可查，
+      上一轮扫到 `to=latest` 却漏掉该块事件时，游标已推进到 latest，旧实现永远不再看它。
+      重扫一个块的事件应用是幂等的（changed=0 时不会记事件/发通知），代价是追平后最多每两轮
+      多一次单块日志查询；这比“漏掉 ReceiptConfirmed 后只能靠 /sync 降级成 settled”便宜。
+    */
+    if (from > 0) {
+      if (!headRescanPending) {
+        headRescanPending = true;
+      } else {
+        headRescanPending = false;
+        from -= 1;
+      }
+    }
+    if (from >= latest) {
+      Object.assign(watcherStatus, {
+        cursor: from,
+        latest,
+        lagBlocks: 0,
+        upToDate: true,
+        lastOkAt: Date.now(),
+        lastError: null,
+      });
+      return { upToDate: true, from, latest };
+    }
   }
+  headRescanPending = false;
   const to = Math.min(latest, from + SCAN_LIMIT);
   watcherStatus.cursor = from;
   watcherStatus.latest = head;
@@ -1194,11 +1313,6 @@ export async function pollOnce() {
     });
     for (const [oid, rec] of orderSeq) if (rec.terminalAfter) skipAutoDeliver.add(oid);
   }
-  // feeBps 快照补录触发事件：创建（OrderCreated）为主；结算类事件（确认/超时释放/仲裁判付/
-  // 同意退款）是对创建时补录失败（RPC 抖动静默）的二次机会——收款流水净额口径依赖 fee_bps 落库
-  // （见 routes/orders.js ledger），sync 路径还会再补（人工兜底）
-  const FEE_FILL_EVENTS = new Set(['OrderCreated', 'ReceiptConfirmed', 'OrderExpiredReleased', 'Arbitrated', 'RefundApproved']);
-
   /*
     链上真值预取（源码审计 2026-09，防「诱饵单」）：此前只有 OrderCreated 分支核对链上参数，
     攻击者可用他人草稿的 orderId 建 1 wei 单再 releaseExpired，把本地未付款 draft 改成 expired
@@ -1208,12 +1322,17 @@ export async function pollOnce() {
     取不到（RPC 失败）时**不阻断整轮**：该 orderId 记为 unverified，其事件在下面按单条失败处理
     （重试 → 隔离），既不会「无法核对就直接落地」，也不会因一个单拖住整窗扫描。
     每个 orderId 至多一次 RPC；本地无此单的偶发事件不打 RPC（链上的单不限于本节点）。
+    提货争议事件（Claim*）没有普通订单状态要改，不在这里预取（由 applyClaimChainEvent 处理）。
   */
-  const paramsById = new Map(); // orderId → { ok:true, buyer, seller, amount, timeoutBlocks, commissionTo } | { ok:false }
+  const paramsById = new Map(); // orderId → { ok:true, buyer, seller, amount, timeoutBlocks, token } | { ok:false }
   {
     const needIds = new Set();
     for (const ev of all) {
-      if (ev.name === 'OrderCreated') continue;
+      /*
+        OrderCreated 也必须预取：事件本身不带支付资产，只比 orderId/买卖家/金额
+        会让「ERC20 单 + 原生灰尘支付」通过；token 只能从 getOrder/orderToken 现读。
+      */
+      if (ev.name.startsWith('Claim')) continue;
       const oid = String(ev.args?.orderId || '').toLowerCase();
       if (oid) needIds.add(oid);
     }
@@ -1228,8 +1347,7 @@ export async function pollOnce() {
           seller: p.seller,
           amount: p.amount,
           timeoutBlocks: p.timeoutBlocks,
-          // 店铺节点：与本地报价列比对，挡住"同一卖家的另一家店"用同 orderId 驱动终局事件
-          commissionTo: p.commissionTerms?.commissionTo || '',
+          token: p.token,
         });
       } catch (e) {
         paramsById.set(oid, { ok: false });
@@ -1266,11 +1384,20 @@ export async function pollOnce() {
       */
       if (ev.name === 'CommitteeUpdated' || ev.name === 'ArbiterRevoked') {
         invalidateCommitteeCache();
-        invalidateProtocolGovernanceCache();
+        continue;
+      }
+      /*
+        提货争议事件：**不落到订单状态**，只把链上 `ClaimCase` 的结论写回 `nft_claims` 的
+        dispute_* 列（按节点自己在开案时记下的 `dispute_claim_id` 匹配）。
+        节点没有这一行（不是本节点开的案 / 钱包直接开的案）⇒ 0，不建行、不猜。
+      */
+      if (String(ev.name).startsWith('Claim')) {
+        updated += await applyClaimChainEvent(ev.name, ev.args);
+        quarantined.delete(fp);
         continue;
       }
       const oidOfEv = String(ev.args?.orderId || '').toLowerCase();
-      const prefetched = ev.name === 'OrderCreated' ? undefined : paramsById.get(oidOfEv);
+      const prefetched = paramsById.get(oidOfEv);
       // 本地有此单但链上真值没取到 → 本条事件按失败处理（重试/隔离），绝不无核对落地
       if (prefetched && prefetched.ok === false) {
         throw new Error('链上真值未取到（RPC 读取失败），本轮不落地该事件（防无法核对即推进）');
@@ -1278,15 +1405,14 @@ export async function pollOnce() {
       const n = await applyEvent(ev.name, ev.args, {
         txHash: ev.txHash,
         block: ev.block,
-        // 链上真值（买家/卖家/金额）：非 OrderCreated 事件据此拒绝「他人对同一 orderId 的诱饵单」，
-        // 见 applyEventCore 头部说明。OrderCreated 自身已用事件字段比对，无需重复传。
+        // 链上真值（买家/卖家/金额/验货窗口）：非 OrderCreated 事件据此拒绝「他人对同一 orderId
+        // 的诱饵单」，见 applyEventCore 头部说明。OrderCreated 自身已用事件字段比对。
         chainParams: prefetched && prefetched.ok ? {
           buyer: prefetched.buyer,
           seller: prefetched.seller,
           amount: prefetched.amount,
           timeoutBlocks: prefetched.timeoutBlocks,
-          // 店铺节点：同一卖家的另一家店不能驱动本单的终局/冻结事件（见 chainOrder.chainParamsMatch）
-          commissionTo: prefetched.commissionTo || '',
+          token: prefetched.token,
         } : undefined,
         // 本批预扫命中 或 未达链头的跨窗回放（behind）→ OrderCreated 抑制自动交付
         skipAutoDeliver: ev.name === 'OrderCreated' && (skipAutoDeliver.has(oidOfEv) || behind),
@@ -1294,71 +1420,6 @@ export async function pollOnce() {
       updated += n;
       // 成功即从隔离清单摘除（此前失败可能是暂态：RPC 抖动/竞争窗口）
       quarantined.delete(fp);
-      // 订单级 feeBps 快照补录（链上 getOrder 权威；收款净额口径）：
-      // 本地行缺快照时尝试补录（paid 快路径先行迁移时同样覆盖——paid 路由尽力补录可能失败，
-      // 此处兜底）；读不到只记一行日志、**不算事件失败**，sync 路径还会再补。
-      if (n > 0 && FEE_FILL_EVENTS.has(ev.name)) {
-        /*
-          两个 try 的**范围是刻意的**（2026-10-14 修）：本地 SELECT 与链上读取分开。
-          旧实现把两者裹在同一个 try 里、catch 里用 `row.id` 报错，而 `row` 是那个 try 的
-          块级 const ⇒ catch 触发的是 ReferenceError。它是从下面那个 `catch (e)`（外层、按
-          "事件应用失败"处理）里被看见的，于是**一次纯粹的 RPC 失败**会变成：该事件被计为失败、
-          隔离重试 +1、游标回退到 `failedFrom - 1`（最多 2000 块重扫）——而这条事件的迁移其实
-          早已提交成功。也就是说"补录失败"这件事被记到了错误的维度上：代价（重扫 + 隔离计数）
-          挂在了"事件坏了"那一维，而真实原因只是"这次 RPC 没读到"。
-          缺快照的判据是 `fee_collector_at_create IS NULL`（**不是** `fee_bps = 0`）：两列由
-          同一条 UPDATE 成对补录，而"费率确实为 0"与"从未补录"在 fee_bps 上同形（见 fees.js 的
-          feeSnapshotReadOf）。旧实现按 fee_bps 判，于是链上费率合法的 0 会被每轮重补一次；
-          现在补录成功即让该列非空，下一轮自然不再进这条分支。
-        */
-        let needsFeeFill = false;
-        let localRowId = 0;
-        try {
-          const row = await db.get(
-            `SELECT o.id AS order_id, o.fee_collector_at_create
-               FROM orders o JOIN order_chain c ON c.order_id = o.id
-              WHERE c.escrow_order_id = ?`,
-            String(ev.args.orderId).toLowerCase()
-          );
-          if (row) {
-            needsFeeFill = row.fee_collector_at_create === null || row.fee_collector_at_create === undefined;
-            localRowId = row.order_id;
-          }
-        } catch (e) {
-          console.warn(
-            `[watcher] 费率快照补录前的本地行读取失败（orderId=${String(ev.args?.orderId || '').slice(0, 18)}…，本单账本继续退回全局口径）：${(e && e.message) || e}`
-          );
-        }
-        /*
-          RPC 失败只记一行日志（**不抛出**）：补录是"锦上添花"，失败时后续结算事件与 /sync
-          还会再补；把它升级成"事件失败"会在游标回退 + 隔离重试上白付代价，而那一维度描述的是
-          "这条事件本身坏了"——两件事不该共用同一个计数。
-        */
-        if (needsFeeFill) {
-          try {
-            /*
-              走 `fetchOnchainOrder`（而不是直接 `escrow.getOrder`）：它把 `getOrder` 与
-              `commissionTermsAtCreate` 放在**同一个 tick**（ethers 会打成一次批量 JSON-RPC），
-              所以拿到抽成条款**不额外增加一次往返**——而抽成条款不在 `getOrder` 元组里
-              （`Order` 加到第 14 个字会让合约编译不过），必须单独读。
-            */
-            const o = await fetchOnchainOrder(String(ev.args.orderId).toLowerCase());
-            /*
-              费率、创建时收取方与**节点抽成条款**一并补录——取值与写入都在 src/fees.js 的唯一实现里
-              （`feeSnapshotOf` / `commissionSnapshotOf` 判三态、`writeFeeSnapshot` 是唯一写入点）：
-              三样里有任何一样没读到，`writeFeeSnapshot` 就按"抽成未知"写 NULL（**不是**写 0），
-              保持库里原值（可能是此前补录过的确证快照）。
-              旧实现在这里自己写 UPDATE 并配 `snap.feeBps > 0 || snap.feeCollectorAtCreate` 的条件，
-              等于把"该不该写"又判了一遍——而判据已经在返回值里了。
-            */
-            await writeFeeSnapshot(db, localRowId, feeSnapshotOf(o), commissionSnapshotOf(o.commissionTerms));
-          } catch (e) {
-            console.warn(
-              `[watcher] 订单 ${localRowId} 的费率快照补录失败（该单账本将退回全局口径）：${(e && e.message) || e}`
-            );
-          }
-        }
-      }
     } catch (e) {
       // 单事件应用失败：记录重试次数并继续处理其余事件（防止个别坏事件阻塞整轮）；
       // 本轮结束后游标回退到最早失败块前——下一轮重扫该区间（迁移幂等、不重复记账）。

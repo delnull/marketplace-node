@@ -69,13 +69,6 @@ const chainTruthOf = (row) => ({
   status: 'Created',
   refundRequested: false,
   timeoutBlocks: Number(row.timeout_blocks),
-  // 与本地报价一致（不是零地址：bps=0 时链上仍存 host，交付闸按 (seller, host) 比店铺键）
-  // 顶层 commissionTo 是订单身份的一部分（chainParamsMatch 读它），必须与嵌套那份同值
-  commissionTo: String(row.commission_quoted_to ?? ZERO).toLowerCase(),
-  commissionTerms: {
-    commissionTo: String(row.commission_quoted_to ?? ZERO).toLowerCase(),
-    commissionBps: Number(row.commission_quoted_bps) || 0,
-  },
   refundedAmount: '0',
 });
 

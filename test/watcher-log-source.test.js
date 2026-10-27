@@ -24,9 +24,14 @@ const config = (await import('../src/config.js')).default;
 const { pollOnce } = await import('../src/escrowWatcher.js');
 
 const EVENT_IFACE = new Interface([
-  'event OrderCreated(bytes32 indexed orderId, address indexed buyer, address indexed seller, address host, uint256 amount)',
+  'event OrderCreated(bytes32 indexed orderId, address indexed buyer, address indexed seller, uint256 amount)',
 ]);
 const createdEvent = EVENT_IFACE.getEvent('OrderCreated');
+/** watcher 的 OrderCreated 预取会读 getOrder + orderToken（原生单） */
+const CHAIN_IFACE = new Interface([
+  'function getOrder(bytes32) view returns (address buyer, address seller, uint256 amount, uint64 timeoutBlocks, uint64 createdAtBlock, bool refundRequested, bool refundRejected, uint256 refundedAmount, uint8 status, bool buyerConfirmed)',
+  'function orderToken(bytes32) view returns (address)',
+]);
 
 const HEAD = 100;
 const AMOUNT = '1000000000000000000';
@@ -39,7 +44,6 @@ function logFor(orderId) {
   const encoded = EVENT_IFACE.encodeEventLog(createdEvent, [
     orderId,
     buyer.address,
-    owner.address,
     owner.address,
     BigInt(AMOUNT),
   ]);
@@ -57,6 +61,32 @@ const rpcServer = http.createServer((req, res) => {
           return { result: `0x${Number(config.chain.chainId).toString(16)}` };
         case 'eth_blockNumber':
           return { result: `0x${HEAD.toString(16)}` };
+        case 'eth_call': {
+          const data = String(j.params?.[0]?.data || '');
+          const sel = data.slice(0, 10);
+          if (sel === CHAIN_IFACE.getFunction('orderToken').selector) {
+            return {
+              result: CHAIN_IFACE.encodeFunctionResult('orderToken', ['0x0000000000000000000000000000000000000000']),
+            };
+          }
+          if (sel === CHAIN_IFACE.getFunction('getOrder').selector) {
+            return {
+              result: CHAIN_IFACE.encodeFunctionResult('getOrder', [
+                buyer.address,
+                owner.address,
+                BigInt(AMOUNT),
+                120960n,
+                7n,
+                false,
+                false,
+                0n,
+                1, // Created
+                false,
+              ]),
+            };
+          }
+          return { error: { code: -32601, message: `unit-test: 未预期的 eth_call selector ${sel}` } };
+        }
         case 'eth_getLogs': {
           const f = j.params?.[0] || {};
           const topic0 = String(f.topics?.[0] || '').toLowerCase();

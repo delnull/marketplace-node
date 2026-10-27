@@ -8,7 +8,7 @@
  * 判据：
  *   ① 有对外域名时节点默认名 = 域名（与 SIWE 身份同源）；没有域名时用中性占位；
  *   ② 店铺没有默认名（写入口拒绝空名），不被节点默认名影响；
- *   ③ 三个公开读数（/healthz、/api/shop、/api/registry-info）取到同一个节点名。
+ *   ③ 三个公开读数（/healthz、/api/shop、/api/shop/node-identity）取到同一个节点名。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -62,11 +62,11 @@ test('三个公开读数用同一个节点名（域名），且不借用店铺�
 
   const health = await ctx.request(ctx.app).get('/healthz').expect(200);
   const shop = await ctx.request(ctx.app).get('/api/shop').expect(200);
-  const registry = await ctx.request(ctx.app).get('/api/shop/registry-info').expect(200);
+  const registry = await ctx.request(ctx.app).get('/api/shop/node-identity').expect(200);
 
   assert.equal(health.body.data.name, 'lingsui.cc', '/healthz 的 name 是节点名（默认取域名）');
   assert.equal(shop.body.data.name, 'lingsui.cc', '/api/shop 的顶层 name 是节点名');
-  assert.equal(registry.body.data.name, 'lingsui.cc', '/api/shop/registry-info 的 name 是节点名');
+  assert.equal(registry.body.data.name, 'lingsui.cc', '/api/shop/node-identity 的 name 是节点名');
   for (const body of [health.body.data, shop.body.data, registry.body.data]) {
     assert.notEqual(body.name, '我的联邦小店', '节点读数里不许再出现店铺式占位名');
   }

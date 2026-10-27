@@ -293,7 +293,7 @@ test('应答异常：非 JSON / 非 200 / 3xx / allow 缺失或非布尔 → 拒
 
 // ── (f) 签名 ──
 
-test('签名：配置 secret 才有 x-mk-signature，且为请求体原文的 HMAC-SHA256', async () => {
+test('签名：配置 secret 才有 x-mk-signature，且为 timestamp.body 的 HMAC-SHA256', async () => {
   process.env.MK_ORDER_GATE_URL = GATE_URL;
   responder = async () => ({ status: 200, json: async () => ({ allow: true }) });
   const p = await listProduct(productPayload({ kind: 'digital', title: '风控签名商品' }));
@@ -303,8 +303,12 @@ test('签名：配置 secret 才有 x-mk-signature，且为请求体原文的 HM
   calls.length = 0;
   assertOk(await draftAttempt(p.slug, {}));
   assert.equal(calls.length, 1);
-  const expected = crypto.createHmac('sha256', 'gate-secret-1').update(calls[0].body).digest('hex');
-  assert.equal(calls[0].headers['x-mk-signature'], expected, '签名 = HMAC-SHA256(secret, body 原文)');
+  assert.match(calls[0].headers['x-mk-timestamp'], /^\d{10}$/);
+  const expected = crypto
+    .createHmac('sha256', 'gate-secret-1')
+    .update(`${calls[0].headers['x-mk-timestamp']}.${calls[0].body}`)
+    .digest('hex');
+  assert.equal(calls[0].headers['x-mk-signature'], expected, '签名覆盖 timestamp.body');
   assert.match(calls[0].headers['x-mk-signature'], /^[0-9a-f]{64}$/);
   assert.equal(calls[0].headers['content-type'], 'application/json');
 
@@ -314,6 +318,7 @@ test('签名：配置 secret 才有 x-mk-signature，且为请求体原文的 HM
   assertOk(await draftAttempt(p.slug, {}));
   assert.equal(calls.length, 1);
   assert.ok(!('x-mk-signature' in calls[0].headers), '无密钥则不带签名头');
+  assert.ok(!('x-mk-timestamp' in calls[0].headers), '无密钥也不带时间戳');
   process.env.MK_ORDER_GATE_URL = '';
 });
 
@@ -323,7 +328,7 @@ test('SSRF：内网字面量与「解析到内网」都拒单且不外呼（URL 
   const p = await listProduct(productPayload({ kind: 'physical', title: '风控 SSRF 商品', capacity: 5 }));
 
   // 1) 字面量内网/回环/云元数据：不需要 DNS 就能判
-  for (const bad of ['http://127.0.0.1:9000/gate', 'http://169.254.169.254/latest/meta-data/', 'http://192.168.1.1/gate']) {
+  for (const bad of ['https://127.0.0.1:9000/gate', 'https://169.254.169.254/latest/meta-data/', 'https://192.168.1.1/gate']) {
     process.env.MK_ORDER_GATE_URL = bad;
     calls.length = 0;
     const res = await draftAttempt(p.slug, {}, 403);

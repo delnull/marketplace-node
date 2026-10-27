@@ -253,8 +253,6 @@ function createdArgs(orderId, overrides = {}) {
     orderId,
     buyer: GOOD_BUYER,
     seller: GOOD_SELLER,
-    // `insertOrder` 的默认报价 host = seller；真实事件必带 host
-    host: GOOD_SELLER,
     amount: GOOD_AMOUNT,
     ...overrides,
   };
@@ -278,28 +276,6 @@ test('防伪：卖家不符的托管事件不推进', async () => {
   );
 });
 
-test('防伪：店铺节点不符的托管事件不推进（同一卖家的另一家店）', async () => {
-  const a = await insertOrder('draft');
-  const quotedHost = '0x' + '4'.repeat(40);
-  await db.run('UPDATE orders SET commission_quoted_to = ? WHERE id = ?', quotedHost, a.orderId);
-
-  // 同一卖家、同一金额，但事件 host 是另一家店 ⇒ 不得把本店草稿推进为 escrowed
-  assert.equal(
-    await applyEvent('OrderCreated', createdArgs(a.escrowOrderId, { host: '0x' + '5'.repeat(40) })),
-    0
-  );
-  assert.equal(
-    (await db.get('SELECT status FROM v_orders WHERE order_id = ?', a.orderId)).status,
-    'draft'
-  );
-
-  // host 对上才推进（避免把正经的自营/租户店误杀）
-  assert.equal(await applyEvent('OrderCreated', createdArgs(a.escrowOrderId, { host: quotedHost })), 1);
-  assert.equal(
-    (await db.get('SELECT status FROM v_orders WHERE order_id = ?', a.orderId)).status,
-    'escrowed'
-  );
-});
 
 test('防伪：金额/卖家全部匹配的真实托管事件正常推进', async () => {
   const a = await insertOrder('draft');
@@ -357,8 +333,6 @@ test('拆分结算：部分退款（refundWei < amount）落 settled 并记录�
       buyer: '0x00000000000000000000000000000000000000aa',
       seller: '0x00000000000000000000000000000000000000bb',
       amount: '1000000000000000000',
-      // 夹具的报价 host 默认就是 seller（见 setup.mjs 的 insertOrderRow）：链上真值必须逐字相等
-      commissionTo: '0x00000000000000000000000000000000000000bb',
     },
   });
   assert.equal(changed, 1);
@@ -366,6 +340,45 @@ test('拆分结算：部分退款（refundWei < amount）落 settled 并记录�
   assert.equal(row.status, 'settled', '部分退款属「拆分结算」→ 成交向终态 settled');
   assert.equal(row.refunded_amount_wei, '400000000000000000', '已退金额必须落库（账本净额/UI 依据）');
   assert.equal(row.refund_status, 'none', '终局复位售后镜像');
+});
+
+test('SellerRefunded：结算后退款按累计总额落库，重放不重复加', async () => {
+  const a = await insertOrder('settled');
+  assert.equal(
+    await applyEvent(
+      'SellerRefunded',
+      { orderId: a.escrowOrderId, buyer: '0x' + 'aa'.repeat(20), amount: '250000000000000000', refundedTotal: '250000000000000000' },
+      { txHash: '0x' + '8'.repeat(64), block: 71 }
+    ),
+    1
+  );
+  assert.equal(
+    (await db.get('SELECT refunded_amount_wei FROM v_orders WHERE order_id = ?', a.orderId)).refunded_amount_wei,
+    '250000000000000000'
+  );
+  // 同一事件重放：refundedTotal 是绝对值，不是 += amount
+  assert.equal(
+    await applyEvent(
+      'SellerRefunded',
+      { orderId: a.escrowOrderId, buyer: '0x' + 'aa'.repeat(20), amount: '250000000000000000', refundedTotal: '250000000000000000' },
+      { txHash: '0x' + '8'.repeat(64), block: 71 }
+    ),
+    0
+  );
+  assert.equal(
+    (await db.get('SELECT refunded_amount_wei FROM v_orders WHERE order_id = ?', a.orderId)).refunded_amount_wei,
+    '250000000000000000'
+  );
+  // 追加赔付：绝对额度覆盖
+  await applyEvent(
+    'SellerRefunded',
+    { orderId: a.escrowOrderId, buyer: '0x' + 'aa'.repeat(20), amount: '50000000000000000', refundedTotal: '300000000000000000' },
+    { block: 72 }
+  );
+  assert.equal(
+    (await db.get('SELECT refunded_amount_wei FROM v_orders WHERE order_id = ?', a.orderId)).refunded_amount_wei,
+    '300000000000000000'
+  );
 });
 
 test('拆分结算：refundWei = amount 落 refunded（全额退款），0 落 settled（全额判卖家）', async () => {
@@ -419,7 +432,7 @@ test('防伪（终局事件）：链上买家与本单买家不符的 OrderExpir
     txHash: '0x' + 'a'.repeat(64),
     block: 100,
     // pollOnce 预取的链上真值：买家是攻击者、金额 1 wei（诱饵单）
-    chainParams: { buyer: OTHER_BUYER, seller: '0x' + 'b'.repeat(40), amount: '1', commissionTo: '0x' + 'b'.repeat(40) },
+    chainParams: { buyer: OTHER_BUYER, seller: '0x' + 'b'.repeat(40), amount: '1' },
   });
   assert.equal(changed, 0, '与链上真值不符的终局事件不推进');
   assert.equal(await statusOf(a.orderId), 'draft', '受害者草稿保持未支付');
@@ -427,36 +440,6 @@ test('防伪（终局事件）：链上买家与本单买家不符的 OrderExpir
   assert.ok(!row.onchain_events || !String(row.onchain_events).includes('OrderExpiredReleased'), '伪造事件不得进入事件史');
 });
 
-test('防伪（终局事件）：店铺节点不符的 OrderExpiredReleased 不得推进（同一卖家另一家店）', async () => {
-  const a = await insertOrder('draft');
-  const host = '0x' + '4'.repeat(40);
-  await db.run('UPDATE orders SET commission_quoted_to = ? WHERE id = ?', host, a.orderId);
-
-  const base = {
-    buyer: '0x00000000000000000000000000000000000000aa',
-    seller: '0x00000000000000000000000000000000000000bb',
-    amount: '1000000000000000000',
-  };
-  assert.equal(
-    await applyEvent('OrderExpiredReleased', { orderId: a.escrowOrderId }, {
-      txHash: '0x' + 'a'.repeat(64),
-      block: 102,
-      chainParams: { ...base, commissionTo: '0x' + '5'.repeat(40) },
-    }),
-    0,
-    '店铺节点不符的终局事件不推进'
-  );
-  assert.equal(await statusOf(a.orderId), 'draft');
-  assert.equal(
-    await applyEvent('OrderExpiredReleased', { orderId: a.escrowOrderId }, {
-      txHash: '0x' + 'b'.repeat(64),
-      block: 103,
-      chainParams: { ...base, commissionTo: host },
-    }),
-    1
-  );
-  assert.equal(await statusOf(a.orderId), 'expired', '本店 host 匹配时正常推进');
-});
 
 test('防伪（终局事件）：链上真值一致时正常推进（真实超时释放不受影响）', async () => {
   const a = await insertOrder('escrowed');
@@ -467,7 +450,6 @@ test('防伪（终局事件）：链上真值一致时正常推进（真实超�
       buyer: '0x00000000000000000000000000000000000000aa',
       seller: '0x00000000000000000000000000000000000000bb',
       amount: '1000000000000000000',
-      commissionTo: '0x00000000000000000000000000000000000000bb',
     },
   });
   assert.equal(changed, 1);
@@ -481,7 +463,6 @@ test('防伪（仲裁/退款类事件）：链上金额不符的 Arbitrated 不�
       buyer: '0x00000000000000000000000000000000000000aa',
       seller: '0x00000000000000000000000000000000000000bb',
       amount: '1', // 诱饵单金额
-      commissionTo: '0x00000000000000000000000000000000000000bb',
     },
   });
   assert.equal(changed, 0);
@@ -493,7 +474,6 @@ test('防伪（仲裁/退款类事件）：链上金额不符的 Arbitrated 不�
       buyer: '0x00000000000000000000000000000000000000aa',
       seller: '0x00000000000000000000000000000000000000bb',
       amount: '1000000000000000000',
-      commissionTo: '0x00000000000000000000000000000000000000bb',
     },
   });
   assert.equal(done, 1);

@@ -129,11 +129,11 @@ test('表与视图清单被钉住：少建一张或多建一张都要当场现�
     而且日志里一个字都没有。这条断言就是防那一类静默错账。
   */
   const expected = [
-    'audit_logs', 'buyer_draft_quota', 'buyer_product_quota', 'dispute_evidence',
-    'evidence_files', 'node', 'order_alerts', 'order_chain', 'order_delivery_claims',
-    'order_delivery_items', 'order_returns', 'order_shipping', 'orders', 'product_codes',
-    'product_nft_tokens', 'product_skus', 'products', 'proxy_drafts', 'reviews',
-    'seller_proxy_draft_quota', 'seller_proxy_product_quota', 'shop_applications',
+    'audit_logs', 'buyer_blocks', 'buyer_draft_quota', 'buyer_product_quota', 'dispute_evidence',
+    'evidence_files', 'nft_claims', 'node', 'node_staff', 'order_alerts', 'order_chain',
+    'order_delivery_claims', 'order_delivery_items', 'order_returns', 'order_shipping',
+    'orders', 'payment_tokens', 'product_codes', 'product_nft_tokens', 'product_skus', 'products', 'proxy_drafts',
+    'reviews', 'seller_proxy_draft_quota', 'seller_proxy_product_quota', 'shop_applications',
     'shop_claims', 'shop_operators', 'shop_webhook', 'shops', 'siwe', 'v_orders',
   ].sort();
   assert.deepEqual(names, expected, 'DDL 里的表/视图清单与预期不一致——多一张少一张都会让某条链路静默失效');

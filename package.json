@@ -10,9 +10,9 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env src/server.js",
     "dev": "node --watch --env-file-if-exists=.env src/server.js",
-    "test": "node --env-file-if-exists=.env.test --test --test-concurrency=6 test/*.test.js",
-    "reconcile": "node --env-file-if-exists=.env scripts/reconcile-ledger.js",
+    "test": "node scripts/test-all.mjs",
     "check:integrity": "node --env-file-if-exists=.env scripts/check-integrity.js",
+    "auto-confirm": "node --env-file-if-exists=.env scripts/auto-confirm.mjs",
     "e2e": "node --env-file-if-exists=.env scripts/e2e-mainnet.mjs"
   },
   "dependencies": {

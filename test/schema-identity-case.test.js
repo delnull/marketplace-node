@@ -103,7 +103,7 @@ async function checkRejected(label, sql, params) {
   );
 }
 
-test('清单从 SCHEMA_DDL 派生：23 个 CHAR(42) 地址列、7 个 CHAR(9) 店铺编号列', () => {
+test('清单从 SCHEMA_DDL 派生：26 个 CHAR(42) 地址列、9 个 CHAR(9) 店铺编号列', () => {
   /*
     清单钉死是**结果**，不是判据：真正的判据是下面两条"每个派生列都必须有对应 CHECK"。
     这里把当前清单写出来，是为了让"某一列被悄悄改成 VARCHAR 从而逃出约束范围"也现形
@@ -113,23 +113,26 @@ test('清单从 SCHEMA_DDL 派生：23 个 CHAR(42) 地址列、7 个 CHAR(9) �
     addressColumns.map((c) => `${c.table}.${c.column}`).sort(),
     [
       'audit_logs.actor',
+      'buyer_blocks.buyer',
       'buyer_draft_quota.buyer',
       'buyer_product_quota.buyer',
+      'nft_claims.claimant',
+      'nft_claims.seller',
+      'nft_claims.token_contract',
       'node.escrow_address',
       'node.owner',
+      'node.staking_address',
+      'node_staff.address',
       'orders.buyer',
-      'orders.commission_quoted_to',
-      'orders.commission_to',
-      'orders.fee_collector_at_create',
+      'orders.payment_token',
       'orders.seller',
+      'payment_tokens.address',
       'products.nft_contract',
       'reviews.buyer',
       'seller_proxy_draft_quota.buyer',
       'seller_proxy_draft_quota.seller',
       'seller_proxy_product_quota.buyer',
       'seller_proxy_product_quota.seller',
-      'shop_applications.commission_to',
-      'shop_applications.host',
       'shop_applications.seller',
       'shop_claims.address',
       'shop_operators.address',
@@ -141,6 +144,8 @@ test('清单从 SCHEMA_DDL 派生：23 个 CHAR(42) 地址列、7 个 CHAR(9) �
     codeColumns.map((c) => `${c.table}.${c.column}`).sort(),
     [
       'audit_logs.shop_code',
+      'buyer_blocks.shop_code',
+      'nft_claims.shop_code',
       'orders.shop_code',
       'products.shop_code',
       'shop_claims.shop_code',
@@ -187,22 +192,14 @@ test('地址录入口：带校验和的写法在每张表上都被拒（不是�
 
   await checkRejected('node.owner', 'UPDATE node SET owner = ? WHERE id = 1', [UPPER]);
   await checkRejected('node.escrow_address', 'UPDATE node SET escrow_address = ? WHERE id = 1', [UPPER]);
+  await checkRejected('node.staking_address', 'UPDATE node SET staking_address = ? WHERE id = 1', [UPPER]);
+  await checkRejected('node_staff.address', 'INSERT INTO node_staff (address) VALUES (?)', [UPPER]);
   await checkRejected('shops.seller', 'UPDATE shops SET seller = ? WHERE code = ?', [UPPER, TEST_SHOP_CODE]);
 
   await checkRejected(
     'shop_applications.seller',
-    'INSERT INTO shop_applications (seller, host, commission_bps, deadline) VALUES (?, ?, 0, NOW(3))',
-    [UPPER, otherLower(1)]
-  );
-  await checkRejected(
-    'shop_applications.host',
-    'INSERT INTO shop_applications (seller, host, commission_bps, deadline) VALUES (?, ?, 0, NOW(3))',
-    [otherLower(2), UPPER]
-  );
-  await checkRejected(
-    'shop_applications.commission_to',
-    'INSERT INTO shop_applications (seller, host, commission_to, commission_bps, deadline) VALUES (?, ?, ?, 0, NOW(3))',
-    [otherLower(3), otherLower(4), UPPER]
+    "INSERT INTO shop_applications (seller, name, notice, status) VALUES (?, '', '', 'pending')",
+    [UPPER]
   );
 
   await checkRejected('shop_operators.address', 'INSERT INTO shop_operators (shop_code, address) VALUES (?, ?)', [
@@ -216,10 +213,38 @@ test('地址录入口：带校验和的写法在每张表上都被拒（不是�
   );
 
   await checkRejected('products.nft_contract', 'UPDATE products SET nft_contract = ? WHERE id = ?', [UPPER, nft.productId]);
-  for (const column of ['buyer', 'seller', 'fee_collector_at_create', 'commission_to', 'commission_quoted_to']) {
+  for (const column of ['buyer', 'seller']) {
     // 列名来自上面的派生清单，不是从请求里拼的：这里只跑确定在 schema 里的列
     await checkRejected(`orders.${column}`, `UPDATE orders SET \`${column}\` = ? WHERE id = ?`, [UPPER, draft.orderId]);
   }
+
+  /*
+    NFT 提货声明的两个地址列（token 合约 / 提交人）：先造一条合法行，再试带校验和的写法。
+    它们没有"NULL 三态"之外的旁路——CHECK 挂在列上，任何写者都绕不过去。
+  */
+  const claimIns = await db.run(
+    `INSERT INTO nft_claims
+       (claim_no, shop_code, product_id, product_slug, order_id, order_no, seller,
+        token_contract, token_id, claimant, status, shipping_name, shipping_phone, shipping_address)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, '1', ?, 'requested', 'n', 'p', 'a')`,
+    'C' + '0'.repeat(20),
+    TEST_SHOP_CODE,
+    nft.productId,
+    nft.slug,
+    draft.orderId,
+    draft.orderNo,
+    owner.address.toLowerCase(),
+    LOWER,
+    otherLower(7)
+  );
+  await checkRejected(
+    'nft_claims.token_contract',
+    'UPDATE nft_claims SET token_contract = ? WHERE id = ?',
+    [UPPER, claimIns.insertId]
+  );
+  await checkRejected('nft_claims.claimant', 'UPDATE nft_claims SET claimant = ? WHERE id = ?', [UPPER, claimIns.insertId]);
+  await checkRejected('nft_claims.seller', 'UPDATE nft_claims SET seller = ? WHERE id = ?', [UPPER, claimIns.insertId]);
+  await db.run('DELETE FROM nft_claims WHERE id = ?', claimIns.insertId);
 
   await checkRejected(
     'reviews.buyer',
@@ -239,10 +264,10 @@ test('地址录入口：带校验和的写法在每张表上都被拒（不是�
   ]);
 });
 
-test('店铺编号口：小写编号被拒（链上铸造的规范形是大写）', async () => {
+test('店铺编号口：小写编号被拒（本节点铸造的规范形是大写）', async () => {
   await checkRejected(
     'shops.code',
-    "INSERT INTO shops (code, seller, name, notice, listed, commission_bps) VALUES ('0000test1', ?, '', '', 1, 0)",
+    "INSERT INTO shops (code, seller, name, notice, listed) VALUES ('0000test1', ?, '', '', 1)",
     [otherLower(5)]
   );
 });

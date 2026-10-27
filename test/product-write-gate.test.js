@@ -70,6 +70,29 @@ const patch = async (slug, body) => {
   return res.body.data;
 };
 
+test('active/claimable 非法值明确拒绝（不得静默转成"开启"）', async () => {
+  /*
+    旧实现 `active = v.active === false || v.active === 0 ? 0 : 1`：
+    客户端传 "false"/"0"/null 都会变成 1（商品"下架"实际仍在卖）；claimable 同理把
+    "false" 当成开启。这是"提交了但结果反了"的静默错误，必须由输入边界拒绝。
+  */
+  const badActive = await request(app)
+    .post('/api/products')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send(productPayload({ active: 'false' }))
+    .expect(200);
+  assert.notEqual(badActive.body.code, 0);
+  assert.match(String(badActive.body.message), /active/);
+
+  const badClaimable = await request(app)
+    .post('/api/products')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ ...productPayload({ kind: 'nft', nftContract: '0x' + '8'.repeat(40) }), claimable: 'false' })
+    .expect(200);
+  assert.notEqual(badClaimable.body.code, 0);
+  assert.match(String(badClaimable.body.message), /claimable/);
+});
+
 test('草稿：POST 采纳 active=false；买家看不到、店主看得到；上架后立即公开', async () => {
   const draft = await create(productPayload({ kind: 'physical', title: '草稿商品·未发布', active: false }));
   assert.equal(draft.active, false, 'POST 必须采纳请求体里的 active（此前硬编码为 1，永远建不出草稿）');

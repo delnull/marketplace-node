@@ -14,7 +14,7 @@ import { getDb } from '../db.js';
 import { verifyToken, roleOf } from '../auth.js';
 import { ok, fail, wrap, makeAuthMiddleware } from '../http.js';
 import { logAudit } from '../audit.js';
-import { createReturn, setReturnTracking, settleReturn, returnToPublic } from '../returns.js';
+import { createReturn, requestReturn, setReturnAddress, setReturnTracking, settleReturn, returnToPublic } from '../returns.js';
 import { findOrderInShop } from '../orderScope.js';
 
 const router = Router();
@@ -38,7 +38,7 @@ const audit = async (req, action, targetId, detail) =>
   logAudit({
     req,
     actor: req.auth?.address,
-    actorRole: await roleOf(req.auth?.address || '', req.shop.code),
+    actorRole: req.shopRole && req.shopRole !== 'user' ? req.shopRole : await roleOf(req.auth?.address || '', req.shop.code),
     shopCode: req.shop.code,
     action,
     targetType: 'return',
@@ -55,6 +55,32 @@ const audit = async (req, action, targetId, detail) =>
 const isJustCreated = (row, now = Date.now()) => row?.created_at instanceof Date && now - row.created_at.getTime() < 5000;
 
 /** 店主创建退货单 */
+/**
+ * 买家发起退货申请：只创建 open 的空地址退货单，seller 补地址后买家再填回寄单号。
+ * 这是退货的**发起权**归买家；卖家仍可用下面 `POST /return` 直接建单（历史路径）。
+ */
+router.post('/:orderNo/return/request', requireAuth, wrap(async (req, res) => {
+  const order = await findOrderForBuyer(req.params.orderNo);
+  if (!order) return fail(res, '订单不存在', 404, 404);
+  const r = await requestReturn({
+    order,
+    buyer: req.auth.address,
+    note: req.body?.note,
+  });
+  if (r.error) return fail(res, r.error, r.forbidden ? 403 : r.notFound ? 404 : 1, r.forbidden ? 403 : r.notFound ? 404 : 200);
+  await logAudit({
+    req,
+    actor: req.auth.address,
+    actorRole: 'buyer',
+    shopCode: order.shop_code,
+    action: 'return.request',
+    targetType: 'order',
+    targetId: order.order_no,
+    detail: { status: r.data.status },
+  });
+  ok(res, returnToPublic(r.data), '退货申请已提交，等待卖家填写退货地址');
+}));
+
 router.post('/:orderNo/return', staffOnly, wrap(async (req, res) => {
   const order = await findOrderInShop(req.params.orderNo, req.shop.code);
   if (!order) return fail(res, '订单不存在', 404, 404);
@@ -66,8 +92,18 @@ router.post('/:orderNo/return', staffOnly, wrap(async (req, res) => {
 }));
 
 /** 买家回填退回物流单号（可带承运方名称；归一与上限见 src/returns.js → src/shipping.js） */
-router.post('/:orderNo/return/tracking', requireAuth, wrap(async (req, res) => {
-  const order = await findOrderForBuyer(req.params.orderNo);
+/** 卖家填写/修改退货地址（买家发起申请后；只允许 open）。 */
+router.patch('/:orderNo/return/address', staffOnly, wrap(async (req, res) => {
+  const order = await findOrderInShop(req.params.orderNo, req.shop.code);
+  if (!order) return fail(res, '订单不存在', 404, 404);
+  const returnRow = await getDb().get('SELECT * FROM order_returns WHERE order_id = ?', order.order_id);
+  const r = await setReturnAddress({ returnRow, address: req.body?.address });
+  if (r.error) return fail(res, r.error);
+  await audit(req, 'return.address', order.order_no, {});
+  ok(res, returnToPublic(r.data), '退货地址已保存');
+}));
+
+router.post('/:orderNo/return/tracking', requireAuth, wrap(async (req, res) => {  const order = await findOrderForBuyer(req.params.orderNo);
   if (!order) return fail(res, '订单不存在', 404, 404);
   // `order_returns.order_id` 是内部订单键（子表外键），所以这里用视图的 `order_id`
   const returnRow = await getDb().get('SELECT * FROM order_returns WHERE order_id = ?', order.order_id);

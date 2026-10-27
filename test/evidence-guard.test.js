@@ -160,11 +160,11 @@ test('擦除不 sticky：cancel → erase-pii → 仍然无法在这张单上落
 test('已擦除的单即使有在途售后案件也不再收新陈述（否则"删了又收"，保留期还为该案让路）', async () => {
   /*
     2026-10-15 审计 D3 的现场：`isAfterSaleOpen(order)` 一成立，门就开着（终局单也受理售后陈述），
-    而**手动擦除**并不看在途案件（只有保留期扫描排除它，见 afterSaleSql.js 的 AFTER_SALE_NOT_OPEN_SQL）。
-    于是这条路径成立：终局单开案 → 店主执行删除请求 → 买家在窗口内继续提交陈述与附件
-    ⇒ 刚删掉的个人信息被重新写回同一张单，而保留期扫描又为在途案件让路（跳过它）
-    ⇒ 新写入的个人信息**可能长期留存**，删除请求形同虚设。
-    判据落在唯一的阶段门（evidenceStatusError）：陈述与附件两个端点一起关门。
+    而**当时的手动擦除**并不看在途案件（只有保留期扫描排除它）。于是这条路径成立：
+    终局单开案 → 店主执行删除请求 → 买家在窗口内继续提交陈述与附件 ⇒ 刚删掉的个人信息被
+    重新写回同一张单，而保留期扫描又为在途案件让路（跳过它）⇒ 新写入的个人信息可能长期留存。
+    现在擦除内核已拒绝在途案件（case_open），这里直接造出“历史已擦除 + 案件 open”的状态，
+    继续验证第二半：擦除标记一旦落下，陈述/附件都不能再写回。
   */
   const o = await insertOrder({ status: 'confirmed', paid: true });
   await db.run("UPDATE order_chain SET after_sale_status = 'open', after_sale_opened_at = ? WHERE order_id = ?", new Date(), o.orderId);
@@ -173,8 +173,13 @@ test('已擦除的单即使有在途售后案件也不再收新陈述（否则"�
   assert.equal(before.body.code, 0, '前置：在途售后案件受理陈述');
   const evId = Number(before.body.data.evidenceId);
 
-  assertOk(await erasePii(o.orderNo));
-  assert.ok((await rowOf(o.orderId)).pii_erased_at, '擦除已生效（confirmed 在可擦集里）');
+  /*
+    现在显式删除请求也会拒绝在途售后案件（piiErase 内核的 case_open 闸），所以
+    “已擦除 + 案件仍 open”只能来自历史行/人工修复；这里直接造出这个状态，继续验证
+    阶段门本身：擦除标记一旦落下，陈述/附件都不能再写回。
+  */
+  await db.run('UPDATE orders SET pii_erased_at = ? WHERE id = ?', new Date(), o.orderId);
+  assert.ok((await rowOf(o.orderId)).pii_erased_at, '擦除标记已落下（confirmed 在可擦集里）');
 
   const stmt = await postEvidence(o.orderNo, { phase: 'after_sale', content: '擦完以后再写一段个人信息' });
   assert.notEqual(stmt.body.code, 0, '擦除之后不许再落下新的个人信息');

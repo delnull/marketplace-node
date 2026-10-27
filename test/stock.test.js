@@ -399,6 +399,49 @@ test('sweeper 关单后链上托管落定：watcher 自动恢复为 escrowed 并
   assert.equal(await availOf(p.slug), 2);
 });
 
+test('不限量期下单 → 取消 → 改限量 → 迟到付款恢复：必须按当前容量补占位', async () => {
+  /*
+    回归：旧 `restockOrder` 对 hold_qty=0 直接 return true（"从未占位，无需恢复"）。
+    但取消之后卖家可以把组合改成限量；此时买家迟到付款、watcher 恢复为 escrowed，
+    committed 仍是 0 ⇒ 该件货可被再卖一次（超卖）。恢复必须以**当前** SKU 重新占位。
+  */
+  const p = await listProduct(productPayload({ kind: 'physical', title: '迟到付款商品', capacity: null }));
+  const d = (await createDraft(p.slug)).body.data;
+  assert.equal((await db.get('SELECT hold_qty FROM v_orders WHERE order_no = ?', d.id)).hold_qty, 0);
+
+  await ageDrafts(db, d.id, 2 * 3600_000);
+  assert.equal(await sweepExpiredDrafts(), 1);
+  assert.equal(await commOf(p.slug), 0);
+
+  // 取消之后才改成限量 1：补记逻辑只覆盖在途单，这行仍是 hold_qty=0。
+  const limited = await request(app)
+    .patch(`/api/products/${p.slug}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ skus: [{ key: '', capacity: 1 }] })
+    .expect(200);
+  assertOk(limited);
+  assert.equal(await commOf(p.slug), 0, '已取消单不在补记范围');
+
+  const changed = await applyEvent(
+    'OrderCreated',
+    {
+      orderId: d.escrowOrderId,
+      buyer: buyer.address.toLowerCase(),
+      seller: owner.address.toLowerCase(),
+      amount: BigInt(d.amountWei),
+    },
+    { txHash: payHash(), block: 121 }
+  );
+  assert.equal(changed, 1, '已取消行收到匹配托管事件应恢复');
+  assert.equal((await db.get('SELECT status, hold_qty FROM v_orders WHERE order_no = ?', d.id)).status, 'escrowed');
+  assert.equal(
+    (await db.get('SELECT hold_qty FROM v_orders WHERE order_no = ?', d.id)).hold_qty,
+    1,
+    '恢复时必须补记 hold_qty'
+  );
+  assert.equal(await commOf(p.slug), 1, '恢复时必须补占当前限量容量');
+});
+
 test('不限量期下单 → 切回限量：在途未占位单纳入占位；容量不足拒绝切换', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '切换限量商品', capacity: null }));
   // 不限量期下单：不占位（hold_qty=0）
