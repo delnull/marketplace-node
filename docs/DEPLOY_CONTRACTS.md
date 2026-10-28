@@ -24,7 +24,7 @@
 
 按 `10 gwei`、3 个委员计算：gasLimit 合计 `13,240,000`，约 **0.133 BTY**。
 
-建议钱包准备 **0.3 BTY 以上**：BTY 按 gasLimit 扣费，失败/重试也会消耗 gasLimit，留出 gas 价波动和重试余量；`--check` 会按当前 `eth_gasPrice` 重新计算并拒绝余额不足。
+建议钱包准备 **0.5 BTY 以上**：BTY 按 gasLimit 扣费，失败/重试也会消耗 gasLimit，留出 gas 价波动和重试余量；`--check` 会按当前 `eth_gasPrice` 重新计算并拒绝余额不足。
 
 每多一个委员约增加 `25,000` gasLimit（`10 gwei` 下约 `0.00025 BTY`）。
 
