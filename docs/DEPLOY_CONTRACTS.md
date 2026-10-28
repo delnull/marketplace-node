@@ -20,6 +20,14 @@
 - 至少 3 个仲裁人地址，彼此独立；`ARBITER_THRESHOLD` 必须小于人数；
 - 原样使用本仓 `contracts/`。`foundry.toml` 固定了 solc 0.8.24 / optimizer runs 1 / evm_version paris；目录按 Escrow/Staking 运行时字节码哈希放行，改源码或编译参数会导致登记被拒。
 
+## 费用
+
+按 `10 gwei`、3 个委员计算：gasLimit 合计 `13,240,000`，约 **0.133 BTY**。
+
+建议钱包准备 **0.2 BTY 以上**：BTY 按 gasLimit 扣费，失败/重试也会消耗 gasLimit，留出 gas 价波动和重试余量；`--check` 会按当前 `eth_gasPrice` 重新计算并拒绝余额不足。
+
+每多一个委员约增加 `25,000` gasLimit（`10 gwei` 下约 `0.00025 BTY`）。
+
 ## 1. 编译
 
 ```bash
