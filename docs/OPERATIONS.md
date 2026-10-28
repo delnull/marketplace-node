@@ -47,7 +47,7 @@ docker run --rm -v marketplace-node-data:/data -v "$PWD":/backup --entrypoint ta
 
 - 安装目录 `.env`（含 `MK_TOKEN_SECRET`，丢了会导致所有登录失效）；
 - 内置 MySQL 的 `.mysql-root`；
-- `deploy-constants.json`（合约批次）；
+- `deploy-constants.json`（本节点 Escrow / Staking / startBlock）；
 - 上面两份备份。
 
 ## 3. 恢复
@@ -86,7 +86,7 @@ curl http://127.0.0.1:8090/healthz
 bash deploy.sh --update
 ```
 
-会重建镜像，用同一个数据卷和同一套 MySQL 重建容器，数据不动。`--update` 默认只用安装目录里的代码；要拉公开仓最新版用 `--update --pull`，或重新跑一遍 `install.sh`。新容器健康检查失败时脚本会自动回滚到上一个镜像；回滚也失败时看上面的日志手工介入。
+会重建镜像，用同一个数据卷和同一套 MySQL 重建容器，数据不动。`--update` 默认只用安装目录里的代码；要拉公开仓最新版用 `bash deploy.sh --update --pull`（不要只重跑 `install.sh`：非更新模式会沿用现有代码目录，仍用旧代码重建镜像）。新容器健康检查失败时脚本会自动回滚到上一个镜像；回滚也失败时看上面的日志手工介入。
 
 ## 5. 数据库结构
 

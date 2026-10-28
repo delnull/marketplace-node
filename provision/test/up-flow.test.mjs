@@ -164,7 +164,7 @@ test('一条流程走完：装好节点、拿到 endpoint、状态落盘', async
   assert.match(deploy.script, /--tls-mode caddy/);
   assert.match(deploy.script, /--domain 'shop\.example\.com'/);
   assert.match(deploy.script, new RegExp(`--owner '${OWNER}'`));
-  assert.match(deploy.script, /--no-register/); // 链上登记刻意留给店主钱包
+  assert.doesNotMatch(deploy.script, /--no-register/); // deploy.sh 没有链上登记步骤
   // 上传的是 git archive 出来的包（内容来自提交，不是工作区）
   assert.ok(sshCalls.some((c) => c.kind === 'upload' && /node-[0-9a-f]+\.tgz$/.test(c.local)));
 

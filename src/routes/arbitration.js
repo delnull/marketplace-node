@@ -132,6 +132,8 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null } = {}) {
       未登录的仲裁台看不到详情链接，需要先按本节点登录（前端 tokenOf(origin) 已有）。
     */
     orderNo: actor && o.escrow_order_id && (await isArbiterForOrder(actor, o.escrow_order_id)) ? o.order_no : null,
+    /* 订单详情的店铺维度；配合该节点 operator 才能构造 `/orders/<operator>:<code>/<orderNo>`。 */
+    shopCode: o.shop_code || null,
     escrowOrderId: o.escrow_order_id,
     /*
       订单身份的另一半：**快照哈希**。仲裁动作要在本地复算

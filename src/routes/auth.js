@@ -21,6 +21,7 @@
  * 与任何店铺都对不上的值（那正是本次要删掉的那类假话）。
  */
 import { Router } from 'express';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { issueSiwe, verifySiwe, issueToken, roleOf, isHost, operatedShopCodes, isNodeStaffOf } from '../auth.js';
 import { isAddress } from '../chain.js';
 import { shopDto, shopRowByCode, nodeOwner } from '../shops.js';
@@ -31,6 +32,86 @@ import { notifyRaw } from '../webhook.js';
 
 /** "节点主没开店 ⇒ 没有告警收件人"只报一次（见登录告警那段） */
 let ownerLoginAlertNoRecipientWarned = false;
+
+/**
+ * 一次成功登录的**唯一回执形状**：普通 SIWE 登录与扫码登录共用。
+ * 若两处各拼一次，`shops` 的角色判据迟早漂移。
+ */
+async function loginPayload(address, hostNow) {
+  const recovered = String(address).toLowerCase();
+  const nodeAddr = await nodeOwner();
+  const nodeStaff = await isNodeStaffOf(recovered);
+  const shops = [];
+  for (const code of await operatedShopCodes(recovered)) {
+    const row = await shopRowByCode(code);
+    if (!row) continue;
+    const role = await roleOf(recovered, code);
+    if (role === 'owner' || role === 'staff') shops.push({ ...shopDto(row, nodeAddr), role });
+  }
+  return {
+    token: issueToken(recovered),
+    address: recovered,
+    isHost: hostNow,
+    isNodeStaff: nodeStaff,
+    shops,
+  };
+}
+
+/** 节点主登录告警：普通登录与扫码登录共用（不是第二套权限判据） */
+async function alertOwnerLogin(recovered, hostNow, req) {
+  if (!hostNow || !config.webhook.ownerLoginAlert) return;
+  const hostShops = await operatedShopCodes(recovered);
+  if (hostShops.length) {
+    notifyRaw('auth.owner_login', {
+      shopCode: hostShops[0],
+      address: recovered,
+      ip: clientIp(req),
+    }).catch((e) => console.error('[auth] 节点主登录告警投递异常：', e?.message || e));
+  } else if (!ownerLoginAlertNoRecipientWarned) {
+    ownerLoginAlertNoRecipientWarned = true;
+    console.warn(
+      '[auth] MK_OWNER_LOGIN_ALERT 已开启，但节点主在本节点没有任何店铺 ⇒ 没有可投递的 webhook，该告警不会发出'
+    );
+  }
+}
+
+/**
+ * 扫码登录的短暂配对票据。
+ *
+ * 桌面端拿到 code + secret；二维码里只带 code。手机钱包签名后把令牌写回 code；
+ * 桌面端再用 secret 取走。code 被旁观者看到也不能读走令牌，secret 不出现在二维码/URL 里。
+ * 内存 TTL 2 分钟：这是一次性配对，不需要跨进程，也不该在库里留下登录令牌。
+ */
+const QR_TTL_MS = 120_000;
+const QR_MAX = 2_000;
+const qrSessions = new Map();
+
+function sweepQr(now = Date.now()) {
+  for (const [code, row] of qrSessions) {
+    if (row.expiresAt <= now) qrSessions.delete(code);
+  }
+  while (qrSessions.size >= QR_MAX) {
+    const oldest = qrSessions.keys().next().value;
+    if (!oldest) break;
+    qrSessions.delete(oldest);
+  }
+}
+
+function qrSessionOf(code) {
+  const row = qrSessions.get(String(code || ''));
+  if (!row) return null;
+  if (row.expiresAt <= Date.now()) {
+    qrSessions.delete(String(code));
+    return null;
+  }
+  return row;
+}
+
+function sameSecret(a, b) {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+  return left.length === right.length && left.length > 0 && timingSafeEqual(left, right);
+}
 
 const router = Router();
 
@@ -55,6 +136,9 @@ function originProtocolGuard(req, res, next) {
 const RATE_LIMIT = {
   '/nonce': { windowMs: 60_000, max: 120 }, // 取 nonce 是廉价但可无限刷表/占地址
   '/login': { windowMs: 60_000, max: 60 },
+  '/qr-session': { windowMs: 60_000, max: 60 },
+  '/qr-approve': { windowMs: 60_000, max: 30 },
+  '/qr-read': { windowMs: 60_000, max: 180 },
 };
 const hits = new Map(); // key: `${path}|${ip}` → number[]（时间戳）
 
@@ -110,58 +194,54 @@ router.post('/login', rateLimit('/login'), originProtocolGuard, wrap(async (req,
     return fail(res, String(e?.message || '签名校验失败，请重新获取签名原文后再登录'), 1, 401);
   }
   const hostNow = await isHost(recovered, { force: true });
-  // 节点主登录告警（可选开：MK_OWNER_LOGIN_ALERT=1）：host 令牌 = 节点级写权限，
-  // 若因钓鱼中继/令牌失窃被冒领，节点主经自有 webhook 通道第一时间知情（轮换/撤销先行）
-  if (hostNow && config.webhook.ownerLoginAlert) {
-    /*
-      ⚠️ 节点级事件**也必须带 `shopCode`**：`webhook.deliver()` 按 `payload.shopCode` 去查
-      `shop_webhook`（一行一店）。缺了它 `webhookConfig(undefined)` 把键折成 `''` ⇒ url 为空
-      ⇒ **一次尝试都不发**就 resolve(false)，而返回的 false 正是"没配地址"的意思
-      —— 这条通知此前因此**结构性发不出去**，且看不出任何异常。
+  await alertOwnerLogin(recovered, hostNow, req);
+  ok(res, await loginPayload(recovered, hostNow));
+}));
 
-      收件人取"这个地址能经营的店"里的第一家：这是**通知**不是**授权**，同一个人名下的哪家店
-      落到的是同一个人。一家店都没有（节点主自己没开店）时不是"地址没配"而是"**没有收件人**"
-      —— 那种情况只报一次，且不假装发过。
-    */
-    const hostShops = await operatedShopCodes(recovered);
-    if (hostShops.length) {
-      // fire-and-forget 也必须接住异常：未处理的 rejection 会让进程按未捕获错误退出
-      notifyRaw('auth.owner_login', {
-        shopCode: hostShops[0],
-        address: recovered,
-        ip: clientIp(req),
-      }).catch((e) => console.error('[auth] 节点主登录告警投递异常：', e?.message || e));
-    } else if (!ownerLoginAlertNoRecipientWarned) {
-      ownerLoginAlertNoRecipientWarned = true;
-      console.warn(
-        '[auth] MK_OWNER_LOGIN_ALERT 已开启，但节点主在本节点没有任何店铺 ⇒ 没有可投递的 webhook，该告警不会发出'
-      );
-    }
+/**
+ * 桌面端创建扫码票据。二维码只带 code；secret 只留在桌面端内存/弹窗里。
+ * 手机批准后把登录回执写进这笔票据，桌面端轮询取走。
+ */
+router.post('/qr/session', rateLimit('/qr-session'), originProtocolGuard, wrap(async (_req, res) => {
+  sweepQr();
+  const code = randomBytes(9).toString('base64url');
+  const secret = randomBytes(32).toString('base64url');
+  const expiresAt = Date.now() + QR_TTL_MS;
+  qrSessions.set(code, { secret, expiresAt, status: 'pending', login: null });
+  ok(res, { code, secret, expiresIn: Math.floor(QR_TTL_MS / 1000), expiresAt: new Date(expiresAt).toISOString() });
+}));
+
+/** 桌面端轮询：必须带 secret，只有它能取走令牌 */
+router.get('/qr/session/:code', rateLimit('/qr-read'), wrap(async (req, res) => {
+  const row = qrSessionOf(req.params.code);
+  if (!row) return fail(res, '扫码登录已过期，请刷新二维码', 404, 410);
+  if (!sameSecret(req.query.secret, row.secret)) return fail(res, '扫码登录凭证无效', 403, 403);
+  ok(res, {
+    status: row.status,
+    expiresIn: Math.max(0, Math.ceil((row.expiresAt - Date.now()) / 1000)),
+    ...(row.status === 'approved' ? { login: row.login } : {}),
+  });
+}));
+
+/** 手机钱包内置浏览器批准：验签通过后才写入票据；不回传令牌给只拿 code 的手机页 */
+router.post('/qr/session/:code/approve', rateLimit('/qr-approve'), originProtocolGuard, wrap(async (req, res) => {
+  const row = qrSessionOf(req.params.code);
+  if (!row) return fail(res, '扫码登录已过期，请回到电脑刷新二维码', 404, 410);
+  if (row.status === 'approved') return fail(res, '这笔扫码登录已经确认过了', 409, 409);
+  const { address, message, signature } = req.body || {};
+  if (!isAddress(address)) return fail(res, 'address 参数无效');
+  if (!message || !signature) return fail(res, '缺少 message 或 signature');
+  let recovered;
+  try {
+    recovered = await verifySiwe(address, message, signature);
+  } catch (e) {
+    return fail(res, String(e?.message || '签名校验失败，请重新获取签名原文后再登录'), 1, 401);
   }
-  const token = issueToken(recovered);
-  /*
-    `shops` 是"这个地址在这台机器上能经营哪些店"的清单（带各自角色）——前端的店铺切换器
-    据此一次画出来，不必再为每家店试一次登录。判据与 http.js 中间件解析默认店铺用的是
-    **同一个** `operatedShopCodes`（seller ∪ 店员白名单 ∪ 节点员工的本节点自营店），
-    两处不会给出不同的清单。它只含**这个地址自己有份**的店，不是租户列表（租户列表在公开的 GET /api/shops）。
-    节点员工的自营店已经在那份清单里（见 auth.operatedShopCodes），这里**不再单独补一次**：
-    补一次就是第二份判据，两处迟早漂移（例如员工被解除后登录回执仍列出那家店）。
-  */
-  const addr = recovered.toLowerCase();
-  const nodeAddr = await nodeOwner();
-  const nodeStaff = await isNodeStaffOf(addr);
-  const shops = [];
-  for (const code of await operatedShopCodes(addr)) {
-    const row = await shopRowByCode(code);
-    if (!row) continue; // 清单与这一行同源，读不到只可能是并发删店；不猜、跳过
-    /*
-      角色一律走 `roleOf`（唯一判据）：不要在这里用 `row.seller === addr` 自己推——
-      "owner 还是 staff"是授权判据，抄一份在这里就多一处会漂移的第二真相。
-    */
-    const role = await roleOf(addr, code);
-    if (role === 'owner' || role === 'staff') shops.push({ ...shopDto(row, nodeAddr), role });
-  }
-  ok(res, { token, address: recovered, isHost: hostNow, isNodeStaff: nodeStaff, shops });
+  const hostNow = await isHost(recovered, { force: true });
+  await alertOwnerLogin(recovered, hostNow, req);
+  row.login = await loginPayload(recovered, hostNow);
+  row.status = 'approved';
+  ok(res, { status: 'approved', address: row.login.address });
 }));
 
 export default router;

@@ -338,6 +338,54 @@ test('提货争议关闭后不能重新生成参数；ClaimClosed 回写实际�
   assert.equal(String(row.claim_amount_wei), '55', '卖家看到的应是实际赔付额，不是开案请求额');
 });
 
+test('提货卖家列表包含本店店员（与处理动作同一授权面）', async () => {
+  const staff = Wallet.createRandom();
+  const add = await request(app)
+    .put('/api/shop/staff')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ action: 'add', address: staff.address })
+    .expect(200);
+  assertOk(add);
+
+  const p = await createNftProduct();
+  await request(app)
+    .post(`/api/products/${p.slug}/tokens`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ tokens: ['9'] })
+    .expect(200);
+  await deliverToken(p.slug, '9');
+  currentOwner = buyer.address.toLowerCase();
+  const c = await submit(buyerToken, { nftContract: NFT, tokenId: '9', shipping: { name: '赵六', phone: '136', address: '深圳' } }).expect(200);
+  assertOk(c);
+
+  const staffToken = (await login(ctx, staff)).token;
+  const acted = await request(app)
+    .post(`/api/claims/nft/${c.body.data.id}/seller`)
+    .set('Authorization', `Bearer ${staffToken}`)
+    .send({ action: 'approve' })
+    .expect(200);
+  assertOk(acted);
+  const list = await request(app)
+    .get('/api/claims/nft/seller')
+    .set('Authorization', `Bearer ${staffToken}`)
+    .expect(200);
+  assertOk(list);
+  assert.ok(list.body.data.claims.some((row) => row.id === c.body.data.id), '店员必须看得到本店提货行');
+
+  const removed = await request(app)
+    .put('/api/shop/staff')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ action: 'remove', address: staff.address })
+    .expect(200);
+  assertOk(removed);
+  const after = await request(app)
+    .get('/api/claims/nft/seller')
+    .set('Authorization', `Bearer ${staffToken}`)
+    .expect(200);
+  assertOk(after);
+  assert.ok(!after.body.data.claims.some((row) => row.id === c.body.data.id), '移除店员后立即失去列表可见性');
+});
+
 test('零赔付结案/撤销争议必须释放声明占位，不能把 token 永久锁死', async () => {
   const p = await createNftProduct();
   await request(app)

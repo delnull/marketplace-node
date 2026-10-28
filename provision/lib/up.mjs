@@ -686,6 +686,6 @@ test -f "$SRC/deploy.sh" || { echo "包里没有 deploy.sh —— 打包内容�
 cd "$SRC"
 bash deploy.sh --owner ${shellQuote(owner)} --domain ${shellQuote(domain)} \\
   --email ${shellQuote(email)} --tls-mode caddy --dir "$SRC" \\
-  --service marketplace-node --volume marketplace-node-data --port 8090 --no-register --yes
+  --service marketplace-node --volume marketplace-node-data --port 8090 --yes
 `;
 }

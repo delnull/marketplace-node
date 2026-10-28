@@ -1,14 +1,15 @@
 /**
  * 店铺目录与开店审批（挂 `/api/shops`）——**店铺完全在节点链下**。
  *
- *  GET  /                    公开：本节点**在售**店铺列表（编号/店名/卖家地址/在售状态）
+ *  GET  /                    公开：本节点**在售**店铺列表（编号/店名/卖家地址/在售状态）；
+ *                            带登录令牌时附 `mine`（这个钱包在本节点的开店状态，含暂停店与待审批申请）
  *  GET  /admin/all           节点管理员：本节点**全部**店铺（含暂停接单，用于节点主恢复）
  *  PATCH /admin/listing       节点管理员：批量暂停/恢复接单 {codes, listed, reason}
  *  PATCH /admin/:code/listing 节点管理员：暂停/恢复一家店的接单（原因必填）
  *  GET  /:code               公开：单店详情（含在售状态）
  *  POST /applications        店主提交开店申请（需登录；只有店名/公告）
  *  GET  /applications/list   节点主/员工查看申请队列（nodeAdmin；page/pageSize/q，返回 total）
- *  GET  /applications/mine   店主查看**自己**的申请进展（需登录）
+ *  GET  /applications/mine   店主查看**自己**的申请进展与本节点开店状态（需登录）
  *  POST /applications/:id/review   节点主/员工审批（nodeAdmin）：通过 ⇒ **本节点铸造编号并建店**；驳回 ⇒ 记原因
  *  POST /applications/batch-review 节点主/员工**批量**审批（nodeAdmin）：整批通过/整批驳回，任一条不满足则整批不写
  *
@@ -52,7 +53,10 @@ const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true });
 // 开店申请是免费 SIWE 的写入口：不限流时可用大量地址填满申请队列与库（节点主审核面 DoS）
 const applicationLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '开店申请过于频繁，请稍后再试' });
 
-/** 可选登录：目录公开可读，但带买家令牌时按该买家在本节点的屏蔽过滤。 */
+/**
+ * 可选登录：目录公开可读。带令牌时同时用于两件事——
+ * 按该钱包在本节点的屏蔽过滤店铺，以及下发它自己的开店状态（`mine`）。
+ */
 function optionalBuyer(req) {
   const token = bearerToken(req);
   if (!token) return null;
@@ -190,6 +194,39 @@ async function applicationRows(whereOrderSql, ...params) {
   );
 }
 
+/**
+ * 「这个钱包在本节点的开店状态」——**唯一读形状**（`GET /api/shops` 与
+ * `GET /api/shops/applications/mine` 共用）。
+ *
+ * 它回答的三件事正好对应界面的三条规则：
+ *   · `shop`（**含暂停接单**，所以不能从公开在售列表推）⇒ 已有店铺，不能再申请；
+ *   · `pendingApplication` ⇒ 已有一条待审批申请，不能再申请；
+ *   · 两者都为 null（并且这个钱包只有 rejected 的历史）⇒ 可以（重新）申请。
+ *
+ * 为什么由节点下发而不是前端拿 `shops` 自己猜：公开列表只含 `listed = 1` 的店，
+ * 店主一旦暂停接单，前端就会以为"这个人还没有店铺"并再次给出申请表单；而真正的判据
+ * `uq_shops_seller` 在库里管的是**全部**店铺行。让节点从同一张表回答，界面才和约束同义。
+ */
+async function mineAtNode(seller, host) {
+  const [shop, pending] = await Promise.all([
+    shopRowBySeller(seller),
+    getDb().get(
+      "SELECT id, name, created_at FROM shop_applications WHERE seller = ? AND status = 'pending' LIMIT 1",
+      seller
+    ),
+  ]);
+  return {
+    shop: shop ? shopDto(shop, host) : null,
+    pendingApplication: pending
+      ? {
+          id: String(pending.id),
+          name: String(pending.name || ''),
+          createdAt: pending.created_at,
+        }
+      : null,
+  };
+}
+
 /** 公开：本节点在售店铺列表（`listed = 0` 的店**不进**这个列表——它已经不接单也不该被聚合） */
 router.get('/', wrap(async (req, res) => {
   const nodeAddr = await nodeOwner();
@@ -205,6 +242,11 @@ router.get('/', wrap(async (req, res) => {
     shops: rows.map((r) => shopDto(r, nodeAddr)),
     /** 该买家在本节点设置的屏蔽导致目录隐藏的店铺数（不是全节点统计） */
     hiddenBlocked: totalListed - rows.length,
+    /**
+     * 当前登录钱包在本节点的开店状态；没有令牌 = `null`（未知，不是"没有店"）。
+     * 前端据此把"申请开店"换成"我的店铺 / 申请审批中"。
+     */
+    mine: buyer ? await mineAtNode(buyer, nodeAddr) : null,
   });
 }));
 
@@ -304,8 +346,9 @@ router.patch('/admin/:code/listing', nodeAdmin, wrap(async (req, res) => {
 
 /**
  * 公开：单店详情。
- * **暂停接单的店对匿名访问按"不存在"处理**（404）：公开详情若仍可读，等于把"暂停接单"
- * 做成"只是不显示在列表里"。店主/店员要读自己的店走带鉴权的 `/api/shop/settings`。
+ * **暂停接单的店仍返回这一行（`listed:false`），但不出现在公开目录**：买家点到已分享的链接时，
+ * 必须能读到“这家店暂停接单”而不是把链接当成坏链。返回的只是店铺身份，不返回商品；
+ * 商品/聚合端点仍由 `listedShopScope` 对暂停店返回 409。
  *
  * 两次查找**都必须 await**：`shopRowByCode(...) || resolveShopRef(...)` 里的 `||` 作用在
  * Promise 上时左侧恒真（哪怕店铺不存在），于是"没有这家店"这条 404 永远不会走到。
@@ -313,8 +356,8 @@ router.patch('/admin/:code/listing', nodeAdmin, wrap(async (req, res) => {
 router.get('/:code', wrap(async (req, res) => {
   const ref = String(req.params.code || '');
   const row = (await shopRowByCode(ref.toUpperCase())) || (await resolveShopRef(ref));
-  if (!row || Number(row.listed) !== 1) {
-    return fail(res, '没有这家店（或该店已暂停接单）', 404, 404);
+  if (!row) {
+    return fail(res, '没有这家店', 404, 404);
   }
   ok(res, shopDto(row, await nodeOwner()));
 }));
@@ -340,25 +383,25 @@ router.post('/applications', requireAuth, applicationLimiter, wrap(async (req, r
 
   const db = getDb();
   /*
-    一个钱包在本节点只能开一家店（`shops.uq_shops_seller` 是真正的判据）：先给一句可读的话。
-    没有"墓碑重开"这一档——店铺不注销，只是 `listed=0`，那一行仍然占着 seller。
-  */
-  const existing = await shopRowBySeller(seller);
-  if (existing) {
-    return fail(res, '该钱包在本节点已有店铺（一个钱包只能开一家店）', 409, 409);
-  }
-  /*
-    队列容量是**节点级**的准入判据：count 与 insert 必须在同一个事务、同一把锁下完成，
-    否则 N 个并发提交会各自看到"还没满"而一起插进去。锁 `node` 单例行（不是全表）：
-    所有提交都走这一条路径，短暂串行换"上限真的成立"。
+    队列容量与"已有店铺"都是**节点级准入判据**：判与写必须在同一个事务、同一把锁下完成。
+    锁 `node` 单例行（不是全表），审批通过建店时也先取这把锁（见 reviewApplications）——
+    否则会出现这样的交错：提交方读到"没有店铺"→ 审批方建店并提交 → 提交方插入申请成功，
+    留下"钱包已有店铺 + 一条永远批不出来的待审批申请"。
     `maxPending = 0` 表示不设上限（受控测试环境）。
   */
   const maxPending = config.applications.maxPending;
   let id;
   try {
     const out = await withTransaction(async () => {
+      await db.get('SELECT id FROM node WHERE id = 1 FOR UPDATE');
+      /*
+        一个钱包在本节点只能开一家店（`shops.uq_shops_seller` 是真正的判据）：
+        先给一句可读的话。没有"墓碑重开"这一档——店铺不注销，只是 `listed=0`，
+        那一行仍然占着 seller，所以暂停店也算"已有店铺"。
+      */
+      const existing = await shopRowBySeller(seller);
+      if (existing) return { exists: existing };
       if (maxPending > 0) {
-        await db.get('SELECT id FROM node WHERE id = 1 FOR UPDATE');
         const pending = Number(
           (await db.get("SELECT COUNT(*) AS c FROM shop_applications WHERE status = 'pending'")).c
         );
@@ -373,6 +416,14 @@ router.post('/applications', requireAuth, applicationLimiter, wrap(async (req, r
       );
       return { id: Number(ins.insertId) };
     });
+    if (out.exists) {
+      return fail(
+        res,
+        `该钱包在本节点已有店铺（编号 ${out.exists.code}）：一个钱包在一个节点只能开一家店，不能再次申请`,
+        409,
+        409
+      );
+    }
     if (out.full !== undefined) {
       return fail(
         res,
@@ -454,7 +505,15 @@ router.get('/applications/mine', requireAuth, wrap(async (req, res) => {
   const rows = all
     ? await applicationRows('WHERE a.seller = ? ORDER BY a.id DESC', seller)
     : await applicationRows("WHERE a.seller = ? AND a.status = 'pending' ORDER BY a.id DESC", seller);
-  ok(res, { applications: rows.map((row) => applicationDto(row)) });
+  /*
+    `mine` 与 `GET /api/shops` 下发的是**同一个形状**：申请页读它来判"还能不能提交"，
+    申请历史只负责展示（驳回原因等）。两处若各判一套，某一边漏掉暂停店或 pending，
+    就会出现"界面给了表单、节点 409"——必然失败的请求不是界面出口。
+  */
+  ok(res, {
+    applications: rows.map((row) => applicationDto(row)),
+    mine: await mineAtNode(seller, await nodeOwner()),
+  });
 }));
 
 /**
@@ -483,6 +542,16 @@ async function reviewApplications({ req, ids, action, reason, batch = false }) {
   */
   const actorIsHost = await isHost(actor);
   const out = await withTransaction(async () => {
+    /*
+      建店（approve）与"提交申请时判已有店铺"是同一条不变量的两半，必须取同一把节点锁：
+      `POST /applications` 先锁 `node` 再读 `shops`，这里也必须先锁 `node` 再读/写 `shops`，
+      否则两边各自都能看到"还没有"，于是留下"已有店铺 + 待审批申请"的半截状态。
+      锁顺序固定为 node → shop_applications（提交路径只取前者），不存在反向加锁。
+      代价：同一节点的批量审批期间，新的开店申请会排队等这把锁——这是为了
+      "一个钱包在一个节点只能有一家店"在并发下也成立，不是可以省的优化。
+      reject 不建店，不取这把锁。
+    */
+    if (action === 'approve') await db.get('SELECT id FROM node WHERE id = 1 FOR UPDATE');
     const marks = ids.map(() => '?').join(',');
     /*
       锁行顺序按 id：两个批量请求（或批量与单品交错）以同一顺序取锁，避免死锁；
@@ -524,7 +593,8 @@ async function reviewApplications({ req, ids, action, reason, batch = false }) {
 
     /*
       一个钱包只能开一家店：真正的判据是 `uq_shops_seller`。这里先读一次只是为了给
-      "整批未执行"一个可读原因；读与写在同一事务、申请行已锁，正常路径不会漂移。
+      "整批未执行"一个可读原因；读与写在同一事务、node 行与申请行都已锁，
+      "提交申请"与"建店"不可能交错看到彼此之前的旧状态。
     */
     const sellers = [...new Set(ordered.map((r) => String(r.seller).toLowerCase()))];
     const shopMarks = sellers.map(() => '?').join(',');

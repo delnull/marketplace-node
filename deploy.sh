@@ -3,7 +3,7 @@
 #  联邦商城 · 开店节点一键部署（fedmall.bityuan.com）—— **Docker 版**
 #
 #  一条命令把你这台服务器变成联邦商城的一家店：装 Docker（若没有）→ 构建镜像 →
-#  建数据卷 → 起容器 → 探活 →（可选）链上登记。
+#  建数据卷 → 起容器 → 探活 → 打印链上登记指引。
 #
 #  ── 为什么只用 Docker ──────────────────────────────────────────────────────
 #  上一版是"在宿主机上装"：装 Node 到 /usr/local、写 systemd 单元、装 nginx/certbot。
@@ -54,30 +54,41 @@
 #      --db-volume NAME                  内置 MySQL 数据卷（默认 <service>-mysql-data）
 #      --db-image IMAGE                  内置 MySQL 镜像（默认 mysql:8.4）
 #      --image marketplace-node:latest   镜像名:标签
+#      --escrow 0x… --staking 0x… --start-block N
+#                                         本节点 Escrow / Staking / 起始扫描块；不填则读 deploy-constants.json
 #      --no-domain                       先不配域名
 #      --pull                            --update 时强制从公开仓拉最新代码（没有 git 的安装用）
 #      --yes / --force                   不交互 / 覆盖同名容器
 #
 #  ── 关于私钥 ───────────────────────────────────────────────────────────────
-#  链上登记由店主在 $FRONTEND 的「开店/登记我的节点」用钱包插件完成（部署脚本不持私钥、不代登记）。
+#  链上登记由店主在前端（fedmall.bityuan.com）的「开店/登记我的节点」用钱包插件完成（部署脚本不持私钥、不代登记）。
 # =============================================================================
 set -Eeuo pipefail
 
-# 本联邦的共享合约（店主不需要填、也不该改）。
-# ⚠️ 这些值现在住在 `deploy-constants.json`（与 Windows 原生路径 `deploy.ps1` **共用同一份**）。
-# 为什么必须共用：两条部署路径要装出同一个节点，而"接错托管合约"的表现是**静默的**
-# ——节点照常启动、商品照常展示，只有买家付款路径指向别处。各写一份常量，换批时必然分叉。
-# 为什么是 JSON 而不是这里的 shell 常量：PowerShell 读 JSON 是一等公民（ConvertFrom-Json），
-# 读 shell 变量则要自己解析；反过来 bash 用一行 sed 就能从固定结构里取值。
+# ── 输出与失败 ──
+# 先定义：下面解析参数、读常量、平台探测都会用到 die，不能等到常量门禁之后才定义。
+# （上一版 const() 在 die 之前调用它，取不到常量时先打出 "die: command not found"。）
+c_ok=$'\033[32m'; c_warn=$'\033[33m'; c_err=$'\033[31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+log()  { printf '%s\n' "$*"; }
+info() { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$c_ok" "$c_off" "$*"; }
+warn() { printf '%s!%s %s\n' "$c_warn" "$c_off" "$*" >&2; }
+die()  { printf '%s✗ %s%s\n' "$c_err" "$*" "$c_off" >&2; exit 1; }
+step() { printf '\n%s── %s ──%s\n' "$c_dim" "$*" "$c_off"; }
+
+# ── 部署常量从哪来 ──────────────────────────────────────────────────────────
+# 本节点自己的 Escrow / Staking / 起始扫描块住在 deploy-constants.json（与 Windows 原生路径
+# deploy.ps1 共用同一份），脚本里不内置默认值：接错托管合约的表现是**静默的**——节点照常启动、
+# 商品照常展示，只有买家付款路径指向别处。所以缺值/坏值在安装/升级前当场拒绝。
 #
-# ⚠️ 换批时：改 `deploy-constants.json` 的 contracts 三项（escrow / staking / startBlock），
-# 两边脚本**同时**生效，不需要改脚本本体。
-#   · 平台 Registry 只是前端发现层；每个节点自己部署 Escrow + Staking（contracts/script/DeployNode.s.sol）；
-#   · 本节点 Escrow 与 Staking 必须互相回指，且 owner 都是节点 operator；
+# 每个节点部署自己的 Escrow + Staking（contracts/script/DeployNode.s.sol）：
+#   · Escrow 与 Staking 必须互相回指，且 owner 都是节点 operator；
 #   · startBlock 取 Escrow/Staking 中最早的部署块；错成更高高度会漏扫历史事件；
 #   · 链上登记由店主在前端用钱包完成，部署脚本**不持私钥、不自动登记**。
+# 换节点/换批时三项同批改；一行安装也可以用 --escrow / --staking / --start-block 直接传，
+# 不必先改文件（install.sh 会原样透传给 deploy.sh）。
 #
-# contracts 四项留空 / startBlock=0 = 未部署：下面的形状门禁会当场拒绝，而不是静默接错。
+# contracts 三项留空 / startBlock=0 = 未部署：安装/升级时的形状门禁会当场拒绝，而不是静默接错。
 # 取源码用（只在"宿主机没有源码也没有 git"时启用；见 ② 取代码）
 SRC_REPO='https://github.com/delnull/marketplace-node.git'
 SRC_TARBALL='https://codeload.github.com/delnull/marketplace-node/tar.gz/refs/heads/main'
@@ -88,97 +99,154 @@ KEEP_SECRET=''
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IN_REPO=0; [ -f "$HERE/package.json" ] && [ -f "$HERE/src/server.js" ] && IN_REPO=1
 CONSTANTS_FILE="$HERE/deploy-constants.json"
-# 一行安装（curl | bash）时 BASH_SOURCE 是 /dev/fd/63，旁边没有 deploy-constants.json。
-# 先把当批常量取到临时文件；后面仍然走“下载完整源码 → 安装目录”的同一条路径。
-if [ ! -r "$CONSTANTS_FILE" ]; then
-  if [ "$IN_REPO" = 1 ]; then
-    : # 仓库里缺文件，交给下面的结构门禁报错
-  elif ! command -v curl >/dev/null 2>&1; then
-    printf '%s\n' '[deploy.sh] 缺少 curl：一行安装需要 curl 下载当批 deploy-constants.json' >&2
-    exit 1
-  else
-    CONSTANTS_TMP="$(mktemp "${TMPDIR:-/tmp}/marketplace-constants.XXXXXX")" || exit 1
-    if ! curl -fsSL --max-time 30 \
-      'https://raw.githubusercontent.com/delnull/marketplace-node/main/deploy-constants.json' \
-      -o "$CONSTANTS_TMP"; then
-      rm -f "$CONSTANTS_TMP"
-      printf '%s\n' '[deploy.sh] 下载 deploy-constants.json 失败（检查网络/代理）' >&2
-      exit 1
-    fi
-    CONSTANTS_FILE="$CONSTANTS_TMP"
-    trap 'rm -f "${CONSTANTS_TMP:-}"' EXIT
-  fi
-fi
-
-# ── 部署常量：**唯一真相**在 deploy-constants.json（与 Windows 原生路径 deploy.ps1 共用同一份）
-# 从这里取，不在脚本里各留一份。取不到就当场失败 —— 绝不退回某个内建默认值
-# （退回默认值正是"静默接了错合约"的形状）。
-[ -r "$CONSTANTS_FILE" ] || die "缺少 $CONSTANTS_FILE —— 部署常量（合约地址/RPC/端口）的唯一真相在那里；文件不在就无法保证接的是本批合约，拒绝继续"
-
-# 从固定结构的 JSON 里取标量（`"key": value`，value 是字符串/数字/布尔）。
-# 为什么自己做而不依赖 jq：宿主上不能假定有 jq（本脚本的定位是"只有 Docker 就行"）。
+# ── 部署常量 ────────────────────────────────────────────────────────────────
+# 唯一真相仍是 deploy-constants.json（与 Windows 原生路径 deploy.ps1 共用同一份）。
+# 一行安装（curl | bash）时 BASH_SOURCE 是 /dev/fd/63，旁边没有这个文件；
+# 这里只在 install/update 真正需要常量时下载，--help/--status/--health/--uninstall 不碰它。
+const_raw_from() {
+  local key="$1" file="$2"
+  [ -r "$file" ] || { printf '%s' ''; return 0; }
+  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$file" | head -1 | sed 's/[[:space:]]*$//'
+}
+const_raw() { const_raw_from "$1" "$CONSTANTS_FILE"; }
 const() {
-  local key="$1" val
-  val="$(sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$CONSTANTS_FILE" | head -1 | sed 's/[[:space:]]*$//')"
-  [ -n "$val" ] || die "deploy-constants.json 里取不到 $key —— 文件结构变了？脚本拒绝用一个猜出来的值继续"
+  local val
+  val="$(const_raw "$1")"
+  [ -n "$val" ] || die "deploy-constants.json 里取不到 $1 —— 文件结构变了？脚本拒绝用一个猜出来的值继续"
   printf '%s' "$val"
 }
-# 取**数值**型常量：多一道 expr 校验，因为下面要把它裸着写进 .env 的 here-doc
+# 取**数值**型常量：多一道字符集校验，因为下面要把它裸着写进 .env 的 here-doc
 # （here-doc 里裸写的值会被当算术表达式展开，塞进非数字就是一个"看起来成功、写进去却是 0/空"的坑）。
-# expr 不认就当场退出，问题止在取值这一步。
 constN() {
-  local key="$1" val
-  val="$(const "$key")"
+  local val
+  val="$(const "$1")"
   # 不要用 `expr "$val" + 0` 判数字：`expr 0 + 0` 的输出是 0，但退出码是 1，
   # 于是合法的 0（例如 MK_CORS_ALLOW_ALL=0）会被当成“不是数字”。这里按字符集判。
-  case "$val" in ''|*[!0-9]*) die "deploy-constants.json 的 $key 不是数字：'$val'（脚本不猜）" ;; esac
+  case "$val" in ''|*[!0-9]*) die "deploy-constants.json 的 $1 不是数字：'$val'（脚本不猜）" ;; esac
   printf '%s' "$val"
 }
-FRONTEND="$(const frontendOrigin)"
-RPC_URL="$(const rpcUrl)"
-CHAIN_ID="$(const chainId)"
-ESCROW="$(const escrow)"
-STAKING="$(const staking)"
-START_BLOCK="$(const startBlock)"
-CONTAINER_PORT="$(const containerPort)"
-# 容器停机宽限期（秒）⇒ `docker run --stop-timeout`。它必须**大于** .env 里的
-# MK_SHUTDOWN_DRAIN_MS（节点自己等在途请求的上限）：相等或更短时，宽限期一到 SIGKILL 就把
-# 优雅关闭截断，而节点已经打了"已关闭"那一行（看起来一切正常）。这条不等式由
-# test/deploy-plan.test.js 对 deploy-constants.json 守着，脚本不重复判。
-STOP_GRACE="$(constN stopGraceSeconds)"
-CADDY_IMAGE='caddy:2-alpine'
 
-# ── 构建期硬门禁：共享合约地址必须是**本批**的（fail-closed，不静默） ───────────────
+# ── 安装/升级期的硬门禁：本节点 Escrow/Staking/起始块必须是**本批**的（fail-closed）──
 # 为什么是一条门禁而不是靠注释提醒（2026-10-14）：这些值决定"买家把钱锁到哪个合约、
 # 节点按哪份名单过滤"，而错了之后的表现是**静默的**——节点照常启动、商品照常展示，
-# 只有买家付款路径指向别处（或名单过滤整体不生效、界面上什么都不挡）。
-# 历史已经踩过一次：那批链上字节码与仓库代码不一致（缺 sellerOpenExposure 等读法），
+# 只有买家付款路径指向别处。历史已经踩过一次：那批链上字节码与仓库代码不一致，
 # 后果是店主提不出质押而 `/healthz` 一切正常。"常量填错"必须当场停下。
 # 判据只做**结构性**校验（地址形状 + 起始块非 0）：「是不是上一批已弃用的那个合法地址」
 # 脚本无法判断，只能由部署者按发布检查表逐项核对。
-if ! printf '%s' "$ESCROW" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
-   || ! printf '%s' "$STAKING" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
-   || ! printf '%s' "$START_BLOCK" | grep -Eq '^[0-9]+$' \
-   || [ "$START_BLOCK" = '0' ]; then
+require_contract_constants() {
+  if printf '%s' "$ESCROW" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+     && printf '%s' "$STAKING" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+     && printf '%s' "$START_BLOCK" | grep -Eq '^[0-9]+$' \
+     && [ "$START_BLOCK" != '0' ]; then
+    return 0
+  fi
   cat >&2 <<EOF
-[deploy.sh] 拒绝执行：deploy-constants.json 里的合约常量不合法。
+[deploy.sh] 拒绝执行：没有可用的本节点合约常量。
 
   取到的值：escrow=$ESCROW  staking=$STAKING  startBlock=$START_BLOCK
 
-  本脚本把这些值编进镜像（店主不需要、也不该自己填），它们必须由部署方按当批部署结果填：
-    1) 节点合约：contracts/script/DeployNode.s.sol（Escrow + Staking + 委员会 + NodeGovernance）
-    2) 把 DeployNode 输出的 Escrow / Staking / 起始扫描块填进 deploy-constants.json 的 contracts
-       （**不要改脚本**：Windows 原生路径 deploy.ps1 读的是同一份文件）
-    3) 起始块不能是 0（0 = 从最新块开始 ⇒ 漏扫历史事件且不报错）
-    4) Escrow 与 Staking 必须由同一节点部署、互相回指、owner 都是该节点 operator
+  这三项会被写进 <安装目录>/.env（docker --env-file 注入容器）与安装目录的
+  deploy-constants.json，不是编进镜像。它们必须与**本节点**部署的合约一致，两种给法任选其一：
+    1) 写进 deploy-constants.json 的 contracts 三项
+       （Windows 原生路径 deploy.ps1 只读这份文件，不接受下面三个参数）
+    2) 直接传给本脚本（一行安装 install.sh 会原样透传）：
+       --escrow 0x...  --staking 0x...  --start-block <块高>
+       命令行给的值会写回安装目录的 deploy-constants.json，之后 --update 不必重复带。
+  约束：
+    · 先部署本节点合约：contracts/script/DeployNode.s.sol（Escrow + Staking + 委员会 + NodeGovernance）
+    · 起始块不能是 0（0 = 从最新块开始 ⇒ 漏扫历史事件且不报错）
+    · Escrow 与 Staking 必须由同一节点部署、互相回指、owner 都是该节点 operator
 EOF
   exit 1
-fi
+}
+
+# 只在 install/update 路径调用（**刷新代码之前**）。共享值来自本次代码；
+# 三项按 CLI > 安装目录里现有值 > 本次代码包里的值（首次安装，或店主直接改了代码包）。
+# 最终三项只经过 require_contract_constants 这一道判据，不在别处各判一次。
+load_deploy_constants() {
+  if [ ! -r "$CONSTANTS_FILE" ]; then
+    if [ "$IN_REPO" = 1 ]; then
+      : # 仓库里缺文件，交给下面的结构门禁报错
+    elif ! command -v curl >/dev/null 2>&1; then
+      die "缺少 curl：一行安装需要 curl 下载当批 deploy-constants.json"
+    else
+      CONSTANTS_TMP="$(mktemp "${TMPDIR:-/tmp}/marketplace-constants.XXXXXX")" || die "无法创建临时文件"
+      if ! curl -fsSL --max-time 30 \
+        'https://raw.githubusercontent.com/delnull/marketplace-node/main/deploy-constants.json' \
+        -o "$CONSTANTS_TMP"; then
+        rm -f "$CONSTANTS_TMP"
+        die "下载 deploy-constants.json 失败（检查网络/代理）"
+      fi
+      CONSTANTS_FILE="$CONSTANTS_TMP"
+      trap 'rm -f "${CONSTANTS_TMP:-}"' EXIT
+    fi
+  fi
+  [ -r "$CONSTANTS_FILE" ] || die "缺少 $CONSTANTS_FILE —— 部署常量（合约地址/RPC/端口）的唯一真相在那里；文件不在就无法保证接的是本批合约，拒绝继续"
+
+  FRONTEND="$(const frontendOrigin)"
+  RPC_URL="$(const rpcUrl)"
+  CHAIN_ID="$(const chainId)"
+  # 共享常量（RPC/链 ID/前端/运行参数）来自**本次要部署的代码**。
+  # 三项本节点合约属于安装状态：命令行显式值 > 安装目录里现有的 deploy-constants.json
+  # > 本次代码包里的值（首次安装；或店主直接在代码包里改过）。
+  local install_file="$DIR/deploy-constants.json" node_file
+  if [ -r "$install_file" ]; then node_file="$install_file"; else node_file="$CONSTANTS_FILE"; fi
+  ESCROW="${ESCROW_ARG:-$(const_raw_from escrow "$node_file")}"
+  STAKING="${STAKING_ARG:-$(const_raw_from staking "$node_file")}"
+  START_BLOCK="${START_BLOCK_ARG:-$(const_raw_from startBlock "$node_file")}"
+  CONTAINER_PORT="$(const containerPort)"
+  # 容器停机宽限期（秒）⇒ `docker run --stop-timeout`。它必须**大于** .env 里的
+  # MK_SHUTDOWN_DRAIN_MS（节点自己等在途请求的上限）：相等或更短时，宽限期一到 SIGKILL 就把
+  # 优雅关闭截断，而节点已经打了"已关闭"那一行（看起来一切正常）。这条不等式由
+  # test/deploy-plan.test.js 对 deploy-constants.json 守着，脚本不重复判。
+  STOP_GRACE="$(constN stopGraceSeconds)"
+  require_contract_constants
+}
+
+# 把本次解析出的三项写回**安装目录**的 deploy-constants.json。
+# 为什么必须写回：一行安装可以用 --escrow/--staking/--start-block 传值；不落盘的话，
+# 下一次 --update（没带参数）会读到代码包里的空模板并被门禁拒绝。写回后，
+# 安装目录里的这一份就是后续升级的唯一真相；代码包里的共享默认值（RPC/链 ID/appDefaults）
+# 仍然以本次部署的代码为准（见 load_deploy_constants 的读取顺序）。
+persist_contract_constants() {
+  local file="$DIR/deploy-constants.json" tmp
+  if [ ! -f "$file" ]; then
+    [ -f "$CONSTANTS_FILE" ] || die "缺少 $CONSTANTS_FILE：无法在安装目录生成 deploy-constants.json"
+    cp -a "$CONSTANTS_FILE" "$file" || die "无法把 deploy-constants.json 放进 $DIR"
+  fi
+  if [ "$(const_raw_from escrow "$file")" = "$ESCROW" ] \
+     && [ "$(const_raw_from staking "$file")" = "$STAKING" ] \
+     && [ "$(const_raw_from startBlock "$file")" = "$START_BLOCK" ]; then
+    return 0
+  fi
+  tmp="$(mktemp "${TMPDIR:-/tmp}/marketplace-constants.XXXXXX")" || die "无法创建临时文件"
+  if ! sed \
+      -e "s/\(\"escrow\"[[:space:]]*:[[:space:]]*\)\"[^\"]*\"/\1\"$ESCROW\"/" \
+      -e "s/\(\"staking\"[[:space:]]*:[[:space:]]*\)\"[^\"]*\"/\1\"$STAKING\"/" \
+      -e "s/\(\"startBlock\"[[:space:]]*:[[:space:]]*\)[0-9][0-9]*/\1$START_BLOCK/" \
+      "$file" > "$tmp"; then
+    rm -f "$tmp"
+    die "写回 $file 失败（sed）"
+  fi
+  if ! cat "$tmp" > "$file"; then
+    rm -f "$tmp"
+    die "写回 $file 失败（写入）"
+  fi
+  rm -f "$tmp"
+  [ "$(const_raw_from escrow "$file")" = "$ESCROW" ] \
+    && [ "$(const_raw_from staking "$file")" = "$STAKING" ] \
+    && [ "$(const_raw_from startBlock "$file")" = "$START_BLOCK" ] \
+    || die "写回 $file 后核对不一致（escrow/staking/startBlock）"
+}
+
+CADDY_IMAGE='caddy:2-alpine'
 
 MODE=install
 DRY_RUN=0; ASSUME_YES=0; FORCE=0; NO_DOMAIN=0; PULL=0
 OWNER=''; DOMAIN=''; EMAIL=''; PORT=''; DIR=''; SERVICE=''; VOLUME=''; IMAGE=''
 TLS_MODE=''; TLS_MODE_GIVEN=0; BIND=''; BIND_GIVEN=0; DIR_GIVEN=0
+# 本节点合约三项：命令行显式值优先于 deploy-constants.json，供一行安装把值带进来。
+ESCROW_ARG=''; STAKING_ARG=''; START_BLOCK_ARG=''
 # MySQL：默认交互询问；--db-mode 供非交互/自动化显式选择。
 # external = 用户已有的 MySQL；container = 本脚本部署一个仅节点可达的 MySQL 容器。
 DB_MODE=''; DB_MODE_GIVEN=0
@@ -195,6 +263,9 @@ while [ $# -gt 0 ]; do
     --service) SERVICE="${2:-}"; shift 2 ;;
     --volume) VOLUME="${2:-}"; shift 2 ;;
     --image) IMAGE="${2:-}"; shift 2 ;;
+    --escrow) ESCROW_ARG="${2:-}"; shift 2 ;;
+    --staking) STAKING_ARG="${2:-}"; shift 2 ;;
+    --start-block) START_BLOCK_ARG="${2:-}"; shift 2 ;;
     --tls-mode) TLS_MODE="${2:-}"; TLS_MODE_GIVEN=1; shift 2 ;;
     --no-tls) TLS_MODE=none; TLS_MODE_GIVEN=1; shift ;;
     # 发布到哪个宿主地址：默认跟着 TLS 方式走（配了 TLS 就只绑本机，让本机反代访问；
@@ -222,14 +293,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# ── 输出 ──
-c_ok=$'\033[32m'; c_warn=$'\033[33m'; c_err=$'\033[31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
-log()  { printf '%s\n' "$*"; }
-info() { printf '%s\n' "$*"; }
-ok()   { printf '%s✓%s %s\n' "$c_ok" "$c_off" "$*"; }
-warn() { printf '%s!%s %s\n' "$c_warn" "$c_off" "$*" >&2; }
-die()  { printf '%s✗ %s%s\n' "$c_err" "$*" "$c_off" >&2; exit 1; }
-step() { printf '\n%s── %s ──%s\n' "$c_dim" "$*" "$c_off"; }
+# --help 只打印文件头那段注释（不能写死行号：上一版按 '2,57p' 取行，头部一改就把下面的
+# 代码行也当帮助打出来了 —— 用"遇到第一行非注释就停"的规则，头部怎么改都不会漏出代码）。
+# 放在读常量与平台探测之前：全新 checkout 上也能先看用法。
+if [ "$MODE" = help ]; then
+  awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+  exit 0
+fi
+
 # 交互提问。stdin 不是终端时**绝不空等**：有默认值就用默认值，没有就直接报错并给出对应参数。
 # （踩过的坑：ssh 里不带 -t 跑、或 curl | bash 时，read 会永久阻塞，表现为"脚本卡住不动"，
 #   现场完全看不出是卡在提问上 —— 没人盯着终端时这不叫交互，叫挂死。）
@@ -299,12 +370,6 @@ else
 fi
 host_probe
 
-# --help 只打印文件头那段注释（不能写死行号：上一版按 '2,57p' 取行，头部一改就把下面的
-# 代码行也当帮助打出来了 —— 用"遇到第一行非注释就停"的规则，头部怎么改都不会漏出代码）
-if [ "$MODE" = help ]; then
-  awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
-  exit 0
-fi
 case "$MODE" in status|health|update|uninstall|purge) ;; *) MODE=install ;; esac
 
 # ── 目录/名字/端口的默认值 ──
@@ -327,6 +392,9 @@ if [ -f "$STATE_FILE" ]; then
   [ -n "${STATE_SERVICE:-}" ] && [ -z "$SERVICE" ] && SERVICE="$STATE_SERVICE"
   [ -n "${STATE_PORT:-}" ] && [ -z "$PORT" ] && PORT="$STATE_PORT"
   [ -n "${STATE_VOLUME:-}" ] && [ -z "$VOLUME" ] && VOLUME="$STATE_VOLUME"
+  # 镜像名也是安装状态：带 --image 装过一次后，--update 不能悄悄退回 marketplace-node:latest
+  # （同机第二个节点会用同一个 tag，先更新谁谁生效）。
+  [ -n "${STATE_IMAGE:-}" ] && [ -z "$IMAGE" ] && IMAGE="$STATE_IMAGE"
   [ -n "${STATE_TLS:-}" ] && [ -z "$TLS_MODE" ] && TLS_MODE="$STATE_TLS"
   # 邮箱没有对应的 .env 键（证书在 Caddy/宿主 nginx 那一侧），只能记在状态文件里：
   # 不记的话 --update --yes 每次都会把 Caddyfile 的 email 写成占位地址。
@@ -656,6 +724,10 @@ ensure_mysql_container() {
 
 
 if [ "$MODE" != status ] && [ "$MODE" != health ] && [ "$MODE" != uninstall ] && [ "$MODE" != purge ]; then
+  # 合约常量在**刷新代码之前**解析：安装目录里那份是节点身份，新代码包里的空模板不能覆盖它；
+  # 读不到/不合法在动任何代码之前就拒绝。
+  # --help/--status/--health/--uninstall/--purge 在读常量之前就已经返回。
+  load_deploy_constants
   ensure_docker
   check_legacy_host_install
 fi
@@ -670,6 +742,11 @@ if [ "$MODE" = status ] || [ "$MODE" = health ]; then
   # 想看容器/卷/配置/最近日志的细节请用 --status —— 两者用途不同，别混成一段输出。
   if [ "$MODE" = health ]; then
     STATE="$(dk inspect -f '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}无healthcheck{{end}}' "$CONTAINER" 2>/dev/null || echo '容器不存在')"
+    # 容器不存在/没在跑时，端口 $PORT 上可能是**别的**服务；此时探活会给出假阳性。
+    case "$STATE" in
+      running/*) ;;
+      *) warn "不健康：容器 $STATE（预期的 $CONTAINER 不在运行）；未探活"; exit 2 ;;
+    esac
     BODY="$(curl -s -m 8 "http://127.0.0.1:$PORT/healthz" || true)"
     if printf '%s' "$BODY" | grep -q '"code":0'; then
       ok "健康：容器 $STATE；探活 $(printf '%s' "$BODY" | grep -o '"code":[0-9]*' | head -1)；$(printf '%s' "$BODY" | grep -o '"cursor":[0-9]*' | head -1) $(printf '%s' "$BODY" | grep -o '"lagBlocks":[0-9]*' | head -1)"
@@ -695,12 +772,19 @@ if [ "$MODE" = status ] || [ "$MODE" = health ]; then
   else
     warn "配置不存在：$ENV_FILE"
   fi
+  RUNNING=0
   if dk ps --filter "name=^${CONTAINER}\$" --format '{{.Names}}' | grep -q .; then
+    RUNNING=1
     info "健康状态：$(dk inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}（无 healthcheck）{{end}}' "$CONTAINER" 2>/dev/null)"
     info "最近日志："
     dk logs --tail 20 "$CONTAINER" 2>&1 | sed 's/^/    /' || true
   fi
   step "探活"
+  if [ "$RUNNING" != 1 ]; then
+    # 容器没在跑时不要探端口：那个端口上可能是同机另一个服务，会给出"健康"的假阳性。
+    warn "容器 $CONTAINER 不在运行：跳过探活（端口 $PORT 上可能是别的服务）"
+    exit 2
+  fi
   BODY="$(curl -s -m 8 "http://127.0.0.1:$PORT/healthz" || true)"
   if [ -n "$BODY" ]; then ok "探活：$BODY"; else warn "探活失败：http://127.0.0.1:$PORT/healthz（容器没起？端口没发布？）"; exit 2; fi
   exit 0
@@ -833,6 +917,8 @@ fi
 # "这不是一份节点代码"，把"先看计划再决定"这个用法直接抹掉了。
 if [ "$DRY_RUN" != 1 ]; then
   [ -f "$DIR/Dockerfile" ] || die "$DIR 里没有 Dockerfile —— 这不是一份节点代码（用 --dir 指到正确目录）"
+  # 代码就位后，把本次解析出的三项写回安装目录；之后 --update / 重跑安装都不必重复带参数。
+  persist_contract_constants
 fi
 
 # =============================================================================
@@ -938,7 +1024,7 @@ info "店主地址：$OWNER"
 info "对外域名：${ENDPOINT:-（未指定，节点不会被买家发现）}"
 info "HTTPS   ：$TLS_MODE"
 info "链上登记：稍后到 $FRONTEND 的「开店/登记我的节点」用钱包完成（部署脚本不持私钥）"
-info "合约：Escrow=$ESCROW  Staking=$STAKING（已内置）"
+info "合约：Escrow=$ESCROW  Staking=$STAKING（本次部署）"
 # 域名给了但本机不申请证书时，在这里把"这不等于不能上 https"说清楚（拓扑 A 的定位说明）
 if [ -n "$ENDPOINT" ] && [ "$TLS_MODE" = none ]; then
   info "证书    ：本机不申请（TLS 在哪终止、证书就在哪申请 —— 见上面第 ⑧ 步）"

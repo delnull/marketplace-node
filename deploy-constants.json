@@ -8,7 +8,7 @@
     "appDefaults 是两条路径都必须写进 .env 的运行参数；runtime.stopGraceSeconds 必须大于 MK_SHUTDOWN_DRAIN_MS。"
   ],
   "network": {
-    "rpcUrl": "https://mainnet.bityuan.com/eth",
+    "rpcUrl": "https://node1.bityuan.com/eth",
     "chainId": 2999,
     "frontendOrigin": "https://fedmall.bityuan.com"
   },

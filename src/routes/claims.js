@@ -65,9 +65,26 @@ router.get('/nft/mine', requireAuth, wrap(async (req, res) => {
   ok(res, { claims: rows.map((r) => claimDto(r, { as: 'holder' })) });
 }));
 
-/** 我作为卖家（本节点）的提货行（需登录；所有状态，新的在前） */
+/**
+ * 我作为卖家/本店店员（本节点）的提货行（需登录；所有状态，新的在前）。
+ *
+ * 列表的授权面必须与 `POST /nft/:id/seller` 完全一致：动作允许该行的 seller **或本店店员**，
+ * 而旧列表只按 `seller = ?` 过滤——店员能处理却看不到，只能靠猜 claim id。
+ * 这里用 `shop_operators` 找出当前地址任店员的本店编号，再取这些店的提货行。
+ */
 router.get('/nft/seller', requireAuth, wrap(async (req, res) => {
-  const rows = await getDb().all('SELECT * FROM nft_claims WHERE seller = ? ORDER BY id DESC LIMIT 200', req.auth.address);
+  const address = req.auth.address;
+  const staffShops = (
+    await getDb().all('SELECT shop_code FROM shop_operators WHERE address = ?', address)
+  ).map((r) => String(r.shop_code));
+  const rows = staffShops.length
+    ? await getDb().all(
+        `SELECT * FROM nft_claims WHERE seller = ? OR shop_code IN (${staffShops.map(() => '?').join(',')})
+         ORDER BY id DESC LIMIT 200`,
+        address,
+        ...staffShops
+      )
+    : await getDb().all('SELECT * FROM nft_claims WHERE seller = ? ORDER BY id DESC LIMIT 200', address);
   ok(res, { claims: rows.map((r) => claimDto(r, { as: 'seller' })) });
 }));
 

@@ -221,7 +221,7 @@ const config = {
   },
 
   chain: {
-    rpcUrl: process.env.MK_RPC_URL || 'https://mainnet.bityuan.com/eth',
+    rpcUrl: process.env.MK_RPC_URL || 'https://node1.bityuan.com/eth',
     chainId: intEnv('MK_CHAIN_ID', 2999),
     // 托管/注册合约地址：代码不写死任何默认地址，由部署方经 .env 注入
     // （本节点只读自己的 Escrow/Staking；不读 Registry，目录登记由 operator 钱包在客户端完成）；

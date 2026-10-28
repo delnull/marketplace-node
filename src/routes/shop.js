@@ -225,11 +225,11 @@ router.get('/', optionalShop, wrap(async (req, res) => {
   const node = await nodeRow();
   const owner = nodeOwnerOf(node);
   /*
-    匿名视角把"暂停接单"按**不存在**处理（与旧行为一致）：请求头指到的那家店不返回 `shop` 对象。
-    这与聚合统计的 409（见 listedShopScope）是两件事——这里只是少给一块信息，
-    不会把别家/全节点的数字冒充成这一家的。
+    带 X-Mk-Shop 时即使这家店暂停接单也返回它的身份（`listed:false`）：
+    店铺页要能显示“暂停接单”而不是 404；商品/聚合端点仍由 listedShopScope 拒绝。
+    不带请求头时 req.shop 为 null，不会泄露任何店。
   */
-  const shop = req.shopNotSellable ? null : req.shop;
+  const shop = req.shop;
   const listed = await listListedShopRows();
   ok(res, {
     /* 节点 operator：链上 Registry 登记的主体，也是 Escrow/Staking 的 owner；唯一的字段名。 */

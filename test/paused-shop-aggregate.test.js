@@ -40,7 +40,7 @@ test('挂起店铺的聚合端点被拒（409 + 唯一拒因）；无头仍可�
   const beforePause = await request(app).get('/api/shop/reputation').expect(200);
   assertOk(beforePause);
 
-  await db.run('UPDATE shops SET listed = 0 WHERE code = ?', shopRef.value);
+  await db.run("UPDATE shops SET listed = 0, listed_reason = '测试暂停' WHERE code = ?", shopRef.value);
 
   for (const path of ['/api/shop/reputation', '/api/shop/reviews/stats', '/api/shop/claims']) {
     const res = await request(app).get(path).set('X-Mk-Shop', shopRef.value);
@@ -68,10 +68,12 @@ test('挂起店铺的聚合端点被拒（409 + 唯一拒因）；无头仍可�
   assert.match(String(detail.body.message), /暂停接单/);
 
   /*
-    匿名 `/api/shop` 仍把暂停店按不存在处理（不返回 shop 对象），与旧口径一致；
-    它不会把别家的数字冒充成这一家的（这里只有节点级信息与在售店铺列表）。
+    `/api/shop` 带 X-Mk-Shop 时返回暂停店的身份（`listed:false`），但不返回它的商品：
+    店铺页要能显示“暂停接单”，商品面仍由 listedShopScope/409 拒绝。
   */
   const shopInfo = await request(app).get('/api/shop').set('X-Mk-Shop', shopRef.value).expect(200);
   assertOk(shopInfo);
-  assert.equal(shopInfo.body.data.shop, undefined, '暂停店在匿名视角下按不存在处理');
+  assert.equal(shopInfo.body.data.shop.code, shopRef.value);
+  assert.equal(shopInfo.body.data.shop.listed, false);
+  assert.match(String(shopInfo.body.data.shop.listedReason), /测试暂停/);
 });

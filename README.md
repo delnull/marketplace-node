@@ -13,19 +13,15 @@
 
 ## 节点合约（首次部署必须先做）
 
-每个节点自己部署 `TokenPayoutVault`、`Escrow`、`Staking`、`NodeGovernance`；公开仓里的
-`contracts/` 是源码与 Foundry 脚本，节点启动前先从这一份部署：
+每个节点自己部署 `TokenPayoutVault`、`Escrow`、`Staking`、`NodeGovernance`；目录合约
+`MarketplaceRegistry` 由平台部署，节点部署完成后用自己的钱包登记。`contracts/` 与 Foundry
+脚本随本仓发布。
 
-```bash
-cd contracts
-export DEPLOYER_PRIVATE_KEY=0x...       # 节点 operator，也是 E/S 的 owner
-export ARBITERS=0x...,0x...,0x...      # 至少 3 人，阈值小于人数
-export ARBITER_THRESHOLD=2
-forge script script/DeployNode.s.sol:DeployNodeScript --rpc-url <rpc> --broadcast
-```
+完整步骤、参数、`startBlock` 取法与启动自检见 [docs/DEPLOY_CONTRACTS.md](docs/DEPLOY_CONTRACTS.md)。
 
-把输出的 Escrow、Staking 与最早部署块填进 `deploy-constants.json` 的 `contracts` 三项，再启动节点。
-`deploy-constants.json` 里留空/`startBlock=0` 会被部署脚本当场拒绝，不会静默接错合约。
+`deploy-constants.json` 的 `contracts` 三项（Escrow / Staking / startBlock）默认留空；部署完填
+**本节点**的结果，或用 `--escrow` / `--staking` / `--start-block` 传给安装脚本。留空或
+`startBlock=0` 会被部署脚本当场拒绝，不会静默接错合约。
 
 > 合约源码与 `frontend/` 无关；前端不随节点仓发布。合约地址与 Registry 登记由节点方自己完成。
 
@@ -33,11 +29,14 @@ forge script script/DeployNode.s.sol:DeployNodeScript --rpc-url <rpc> --broadcas
 
 ## 一行部署
 
+首次安装必须把本节点合约的三项带进来（先做上一节的合约部署）：
+
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/install.sh) \
+  --escrow 0x你的Escrow --staking 0x你的Staking --start-block <Escrow 的部署块高>
 ```
 
-脚本会自己取代码、构建镜像、建数据卷、启动容器并探活。首次会先检查本机环境：
+其它参数（`--owner`、`--domain`、`--db-mode` 等）可以直接接在后面。脚本会自己取代码、构建镜像、建数据卷、启动容器并探活。首次会先检查本机环境：
 
 - 已有同名 MySQL 容器/数据卷：直接复用，不重新安装；
 - 本机已有 MySQL 服务：询问是否使用它；选“是”只填连接，不会另装；
@@ -51,7 +50,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/mai
    - 有：输入地址（`host` 或 `host:port`）、库名、用户名、密码；
    - 没有：脚本自动创建 `mysql:8.4` 容器、命名数据卷和独立网络。
 
-不需要先 clone，也不需要执行 `./deploy`。想改代码或离线审阅时才用：
+不需要先 clone；但首次安装必须给上面三项（或先 clone 再改 `deploy-constants.json`）。想改代码或离线审阅时才用：
 
 ```bash
 git clone https://github.com/delnull/marketplace-node.git && cd marketplace-node && bash deploy.sh
@@ -63,6 +62,7 @@ git clone https://github.com/delnull/marketplace-node.git && cd marketplace-node
 
 ```bash
 MK_DB_PASSWORD='你的密码' bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/install.sh) \
+  --escrow 0x你的Escrow --staking 0x你的Staking --start-block <Escrow 的部署块高> \
   --owner 0x你的节点主钱包 --domain shop.example.com --email you@example.com \
   --db-mode external --db-host db.example.com --db-port 3306 \
   --db-name marketplace_node --db-user marketplace_node --yes
@@ -72,6 +72,7 @@ MK_DB_PASSWORD='你的密码' bash <(curl -fsSL https://raw.githubusercontent.co
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/install.sh) \
+  --escrow 0x你的Escrow --staking 0x你的Staking --start-block <Escrow 的部署块高> \
   --owner 0x你的节点主钱包 --domain shop.example.com --email you@example.com \
   --db-mode container --yes
 ```
@@ -128,4 +129,4 @@ docker logs -f marketplace-node
 - `.env` 含令牌密钥和数据库密码，权限保持 0600，不要提交到仓库。
 - 生产环境把 `MK_CORS_ORIGIN` 收窄到实际前端域名。
 - 对外只暴露 HTTPS；MySQL 不应对公网开放。
-- 根目录的 `deploy-constants.json` 只记**本节点**的 Escrow / Staking / startBlock 三项；换批时三项同批更新，不要手改单个地址。部署前必须是真实地址，空值或 `startBlock=0` 会被脚本拒绝。
+- 根目录的 `deploy-constants.json` 只记**本节点**的 Escrow / Staking / startBlock 三项；换批时三项同批更新，不要手改单个地址。部署前必须拿到真实地址：写进这个文件，或用 `--escrow` / `--staking` / `--start-block` 传；两者都没有（或 `startBlock=0`）时脚本拒绝。

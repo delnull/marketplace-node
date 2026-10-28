@@ -152,7 +152,7 @@ if (config.chain.escrowAddress) {
       `  拒绝退款后的释放静置期、下单最小超时窗口、三个资金出口参数的可调与按单快照），\n` +
       `  节点照常跑起来只会把这些能力静默降级。\n` +
       `  处置：把 MK_ESCROW_ADDRESS / MK_ESCROW_START_BLOCK 两个值同批换成\n` +
-      `  当前这一批（见 docs/DEPLOY_NODE.md），然后**重建容器**（改 .env 后 docker restart 读不到）；\n` +
+      `  当前这一批（见 docs/DEPLOY_CONTRACTS.md），然后**重建容器**（改 .env 后 docker restart 读不到）；\n` +
       `  若确实要以只读方式接旧实例，设 MK_CONTRACT_GEN_ACK=1 显式声明。`;
     if (String(process.env.MK_CONTRACT_GEN_ACK || '') !== '1') {
       console.error(`[server] 托管合约代次自检未通过：\n  ${why}`);

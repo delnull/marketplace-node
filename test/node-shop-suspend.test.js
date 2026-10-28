@@ -43,8 +43,9 @@ test('暂停店铺：原因必填、公开面隐藏、店主仍可读设置；�
     false,
     '暂停店不能出现在公开目录'
   );
-  const publicDetail = await request(app).get(`/api/shops/${code}`);
-  assert.equal(publicDetail.status, 404, '暂停店的公开详情按不存在处理');
+  const publicDetail = await request(app).get(`/api/shops/${code}`).expect(200);
+  assert.equal(publicDetail.body.data.listed, false, '暂停店仍可读身份，但明确标为暂停');
+  assert.match(String(publicDetail.body.data.listedReason), /售假投诉成立/);
 
   const settings = await request(app)
     .get('/api/shop/settings')
