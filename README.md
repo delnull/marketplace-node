@@ -18,8 +18,8 @@
 脚本随本仓发布。
 
 完整步骤、参数、`startBlock` 取法与启动自检见 [docs/DEPLOY_CONTRACTS.md](docs/DEPLOY_CONTRACTS.md)；
-主网部署入口是 `node scripts/deploy-node-mainnet.cjs`：先 `--check`，再 `--broadcast`。四个合约在
-`10 gwei`、3 个委员下约 **0.133 BTY**，建议钱包准备 **0.5 BTY 以上**。
+主网部署入口是 `node scripts/deploy-node-mainnet.cjs`：先 `--check`，再 `--broadcast`。整个部署
+（四个合约 + 节点登记）建议钱包准备 **0.5 BTY 以上**；合约本身在 `10 gwei`、3 个委员下约 **0.133 BTY**。
 
 `deploy-constants.json` 的 `contracts` 三项（Escrow / Staking / startBlock）默认留空；部署完填
 **本节点**的结果，或用 `--escrow` / `--staking` / `--start-block` 传给安装脚本。留空或
