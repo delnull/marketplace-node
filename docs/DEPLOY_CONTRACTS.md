@@ -15,7 +15,7 @@
 
 - Foundry `1.8.1`：`forge --version` 和 `cast --version` 都应为 `1.8.1`。本手册按 1.8.1 验证；旧版可能缺少脚本用到的 `vm.split` / `vm.trim`；
 - BTY EVM 主网 RPC，chainId `2999`（`DeployNode` 硬性要求，其他链直接 revert）。优先用 `https://node1.bityuan.com/eth`，不可用时依次换 `https://node2.bityuan.com/eth`、`https://mainnet.bityuan.com/eth`。部署前用 `cast chain-id --rpc-url <rpc>` 确认返回 `2999`；
-- gas price 不用手工设：`DeployNode.s.sol` 没有写死，forge 广播时向 RPC 取当前费率。BTY 主网是 legacy 定价（区块没有 baseFee），当前三个 RPC 都返回 `10 gwei`；部署前用 `cast gas-price --rpc-url <rpc>` 核对。只有 RPC 报价明显异常时，才在部署命令上临时加 `--with-gas-price`（值取上面这条命令的输出）；不要把这个值写死进脚本或 `.env`；
+- gas price 不用手工设：`DeployNode.s.sol` 没有写死，forge 广播时向 RPC 取当前费率。当前三个 RPC 都返回 `10 gwei`；部署前用 `cast gas-price --rpc-url <rpc>` 核对。只有 RPC 报价明显异常时，才在部署命令上临时加 `--with-gas-price`（值取上面这条命令的输出）；不要把这个值写死进脚本或 `.env`；
 - operator 钱包，余额足够支付部署 gas；这个地址就是稍后的 `MK_SHOP_OWNER`；
 - 至少 3 个仲裁人地址，彼此独立；`ARBITER_THRESHOLD` 必须小于人数；
 - 原样使用本仓 `contracts/`。`foundry.toml` 固定了 solc 0.8.24 / optimizer runs 1 / evm_version paris；目录按 Escrow/Staking 运行时字节码哈希放行，改源码或编译参数会导致登记被拒。
@@ -46,7 +46,7 @@ forge script script/DeployNode.s.sol:DeployNodeScript \
   --broadcast
 ```
 
-`DeployNode.s.sol` 不设置 gas price；forge 默认按 RPC 的 `eth_gasPrice` 报价。部署前可以先看一眼：
+`DeployNode.s.sol` 不设置 gas price；forge 广播时会向 RPC 取当前费率。部署前可以先看一眼：
 
 ```bash
 cast gas-price --rpc-url "$RPC_URL"      # BTY 主网当前是 10 gwei
