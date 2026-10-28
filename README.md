@@ -17,7 +17,8 @@
 `MarketplaceRegistry` 由平台部署，节点部署完成后用自己的钱包登记。`contracts/` 与 Foundry
 脚本随本仓发布。
 
-完整步骤、参数、`startBlock` 取法与启动自检见 [docs/DEPLOY_CONTRACTS.md](docs/DEPLOY_CONTRACTS.md)。
+完整步骤、参数、`startBlock` 取法与启动自检见 [docs/DEPLOY_CONTRACTS.md](docs/DEPLOY_CONTRACTS.md)；
+主网部署入口是 `node scripts/deploy-node-mainnet.cjs`：先 `--check`，再 `--broadcast`。
 
 `deploy-constants.json` 的 `contracts` 三项（Escrow / Staking / startBlock）默认留空；部署完填
 **本节点**的结果，或用 `--escrow` / `--staking` / `--start-block` 传给安装脚本。留空或

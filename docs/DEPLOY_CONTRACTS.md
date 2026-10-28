@@ -13,10 +13,10 @@
 
 ## 前置
 
-- Foundry `1.8.1`：`forge --version` 和 `cast --version` 都应为 `1.8.1`；脚本需要 `vm.split` / `vm.trim`；
-- BTY EVM 主网 RPC，chainId `2999`（`DeployNode` 硬性要求，其他链直接 revert）。优先用 `https://node1.bityuan.com/eth`，不可用时依次换 `https://node2.bityuan.com/eth`、`https://mainnet.bityuan.com/eth`。部署前用 `cast chain-id --rpc-url <rpc>` 确认返回 `2999`；
-- gas price 不用手工设：`DeployNode.s.sol` 没有写死，forge 广播时向 RPC 取当前费率。当前三个 RPC 都返回 `10 gwei`；部署前用 `cast gas-price --rpc-url <rpc>` 核对。只有 RPC 报价明显异常时，才在部署命令上临时加 `--with-gas-price`（值取上面这条命令的输出）；不要把这个值写死进脚本或 `.env`；
-- operator 钱包，余额足够支付部署 gas；这个地址就是稍后的 `MK_SHOP_OWNER`；
+- Foundry `1.8.6`：`forge --version` 为 `1.8.6`，只用来编译 `contracts/`；主网部署不走 `forge script`；
+- BTY EVM 主网 RPC，chainId `2999`。优先用 `https://node1.bityuan.com/eth`，不可用时依次换 `https://node2.bityuan.com/eth`、`https://mainnet.bityuan.com/eth`。部署前用 `cast chain-id --rpc-url <rpc>` 确认返回 `2999`；
+- gas 由 `eth_gasPrice` 给出（当前 `10 gwei`）。BTY 主网按 **gasLimit** 扣费，未用完不退，所以脚本用实测 gasUsed + 10% 的固定上限，`eth_estimateGas` 只用来确认交易不会被拒绝；不要把 gasLimit 拍高；
+- operator 钱包，余额要覆盖脚本打印的 `gasCost`；这个地址就是稍后的 `MK_SHOP_OWNER`；
 - 至少 3 个仲裁人地址，彼此独立；`ARBITER_THRESHOLD` 必须小于人数；
 - 原样使用本仓 `contracts/`。`foundry.toml` 固定了 solc 0.8.24 / optimizer runs 1 / evm_version paris；目录按 Escrow/Staking 运行时字节码哈希放行，改源码或编译参数会导致登记被拒。
 
@@ -25,15 +25,17 @@
 ```bash
 cd contracts
 forge build
+cd ..
 ```
 
 ## 2. 部署
 
 ```bash
-export RPC_URL=https://node1.bityuan.com/eth
-cast chain-id --rpc-url "$RPC_URL"       # 必须输出 2999
+export MK_RPC_URL=https://node1.bityuan.com/eth
+cast chain-id --rpc-url "$MK_RPC_URL"    # 必须输出 2999
 
 export DEPLOYER_PRIVATE_KEY=0x...       # operator；会成为 Escrow/Staking/TokenPayoutVault 的 owner
+# 也可以不导私钥，改成：export MK_KEY_FILE=/path/to/key
 export ARBITERS=0x...,0x...,0x...       # 至少 3 个，不能重复
 export ARBITER_THRESHOLD=2              # 必须小于 ARBITERS 人数
 # 可选窗口，括号里是默认值（单位：块）
@@ -41,35 +43,37 @@ export REJECT_GRACE_BLOCKS=17280        # 拒绝退款后的释放静置期
 export MIN_TIMEOUT_BLOCKS=17280         # 下单允许的最小超时
 export AFTER_SALE_WINDOW_BLOCKS=3110400 # 确认收货后的售后窗口
 
-forge script script/DeployNode.s.sol:DeployNodeScript \
-  --rpc-url "$RPC_URL" \
-  --broadcast
+node scripts/deploy-node-mainnet.cjs --check
+node scripts/deploy-node-mainnet.cjs --broadcast
 ```
 
-`DeployNode.s.sol` 不设置 gas price；forge 广播时会向 RPC 取当前费率。部署前可以先看一眼：
+`--check` 只读：检查 RPC、余额、nonce、gas 预算，不广播。`--broadcast` 才部署并做链上复核。
 
-```bash
-cast gas-price --rpc-url "$RPC_URL"      # BTY 主网当前是 10 gwei
-```
+主网不用 `forge script`：BTY RPC 不接受 Forge 广播前使用的 EIP-1898 区块对象，会报
+`invalid argument 1: json: cannot unmarshal object into Go value of type string`；`contracts/script/DeployNode.s.sol`
+只用于本地 anvil。部署脚本用 ethers 发交易、原始 JSON-RPC 读链，顺序与 `DeployNode.s.sol` 一致：
+`TokenPayoutVault` → `Escrow` → `vault.setEscrow` → `Staking` → `escrow.setStaking` → `escrow.setArbiters`
+→ `NodeGovernance` → `escrow.setGovernor` / `staking.setGovernor`。
 
-只有 RPC 返回的报价明显异常时，才在部署命令上临时加 `--with-gas-price`，值取 `cast gas-price` 的输出；不要把这个值写死进脚本或 `.env`。
-
-脚本按固定顺序部署并接线：`TokenPayoutVault` → `Escrow` → `vault.setEscrow` → `Staking` → `escrow.setStaking` → `escrow.setArbiters` → `NodeGovernance` → `escrow.setGovernor` / `staking.setGovernor`。
+脚本自动取 `eth_gasPrice`；只有 RPC 报价异常时才临时设 `MK_GAS_PRICE`（wei）。
 
 ## 3. 记录输出
 
-从 forge 的输出里抄下：
+部署成功后脚本会打印一段 JSON：
 
-```text
-operator
-Escrow
-Staking
-TokenPayoutVault
-NodeGovernance
-escrowCodeHash
+```json
+{
+  "operator": "0x...",
+  "escrow": "0x...",
+  "staking": "0x...",
+  "tokenPayoutVault": "0x...",
+  "nodeGovernance": "0x...",
+  "escrowCodeHash": "0x...",
+  "startBlock": 12345678
+}
 ```
 
-`startBlock` 取 **Escrow 那笔 CREATE 交易所在的区块**（forge 输出里的 `Block:`；也可以 `cast receipt <Escrow 部署交易哈希> blockNumber --rpc-url <rpc>`）。不要用当前最新块，否则节点会漏扫部署后到启动前的事件。
+`startBlock` 是 Escrow 的部署块，脚本直接给出。不要用当前最新块，否则节点会漏扫部署后到启动前的事件。
 
 ## 4. 填进节点配置
 
