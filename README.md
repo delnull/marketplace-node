@@ -25,7 +25,7 @@
 
 > 合约源码与 `frontend/` 无关；前端不随节点仓发布。合约地址与 Registry 登记由节点方自己完成。
 
-> Windows 原生路径 `deploy.ps1` 仍使用已有 MySQL；自动 MySQL 容器只随 Linux/macOS 的 `deploy.sh`。
+> Windows 原生路径 `deploy.ps1` 使用已有 MySQL；自动 MySQL 容器只随 Linux/macOS 的 `deploy.sh`。
 
 ## 一行部署
 

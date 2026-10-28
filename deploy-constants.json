@@ -1,7 +1,7 @@
 {
   "_comment": [
     "部署期常量：**唯一真相**。deploy.sh（Linux/macOS，容器路径）与 deploy.ps1（Windows，原生路径）都从这里读。",
-    "新架构：平台 Registry 只是前端发现层；每个节点自己部署 Escrow + Staking。",
+    "平台 Registry 只是前端发现层；每个节点自己部署 Escrow + Staking。",
     "contracts 三项必须与**本节点**的 DeployNode.s.sol 输出一致：escrow / staking / startBlock。",
     "startBlock 取 Escrow/Staking 中最早的部署块；0 = 未部署，两条部署脚本都会拒绝。",
     "店铺、商品、订单、员工、对店铺的收费全部在节点自己的库里；平台不登记店铺、不收平台费。",

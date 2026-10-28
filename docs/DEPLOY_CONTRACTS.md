@@ -9,11 +9,11 @@
 | `Staking` | 卖家保证金、罚没、提货赔付 |
 | `NodeGovernance` | 节点主提议、委员会 2/3、2 天时间锁、快速解冻 |
 
-合约不可升级：再部署一次会得到一组新地址，旧合约里的托管和质押不会迁移。换合约前先把在途订单结清。
+合约不可升级：再部署会得到一组新地址；原合约里的托管和质押不会迁移，换合约前先把在途订单结清。
 
 ## 前置
 
-- Foundry `1.8.1`：`forge --version` 和 `cast --version` 都应为 `1.8.1`。本手册按 1.8.1 验证；旧版可能缺少脚本用到的 `vm.split` / `vm.trim`；
+- Foundry `1.8.1`：`forge --version` 和 `cast --version` 都应为 `1.8.1`；脚本需要 `vm.split` / `vm.trim`；
 - BTY EVM 主网 RPC，chainId `2999`（`DeployNode` 硬性要求，其他链直接 revert）。优先用 `https://node1.bityuan.com/eth`，不可用时依次换 `https://node2.bityuan.com/eth`、`https://mainnet.bityuan.com/eth`。部署前用 `cast chain-id --rpc-url <rpc>` 确认返回 `2999`；
 - gas price 不用手工设：`DeployNode.s.sol` 没有写死，forge 广播时向 RPC 取当前费率。当前三个 RPC 都返回 `10 gwei`；部署前用 `cast gas-price --rpc-url <rpc>` 核对。只有 RPC 报价明显异常时，才在部署命令上临时加 `--with-gas-price`（值取上面这条命令的输出）；不要把这个值写死进脚本或 `.env`；
 - operator 钱包，余额足够支付部署 gas；这个地址就是稍后的 `MK_SHOP_OWNER`；
@@ -100,7 +100,7 @@ bash deploy.sh --escrow 0x... --staking 0x... --start-block 12345678
 - `Escrow.owner()` 等于 `MK_SHOP_OWNER`；
 - `Escrow.staking()` 等于 `MK_STAKING_ADDRESS`，且 `Staking.owner()` 等于 `MK_SHOP_OWNER`；
 - RPC 的 chainId 等于 `MK_CHAIN_ID`；
-- Escrow 具有本版本代码要求的入口（旧代次实例会被拒绝）。
+- Escrow 必须包含本版本代码要求的入口。
 
 所以 `DEPLOYER_PRIVATE_KEY` 对应的地址必须和安装时填的节点主地址是同一个；改这个地址只能重新部署并重新登记。
 
@@ -123,7 +123,7 @@ cast call <Escrow> "governor()(address)" --rpc-url <rpc>
 - 两个合约的运行时字节码哈希都在目录白名单里；
 - 同一个 Escrow / Staking 没有被别的 operator 占用。
 
-登记报 `ImplementationNotApproved` 时，说明当前编译产物不是目录放行的那一代；换回本仓原样的 `contracts/` 和 `foundry.toml` 重新部署，不要改合约去绕过。
+目录只放行本仓这一版 `contracts/` 编译出的字节码；编译产物不一致时登记会报 `ImplementationNotApproved`，不要改合约去绕过。
 
 ## 7. 留档
 
