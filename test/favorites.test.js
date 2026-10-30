@@ -47,7 +47,16 @@ test('收藏：读公开；写必须登录', async () => {
 
   const read = await request(app).get(`/api/favorites?address=${buyer.address.toLowerCase()}`).expect(200);
   assertOk(read);
-  assert.deepEqual(read.body.data.products, [{ code: shopRef.value, slug: product.slug }]);
+  assert.deepEqual(read.body.data.products, [
+    {
+      code: shopRef.value,
+      slug: product.slug,
+      title: '收藏测试商品',
+      priceUsdt: '88',
+      media: [{ type: 'image', url: 'https://example.com/a.jpg' }],
+      active: true,
+    },
+  ]);
   assert.deepEqual(read.body.data.shops, []);
 });
 
@@ -56,8 +65,17 @@ test('收藏：店铺与商品分开；删除只删自己的那一类', async ()
 
   const read = await request(app).get(`/api/favorites?address=${buyer.address.toLowerCase()}`).expect(200);
   assertOk(read);
-  assert.deepEqual(read.body.data.shops, [shopRef.value]);
-  assert.deepEqual(read.body.data.products, [{ code: shopRef.value, slug: product.slug }]);
+  assert.deepEqual(read.body.data.shops, [{ code: shopRef.value, name: '', listed: true }]);
+  assert.deepEqual(read.body.data.products, [
+    {
+      code: shopRef.value,
+      slug: product.slug,
+      title: '收藏测试商品',
+      priceUsdt: '88',
+      media: [{ type: 'image', url: 'https://example.com/a.jpg' }],
+      active: true,
+    },
+  ]);
 
   await request(app)
     .delete('/api/favorites')
@@ -68,7 +86,7 @@ test('收藏：店铺与商品分开；删除只删自己的那一类', async ()
   const after = await request(app).get(`/api/favorites?address=${buyer.address.toLowerCase()}`).expect(200);
   assertOk(after);
   assert.deepEqual(after.body.data.products, []);
-  assert.deepEqual(after.body.data.shops, [shopRef.value]);
+  assert.deepEqual(after.body.data.shops, [{ code: shopRef.value, name: '', listed: true }]);
 
   await request(app)
     .delete('/api/favorites')
@@ -81,7 +99,7 @@ test('收藏：写入身份取令牌，不认 body 里的 address', async () => 
   await putFavorite({ kind: 'shop', code: shopRef.value, address: owner.address }).expect(200);
   const mine = await request(app).get(`/api/favorites?address=${buyer.address.toLowerCase()}`).expect(200);
   assertOk(mine);
-  assert.deepEqual(mine.body.data.shops, [shopRef.value]);
+  assert.deepEqual(mine.body.data.shops, [{ code: shopRef.value, name: '', listed: true }]);
   const spoofed = await request(app)
     .get(`/api/favorites?address=${owner.address.toLowerCase()}`)
     .expect(200);

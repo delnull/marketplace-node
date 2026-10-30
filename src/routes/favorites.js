@@ -2,6 +2,7 @@
  * 买家收藏（店铺 / 商品）—— **每节点各存一份**。
  *
  *  GET    /api/favorites?address=0x…   公开读：按地址返回本节点已收藏的店铺与商品
+ *                                     （商品带标题/价格/首图；页面不再逐店补列表）
  *  PUT    /api/favorites               登录写：{kind:'shop'|'product', code, slug?}
  *  DELETE /api/favorites               登录删：同上
  *
@@ -12,7 +13,8 @@ import { Router } from 'express';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
 import { verifyToken } from '../auth.js';
 import { getDb, withTransaction } from '../db.js';
-import { isShopCodeShape } from '../shops.js';
+import { isShopCodeShape, shopDisplayName } from '../shops.js';
+import { usdtOf } from '../money.js';
 
 const router = Router();
 const requireAuth = makeAuthMiddleware(verifyToken);
@@ -52,24 +54,55 @@ async function assertTarget({ kind, code, slug }) {
   return { ok: true };
 }
 
+function mediaOf(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw !== 'string' || raw === '') return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
 router.get('/', wrap(async (req, res) => {
   // 按钱包地址的偏好：即使接口公开，也不能进共享缓存。
   res.setHeader('Cache-Control', 'private, no-store');
   const address = normAddress(req.query.address);
   if (!address) return fail(res, 'address 需为 0x 开头的 40 位地址', 400, 400);
   const rows = await getDb().all(
-    `SELECT f.kind, f.shop_code, f.product_slug
+    `SELECT f.kind, f.shop_code, s.name AS shop_name, s.listed AS shop_listed,
+            p.slug AS product_slug, p.title, p.media, p.active, p.node_hidden,
+            (SELECT MIN(k.price_usdt_micro) FROM product_skus k WHERE k.product_id = p.id) AS min_price
        FROM buyer_favorites f
+       JOIN shops s ON s.code = f.shop_code
        LEFT JOIN products p ON p.shop_code = f.shop_code AND p.slug = f.product_slug
       WHERE f.buyer = ? AND (f.kind = 'shop' OR p.id IS NOT NULL)
       ORDER BY f.created_at ASC, f.shop_code ASC, f.product_slug ASC`,
     address
   );
   ok(res, {
-    shops: rows.filter((r) => r.kind === 'shop').map((r) => String(r.shop_code)),
+    shops: rows
+      .filter((r) => r.kind === 'shop')
+      .map((r) => ({
+        code: String(r.shop_code),
+        name: shopDisplayName({ name: r.shop_name }),
+        listed: Number(r.shop_listed) === 1,
+      })),
     products: rows
       .filter((r) => r.kind === 'product')
-      .map((r) => ({ code: String(r.shop_code), slug: String(r.product_slug) })),
+      .map((r) => ({
+        code: String(r.shop_code),
+        slug: String(r.product_slug),
+        title: String(r.title || ''),
+        priceUsdt: r.min_price == null ? null : usdtOf(r.min_price),
+        media: mediaOf(r.media),
+        // 收藏是买家自己的记录，商品/店铺下架后仍返回，只是标记为不可购买。
+        active:
+          Number(r.active) === 1 &&
+          Number(r.node_hidden) !== 1 &&
+          Number(r.shop_listed) === 1,
+      })),
   });
 }));
 
