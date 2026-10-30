@@ -5,6 +5,7 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {RuntimeCodeHash} from "./RuntimeCodeHash.sol";
 
 /// @dev EIP-1271：合约账户（多签/Safe/金库）对节点登记签名的标准验签入口
 interface IERC1271 {
@@ -17,7 +18,8 @@ interface IERC1271 {
  *
  * 平台不碰店铺、商品、订单、资金、费率、员工；这些都在节点自己的库里。
  * 每个节点部署自己的 Escrow（带委员会）与 Staking（保证金），到本合约登记：
- *   · Escrow/Staking 的运行时字节码哈希必须命中平台维护的白名单；
+ *   · Escrow/Staking 的**实现哈希**（运行时字节码去掉 solc metadata，见 `RuntimeCodeHash`）
+ *     必须命中平台维护的白名单；
  *   · 两个地址都必须是合约且不能相同；
  *   · 一个 Escrow 只能登记给一个节点（_escrowOperator 唯一，**在本目录内**）。
  *
@@ -43,9 +45,9 @@ contract MarketplaceRegistry is Ownable2Step {
     struct NodeInfo {
         address operator; // 节点运营者（目录身份/endpoint 归属人；登记时校验为 E/S 的 owner）
         address escrow; // 托管合约（节点部署）
-        bytes32 escrowCodeHash; // 登记时钉住的运行时字节码哈希
+        bytes32 escrowCodeHash; // 登记时钉住的实现哈希（去 metadata 的运行时字节码）
         address staking; // 保证金合约（节点部署）
-        bytes32 stakingCodeHash; // 登记时钉住的运行时字节码哈希
+        bytes32 stakingCodeHash; // 登记时钉住的实现哈希（去 metadata 的运行时字节码）
         string endpoint; // 节点 API 根地址
         uint64 registeredAtBlock; // 首次注册区块
         uint64 updatedAtBlock; // 最近更新区块
@@ -162,9 +164,9 @@ contract MarketplaceRegistry is Ownable2Step {
 
             n.operator = operator;
             n.escrow = escrow;
-            n.escrowCodeHash = keccak256(escrow.code);
+            n.escrowCodeHash = RuntimeCodeHash.forAddress(escrow);
             n.staking = staking;
-            n.stakingCodeHash = keccak256(staking.code);
+            n.stakingCodeHash = RuntimeCodeHash.forAddress(staking);
             n.endpoint = endpoint;
             n.registeredAtBlock = isNew ? uint64(block.number) : n.registeredAtBlock;
             n.updatedAtBlock = uint64(block.number);
@@ -295,12 +297,14 @@ contract MarketplaceRegistry is Ownable2Step {
         emit NodeForceClosed(operator, endpoint, reason);
     }
 
+    /// @notice 批准/撤销一种 Escrow 实现；`codeHash` 用 `RuntimeCodeHash.forAddress(实现地址)`
     function approveEscrowImplementation(bytes32 codeHash, bool approved) external onlyOwner {
         if (codeHash == bytes32(0)) revert ZeroHash();
         _approvedEscrowCode[codeHash] = approved;
         emit EscrowImplementationApproved(codeHash, approved);
     }
 
+    /// @notice 批准/撤销一种 Staking 实现；`codeHash` 用 `RuntimeCodeHash.forAddress(实现地址)`
     function approveStakingImplementation(bytes32 codeHash, bool approved) external onlyOwner {
         if (codeHash == bytes32(0)) revert ZeroHash();
         _approvedStakingCode[codeHash] = approved;
@@ -377,11 +381,12 @@ contract MarketplaceRegistry is Ownable2Step {
 
     /// @dev 登记行只有在“当前地址代码仍被本目录白名单认可”时才算 active
     function _codeStillApproved(NodeInfo memory n) private view returns (bool) {
-        return _approvedEscrowCode[keccak256(n.escrow.code)] && _approvedStakingCode[keccak256(n.staking.code)];
+        return _approvedEscrowCode[RuntimeCodeHash.forAddress(n.escrow)]
+            && _approvedStakingCode[RuntimeCodeHash.forAddress(n.staking)];
     }
 
     /**
-     * @dev 地址、代码哈希、唯一占用与 **E/S owner == operator**。
+     * @dev 地址、实现哈希、唯一占用与 **E/S owner == operator**。
      *
      * `owner()` 是一次**只读**检查，用于阻止“目录主是 A、资金方是 B”的错位；它不代表
      * Registry 为资金方背书：staking 接线、委员会与真实资金事实仍由消费者核对。
@@ -391,8 +396,8 @@ contract MarketplaceRegistry is Ownable2Step {
         if (escrow == address(0) || escrow.code.length == 0) revert EscrowNotBound();
         if (staking == address(0) || staking.code.length == 0) revert StakingNotBound();
         if (escrow == staking) revert StakingNotBound();
-        if (!_approvedEscrowCode[keccak256(escrow.code)]) revert ImplementationNotApproved();
-        if (!_approvedStakingCode[keccak256(staking.code)]) revert ImplementationNotApproved();
+        if (!_approvedEscrowCode[RuntimeCodeHash.forAddress(escrow)]) revert ImplementationNotApproved();
+        if (!_approvedStakingCode[RuntimeCodeHash.forAddress(staking)]) revert ImplementationNotApproved();
 
         address current = _escrowOperator[escrow];
         if (current != address(0) && current != operator) revert EscrowAlreadyRegistered();

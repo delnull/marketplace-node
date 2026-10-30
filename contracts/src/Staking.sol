@@ -140,8 +140,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      *
      * **不可更换**：没有 setter，任何换源入口都不存在；换 Escrow 必须重部署 Staking 并做一次
      * 显式迁移。这里用 storage 而不是 immutable，是为了让**同一份源码在所有节点实例上产出
-     * 相同的运行时字节码哈希**——平台 Registry 的代码白名单才能认证它。immutable 会把每个
-     * 实例的 escrow 地址嵌进字节码，使每个节点的哈希都不同。
+     * 相同的实现哈希**（运行时字节码去掉 metadata）——平台 Registry 的白名单才能认证它。
+     * immutable 会把每个实例的 escrow 地址嵌进字节码，使每个节点的哈希都不同。
      *
      * 构造期仍做形状探针 + 代码哈希互验（`escrowCodeHash_` 只用于构造期校验，不落 storage）。
      */
@@ -509,9 +509,9 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     /**
      * @param escrow_ 本节点托管合约（**唯一事实源**：订单终局/参与方/**仲裁人**都由它读）。
      *        **不可更换**：换 Escrow 必须重部署 Staking 并做一次显式迁移（见 `escrow` 的说明）。
-     * @param escrowCodeHash_ `escrow_` 的运行时字节码哈希（构造期与 `escrow_.code` 互验）；
-     *        通常直接取部署脚本里的 `keccak256(address(escrow).code)`，与 Registry 的
-     *        本节点锚**同一个值**——于是链下可以用同一个哈希核验两个合约指着同一个托管。
+     * @param escrowCodeHash_ `escrow_` 的**构建哈希**（`keccak256(address(escrow).code)`，含
+     *        构建 metadata）：只用于构造期“地址与哈希是同一次部署的一对”的互验。它**不是**
+     *        Registry 的实现哈希（后者去掉 metadata，见 `RuntimeCodeHash`），两者不要混用。
      * @param initialOwner 合约 owner（只做参数、审批与冻结治理，**不能动用任何质押资金**）
      *
      * 注：原先还有 `arbiter_` 参数与对应的 `arbiter` 存储副本（单仲裁人时代），早已删除——

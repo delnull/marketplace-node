@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {NodeFixture} from "./NodeFixture.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {MarketplaceRegistry} from "../src/MarketplaceRegistry.sol";
+import {RuntimeCodeHash} from "../src/RuntimeCodeHash.sol";
 import {Escrow} from "../src/Escrow.sol";
 import {Staking} from "../src/Staking.sol";
 import {TokenPayoutVault} from "../src/TokenPayoutVault.sol";
@@ -127,8 +128,8 @@ contract ProtocolTest is NodeFixture {
         assertEq(n.operator, operator);
         assertEq(n.escrow, address(escrow));
         assertEq(n.staking, address(staking));
-        assertEq(n.escrowCodeHash, keccak256(address(escrow).code));
-        assertEq(n.stakingCodeHash, keccak256(address(staking).code));
+        assertEq(n.escrowCodeHash, RuntimeCodeHash.forAddress(address(escrow)));
+        assertEq(n.stakingCodeHash, RuntimeCodeHash.forAddress(address(staking)));
         assertTrue(n.active);
         assertFalse(n.suspended);
         assertTrue(registry.isNodeActive(operator));
@@ -136,11 +137,18 @@ contract ProtocolTest is NodeFixture {
         assertEq(registry.getActiveNodes(0, 100).length, 1);
     }
 
+    function testWhitelistKeysOnImplementationHashNotBuildHash() public view {
+        // 白名单认的是可执行代码；构建产物里的 metadata（行尾/注释/构建机）不参与身份。
+        bytes32 raw = keccak256(address(escrow).code);
+        assertTrue(raw != RuntimeCodeHash.forAddress(address(escrow)), "artifact carries metadata");
+        assertFalse(registry.isApprovedEscrowImplementation(raw), "raw build hash is not a whitelist key");
+    }
+
     function testSameEscrowCanRegisterInTwoRegistries() public {
         MarketplaceRegistry r2 = new MarketplaceRegistry(
             address(this),
-            keccak256(vm.getDeployedCode("Escrow.sol:Escrow")),
-            keccak256(vm.getDeployedCode("Staking.sol:Staking"))
+            RuntimeCodeHash.ofBytes(vm.getDeployedCode("Escrow.sol:Escrow")),
+            RuntimeCodeHash.ofBytes(vm.getDeployedCode("Staking.sol:Staking"))
         );
         r2.registerNode(
             operator,
@@ -495,7 +503,7 @@ contract ProtocolTest is NodeFixture {
     }
 
     function testImplementationWhitelistToggle() public {
-        bytes32 h = keccak256(address(escrow).code);
+        bytes32 h = RuntimeCodeHash.forAddress(address(escrow));
         assertTrue(registry.isApprovedEscrowImplementation(h));
         registry.approveEscrowImplementation(h, false);
         assertFalse(registry.isApprovedEscrowImplementation(h));

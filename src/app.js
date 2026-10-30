@@ -36,6 +36,7 @@ import arbitrationRouter from './routes/arbitration.js';
 import shopsRouter from './routes/shops.js';
 import claimsRouter from './routes/claims.js';
 import blocksRouter from './routes/blocks.js';
+import favoritesRouter from './routes/favorites.js';
 
 /**
  * `/healthz` 的**审计链**读数：最近 `AUDIT_CHAIN_WINDOW` 行的哈希链还接得上吗？
@@ -254,7 +255,11 @@ export function createApp() {
   app.use((req, res, next) => {
     const t0 = Date.now();
     res.on('finish', () => {
-      console.log(`${clientIp(req)} ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - t0}ms)`);
+      // 收藏 GET 的 query 是钱包地址 + 偏好，不能原样进访问日志。
+      const loggedUrl = /^\/api\/favorites\/?$/.test(String(req.path || '').toLowerCase())
+        ? `${req.path}?address=[redacted]`
+        : req.originalUrl;
+      console.log(`${clientIp(req)} ${req.method} ${loggedUrl} -> ${res.statusCode} (${Date.now() - t0}ms)`);
     });
     next();
   });
@@ -417,6 +422,8 @@ export function createApp() {
   app.use('/api/auth', authRouter);
   // 买家在本节点的屏蔽名单：持久化在节点 DB，不依赖浏览器/平台目录
   app.use('/api/me/blocks', blocksRouter);
+  // 买家收藏（店铺/商品）：GET 公开按地址读；写必须登录
+  app.use('/api/favorites', favoritesRouter);
   // 店铺目录与开店申请（多店改造新增）：公开列表 /api/shops、详情 /api/shops/:code、申请与审批
   app.use('/api/shops', shopsRouter);
   app.use('/api/shop', shopRouter);

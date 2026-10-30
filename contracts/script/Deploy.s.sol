@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {MarketplaceRegistry} from "../src/MarketplaceRegistry.sol";
+import {RuntimeCodeHash} from "../src/RuntimeCodeHash.sol";
 
 /**
  * @notice 平台侧部署（只有 1 个合约）：MarketplaceRegistry。
@@ -11,9 +12,10 @@ import {MarketplaceRegistry} from "../src/MarketplaceRegistry.sol";
  *   export DEPLOYER_PRIVATE_KEY=0x...
  *   forge script script/Deploy.s.sol:DeployScript --rpc-url <rpc> --broadcast
  *
- * 初始实现哈希直接从本批编译产物取运行时字节码哈希（Escrow 无 immutable；Staking 已改为
- * storage 配置，运行时字节码与实例无关）。节点必须使用同一份产物/编译设置，否则登记时
- * 代码哈希对不上。
+ * 初始实现哈希取运行时字节码**去掉 solc metadata** 后的哈希（`RuntimeCodeHash`）：
+ * Escrow/Staking 无 immutable，同一份源码在任何机器/行尾下构建出的可执行字节一致，
+ * 实现哈希就一致——节点主在 Windows 还是 Linux 上构建都能命中同一份白名单。
+ * 改可执行代码仍会改变哈希，白名单的“只认审过的实现”不放宽。
  */
 contract DeployScript is Script {
     function run() external {
@@ -21,8 +23,8 @@ contract DeployScript is Script {
         address deployer = vm.addr(deployerKey);
         require(block.chainid == 2999, "must deploy on BTY mainnet (chainId 2999)");
 
-        bytes32 escrowCodeHash = keccak256(vm.getDeployedCode("Escrow.sol:Escrow"));
-        bytes32 stakingCodeHash = keccak256(vm.getDeployedCode("Staking.sol:Staking"));
+        bytes32 escrowCodeHash = RuntimeCodeHash.ofBytes(vm.getDeployedCode("Escrow.sol:Escrow"));
+        bytes32 stakingCodeHash = RuntimeCodeHash.ofBytes(vm.getDeployedCode("Staking.sol:Staking"));
 
         console2.log("deployer:", deployer);
         console2.log("chainId:", block.chainid);

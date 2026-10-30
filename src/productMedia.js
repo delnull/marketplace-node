@@ -264,17 +264,22 @@ export function removeMediaByUrl(url) {
 }
 
 /**
- * 上传目录用量（{ files, bytes }），60 秒缓存。
+ * 上传目录用量（{ files, bytes, readable }），60 秒缓存。
  *
  * 为什么要暴露它：孤儿媒体**刻意不删**（订单快照锁的是 URL 字符串，删文件会让历史订单变裂图），
  * 而视频把单个孤儿的成本从 2MB 抬到 50MB —— 磁盘成了这个功能新引入的失败面，
  * 运维必须能在 `/healthz` 上看见它（否则只有"写满磁盘那天"才发现）。
+ *
+ * `readable: false` = 目录存在但这次**读不到**（权限/IO）——此时 files/bytes 是 0，
+ * 但那是"还不知道"，不是"目录是空的"。目录不存在（ENOENT）才是真的 0：
+ * 一次上传都还没有过。三态由 `readable` 表达，读的人不要拿 0 当结论。
  */
-let usageCache = { at: 0, value: { files: 0, bytes: 0 } };
+let usageCache = { at: 0, value: { files: 0, bytes: 0, readable: true } };
 export function mediaUsage({ ttlMs = 60_000, now = Date.now() } = {}) {
   if (now - usageCache.at < ttlMs) return usageCache.value;
   let files = 0;
   let bytes = 0;
+  let readable = true;
   try {
     for (const name of fs.readdirSync(uploadsDir())) {
       if (name.startsWith('.tmp-')) continue;
@@ -288,9 +293,10 @@ export function mediaUsage({ ttlMs = 60_000, now = Date.now() } = {}) {
         /* 并发删除：跳过 */
       }
     }
-  } catch {
-    /* 目录还不存在 = 用量为 0 */
+  } catch (e) {
+    // ENOENT = 还没上传过任何东西（真的 0）；其余（EACCES/EIO…）= 读不到
+    if (e?.code !== 'ENOENT') readable = false;
   }
-  usageCache = { at: now, value: { files, bytes } };
+  usageCache = { at: now, value: { files, bytes, readable } };
   return usageCache.value;
 }

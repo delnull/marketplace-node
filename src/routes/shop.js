@@ -45,6 +45,7 @@ import { logAudit } from '../audit.js';
 import { isAddress, isZeroAddress } from '../chain.js';
 import { assertPublicHttpTarget } from '../netguard.js';
 import { sweepOrphanUploads } from '../mediaSweep.js';
+import { mediaUsage } from '../productMedia.js';
 import { getRates, usdtMicroToPayWei, isPayableAmount } from '../rates.js';
 import {
   listPaymentMethods,
@@ -419,6 +420,13 @@ router.get('/node', nodeAdmin, wrap(async (req, res) => {
       watcher: await escrowWatcherStatus(),
       reconcile: chainReconcileStatus(),
     },
+    /*
+      上传目录用量（{files, bytes, readable}）：`/healthz` 里也有一份，但探活是给编排看的、页面上没人读。
+      而"磁盘是这个功能新引入的失败面"（视频把单个孤儿的成本抬到 50MB），节点主在管理页上
+      要能看到它、并在同一页触发清扫（见 /media/sweep-orphans）。
+      `readable: false` = 读不到（不是"0 个文件"），界面必须分开说。
+    */
+    uploads: mediaUsage(),
   });
 }));
 

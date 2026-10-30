@@ -180,3 +180,33 @@ test('kind 过滤：服务端真过滤，且与光标分页正交', async () => 
   assert.ok(combo.products.every((p) => p.kind === 'physical'));
   assert.ok(combo.products.every((p) => p.title.includes('显卡') || p.description.includes('显卡')));
 });
+
+test('价格档按起价（SKU 最低价）服务端过滤；非法边界不静默', async () => {
+  const tag = '__price_band_test__';
+  const p49 = await listProduct(productPayload({ title: '价格档 49', tags: [tag], priceUsdtMicro: 49_000_000 }));
+  const p50 = await listProduct(productPayload({ title: '价格档 50', tags: [tag], priceUsdtMicro: 50_000_000 }));
+  const p200 = await listProduct(productPayload({ title: '价格档 200', tags: [tag], priceUsdtMicro: 200_000_000 }));
+  const p1000 = await listProduct(productPayload({ title: '价格档 1000', tags: [tag], priceUsdtMicro: 1_000_000_000 }));
+
+  const slugs = (page) => new Set(page.products.map((p) => p.slug));
+
+  const lt50 = await search('', 0, 30, { tag, priceMax: 50_000_000 - 1 });
+  assert.deepEqual(slugs(lt50), new Set([p49.slug]), '50 USDT 以下不含 50');
+
+  const mid = await search('', 0, 30, { tag, priceMin: 50_000_000, priceMax: 200_000_000 - 1 });
+  assert.deepEqual(slugs(mid), new Set([p50.slug]), '50–200 含 50、不含 200');
+
+  const high = await search('', 0, 30, { tag, priceMin: 200_000_000, priceMax: 1_000_000_000 - 1 });
+  assert.deepEqual(slugs(high), new Set([p200.slug]), '200–1000 含 200、不含 1000');
+
+  const top = await search('', 0, 30, { tag, priceMin: 1_000_000_000 });
+  assert.deepEqual(slugs(top), new Set([p1000.slug]), '1000 以上含 1000');
+
+  const bad = await search('', 0, 30, { tag, priceMin: 'abc' });
+  assert.equal(bad.products.length, 0, '非法价格 ⇒ 空结果');
+  assert.ok(bad.priceError, '必须下发 priceError');
+
+  const inverted = await search('', 0, 30, { tag, priceMin: 200, priceMax: 100 });
+  assert.equal(inverted.products.length, 0, 'min>max ⇒ 空结果');
+  assert.ok(inverted.priceError, '必须下发 priceError');
+});

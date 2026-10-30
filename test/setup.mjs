@@ -226,8 +226,15 @@ async function dropTestDatabase() {
   唯一的收尾点（见文件头"收尾"）：先清库，再让进程真的退出去。
   不给 process.exit 传 0——传 `process.exitCode`，让"有用例失败"这件事如实变成退出码；
   实测 node:test 自己也会在收尾时按结果覆盖它，所以更不会被这里抹平。
+
+  **没有建库就不接管退出**（2026-10-29）：有的测试只需要本模块的 env 副作用（例如
+  api-surface.test.js 要在 import src 之前把库名钉住），它们不调 makeCtx、不开连接。
+  旧实现照样 process.exit —— 子进程在逐条用例报告落盘前就退出，`npm test` 只看到
+  "整个文件 ✔ / tests 1"，失败定位与用例名一起消失。进程退出交给 node:test 自己
+  （runner 本来就传 --test-force-exit）。
 */
 after(async () => {
+  if (!testDb) return;
   await dropTestDatabase();
   process.exit(process.exitCode ?? 0);
 });

@@ -170,8 +170,9 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     address public staking;
 
     /// @dev ERC20 出金失败时的挂账合约；address(0) = 未配置，失败出金直接回滚。
-    ///      刻意用 storage 而不是 immutable：Registry 按 runtime code hash 白名单实现，
-    ///      immutable 会把部署参数烧进 runtime，导致每个节点的 Escrow 哈希都不同、无法登记。
+    ///      刻意用 storage 而不是 immutable：Registry 按实现哈希（runtime code 去 metadata）
+    ///      白名单实现，immutable 会把部署参数烧进 runtime，导致每个节点的 Escrow 实现哈希
+    ///      都不同、无法登记。
     address private tokenVault;
 
     /// @notice 委员会治理合约（一次性接线；设置后委员会成员与窗口参数只能由它改）

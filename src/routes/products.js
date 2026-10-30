@@ -1201,6 +1201,39 @@ router.get('/', listedShopScope, wrap(async (req, res) => {
 
   const db = getDb();
   /*
+    价格区间按**商品起价**（各 SKU 最低价）过滤，而不是某一行的价：
+    列表卡片显示的就是起价，按这个口径筛，用户看到的“起价在区间内”才成立。
+    参数单位是微 USDT，与服务端存储/前端计算同口径，不在 query 里做浮点换算。
+  */
+  const parsePriceBound = (raw, label) => {
+    const s = String(raw ?? '').trim();
+    if (!s) return { value: null, error: null };
+    if (!/^\d+$/.test(s)) return { value: null, error: `${label} 需为非负整数（微 USDT）` };
+    const n = Number(s);
+    if (!Number.isSafeInteger(n) || n > PRICE_MAX_MICRO) {
+      return { value: null, error: `${label} 超出范围（0..${PRICE_MAX_MICRO} 微 USDT）` };
+    }
+    return { value: n, error: null };
+  };
+  const rawPriceMin = parsePriceBound(req.query.priceMin, 'priceMin');
+  const rawPriceMax = parsePriceBound(req.query.priceMax, 'priceMax');
+  let priceMin = rawPriceMin.value;
+  let priceMax = rawPriceMax.value;
+  let priceError = rawPriceMin.error || rawPriceMax.error;
+  if (!priceError && priceMin !== null && priceMax !== null && priceMin > priceMax) {
+    priceError = 'priceMin 不能大于 priceMax';
+    priceMin = null;
+    priceMax = null;
+  }
+  const rawReviewed = String(req.query.reviewed ?? '').trim();
+  let reviewed = false;
+  let reviewedError = null;
+  if (rawReviewed !== '') {
+    if (rawReviewed === '1' || rawReviewed === 'true') reviewed = true;
+    else reviewedError = 'reviewed 只接受 1 或 true';
+  }
+
+  /*
     公开聚合列表的**三个正交判据**（缺一不可，不是替换关系）：
       · `active = 1` —— 商品自己有没有上架（店主/店员在商品管理里控制）；
       · `node_hidden = 0` —— 本节点有没有强制下架（节点管理员控制，店主改不动）；
@@ -1250,14 +1283,32 @@ router.get('/', listedShopScope, wrap(async (req, res) => {
     where.push("? MEMBER OF (attributes->'$[*].pair')");
     args.push(attrPair);
   }
-  if (tagError || attrError || kindError) {
+  if (tagError || attrError || kindError || priceError || reviewedError) {
     /*
-      非法/超长标签或非法 kind = **查不到**（空结果），但绝不静默：结果里带 tagError/attrError/
-      kindError、message 里说明，调用方不会把"参数写错了"误读成"这家店没有这个类目"。
-      空结果的实现方式是在 SQL 上加恒假条件（而不是提前 return）——保证响应形状与正常路径
-      完全一致（products/nextCursor/rates/tag/tagError/kindError 一个不少）。
+      非法/超长标签或非法 kind/价格/reviewed = **查不到**（空结果），但绝不静默：
+      结果里带对应 error 字段、message 里说明，调用方不会把"参数写错了"误读成
+      "这家店没有这个类目"。空结果的实现方式是在 SQL 上加恒假条件（而不是提前 return）——
+      保证响应形状与正常路径完全一致。
     */
     where.push('0 = 1');
+  }
+  if (reviewed) {
+    where.push('EXISTS (SELECT 1 FROM reviews r WHERE r.product_id = products.id)');
+  }
+  if (priceMin !== null || priceMax !== null) {
+    /*
+      起价 = 该商品所有 SKU 的最低价（与 rowToPublic / 列表卡片同一个聚合口径）；
+      不按 active SKU 缩范围——停用某个规格不会让商品起价变高。
+    */
+    const minPrice = '(SELECT MIN(k.price_usdt_micro) FROM product_skus k WHERE k.product_id = products.id)';
+    if (priceMin !== null) {
+      where.push(`${minPrice} >= ?`);
+      args.push(priceMin);
+    }
+    if (priceMax !== null) {
+      where.push(`${minPrice} <= ?`);
+      args.push(priceMax);
+    }
   }
   if (kinds.length) {
     where.push(`kind IN (${kinds.map(() => '?').join(',')})`);
@@ -1313,6 +1364,13 @@ router.get('/', listedShopScope, wrap(async (req, res) => {
       //  两者都不是"没有这种商品"）
       kind: kinds.length ? kinds : null,
       kindError,
+      // 价格区间按起价（SKU 最低价）过滤；回显的是实际使用的微 USDT 边界。
+      // null = 这一侧没有设边界，与"设了 0"是两件事。
+      price: priceMin !== null || priceMax !== null ? { minMicro: priceMin, maxMicro: priceMax } : null,
+      priceError,
+      // reviewed=true 表示本次只返回有评价的商品；false = 没按评价筛（不是"只要没评价"）
+      reviewed,
+      reviewedError,
     },
     kindError
       ? `类型筛选未生效：${kindError}（本次结果为空，请改用合法取值）`
@@ -1320,7 +1378,11 @@ router.get('/', listedShopScope, wrap(async (req, res) => {
         ? `标签未生效：${tagError}（本次结果为空，请改用合法标签）`
         : attrError
           ? `参数筛选未生效：${attrError}（本次结果为空，请改用「参数名:值」的形状）`
-          : 'success'
+          : priceError
+            ? `价格筛选未生效：${priceError}（本次结果为空，请检查价格边界）`
+            : reviewedError
+              ? `评价筛选未生效：${reviewedError}（本次结果为空）`
+              : 'success'
   );
 }));
 

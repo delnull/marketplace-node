@@ -2202,6 +2202,28 @@ CREATE TABLE IF NOT EXISTS buyer_blocks (
     )
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
+/*
+  买家收藏（店铺 / 商品）。
+  按节点各存一份：没有中心库；GET 公开按地址读，写操作必须登录（令牌里的地址，不认 body 地址）。
+  product_slug 为空表示店铺收藏；商品收藏带店铺编号，避免同一节点多店的同名 slug 撞键。
+*/
+CREATE TABLE IF NOT EXISTS buyer_favorites (
+    buyer         CHAR(42) NOT NULL,
+    kind          ENUM('shop','product') NOT NULL,
+    shop_code     CHAR(9) NOT NULL,
+    product_slug  VARCHAR(128) NOT NULL DEFAULT '',
+    created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (buyer, kind, shop_code, product_slug),
+    KEY idx_buyer_favorites_shop (shop_code, kind),
+    CONSTRAINT fk_buyer_favorites_shop FOREIGN KEY (shop_code) REFERENCES shops (code) ON DELETE CASCADE,
+    CONSTRAINT ck_buyer_favorites_buyer_lower CHECK (buyer = LOWER(buyer)),
+    CONSTRAINT ck_buyer_favorites_shop_code_upper CHECK (shop_code = UPPER(shop_code)),
+    CONSTRAINT ck_buyer_favorites_product CHECK (
+      (kind = 'shop' AND product_slug = '')
+      OR (kind = 'product' AND product_slug <> '')
+    )
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+
 CREATE TABLE IF NOT EXISTS product_codes (
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     product_id    BIGINT UNSIGNED NOT NULL,
