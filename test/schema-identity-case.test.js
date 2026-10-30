@@ -103,7 +103,7 @@ async function checkRejected(label, sql, params) {
   );
 }
 
-test('清单从 SCHEMA_DDL 派生：26 个 CHAR(42) 地址列、9 个 CHAR(9) 店铺编号列', () => {
+test('清单从 SCHEMA_DDL 派生：27 个 CHAR(42) 地址列、10 个 CHAR(9) 店铺编号列', () => {
   /*
     清单钉死是**结果**，不是判据：真正的判据是下面两条"每个派生列都必须有对应 CHECK"。
     这里把当前清单写出来，是为了让"某一列被悄悄改成 VARCHAR 从而逃出约束范围"也现形
@@ -115,6 +115,7 @@ test('清单从 SCHEMA_DDL 派生：26 个 CHAR(42) 地址列、9 个 CHAR(9) �
       'audit_logs.actor',
       'buyer_blocks.buyer',
       'buyer_draft_quota.buyer',
+      'buyer_favorites.buyer',
       'buyer_product_quota.buyer',
       'nft_claims.claimant',
       'nft_claims.seller',
@@ -145,6 +146,7 @@ test('清单从 SCHEMA_DDL 派生：26 个 CHAR(42) 地址列、9 个 CHAR(9) �
     [
       'audit_logs.shop_code',
       'buyer_blocks.shop_code',
+      'buyer_favorites.shop_code',
       'nft_claims.shop_code',
       'orders.shop_code',
       'products.shop_code',
