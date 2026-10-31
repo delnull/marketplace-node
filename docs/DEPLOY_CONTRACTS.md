@@ -13,12 +13,12 @@
 
 ## 前置
 
-- Foundry（版本以 CI `.github/workflows/ci.yml` 的 pin 为准）：**只有修改合约/重新生成公开编译产物时**才需要；主网部署直接使用随包 `contract-artifacts.json`，不走 `forge script`；
-- BTY EVM 主网 RPC，chainId `2999`。优先用 `https://node1.bityuan.com/eth`，不可用时依次换 `https://node2.bityuan.com/eth`、`https://mainnet.bityuan.com/eth`。部署前用 `cast chain-id --rpc-url <rpc>` 确认返回 `2999`；
+- 不需要 Foundry、solc 或任何本地编译步骤；部署直接使用随包 `contract-artifacts.json`；
+- BTY EVM 主网 RPC，chainId `2999`。优先用 `https://node1.bityuan.com/eth`，不可用时依次换 `https://node2.bityuan.com/eth`、`https://mainnet.bityuan.com/eth`。`--check` 会拒绝 chainId 不符的 RPC；
 - gas 由 `eth_gasPrice` 给出（当前 `10 gwei`）。BTY 主网按 **gasLimit** 扣费，未用完不退，所以脚本用实测 gasUsed + 10% 的固定上限，`eth_estimateGas` 只用来确认交易不会被拒绝；不要把 gasLimit 拍高；
 - operator 钱包，余额要覆盖脚本打印的 `gasCost`；这个地址就是稍后的 `MK_SHOP_OWNER`；
 - 至少 3 个仲裁人地址，彼此独立；`ARBITER_THRESHOLD` 必须 ≥2 且小于人数（单人阈值会让任意一名委员单独裁决）；
-- 原样使用本仓 `contracts/`。`foundry.toml` 固定了 solc 0.8.24 / optimizer runs 1 / evm_version paris；目录按 Escrow/Staking 的**全量 runtime 哈希**（`keccak256(code)`，含 metadata）放行。任何字节变化（含 metadata、行尾、注释、优化参数）都会换哈希、需重新审批；公开节点仓随包的编译产物（ABI + creation/runtime bytecode + 哈希）就是给平台审批/第三方复核用的。
+- 本仓只提供 `contracts/src/` 合约源码供审计；部署/登记以 `contract-artifacts.json` 的 ABI、creation/runtime bytecode 与哈希为准，目录按 Escrow/Staking 的**全量 runtime 哈希**（`keccak256(code)`，含 metadata）放行。任何字节变化（含 metadata、行尾、注释、优化参数）都会换哈希、需重新审批。
 
 ## 费用
 
@@ -28,23 +28,20 @@
 
 每多一个委员约增加 `25,000` gasLimit（`10 gwei` 下约 `0.00025 BTY`）。
 
-## 1. 编译产物（随公开节点仓提供，无需本地 Foundry）
+## 1. 编译产物（随包提供，无需本地编译）
 
-公开节点仓根部的 `contract-artifacts.json` 是平台/发布者从 `contracts/out` 生成的完整产物：
+根部的 `contract-artifacts.json` 是发布者生成的完整产物：
 `{name, abi, creationCodeHash, runtimeCodeHash, bytecode, deployedBytecode}`，其中
 `runtimeCodeHash = keccak256(完整 runtime bytecode，含 solc metadata)`。部署脚本直接使用这份
 bytecode，并在本地校验 `keccak256(bytecode) == creationCodeHash`、
 `keccak256(deployedBytecode) == runtimeCodeHash`；清单被篡改/损坏会当场拒绝。
 
-只有**修改合约**时才需要重新生成：`cd contracts && forge build`，然后用生成脚本跑
-`node scripts/build-contract-artifacts.mjs`，同批提交 `node/contract-artifacts.json`。公开仓
-发布/CI 的 `build-contract-artifacts.mjs --check` 会拒绝"清单与源码构建不一致"。
+`contracts/src/` 只随包提供源码审计，不参与部署；本仓没有 Foundry 配置、依赖库、测试或构建脚本。
 
 ## 2. 部署
 
 ```bash
 export MK_RPC_URL=https://node1.bityuan.com/eth
-cast chain-id --rpc-url "$MK_RPC_URL"    # 必须输出 2999
 
 export DEPLOYER_PRIVATE_KEY=0x...       # operator；会成为 Escrow/Staking/TokenPayoutVault 的 owner
 # 也可以不导私钥，改成：export MK_KEY_FILE=/path/to/key
@@ -59,11 +56,9 @@ node scripts/deploy-node-mainnet.cjs --check
 node scripts/deploy-node-mainnet.cjs --broadcast
 ```
 
-`--check` 只读：检查 RPC、余额、nonce、gas 预算，不广播。`--broadcast` 才部署并做链上复核。
+`--check` 只读：验证 RPC 的 chainId 必须是 `2999`，并检查余额、nonce、gas 预算，不广播。`--broadcast` 才部署并做链上复核。
 
-主网不用 `forge script`：BTY RPC 不接受 Forge 广播前使用的 EIP-1898 区块对象，会报
-`invalid argument 1: json: cannot unmarshal object into Go value of type string`；`contracts/script/DeployNode.s.sol`
-只用于本地 anvil。部署脚本用 ethers 发交易、原始 JSON-RPC 读链，顺序与 `DeployNode.s.sol` 一致：
+部署脚本用 ethers 发交易、原始 JSON-RPC 读链，顺序固定：
 `TokenPayoutVault` → `Escrow` → `vault.setEscrow` → `Staking` → `escrow.setStaking` → `escrow.setArbiters`
 → `NodeGovernance` → `escrow.setGovernor` / `staking.setGovernor`。
 
@@ -122,14 +117,8 @@ bash deploy.sh --escrow 0x... --staking 0x... --start-block 12345678
 
 所以 `DEPLOYER_PRIVATE_KEY` 对应的地址必须和安装时填的节点主地址是同一个；改这个地址只能重新部署并重新登记。
 
-部署完成后可以只读核对：
-
-```bash
-cast call <Escrow> "owner()(address)" --rpc-url <rpc>
-cast call <Escrow> "staking()(address)" --rpc-url <rpc>
-cast call <Escrow> "tokenVaultAddress()(address)" --rpc-url <rpc>
-cast call <Escrow> "governor()(address)" --rpc-url <rpc>
-```
+部署完成后 `--broadcast` 会在链上复核并打印 owner / staking / vault / governor；也可以直接在网页
+「节点管理」里看节点自报的地址，不需要额外的链上命令行工具。
 
 ## 6. 登记到目录
 

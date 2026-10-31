@@ -10,7 +10,7 @@ bash deploy.sh --health       # 健康：一行；不健康才带原因
 docker logs -f marketplace-node
 ```
 
-`/healthz` 返回 200 且 `code=0` 才算健康。链上 watcher 停滞、数据库不可用、schema 不符都会让它返回非 0。多实例部署还要看 `capabilities.redis`：`configured=true, connected=false` 表示限流/共享缓存已回退单进程（见 `.env.example` 的 `MK_REDIS_URL`）。
+`/healthz` 返回 200 且 `code=0` 才算健康。链上 watcher 停滞、数据库不可用、schema 不符都会让它返回非 0。Redis 是硬依赖：`capabilities.redis` 不是 `configured=true, connected=true` 时探活会是 503（见 `.env.example` 的 `MK_REDIS_URL`）。
 
 ## 2. 备份
 

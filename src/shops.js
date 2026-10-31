@@ -195,6 +195,15 @@ export async function shopRowByCode(code) {
   return await getDb().get('SELECT * FROM shops WHERE code = ?', c);
 }
 
+/** 批量版（订单列表用）：一次读回本页所有店铺行，返回 `code → row`。 */
+export async function shopRowsByCodes(codes) {
+  const list = [...new Set((codes || []).map((x) => String(x ?? '').trim()).filter(Boolean))];
+  if (!list.length) return new Map();
+  const placeholders = list.map(() => '?').join(',');
+  const rows = await getDb().all(`SELECT * FROM shops WHERE code IN (${placeholders})`, ...list);
+  return new Map(rows.map((r) => [String(r.code), r]));
+}
+
 /** 按店主地址读一行（大小写由列的排序规则折；读不到返回 undefined） */
 export async function shopRowBySeller(seller) {
   const s = String(seller || '').trim().toLowerCase();

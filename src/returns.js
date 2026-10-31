@@ -55,6 +55,15 @@ export async function fetchReturnByOrder(orderId) {
   return await getDb().get('SELECT * FROM order_returns WHERE order_id = ?', orderId) || null;
 }
 
+/** 批量版（订单列表用）：一次读回本页所有退货单，返回 `order_id → row`。 */
+export async function fetchReturnsByOrderIds(orderIds) {
+  const ids = [...new Set((orderIds || []).map((x) => String(x)).filter(Boolean))];
+  if (!ids.length) return new Map();
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = await getDb().all(`SELECT * FROM order_returns WHERE order_id IN (${placeholders})`, ...ids);
+  return new Map(rows.map((r) => [String(r.order_id), r]));
+}
+
 /**
  * 卖家填写/修改退货地址（买家发起退货申请后）。
  * 只允许 open 状态；已寄出/已收货再改地址没有意义，反而会让买家按旧地址寄丢。

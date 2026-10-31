@@ -4,6 +4,7 @@
  */
 import { ethers } from 'ethers';
 import config from './config.js';
+import { assertRedisReady } from './redis.js';
 import { initDb } from './db.js';
 import { startWatcher } from './escrowWatcher.js';
 import { startChainReconcile } from './chainReconcile.js';
@@ -29,6 +30,12 @@ import { nodeRow, nodeOwnerOf } from './shops.js';
 // 下单风控闸（可选，默认关闭）：启动日志 + 启动门禁（URL 非空但非法 ⇒ 拒绝启动）
 import { orderGateEnabled, orderGateStartupError } from './orderGate.js';
 import { applyEscrowAnchor } from './chainAnchor.js';
+
+/*
+  Redis 是节点运行时的硬依赖（限流/共享缓存），先连上再继续初始化：
+  否则进程会在每次匿名请求时才发现限流器不可用，启动日志却全绿。
+*/
+await assertRedisReady();
 
 /*
   初始化顺序**必须由 await 界定**（2026-10，MySQL 迁移）：`initDb` 现在是异步的

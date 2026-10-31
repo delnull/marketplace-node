@@ -14,10 +14,9 @@
 ## 节点合约（首次部署必须先做）
 
 每个节点自己部署 `TokenPayoutVault`、`Escrow`、`Staking`、`NodeGovernance`；目录合约
-`MarketplaceRegistry` 由平台部署，节点部署完成后用自己的钱包登记。`contracts/` 与 Foundry
-脚本随本仓发布；**主网部署不再要求本地编译**：公开仓根部的 `contract-artifacts.json` 是
-随包提供的完整编译产物（ABI + creation/runtime bytecode + 哈希），
-`node scripts/deploy-node-mainnet.cjs` 直接部署这份清单里的字节码。
+`MarketplaceRegistry` 由平台部署，节点部署完成后用自己的钱包登记。本仓提供**合约源码、
+ABI/字节码/哈希清单与部署脚本**，不含 Foundry 工程或编译步骤；`contract-artifacts.json`
+是随包的完整编译产物，`node scripts/deploy-node-mainnet.cjs` 直接部署清单里的字节码。
 
 完整步骤、参数、`startBlock` 取法与启动自检见 [docs/DEPLOY_CONTRACTS.md](docs/DEPLOY_CONTRACTS.md)；
 先 `--check`，再 `--broadcast`。整个部署
@@ -83,11 +82,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/mai
 
 密码优先用 `MK_DB_PASSWORD` 环境变量传，不要写进命令行历史。
 
-## Redis（共享限流/缓存）
+## Redis（必需：共享限流/缓存）
 
-多实例/多进程部署必须配置 `MK_REDIS_URL`（如 `redis://127.0.0.1:6379/0`）：匿名读限流与 ERC20
-白名单短缓存走 Redis 共享；不配或 Redis 故障时回退进程内实现（`/healthz` 的
-`capabilities.redis` 会给出 `configured/connected`）。同机多节点共用一个 Redis 时用
+启动前必须配置 `MK_REDIS_URL`（如 `redis://127.0.0.1:6379/0`）：匿名读限流与 ERC20
+白名单短缓存只有一个 Redis 计数/缓存源；未配置或连不上时启动失败，运行中掉线则
+`/healthz` 返回 503，限流入口 fail-closed（不会回退进程内实现）。同机多节点共用一个 Redis 时用
 `MK_REDIS_PREFIX` 隔离键空间。Redis 只存计数与 30 秒缓存，不存订单/个人信息/令牌。
 
 ## MySQL

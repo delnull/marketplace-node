@@ -112,53 +112,40 @@ export function bearerToken(req) {
 }
 
 /**
- * 限流中间件：配置了 Redis 时走**跨进程固定窗口**（INCR+PEXPIRE，按 IP + 限流器名），
- * 未配置/Redis 故障时回退单进程滑动窗口。
+ * 限流中间件：**Redis 是唯一计数源**（跨进程固定窗口：INCR+PEXPIRE，按方法+路由+IP）。
  *
- * 为什么必须共享：多实例/多进程部署时，进程内 Map 各算一份，"每 IP 120 次/分"会被实例数
- * 成倍放大。Redis 故障时回退内存是**可用性取舍**，不是第二套判据：计数窗口算法相同，
- * 只是作用域从集群缩回单进程；日志会报一次，运维能从 /healthz 的 redis.connected 看到。
+ * 为什么不再回退进程内 Map：多实例/多进程时每个进程各算一份，"每 IP 120 次/分"会被实例数
+ * 成倍放大；回退内存等于在 Redis 故障时悄悄把限流关掉。这里选择 **fail-closed**：
+ * Redis 不可用/超时 ⇒ 503，不执行被限流的操作。启动时 `assertRedisReady()` 也会先拦一次。
  */
 export function simpleRateLimit({ windowMs, max, message = '请求过于频繁，请稍后再试' } = {}) {
-  const hits = new Map(); // key: ip → number[]（时间戳，Redis 不可用时的兜底）
-  const memoryHit = (res, ip, next) => {
-    const now = Date.now();
-    // 内存护栏：条目数超阈值时惰性清扫整窗已过期条目（防唯一 IP 面大时 Map 无界增长）
-    if (hits.size > 5000) {
-      for (const [k, v] of hits) {
-        if (v.length === 0 || now - v[v.length - 1] >= windowMs) hits.delete(k);
-      }
-    }
-    const list = (hits.get(ip) || []).filter((t) => now - t < windowMs);
-    if (list.length >= max) {
-      res.setHeader('Retry-After', String(Math.max(1, Math.ceil(windowMs / 1000))));
-      fail(res, message, 429, 429);
-      return;
-    }
-    list.push(now);
-    hits.set(ip, list);
-    next();
-  };
   return (req, res, next) => {
     const ip = clientIp(req);
     // 键用「方法 + 挂载路径 + 实际路径」而不是进程内自增 id：多进程各自创建中间件时
     // 自增顺序不保证一致，用路由形状才能共享同一个桶。
     const routeKey = `${req.method} ${req.baseUrl || ''}${req.path || ''}`;
-    // 300ms 预算：Redis 挂了/网络抖动时不能让每个匿名请求都挂住；超时即回退内存。
-    const redisBudget = new Promise((resolve) => {
-      const t = setTimeout(() => resolve(null), 300);
-      if (typeof t.unref === 'function') t.unref();
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('限流 Redis 超时')), 500);
+      if (typeof timer.unref === 'function') timer.unref();
     });
-    Promise.race([redisHit(`${routeKey}:${ip}`, windowMs), redisBudget])
+    Promise.race([redisHit(`${routeKey}:${ip}`, windowMs), timeout])
       .then((hit) => {
-        if (!hit) return memoryHit(res, ip, next);
         if (hit.count > max) {
           res.setHeader('Retry-After', String(Math.max(1, Math.ceil(hit.ttlMs / 1000))));
           return fail(res, message, 429, 429);
         }
         return next();
       })
-      .catch(() => memoryHit(res, ip, next));
+      .catch(() => {
+        /*
+          fail-closed：不再退回内存计数。503 而不是 429，因为它不是"你太快"，
+          而是节点暂时无法证明请求预算；调用方可以稍后重试。
+        */
+        res.setHeader('Retry-After', '1');
+        fail(res, '限流服务暂不可用，请稍后再试', 503, 503);
+      })
+      .finally(() => clearTimeout(timer));
   };
 }
 

@@ -99,6 +99,15 @@ export async function findReviewByOrder(orderId) {
   return await getDb().get('SELECT * FROM reviews WHERE order_id = ?', orderId) || null;
 }
 
+/** 批量版（订单列表用）：一次读回本页所有评价，返回 `order_id → row`。 */
+export async function findReviewsByOrderIds(orderIds) {
+  const ids = [...new Set((orderIds || []).map((x) => String(x)).filter(Boolean))];
+  if (!ids.length) return new Map();
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = await getDb().all(`SELECT * FROM reviews WHERE order_id IN (${placeholders})`, ...ids);
+  return new Map(rows.map((r) => [String(r.order_id), r]));
+}
+
 /**
  * 评价写入口的**唯一门控**（提交评价 / 追评 / 上传评价图三处共用）。
  *

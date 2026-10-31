@@ -1,9 +1,0 @@
-# 合约源码行尾统一 LF。
-#
-# solc 的 metadata 会对每个源文件的**精确字节**取哈希，并附在运行时字节码末尾；
-# 统一成 LF 后，本仓源码在 Windows/Linux 上构建出同一串可执行字节（也避免整文件行尾 diff）。
-#
-# lib/ 是子模块，父仓的 attributes 不覆盖它的检出。合约哈希承诺**完整 runtime**（含 metadata），
-# 子模块行尾/编译环境也会进入 metadata；节点部署使用公开节点仓随包的
-# `contract-artifacts.json`（完整字节码），不要用不同环境的本地重建去登记。这条规则只约束本仓源码。
-*.sol text eol=lf

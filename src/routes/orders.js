@@ -142,12 +142,12 @@ import { ok, fail, wrap, bearerToken, makeAuthMiddleware, simpleRateLimit } from
 // 金额展示口径的唯一实现（usdtOf / goodsMicroOf）——不要再手写 (micro/1e6).toFixed(2)
 import { goodsMicroOf, usdtOf } from '../money.js';
 import { refundUsdtMicroOfRow } from '../stats.js';
-import { submitReview, replyReview, findReviewByOrder, reviewToPublic, parseReviewImages, reviewableAt, followupReview, removeReviewImage, REVIEWABLE_STATUS, reviewWriteRefusal } from '../reviews.js';
+import { submitReview, replyReview, findReviewByOrder, findReviewsByOrderIds, reviewToPublic, parseReviewImages, reviewableAt, followupReview, removeReviewImage, REVIEWABLE_STATUS, reviewWriteRefusal } from '../reviews.js';
 // 评价图上传：复用商品媒体的字节判定/落盘内核，但只收图片、上限更低
 import { storeMediaStream, MediaUploadError, REVIEW_IMAGE_MIMES } from '../productMedia.js';
 import { MEDIA } from '../mediaKinds.js';
 import { UploadByteBudget } from '../uploadBudget.js';
-import { fetchReturnByOrder, returnToPublic } from '../returns.js';
+import { fetchReturnByOrder, fetchReturnsByOrderIds, returnToPublic } from '../returns.js';
 import {
   filesOfEvidenceMany,
   evidencePhaseError,
@@ -176,7 +176,7 @@ import { normalizeCarrier } from '../shipping.js';
 // 卖家待办计数（**唯一实现**）：本文件的徽标端点与 /api/shop/metrics 读同一份谓词与 SQL
 import { sellerTodoCounts } from '../opsMetrics.js';
 // 店铺判据（"能不能卖"的唯一实现）：下单闸与商品闸共用同一份文案
-import { sellableError, shopRowByCode, productSellableSql } from '../shops.js';
+import { sellableError, shopRowByCode, shopRowsByCodes, productSellableSql } from '../shops.js';
 import { findOrderInShop } from '../orderScope.js';
 import { sellerOrderFilters } from '../sellerOrderFilters.js';
 
@@ -290,6 +290,35 @@ async function findOrder(orderNo) {
 // poolEmpty 提示（列表/详情字段）口径见 src/poolAlert.js：与托管落定后的 order.pool_empty
 // 告警共用同一实现（池式商品不限量、下单不占位，故只提示不拦截）。
 
+/**
+ * 订单列表的**批量关系预取**：本页所有订单一次读回交付行/评价/退货单/店铺，
+ * 把 `orderToPublic` 从 4×N 次查询降成固定 4 次（N ≤ pageSize）。
+ *
+ * 为什么放在这里而不是每个列表各写一遍：详情/单条路径仍走单个 reader；
+ * 列表路径只有这一处预取入口，新增列表用例必须经过它（否则 N+1 会悄悄回来）。
+ */
+async function preloadOrderRelations(rows) {
+  const ids = [...new Set(rows.map((o) => String(o.order_id)))];
+  const codes = [...new Set(rows.map((o) => String(o.shop_code || '')).filter(Boolean))];
+  const db = getDb();
+  const idPh = ids.map(() => '?').join(',');
+  const [deliveryRows, reviews, returns, shops] = await Promise.all([
+    ids.length
+      ? db.all(`SELECT order_id, kind, value, tx_hash, created_at FROM order_delivery_items WHERE order_id IN (${idPh}) ORDER BY id ASC`, ...ids)
+      : [],
+    findReviewsByOrderIds(ids),
+    fetchReturnsByOrderIds(ids),
+    shopRowsByCodes(codes),
+  ]);
+  const deliveries = new Map();
+  for (const r of deliveryRows) {
+    const k = String(r.order_id);
+    if (!deliveries.has(k)) deliveries.set(k, []);
+    deliveries.get(k).push(r);
+  }
+  return { deliveries, reviews, returns, shops };
+}
+
 /** DB 行 → 对外字段（金额均字符串化防精度丢失；快照还原商品字段供买家校验）
  *  opts.as: 'owner' 店主视角 / 'arbiter' 仲裁人视角（裁决证据，码全可见）；
  *  'buyer' 买家视角（仅已交付状态可见码）；默认不暴露码。
@@ -316,7 +345,9 @@ async function orderToPublic(o, opts = {}) {
   // NFT 凭证行（tokenId/txHash）不随码规则隐藏：转账凭证链上公开（任何人可查 Transfer），
   // 且买家需凭 txHash 自证持有（仲裁/申诉场景）；匿名可见不构成额外泄露（澄清，
   // 实现刻意恒可见——历史注释「同码隐藏规则」已过时）
-  const rawItems = await getDb().all('SELECT kind, value, tx_hash, created_at FROM order_delivery_items WHERE order_id = ? ORDER BY id ASC', o.order_id);
+  const rawItems = opts.preloaded
+    ? (opts.preloaded.deliveries.get(String(o.order_id)) || [])
+    : await getDb().all('SELECT kind, value, tx_hash, created_at FROM order_delivery_items WHERE order_id = ? ORDER BY id ASC', o.order_id);
   const codeVisible = (() => {
     if (!opts.as) return false;
     if (opts.as === 'owner' || opts.as === 'arbiter') return true;
@@ -346,7 +377,9 @@ async function orderToPublic(o, opts = {}) {
   const shippingVisible = opts.as === 'buyer' || opts.as === 'owner' || opts.as === 'arbiter';
   // 评价标记/内容（同构输出；公开列表仅 rated 驱动入口，内容随详情视角）。
   // 订单键一律用**内部 order_id** 去挂 reviews/order_returns（子表外键就是它）。
-  const reviewRow = await findReviewByOrder(o.order_id);
+  const reviewRow = opts.preloaded
+    ? (opts.preloaded.reviews.get(String(o.order_id)) || null)
+    : await findReviewByOrder(o.order_id);
   const review = reviewRow
     ? {
         rated: true,
@@ -366,12 +399,16 @@ async function orderToPublic(o, opts = {}) {
       }
     : { rated: false, rating: null, reviewable: reviewableAt(o), images: [], followup: null };
   // 退货单（履约/追回信息，按当事人视角可见——同收货信息矩阵）
-  const returnRow = await fetchReturnByOrder(o.order_id);
+  const returnRow = opts.preloaded
+    ? (opts.preloaded.returns.get(String(o.order_id)) || null)
+    : await fetchReturnByOrder(o.order_id);
   const returnInfo = returnRow && shippingVisible ? returnToPublic(returnRow) : null;
   /*
     本单所属店铺的行（用于 `shop` 这一块展示字段）。
   */
-  const shopRow = o.shop_code ? await shopRowByCode(o.shop_code) : undefined;
+  const shopRow = o.shop_code
+    ? (opts.preloaded ? opts.preloaded.shops.get(String(o.shop_code)) : await shopRowByCode(o.shop_code))
+    : undefined;
   return {
     /** **对外标识 = 订单号**（URL/详情/通知/审计同一个值）。内部 `orders.id` 不出现在 DTO 里。 */
     id: o.order_no,
@@ -1347,9 +1384,10 @@ router.get('/', publicListLimiter, wrap(async (req, res) => {
   const db = getDb();
   const total = (await db.get(`SELECT COUNT(*) AS c FROM v_orders WHERE ${where}`, ...params)).c;
   const rows = await db.all(`SELECT * FROM v_orders WHERE ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`, ...params, pageSize, offset);
+  const preloaded = await preloadOrderRelations(rows);
   // 兑换码为敏感字段：仅当请求者携带有效登录令牌且为本单买家时可见（防未登录探码）
   const orders = await Promise.all(
-    rows.map((o) => orderToPublic(o, { as: buyerSelf ? 'buyer' : null }))
+    rows.map((o) => orderToPublic(o, { as: buyerSelf ? 'buyer' : null, preloaded }))
   );
   ok(res, { orders, total, page, pageSize });
 }));
@@ -1492,12 +1530,13 @@ router.get('/seller', staffOnly, wrap(async (req, res) => {
   const db = getDb();
   const total = (await db.get(`SELECT COUNT(*) AS c FROM v_orders WHERE shop_code = ? AND ${where}`, String(req.shop.code), ...params)).c;
   const rows = await db.all(`SELECT * FROM v_orders WHERE shop_code = ? AND ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`, String(req.shop.code), ...params, pageSize, offset);
+  const preloaded = await preloadOrderRelations(rows);
   /*
     `poolEmpty` 必须 await：它是一次真正的库查询（池内可用量与已交付行数，见 poolAlert.js）。
     漏掉 await 时 `JSON.stringify` 会把 Promise 序列化成 `{}` —— 卖家面板读到的
     `poolEmpty` 于是恒为"真值对象"，缺货提示永不显示，而响应仍是 200、没有任何报错。
   */
-  const orders = await Promise.all(rows.map(async (o) => ({ ...(await orderToPublic(o, { as: 'owner' })), poolEmpty: await isPoolEmpty(o) })));
+  const orders = await Promise.all(rows.map(async (o) => ({ ...(await orderToPublic(o, { as: 'owner', preloaded })), poolEmpty: await isPoolEmpty(o) })));
   ok(res, { orders, total, page, pageSize });
 }));
 

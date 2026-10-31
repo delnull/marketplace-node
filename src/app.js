@@ -323,7 +323,11 @@ export function createApp() {
         ? Date.now() - watcherLastOk >= watcherStaleMs
         : Date.now() - Number(watcher.startedAt) >= watcherStaleMs * 4);
     const quarantinedOk = Number(watcher.quarantined) === 0;
-    const healthy = !watcherStalled && quarantinedOk;
+    // Redis 是限流/缓存的硬依赖：掉线时节点仍能读库，但匿名入口无法 prove 请求预算，
+    // 探活必须报 503，而不是让编排以为可以继续接流量。
+    const redis = await redisHealth();
+    const redisOk = redis.connected;
+    const healthy = !watcherStalled && quarantinedOk && redisOk;
     if (!healthy) {
       const why = [
         watcherStalled
@@ -332,12 +336,14 @@ export function createApp() {
             `lagBlocks=${watcher.lagBlocks ?? null}，游标不再推进 ⇒ 订单会停在旧状态）`
           : null,
         !quarantinedOk ? `${watcher.quarantined} 条链上事件已隔离、需人工介入（见 node.quarantined_events）` : null,
+        !redisOk ? 'Redis 不可用：限流/共享缓存无法工作（检查 MK_REDIS_URL 与 Redis 进程）' : null,
       ].filter(Boolean);
       res.status(503);
       return fail(res, `节点不健康：${why.join('；')}`, 1, 503, {
         healthy: false,
         reason: why.join('；'),
         watcher,
+        redis,
         // 503 也要给隔离条数：否则运维只能从 watcher 里猜，node 读数在故障时反而消失。
         node: node
           ? {
@@ -446,8 +452,8 @@ export function createApp() {
           （Docker HEALTHCHECK / deploy.sh / deploy-node.ps1 的 `"code":0`）只认 HTTP 码与顶层 code。
         */
         auditChain: await readAuditChain(),
-        // Redis 是限流/共享缓存的依赖；未配置/掉线只报状态，不把整个节点判死（内存兜底）
-        redis: await redisHealth(),
+        // Redis 是限流/共享缓存的依赖；未配置/掉线会让 /healthz 503（见上方 healthy）
+        redis,
       },
     });
     } catch (e) {

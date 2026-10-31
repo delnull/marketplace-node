@@ -247,7 +247,6 @@ export async function quotePaymentToken(tokenAddress, totalUsdtMicro) {
  */
 const TOKEN_SUPPORT_TTL_MS = 30_000;
 const TOKEN_SUPPORT_TIMEOUT_MS = 2_000;
-const _tokenSupportCache = new Map(); // token -> { at, supported }
 
 function withTokenSupportTimeout(promise) {
   return new Promise((resolve, reject) => {
@@ -267,44 +266,28 @@ let _tokenSupportReader = async (tokenAddress) => {
   return !!(await getEscrow().supportedToken(tokenAddress));
 };
 
-/** 测试注入链上白名单读取器（传 null 恢复默认）；注入即清缓存，避免测试之间串读数。 */
+/** 测试注入链上白名单读取器（传 null 恢复默认）。 */
 export function setTokenSupportReader(fn) {
   _tokenSupportReader = fn || (async (tokenAddress) => {
     const { getEscrow } = await import('./chain.js');
     return !!(await getEscrow().supportedToken(tokenAddress));
   });
-  _tokenSupportCache.clear();
 }
 
 export async function tokenSupportedOnChain(tokenAddress) {
   const key = String(tokenAddress || '').toLowerCase();
-  const mem = _tokenSupportCache.get(key);
-  if (mem && Date.now() - mem.at < TOKEN_SUPPORT_TTL_MS) return mem.supported;
   /*
-    Redis 共享缓存：同一节点多进程/多实例共用链上白名单读数，避免每个进程各自打一次 RPC。
-    Redis 不可用就继续走内存/链上；缓存值只影响 30s 的陈旧窗口，真正收款授权仍由 Escrow 校验。
+    Redis 是唯一缓存来源：同一节点多进程/多实例共用链上白名单读数，不保留进程内 Map。
+    缓存值只影响 30s 的陈旧窗口，真正的收款授权仍由 Escrow 在 createOrderToken 时校验。
   */
-  try {
-    const shared = await redisGetJson(`pay-support:${key}`);
-    if (shared && shared.supported === true) {
-      _tokenSupportCache.set(key, { at: Date.now(), supported: true });
-      return true;
-    }
-  } catch {
-    /* Redis 故障不阻塞链上读 */
-  }
+  const shared = await redisGetJson(`pay-support:${key}`);
+  if (shared && typeof shared.supported === 'boolean') return shared.supported;
   const supported = !!(await withTokenSupportTimeout(Promise.resolve(_tokenSupportReader(key))));
-  _tokenSupportCache.set(key, { at: Date.now(), supported });
-  try {
-    await redisSetJson(`pay-support:${key}`, { supported }, TOKEN_SUPPORT_TTL_MS);
-  } catch {
-    /* 缓存写失败不影响本次结果 */
-  }
+  await redisSetJson(`pay-support:${key}`, { supported }, TOKEN_SUPPORT_TTL_MS);
   return supported;
 }
 
-/** 删除缓存（测试/运维重载用） */
+/** 删除报价缓存（测试/运维重载用；支付 token 白名单缓存由 Redis TTL 过期） */
 export function clearPaymentRateCache() {
   priceCache.clear();
-  _tokenSupportCache.clear();
 }

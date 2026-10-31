@@ -109,6 +109,16 @@ export async function makeCtx() {
   */
   process.env.MK_RPC_URL = 'http://127.0.0.1:1/';
 
+  /*
+    Redis 在测试进程里用假客户端走同一套命令（不是运行时回退）：限流/缓存的生产代码
+    没有内存分支；这里只替换客户端，让测试不依赖本机 Redis。放在 env 设好之后导入，
+    避免 config 在 MK_SHOP_OWNER/MK_DB_NAME 之前被求值。
+  */
+  process.env.MK_REDIS_URL = process.env.MK_REDIS_URL || 'redis://test';
+  const { __setRedisClientForTest } = await import('../src/redis.js');
+  const { createFakeRedis } = await import('./fakeRedis.mjs');
+  __setRedisClientForTest(createFakeRedis());
+
   const { initDb, getDb } = await import('../src/db.js');
   const { default: config } = await import('../src/config.js');
   /*
