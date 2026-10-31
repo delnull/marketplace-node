@@ -35,6 +35,9 @@ export async function getRedis() {
         url: config.redisUrl,
         // 启动/请求都不能挂在无限重连上：连不上就失败，由 startup/健康检查 loud 地报出来。
         socket: { connectTimeout: 3_000, reconnectStrategy: false },
+        // 只用 RESP2：节点不需要 RESP3 特性，测试里的最小 Redis 协议桩也只需实现这一层。
+        RESP: 2,
+        disableClientInfo: true,
       });
     } catch (e) {
       throw new Error(`Redis 客户端创建失败：${e?.message || e}`);

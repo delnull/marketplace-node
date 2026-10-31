@@ -19,13 +19,14 @@
  * 所以那种形态只能靠"停一次容器、看日志里有没有那一行『已关闭（原因：SIGTERM』"来验。
  * 这条用例把它写成一句可照做的动作，而不是假装已经覆盖。
  */
-import { test } from 'node:test';
+import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import mysql from 'mysql2/promise';
+import { startFakeRedis } from './fakeRedisServer.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NODE_DIR = path.resolve(HERE, '..');
@@ -37,6 +38,7 @@ const DB = {
   password: process.env.MK_DB_PASSWORD || '',
 };
 const PORT = 19000 + (process.pid % 1500);
+let redisStub;
 
 async function dropDb() {
   const conn = await mysql.createConnection({ host: DB.host, port: DB.port, user: DB.user, password: DB.password });
@@ -65,6 +67,7 @@ function startNode(extraEnv = {}) {
       MK_PII_RETENTION_DAYS: '0',
       MK_SHUTDOWN_DRAIN_MS: '5000',
       MK_SHUTDOWN_ON_STDIN_EOF: '1',
+      MK_REDIS_URL: redisStub.url,
       ...extraEnv,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -109,8 +112,13 @@ function startNode(extraEnv = {}) {
   return { child, ready, exited, log: () => out };
 }
 
+before(async () => {
+  redisStub = await startFakeRedis();
+});
+
 test.after(async () => {
   await dropDb();
+  await redisStub?.close();
 });
 
 test('真进程：收到停信号 ⇒ 在途请求被应答完、不再接受新连接、自己退出且退出码 0', async () => {
