@@ -46,7 +46,7 @@ const HERE = __dirname;
 const NODE_ROOT = path.resolve(HERE, '..');
 /**
  * 随本包提供**已编译**的字节码（`contract-artifacts.json`，由本仓
- * `node/scripts/build-contract-artifacts.mjs` 从 contracts/out 生成）。主网部署不再要求
+ * `scripts/build-contract-artifacts.mjs` 从 contracts/out 生成）。主网部署不再要求
  * 店主本地装 Foundry/编译：部署的就是这份清单里的完整 bytecode，runtime 哈希与它一一对应。
  */
 const ARTIFACTS = path.join(NODE_ROOT, 'contract-artifacts.json');

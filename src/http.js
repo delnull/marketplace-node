@@ -119,10 +119,8 @@ export function bearerToken(req) {
  * 成倍放大。Redis 故障时回退内存是**可用性取舍**，不是第二套判据：计数窗口算法相同，
  * 只是作用域从集群缩回单进程；日志会报一次，运维能从 /healthz 的 redis.connected 看到。
  */
-let _rateLimitSeq = 0;
-export function simpleRateLimit({ windowMs, max, message = '请求过于频繁，请稍后再试', name = '' } = {}) {
+export function simpleRateLimit({ windowMs, max, message = '请求过于频繁，请稍后再试' } = {}) {
   const hits = new Map(); // key: ip → number[]（时间戳，Redis 不可用时的兜底）
-  const id = name || `rl-${++_rateLimitSeq}`;
   const memoryHit = (res, ip, next) => {
     const now = Date.now();
     // 内存护栏：条目数超阈值时惰性清扫整窗已过期条目（防唯一 IP 面大时 Map 无界增长）
@@ -143,12 +141,15 @@ export function simpleRateLimit({ windowMs, max, message = '请求过于频繁�
   };
   return (req, res, next) => {
     const ip = clientIp(req);
+    // 键用「方法 + 挂载路径 + 实际路径」而不是进程内自增 id：多进程各自创建中间件时
+    // 自增顺序不保证一致，用路由形状才能共享同一个桶。
+    const routeKey = `${req.method} ${req.baseUrl || ''}${req.path || ''}`;
     // 300ms 预算：Redis 挂了/网络抖动时不能让每个匿名请求都挂住；超时即回退内存。
     const redisBudget = new Promise((resolve) => {
       const t = setTimeout(() => resolve(null), 300);
       if (typeof t.unref === 'function') t.unref();
     });
-    Promise.race([redisHit(`${id}:${ip}`, windowMs), redisBudget])
+    Promise.race([redisHit(`${routeKey}:${ip}`, windowMs), redisBudget])
       .then((hit) => {
         if (!hit) return memoryHit(res, ip, next);
         if (hit.count > max) {
