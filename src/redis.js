@@ -107,7 +107,10 @@ export async function redisHealth() {
   if (!config.redisUrl) return { configured: false, connected: false };
   const c = await Promise.race([
     getRedis(),
-    new Promise((resolve) => setTimeout(() => resolve(null), 300)),
+    new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 300);
+      if (typeof t.unref === 'function') t.unref();
+    }),
   ]);
   return { configured: true, connected: !!c?.isReady };
 }

@@ -144,7 +144,10 @@ export function simpleRateLimit({ windowMs, max, message = '请求过于频繁�
   return (req, res, next) => {
     const ip = clientIp(req);
     // 300ms 预算：Redis 挂了/网络抖动时不能让每个匿名请求都挂住；超时即回退内存。
-    const redisBudget = new Promise((resolve) => setTimeout(() => resolve(null), 300));
+    const redisBudget = new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 300);
+      if (typeof t.unref === 'function') t.unref();
+    });
     Promise.race([redisHit(`${id}:${ip}`, windowMs), redisBudget])
       .then((hit) => {
         if (!hit) return memoryHit(res, ip, next);

@@ -37,7 +37,7 @@ bytecode，并在本地校验 `keccak256(bytecode) == creationCodeHash`、
 `keccak256(deployedBytecode) == runtimeCodeHash`；清单被篡改/损坏会当场拒绝。
 
 只有**修改合约**时才需要重新生成：`cd contracts && forge build`，然后用生成脚本跑
-`node node/scripts/build-contract-artifacts.mjs`，同批提交 `node/contract-artifacts.json`。公开仓
+`node scripts/build-contract-artifacts.mjs`，同批提交 `node/contract-artifacts.json`。公开仓
 发布/CI 的 `build-contract-artifacts.mjs --check` 会拒绝"清单与源码构建不一致"。
 
 ## 2. 部署

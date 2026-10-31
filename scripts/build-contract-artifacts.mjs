@@ -17,7 +17,13 @@ import { ethers } from 'ethers';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..');
 const OUT = path.join(ROOT, 'contracts', 'out');
-const TARGET = path.join(ROOT, 'node', 'contract-artifacts.json');
+/**
+ * 开发仓布局：`<root>/node/scripts` + `<root>/node/contract-artifacts.json`；
+ * 公开节点仓布局：`<root>/scripts` + `<root>/contract-artifacts.json`（node/ 摊到仓库根）。
+ */
+const TARGET = existsSync(path.join(ROOT, 'node', 'package.json'))
+  ? path.join(ROOT, 'node', 'contract-artifacts.json')
+  : path.join(ROOT, 'contract-artifacts.json');
 const NAMES = ['MarketplaceRegistry', 'Escrow', 'Staking', 'NodeGovernance', 'TokenPayoutVault'];
 
 function artifactOf(name) {
