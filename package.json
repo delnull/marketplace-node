@@ -1,6 +1,6 @@
 {
   "name": "marketplace-node",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "BitYuan 联邦商城节点：任何人可部署的店铺 API 服务（Express + MySQL 8）",

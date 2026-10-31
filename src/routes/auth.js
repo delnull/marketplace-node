@@ -21,7 +21,6 @@
  * 与任何店铺都对不上的值（那正是本次要删掉的那类假话）。
  */
 import { Router } from 'express';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { issueSiwe, verifySiwe, issueToken, roleOf, isHost, operatedShopCodes, isNodeStaffOf } from '../auth.js';
 import { isAddress } from '../chain.js';
 import { shopDto, shopRowByCode, nodeOwner } from '../shops.js';
@@ -75,44 +74,6 @@ async function alertOwnerLogin(recovered, hostNow, req) {
   }
 }
 
-/**
- * 扫码登录的短暂配对票据。
- *
- * 桌面端拿到 code + secret；二维码里只带 code。手机钱包签名后把令牌写回 code；
- * 桌面端再用 secret 取走。code 被旁观者看到也不能读走令牌，secret 不出现在二维码/URL 里。
- * 内存 TTL 2 分钟：这是一次性配对，不需要跨进程，也不该在库里留下登录令牌。
- */
-const QR_TTL_MS = 120_000;
-const QR_MAX = 2_000;
-const qrSessions = new Map();
-
-function sweepQr(now = Date.now()) {
-  for (const [code, row] of qrSessions) {
-    if (row.expiresAt <= now) qrSessions.delete(code);
-  }
-  while (qrSessions.size >= QR_MAX) {
-    const oldest = qrSessions.keys().next().value;
-    if (!oldest) break;
-    qrSessions.delete(oldest);
-  }
-}
-
-function qrSessionOf(code) {
-  const row = qrSessions.get(String(code || ''));
-  if (!row) return null;
-  if (row.expiresAt <= Date.now()) {
-    qrSessions.delete(String(code));
-    return null;
-  }
-  return row;
-}
-
-function sameSecret(a, b) {
-  const left = Buffer.from(String(a || ''));
-  const right = Buffer.from(String(b || ''));
-  return left.length === right.length && left.length > 0 && timingSafeEqual(left, right);
-}
-
 const router = Router();
 
 /**
@@ -136,9 +97,6 @@ function originProtocolGuard(req, res, next) {
 const RATE_LIMIT = {
   '/nonce': { windowMs: 60_000, max: 120 }, // 取 nonce 是廉价但可无限刷表/占地址
   '/login': { windowMs: 60_000, max: 60 },
-  '/qr-session': { windowMs: 60_000, max: 60 },
-  '/qr-approve': { windowMs: 60_000, max: 30 },
-  '/qr-read': { windowMs: 60_000, max: 180 },
 };
 const hits = new Map(); // key: `${path}|${ip}` → number[]（时间戳）
 
@@ -196,52 +154,6 @@ router.post('/login', rateLimit('/login'), originProtocolGuard, wrap(async (req,
   const hostNow = await isHost(recovered, { force: true });
   await alertOwnerLogin(recovered, hostNow, req);
   ok(res, await loginPayload(recovered, hostNow));
-}));
-
-/**
- * 桌面端创建扫码票据。二维码只带 code；secret 只留在桌面端内存/弹窗里。
- * 手机批准后把登录回执写进这笔票据，桌面端轮询取走。
- */
-router.post('/qr/session', rateLimit('/qr-session'), originProtocolGuard, wrap(async (_req, res) => {
-  sweepQr();
-  const code = randomBytes(9).toString('base64url');
-  const secret = randomBytes(32).toString('base64url');
-  const expiresAt = Date.now() + QR_TTL_MS;
-  qrSessions.set(code, { secret, expiresAt, status: 'pending', login: null });
-  ok(res, { code, secret, expiresIn: Math.floor(QR_TTL_MS / 1000), expiresAt: new Date(expiresAt).toISOString() });
-}));
-
-/** 桌面端轮询：必须带 secret，只有它能取走令牌 */
-router.get('/qr/session/:code', rateLimit('/qr-read'), wrap(async (req, res) => {
-  const row = qrSessionOf(req.params.code);
-  if (!row) return fail(res, '扫码登录已过期，请刷新二维码', 404, 410);
-  if (!sameSecret(req.query.secret, row.secret)) return fail(res, '扫码登录凭证无效', 403, 403);
-  ok(res, {
-    status: row.status,
-    expiresIn: Math.max(0, Math.ceil((row.expiresAt - Date.now()) / 1000)),
-    ...(row.status === 'approved' ? { login: row.login } : {}),
-  });
-}));
-
-/** 手机钱包内置浏览器批准：验签通过后才写入票据；不回传令牌给只拿 code 的手机页 */
-router.post('/qr/session/:code/approve', rateLimit('/qr-approve'), originProtocolGuard, wrap(async (req, res) => {
-  const row = qrSessionOf(req.params.code);
-  if (!row) return fail(res, '扫码登录已过期，请回到电脑刷新二维码', 404, 410);
-  if (row.status === 'approved') return fail(res, '这笔扫码登录已经确认过了', 409, 409);
-  const { address, message, signature } = req.body || {};
-  if (!isAddress(address)) return fail(res, 'address 参数无效');
-  if (!message || !signature) return fail(res, '缺少 message 或 signature');
-  let recovered;
-  try {
-    recovered = await verifySiwe(address, message, signature);
-  } catch (e) {
-    return fail(res, String(e?.message || '签名校验失败，请重新获取签名原文后再登录'), 1, 401);
-  }
-  const hostNow = await isHost(recovered, { force: true });
-  await alertOwnerLogin(recovered, hostNow, req);
-  row.login = await loginPayload(recovered, hostNow);
-  row.status = 'approved';
-  ok(res, { status: 'approved', address: row.login.address });
 }));
 
 export default router;
