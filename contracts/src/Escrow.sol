@@ -810,10 +810,8 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     /// @notice 紧急吊销：不能再投任何单，旧票也不再计入（重新任命才清回 false）
     /**
      * @notice 永久吊销某地址的裁决资格。
-     * @dev **不再要求它是当前届成员**：换届后旧成员仍能对旧届订单投票，若只有"当前届成员"
-     *      可被吊销，被换下的失陷密钥就永远无法止损。墓碑是全局的，旧届计票/出金锁都读它。
-     *      当前届成员只有在缩表后仍满足 threshold < 新人数时才从名单移除；3/2 这类
-     *      移除后会变成 2/2 的委员会保留在数组里、只置墓碑，由计票逻辑跳过。
+     * @dev **不要求它是当前名单成员**：被换下的失陷密钥仍可被拉黑，之后即使重新入名单也不投票。
+     *      墓碑是全局的；当前名单成员缩表后若会跌破阈值则保留墓碑位（`isArbiter`/计票跳过）。
      */
     function revokeArbiter(address member) external onlyGovernor {
         if (member == address(0)) revert InvalidArbiter();

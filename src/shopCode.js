@@ -2,7 +2,7 @@
  * 店铺编号（shop code）——**编号规则与校验的唯一实现**，node / frontend / 脚本共用。
  *
  * 形状：**9 位 = 8 位数据 + 1 位校验**
- *   数据位：节点生成的 8 个 Crockford Base32 字符（`node/src/ids.js` 用 CSPRNG 取字符）；
+ *   数据位：节点生成的 8 个 Crockford Base32 字符（`src/ids.js` 用 CSPRNG 取字符）；
  *   校验位：**加权和** `Σ 值×位权(1..8) mod 37`，值域 0..36 映射到 Crockford 数据字母表，
  *           32..36 用 URL/IM 安全的 `-._~,`（官方写作 `*~$=U`——`*` 在聊天里触发斜体、
  *           `$`/`=` 常被转义，而编号最常贴进聊天）。
@@ -16,7 +16,7 @@
  * 本文件只负责编码与校验，不生成随机数（生成器在 node/src/ids.js，便于用 CSPRNG）。
  *
  * **本文件不依赖任何库**（前端/节点/模拟链/脚本都能直接 import）。
- * 改算法必须同步改 `node/src/ids.js` 的生成路径与测试；前端 `asShopCode` 直接调本文件。
+ * 改算法必须同步改 `src/ids.js` 的生成路径与测试；前端 `asShopCode` 直接调本文件。
  */
 
 /** Crockford Base32 数据字母表（无 I/L/O/U，避免 1/I、0/O 抄错） */

@@ -147,7 +147,7 @@ test('读到过一次之后 RPC 故障：不得把上一届成员当成当前仲
   assert.equal(await getCommittee(), null, '读不到 ⇒ 判定值必须是 null，不是上次成功值');
   assert.equal(await isArbiterAddress(arbiterOnchain), false, '读不到 ⇒ 不把任何人当仲裁人');
   const afterFail = await detailAs(arbiterToken, order.id);
-  assert.deepEqual(afterFail.deliveries, [], '旧届成员密钥在 RPC 故障期间不得再读到交付码');
+  assert.deepEqual(afterFail.deliveries, [], '旧成员密钥在 RPC 故障期间不得再读到交付码');
 
   // ③ 诊断读数：known=false；lastOk 只作"最后读到过谁"的排障线索，不参与判定
   const st = committeeStatus();
