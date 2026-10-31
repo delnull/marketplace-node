@@ -37,7 +37,7 @@
  * 它是**节点级查询的附加过滤**，不是把那些行改判给店铺；CSV 导出不带它。
  */
 import { Router } from 'express';
-import { verifyToken } from '../auth.js';
+import { verifySession } from '../auth.js';
 import { fail, ok, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
 import { exportAudit, logAudit, queryAudit } from '../audit.js';
 import { sendCsv } from '../csv.js';
@@ -45,11 +45,11 @@ import { isShopCodeShape } from '../shops.js';
 
 const router = Router();
 // 审计行含 IP/操作者/被操作对象：店铺级私域，只认该店店主（节点主看节点级那份，见 GET /node）
-const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true });
+const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true });
 // 节点级审计：仅节点主（节点主可以一家店都没有，不要求也不消费请求头）
-const hostOnly = makeAuthMiddleware(verifyToken, { hostOnly: true });
+const hostOnly = makeAuthMiddleware(verifySession, { hostOnly: true });
 // 节点管理员（节点主 ∪ 员工）：只用于"自己的"节点级审计，不放开全节点视图
-const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true });
+const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 
 /** 分页与可选过滤（三条列表路由共用，避免几处各解一次参数而漂移） */
 function listParams(req) {

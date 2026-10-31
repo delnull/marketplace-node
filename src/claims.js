@@ -1,7 +1,7 @@
 /**
  * 店铺身份自主声明（shop claim）的**唯一判据层**：规范消息构造 + 声明值校验 + 签名核验。
  *
- * 要解决的问题：`code`（店铺编号）只解决"唯一"（链上锻造、一店一号），**不解决"哪个才是官方那家"**
+ * 要解决的问题：`code`（本节点生成的 9 位编号）只解决"唯一"（节点本地一店一号），**不解决"哪个才是官方那家"**
  * ——编号本身不携带任何外部身份信息。店主用钱包私钥对一段**规范消息**签名，把
  * "域名 / GitHub / X / Telegram" 这些外部身份绑定到店铺地址上，此后第三方可核验：
  *   · EOA：拿 `message` + `signature` 重算 `ethers.verifyMessage`，与 `address` 比对；
@@ -52,6 +52,7 @@
  */
 import { ethers } from 'ethers';
 import { isValidContractSignature } from './chain.js';
+import { verifyShopCode } from './shopCode.js';
 
 /** 允许的声明类型（顺序即报错文案里的顺序）。每种类型的值规则见 RULES */
 export const CLAIM_KINDS = Object.freeze(['domain', 'github', 'x', 'telegram']);
@@ -214,7 +215,7 @@ export function checkClaimValue(kind, value) {
  * **逐字**使用 `kind` / `value` / `issued`：不 trim、不折大小写、不补当天、不替换任何字符
  * （见文件头铁律）。因此它只做"字段存在且形状能拼成 6 行"的检查，拼不出就抛错：
  *   · `code`：非空、无空白无换行（编号是**本节点**铸造的 `shops.code`，形状/校验位契约在
- *     shared/shopCode.js；这里再写一遍校验规则就是第二套判据——它一旦漂移，合法编号会被拒）；
+ *     ./shopCode.js；这里再写一遍校验规则就是第二套判据——它一旦漂移，合法编号会被拒）；
  *   · `operator`：必须是**已小写**的 0x 地址（大写/校验和形态不替调用方改写，否则两端字节不同）；
  *   · `kind`：必须逐字在 {@link CLAIM_KINDS} 内；
  *   · `value`：非空、不含换行（形状检查；**是否规范形由调用方先过 checkClaimValue 决定**——
@@ -227,9 +228,9 @@ export function checkClaimValue(kind, value) {
  * @throws {Error} 任一字段缺失/形状非法（错误信息是给店主看的中文）
  */
 export function buildClaimMessage({ code, operator, kind, value, issued } = {}) {
-  const c = String(code ?? '');
-  if (!/^[0-9A-Za-z]{4,16}$/.test(c)) {
-    throw new Error('店铺编号不合法（节点应传入 Registry 读到的本店编号；空值说明此时无法核验店主身份）');
+  const c = verifyShopCode(code);
+  if (!c) {
+    throw new Error('店铺编号不合法（本店铺行的编号未通过 9 位校验；空值说明此时无法核验店主身份）');
   }
   const op = String(operator ?? '');
   if (!LOWER_ADDRESS_RE.test(op) || op === ethers.ZeroAddress) {

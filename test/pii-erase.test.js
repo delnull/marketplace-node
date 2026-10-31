@@ -45,7 +45,7 @@ let operatorToken;
 
 /**
  * 第二家店的编号：用来拿一个"只经营自己那家店、但不是节点主"的店主（见 retention/run 那条用例）。
- * ⚠️ 必须落在 `shared/shopCode.js` 的字母表里（`0-9 A-Z` 去掉易混的 `I/L/O/U`）——
+ * ⚠️ 必须落在 `node/src/shopCode.js` 的字母表里（`0-9 A-Z` 去掉易混的 `I/L/O/U`）——
  * 写成含 `O` 的编号会被 `isShopCodeShape` 拒掉，请求头因此解析不到（404），
  * 于是一条本该 403 的越权用例会以 404 通过，看起来还挺像"挡住了"。
  */
@@ -210,6 +210,28 @@ test('erase-pii：在途单拒绝；终局擦除（含附件行与磁盘文件�
   // `onchain_events` 是 `order_chain.events`（JSON 列）：驱动读回来**已是数组**，不再 JSON.parse
   assert.ok((after.onchain_events || []).length >= 2, '链上事件史保留（OrderCreated + 确认）');
   assert.equal((await db.get('SELECT COUNT(*) AS c FROM reviews WHERE order_id = ?', await orderIdOfNo(order.id))).c, 1, '评价（无 PII）保留');
+
+  /*
+    擦除是**终态**：不能再通过评价/追评/评价图把新的个人信息写回同一订单。
+    旧实现只在 evidence 路径挡了"擦后重写"，评价三入口都能绕过删除承诺并把图片重新公开落盘。
+  */
+  const reviewAfterErase = await request(app)
+    .post(`/api/orders/${order.id}/review`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ rating: 4, content: '擦除后又写回' });
+  assert.notEqual(reviewAfterErase.body.code, 0, '擦除后不得再提交评价');
+  const followupAfterErase = await request(app)
+    .post(`/api/orders/${order.id}/review/followup`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ content: '擦除后又追评' });
+  assert.notEqual(followupAfterErase.body.code, 0, '擦除后不得再追评');
+  const imageAfterErase = await request(app)
+    .post(`/api/orders/${order.id}/review/images`)
+    .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+    .set('Content-Type', 'image/png')
+    .send(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  assert.notEqual(imageAfterErase.body.code, 0, '擦除后不得再上传评价图');
+  assert.equal((await db.get('SELECT COUNT(*) AS c FROM reviews WHERE order_id = ?', await orderIdOfNo(order.id))).c, 1, '评价行数量不变');
 
   // 陈述行保留（时间线事实），只有正文换成墓碑
   const evRows = await evidenceRows(order.id);

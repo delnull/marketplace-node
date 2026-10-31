@@ -9,8 +9,9 @@
  * ## 判据链（每一环都在本模块唯一实现）
  *
  *  1. **这枚 token 在本节点被交付过**：`order_delivery_items(kind='nft', value=tokenId)`
- *     + 订单终局（confirmed/settled）+ 商品行的 `nft_contract` 与请求一致。
- *     没有这一条，任何人在任何 NFT 上都能对本节点的一家店发起提货声明。
+ *     + 订单终局（confirmed/settled/expired；expired 只要交付行存在就仍可提货）
+ *     + 商品行的 `nft_contract` 与请求一致。
+ *     没有这一条，任何人在任何 NFT 上都能对本店发起提货声明。
  *  2. **商品开了提货**（`products.claimable = 1`）：收藏品没有线下兑付，不该出现在声明入口。
  *  3. **在提货窗口内**：`claim_window_days` 自**交付订单终局时刻**（`orders.updated_at`）起算；
  *     NULL = 不限期。过期声明直接拒绝，不落行（"过期了还能排上队"比拒绝更糟）。
@@ -35,9 +36,6 @@ import { ethers } from 'ethers';
 import { getDb, withTransaction } from './db.js';
 import { getProvider, isAddress } from './chain.js';
 import { newClaimNo } from './ids.js';
-
-/** 声明状态（与 db.js 的 ENUM 逐值同序；改一处必须同批改另一处） */
-export const CLAIM_STATUSES = ['requested', 'approved', 'shipped', 'fulfilled', 'rejected', 'cancelled', 'expired'];
 
 /** 仍占着"这枚 token 的提货权"的状态：seller 可操作、新声明不能插队 */
 export const CLAIM_OPEN_STATUSES = ['requested', 'approved', 'shipped'];
@@ -109,7 +107,11 @@ export async function nftOwnedBy({ contract, tokenId, claimant }) {
 export async function claimRowByNo(claimNo) {
   const v = String(claimNo ?? '').trim();
   if (!v) return undefined;
-  return await getDb().get('SELECT * FROM nft_claims WHERE claim_no = ?', v);
+  return await getDb().get(
+    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+       FROM nft_claims n WHERE n.claim_no = ?`,
+    v
+  );
 }
 
 /**
@@ -130,6 +132,11 @@ export function claimDto(row, { as = 'public' } = {}) {
     tokenId: row.token_id,
     tokenRef: tokenRefOf(row.token_contract, row.token_id),
     orderNo: row.order_no,
+    /**
+     * 交付这枚 NFT 的链上托管单号（`Escrow.getOrder` 的键）。前端在签名
+     * `openClaimDispute` 前必须用它复核订单的卖家/状态，不能只信节点返回的 `args[1]`。
+     */
+    escrowOrderId: row.escrow_order_id ? String(row.escrow_order_id).toLowerCase() : null,
     seller: row.seller,
     claimant: row.claimant,
     status: row.status,
@@ -178,13 +185,17 @@ export async function deliveredTokenOf(contract, tokenId, { orderId = null } = {
   }
   return await getDb().get(
     `SELECT o.id AS order_id, o.order_no, o.shop_code, o.product_id, o.product_slug, o.seller,
-            o.status, o.updated_at, p.nft_contract, p.claimable, p.claim_type,
+            o.status, o.updated_at, o.pii_erased_at, p.nft_contract, p.claimable, p.claim_type,
             p.claim_window_days, p.claim_instructions
        FROM order_delivery_items d
        JOIN orders o ON o.id = d.order_id
        JOIN products p ON p.id = o.product_id
       WHERE d.kind = 'nft' AND d.value = ? AND p.nft_contract = ?
-        AND o.status IN ('confirmed','settled')${orderClause}
+        /*
+          'expired' 也要收：链上 releaseExpired 把订单结算给卖家（等价 Settled），
+          而 NFT 是否已交付由链下交付行决定；交付过就必须允许持有人继续提货/开争议。
+        */
+        AND o.status IN ('confirmed','settled','expired')${orderClause}
       ORDER BY d.created_at DESC, d.id DESC LIMIT 1`,
     ...params
   );
@@ -235,6 +246,13 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
       ok: false,
       status: 409,
       message: '这枚 token 没有在本节点的已完成订单里交付过（或合约地址与商品不符）——无法发起提货声明',
+    };
+  }
+  if (delivered.pii_erased_at != null) {
+    return {
+      ok: false,
+      status: 409,
+      message: '该交付订单的个人信息已按请求擦除：擦除是终态，不能再新建提货声明写入收货信息',
     };
   }
   if (Number(delivered.claimable) !== 1) {

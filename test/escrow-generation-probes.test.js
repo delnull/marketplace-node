@@ -83,11 +83,11 @@ test('代次探针：必须覆盖合约伙伴/提货争议/委员会那几组读
     assert.ok(names.has(required), `代次探针清单必须包含 ${required}（否则那种"自检通过但出金死掉"的状态又能进来）`);
   }
   // 提货争议读法：缺失时提货声明永远停在"处理中"（watcher 读不到结论），而节点日志里只有一条读不到
-  for (const required of ['claimCase', 'sellerClaimExposure', 'claimEpoch']) {
+  for (const required of ['claimCase', 'sellerClaimExposure']) {
     assert.ok(names.has(required), `代次探针清单必须包含提货争议读法 ${required}`);
   }
   // 委员会读法：缺 `arbiters/arbiterThreshold/committeeEpoch` ⇒ 仲裁人视角整体关闭
-  for (const required of ['arbiters', 'arbiterThreshold', 'committeeEpoch', 'orderEpoch', 'orderArbiters', 'orderThreshold']) {
+  for (const required of ['arbiters', 'arbiterThreshold', 'committeeEpoch']) {
     assert.ok(names.has(required), `代次探针清单必须包含委员会读法 ${required}`);
   }
 });
@@ -104,7 +104,7 @@ test('代次探针：运行时 getCommittee / committeeForOrder 用到的选择�
   const used = new Set(
     [...CHAIN_SRC.slice(start, end).matchAll(/\bescrow\.(\w+)\s*\(/g)].map((m) => m[1])
   );
-  assert.ok(used.size >= 6, `委员会区段至少要读到 6 个选择器（实际 ${[...used].join(', ') || '无'}）`);
+  assert.ok(used.size >= 3, `委员会区段至少要读到 3 个选择器（实际 ${[...used].join(', ') || '无'}）`);
   const probed = new Set(ESCROW_GENERATION_PROBES.map((p) => p.shape.split('(')[0]));
   const missing = [...used].filter((name) => !probed.has(name));
   assert.deepEqual(missing, [], `运行时调用的委员会读法不在代次探针清单里：${missing.join(', ')}`);

@@ -142,12 +142,6 @@ export function sniffMediaMime(buf) {
   return null;
 }
 
-/** MIME → 单文件上限（表里没有的类型返回 null） */
-export function mediaMaxBytes(mime) {
-  const spec = MEDIA[String(mime || '').toLowerCase()];
-  return spec ? spec.maxBytes : null;
-}
-
 /** MIME → 存储扩展名（表里没有的类型返回 null） */
 export function mediaExt(mime) {
   const spec = MEDIA[String(mime || '').toLowerCase()];

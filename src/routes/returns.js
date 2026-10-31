@@ -11,15 +11,15 @@
  */
 import { Router } from 'express';
 import { getDb } from '../db.js';
-import { verifyToken, roleOf } from '../auth.js';
+import { verifySession, roleOf } from '../auth.js';
 import { ok, fail, wrap, makeAuthMiddleware } from '../http.js';
 import { logAudit } from '../audit.js';
-import { createReturn, requestReturn, setReturnAddress, setReturnTracking, settleReturn, returnToPublic } from '../returns.js';
+import { createReturn, requestReturn, setReturnAddress, setReturnQuantity, setReturnTracking, settleReturn, returnToPublic } from '../returns.js';
 import { findOrderInShop } from '../orderScope.js';
 
 const router = Router();
-const requireAuth = makeAuthMiddleware(verifyToken);
-const staffOnly = makeAuthMiddleware(verifyToken, { staffOnly: true });
+const requireAuth = makeAuthMiddleware(verifySession);
+const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true });
 
 /**
  * 店主面的三条路由都必须是**本店**的订单（见 src/orderScope.js）：退货的 `receive/waive`
@@ -66,6 +66,7 @@ router.post('/:orderNo/return/request', requireAuth, wrap(async (req, res) => {
     order,
     buyer: req.auth.address,
     note: req.body?.note,
+    quantity: req.body?.quantity,
   });
   if (r.error) return fail(res, r.error, r.forbidden ? 403 : r.notFound ? 404 : 1, r.forbidden ? 403 : r.notFound ? 404 : 200);
   await logAudit({
@@ -84,11 +85,23 @@ router.post('/:orderNo/return/request', requireAuth, wrap(async (req, res) => {
 router.post('/:orderNo/return', staffOnly, wrap(async (req, res) => {
   const order = await findOrderInShop(req.params.orderNo, req.shop.code);
   if (!order) return fail(res, '订单不存在', 404, 404);
-  const r = await createReturn({ order, address: req.body?.address, note: req.body?.note });
+  const r = await createReturn({ order, address: req.body?.address, note: req.body?.note, quantity: req.body?.quantity });
   if (r.error) return fail(res, r.error, r.notFound ? 404 : 1, r.notFound ? 404 : 200);
-  await audit(req, 'return.create', order.order_no, { status: r.data.status }); // 不落退货地址
+  await audit(req, 'return.create', order.order_no, { status: r.data.status, quantity: r.data.quantity });
   const created = isJustCreated(r.data);
   ok(res, returnToPublic(r.data), created ? '退货单已创建' : '退货单已存在');
+}));
+
+/** 买家回填退回物流单号（可带承运方名称；归一与上限见 src/returns.js → src/shipping.js） */
+/** 卖家修改退货件数（仅 open；确认收到前按实际退回数量修正，占位按这个数释放）。 */
+router.patch('/:orderNo/return/quantity', staffOnly, wrap(async (req, res) => {
+  const order = await findOrderInShop(req.params.orderNo, req.shop.code);
+  if (!order) return fail(res, '订单不存在', 404, 404);
+  const returnRow = await getDb().get('SELECT * FROM order_returns WHERE order_id = ?', order.order_id);
+  const r = await setReturnQuantity({ order, returnRow, quantity: req.body?.quantity });
+  if (r.error) return fail(res, r.error);
+  await audit(req, 'return.quantity', order.order_no, { quantity: r.data.quantity });
+  ok(res, returnToPublic(r.data), `退货件数已改为 ${r.data.quantity} 件`);
 }));
 
 /** 买家回填退回物流单号（可带承运方名称；归一与上限见 src/returns.js → src/shipping.js） */

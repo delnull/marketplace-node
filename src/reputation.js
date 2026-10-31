@@ -411,6 +411,7 @@ export async function reputationSummary(seller) {
                 o.shipped_at
               ) AS delivered_at
        FROM v_orders o
+       JOIN shops s ON s.code = o.shop_code AND s.listed = 1
        ${sel ? 'WHERE o.seller = ?' : ''}`, ...(sel ? [sel] : []));
   return computeReputation(rows, Date.now());
 }

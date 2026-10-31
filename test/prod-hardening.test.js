@@ -194,6 +194,15 @@ test('/healthz 健康判据：轮询器未起过 ⇒ 200；停滞 ⇒ 503（且 
     const notStarted = await request(app).get('/healthz').expect(200);
     assert.equal(notStarted.body.data.healthy, true, '还没轮到第一轮 ⇒ 不因 watcher 判不健康');
 
+    // ②b 首轮已开始但尚未成功：给它宽限；宽限过后仍无成功才判停滞。
+    watcherRuntime.startedAt = Date.now() - 60_000;
+    watcherRuntime.lastOkAt = 0;
+    const firstPoll = await request(app).get('/healthz').expect(200);
+    assert.equal(firstPoll.body.data.healthy, true, '首轮扫描未完成不能立刻 503');
+    watcherRuntime.startedAt = Date.now() - 10 * 60_000;
+    const firstPollTimeout = await request(app).get('/healthz').expect(503);
+    assert.equal(firstPollTimeout.body.data.healthy, false, '首轮宽限过后仍无成功必须判不健康');
+
     // ③ 起过、但最后一次成功轮询远在过去 ⇒ 503
     watcherRuntime.startedAt = Date.now() - 10 * 60_000;
     watcherRuntime.lastOkAt = Date.now() - 10 * 60_000; // 远超三倍轮询间隔且 > 90 秒下限
@@ -210,6 +219,7 @@ test('/healthz 健康判据：轮询器未起过 ⇒ 200；停滞 ⇒ 503（且 
     const quarantined = await request(app).get('/healthz').expect(503);
     assert.match(String(quarantined.body.data.reason), /隔离/, '要说清是隔离事件，而不是含糊的"不健康"');
     assert.equal(quarantined.body.data.watcher.quarantined, 1, '隔离条数取自库里的 node.quarantined_events');
+    assert.equal(quarantined.body.data.node.quarantinedEvents, 1, 'healthz 的 node 读数也要给对象条数，不能恒 null');
 
     // 恢复之后必须回到 200 —— 判据是**读数**，不是"一旦不健康就永久不健康"
     await db.run('UPDATE node SET quarantined_events = ? WHERE id = 1', JSON.stringify(savedQ ?? {}));

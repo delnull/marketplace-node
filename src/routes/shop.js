@@ -30,7 +30,7 @@ import { Router } from 'express';
 import config from '../config.js';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit, optionalShop, listedShopScope } from '../http.js';
 import {
-  verifyToken,
+  verifySession,
   roleOf,
   isHost,
   getShopOperators,
@@ -91,15 +91,20 @@ import { buyerSignal } from '../buyerSignal.js';
 import { opsMetrics, slaReading, SLA_LIMIT_DEFAULT, SLA_LIMIT_MAX } from '../opsMetrics.js';
 
 const router = Router();
+/**
+ * 支付方式公开读：每次请求会对每个已配置 token 读一次链上白名单（无缓存时 N 次 RPC），
+ * oracle 还可能出站取行情。给匿名读一个独立预算，避免被用来放大 RPC/出站流量。
+ */
+const paymentMethodsLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '支付方式查询过于频繁，请稍后再试' });
 // 店铺级财务面：**只认该店店主（seller）**。host 不在此列——租户店铺的账不是节点主的账
 // （他能看到的只有节点级读数，见 GET /node；他自己那家店的账也只有他作为 seller 才看得到）。
-const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true });
-const staffOnly = makeAuthMiddleware(verifyToken, { staffOnly: true });
+const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true });
+const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true });
 // 节点级：节点主 ∪ 节点员工（nodeAdmin；员工与节点主同权限的日常运营动作）。
 // 注意 PII 保留期与节点审计**不在这里**：那两件是 hostOnly（仅节点主，见 routes/pii.js / audit.js）。
-const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true });
+const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 // 增删节点员工是权限授予本身：只允许节点主，避免员工自行扩权/互授。
-const hostOnly = makeAuthMiddleware(verifyToken, { hostOnly: true });
+const hostOnly = makeAuthMiddleware(verifySession, { hostOnly: true });
 
 /* ── 节点资料（`node` 单例行的 name/notice）──
  *
@@ -115,11 +120,6 @@ const hostOnly = makeAuthMiddleware(verifyToken, { hostOnly: true });
 /** 节点对外名称（`node.name` 的展示形；'' = 没设置过 ⇒ 回退对外域名，再回退中性占位） */
 export async function nodeNameOf() {
   return nodeDisplayName(await nodeRow());
-}
-
-/** 节点公告（`node.notice` 的展示形；'' = 没设置过） */
-export async function nodeNoticeOf() {
-  return shopDisplayNotice(await nodeRow());
 }
 
 /**
@@ -284,7 +284,7 @@ router.get('/node-identity', wrap(async (req, res) => {
  * 几家在售、节点员工名单。**不含**订单、买家、金额、商品等任何店铺经营明细——
  * 那些只有该店店主能通过店铺级端点读到。
  */
-router.get('/payment-methods', wrap(async (req, res) => {
+router.get('/payment-methods', paymentMethodsLimiter, wrap(async (req, res) => {
   const raw = String(req.query.usdtMicro ?? '').trim();
   let total = null;
   if (raw) {
@@ -311,7 +311,9 @@ router.get('/payment-methods', wrap(async (req, res) => {
           .filter((t) => t.supported);
       }
     } catch (e) {
-      filtered = tokens.map((t) => ({ ...t, supported: null, unavailable: `无法核验链上白名单：${e?.message || e}` }));
+      // 公开端点不回内部 RPC 错误原文（拓扑/端点会随错误消息泄露）；原文只进节点日志。
+      console.warn(`[shop] 支付白名单链上核验失败：${e?.message || e}`);
+      filtered = tokens.map((t) => ({ ...t, supported: null, unavailable: '链上支付白名单暂时不可核验' }));
     }
   }
   ok(res, {
@@ -902,8 +904,17 @@ router.get('/claims', listedShopScope, claimsLimiter, wrap(async (req, res) => {
   const scoped = req.shop ? String(req.shop.code || '') : null;
   const rows = (
     scoped === null
-      ? await getDb().all('SELECT * FROM shop_claims WHERE revoked_at IS NULL ORDER BY id ASC')
-      : await getDb().all('SELECT * FROM shop_claims WHERE revoked_at IS NULL AND shop_code = ? ORDER BY id ASC', scoped)
+      ? await getDb().all(
+          `SELECT sc.* FROM shop_claims sc
+             JOIN shops s ON s.code = sc.shop_code AND s.listed = 1
+            WHERE sc.revoked_at IS NULL ORDER BY sc.id ASC`
+        )
+      : await getDb().all(
+          `SELECT sc.* FROM shop_claims sc
+             JOIN shops s ON s.code = sc.shop_code AND s.listed = 1
+            WHERE sc.revoked_at IS NULL AND sc.shop_code = ? ORDER BY sc.id ASC`,
+          scoped
+        )
   );
   ok(
     res,

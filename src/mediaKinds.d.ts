@@ -4,8 +4,8 @@
  * 为什么不是"前端再写一份常量"：商品媒体的白名单（png/jpeg/webp/gif + mp4/webm）、
  * 单文件上限（图片 2MB / 视频 50MB）、主图区条数上限（合计 10 项、视频 3 个）与 URL 规则
  * 必须与节点**逐字一致**；两份副本的下场是"前端允许传、后端拒收"（或反过来）的静默漂移。
- * 与 `shared/shopCode.js` + `shared/shopCode.d.ts` 同一取向：规则一份，声明跟着实现走
- * （这份规则为什么住在节点包里而不是根 `shared/`：见 `mediaKinds.js` 文件头）。
+ * 与 `node/src/shopCode.js` + `node/src/shopCode.d.ts` 同一取向：规则一份，声明跟着实现走
+ * （这份规则为什么住在节点包里而不是节点包：见 `mediaKinds.js` 文件头）。
  *
  * 声明与 `node/src/mediaKinds.js` 的导出逐字对应；改 JS 导出必须同步本文件。
  */
@@ -38,9 +38,6 @@ export declare const MEDIA_ACCEPT: string;
 
 /** 真实字节 → MIME（认不出来返回 null）。**唯一**的"这段字节是什么"判据 */
 export declare function sniffMediaMime(buf: Uint8Array | number[]): string | null;
-
-/** MIME → 单文件上限（表里没有的类型返回 null） */
-export declare function mediaMaxBytes(mime: string): number | null;
 
 /** MIME → 存储扩展名（表里没有的类型返回 null） */
 export declare function mediaExt(mime: string): string | null;

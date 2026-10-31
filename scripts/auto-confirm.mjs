@@ -56,89 +56,121 @@ let conn;
 
 async function tick() {
   const latest = await provider.getBlockNumber();
-  const [rows] = await conn.query(
-    `SELECT order_no, escrow_order_id, status, refund_status
-       FROM v_orders
-      WHERE status IN ('escrowed', 'shipped')
-        AND escrow_order_id IS NOT NULL
-        AND escrow_order_id <> ''
-      ORDER BY updated_at ASC
-      LIMIT 100`
-  );
+  /*
+    候选面用**键集分页**遍历，而不是 `ORDER BY updated_at ASC LIMIT 100` 一次定生死：
+    旧的单页查询在"头部 100 单都不可释放"（退款待决/未到期）时，后面的到期单永远轮不到
+    （节点级、跨店共享，忙店很容易到 100）。每页按 (updated_at, order_id) 前进，
+    不依赖 offset，也不因为处理过程中行被 watcher 改掉而跳行。
+  */
+  const PAGE = 100;
   let released = 0;
-  for (const row of rows) {
-    const orderId = String(row.escrow_order_id);
-    if (!/^0x[0-9a-fA-F]{64}$/.test(orderId)) continue;
-    // 退款申请待商家处理时合约会拒绝释放（RefundPending）；跳过它，不白付 gas。
-    if (String(row.refund_status || '') === 'requested') continue;
-    let at;
-    try {
-      at = await escrow.releaseNotBeforeBlock(orderId);
-    } catch (e) {
-      log('read-failed', row.order_no, e?.shortMessage || e?.message || e);
-      continue;
+  let cursor = null;
+  for (let pageNo = 0; pageNo < 100; pageNo += 1) {
+    const pageWhere = cursor
+      ? " AND (updated_at > ? OR (updated_at = ? AND order_id > ?))"
+      : '';
+    const params = cursor ? [cursor.updatedAt, cursor.updatedAt, cursor.orderId] : [];
+    const [rows] = await conn.query(
+      `SELECT order_id, order_no, escrow_order_id, status, refund_status, updated_at
+         FROM v_orders
+        WHERE status IN ('escrowed', 'shipped')
+          AND escrow_order_id IS NOT NULL
+          AND escrow_order_id <> ''${pageWhere}
+        ORDER BY updated_at ASC, order_id ASC
+        LIMIT ${PAGE}`,
+      params
+    );
+    if (!rows.length) break;
+    for (const row of rows) {
+      const orderId = String(row.escrow_order_id);
+      if (!/^0x[0-9a-fA-F]{64}$/.test(orderId)) continue;
+      // 退款申请待商家处理时合约会拒绝释放（RefundPending）；跳过它，不白付 gas。
+      if (String(row.refund_status || '') === 'requested') continue;
+      let at;
+      try {
+        at = await escrow.releaseNotBeforeBlock(orderId);
+      } catch (e) {
+        log('read-failed', row.order_no, e?.shortMessage || e?.message || e);
+        continue;
+      }
+      const d = releaseExpiredDecision(at, latest);
+      if (!d.eligible) continue;
+      if (DRY) {
+        log('dry-run-would-release', row.order_no, `latest=${latest}`);
+        continue;
+      }
+      try {
+        const tx = await escrow.releaseExpired(orderId);
+        log('sent', row.order_no, tx.hash);
+        await tx.wait();
+        released += 1;
+      } catch (e) {
+        log('release-failed', row.order_no, e?.shortMessage || e?.message || e);
+      }
     }
-    const d = releaseExpiredDecision(at, latest);
-    if (!d.eligible) continue;
-    if (DRY) {
-      log('dry-run-would-release', row.order_no, `latest=${latest}`);
-      continue;
-    }
-    try {
-      const tx = await escrow.releaseExpired(orderId);
-      log('sent', row.order_no, tx.hash);
-      await tx.wait();
-      released += 1;
-    } catch (e) {
-      log('release-failed', row.order_no, e?.shortMessage || e?.message || e);
-    }
+    if (rows.length < PAGE) break;
+    const last = rows[rows.length - 1];
+    cursor = { updatedAt: last.updated_at, orderId: last.order_id };
   }
   if (released) log('released', released);
 
   /*
     留存期释放：状态已经 confirmed/settled 的单不在上面的候选面里，但货款可能还在
     Escrow.sellerPending。keeper 不猜留存期，只读链上的 unlockBlock 和 afterSaleOpen。
+    同样按键集分页，避免头部 100 单全部「无留存货款/案件在途」时饿死后面的单。
   */
-  const [settled] = await conn.query(
-    `SELECT order_no, escrow_order_id
-       FROM v_orders
-      WHERE status IN ('confirmed', 'settled', 'expired')
-        AND escrow_order_id IS NOT NULL
-        AND escrow_order_id <> ''
-      ORDER BY updated_at ASC
-      LIMIT 100`
-  );
   let pendingReleased = 0;
-  for (const row of settled) {
-    const orderId = String(row.escrow_order_id);
-    if (!/^0x[0-9a-fA-F]{64}$/.test(orderId)) continue;
-    let pending;
-    let unlock;
-    let caseOpen;
-    try {
-      [pending, unlock, caseOpen] = await Promise.all([
-        escrow.sellerPending(orderId),
-        escrow.sellerPendingUnlockBlock(orderId),
-        escrow.afterSaleOpen(orderId),
-      ]);
-    } catch (e) {
-      log('pending-read-failed', row.order_no, e?.shortMessage || e?.message || e);
-      continue;
+  cursor = null;
+  for (let pageNo = 0; pageNo < 100; pageNo += 1) {
+    const pageWhere = cursor
+      ? " AND (updated_at > ? OR (updated_at = ? AND order_id > ?))"
+      : '';
+    const params = cursor ? [cursor.updatedAt, cursor.updatedAt, cursor.orderId] : [];
+    const [settled] = await conn.query(
+      `SELECT order_id, order_no, escrow_order_id, updated_at
+         FROM v_orders
+        WHERE status IN ('confirmed', 'settled', 'expired')
+          AND escrow_order_id IS NOT NULL
+          AND escrow_order_id <> ''${pageWhere}
+        ORDER BY updated_at ASC, order_id ASC
+        LIMIT ${PAGE}`,
+      params
+    );
+    if (!settled.length) break;
+    for (const row of settled) {
+      const orderId = String(row.escrow_order_id);
+      if (!/^0x[0-9a-fA-F]{64}$/.test(orderId)) continue;
+      let pending;
+      let unlock;
+      let caseOpen;
+      try {
+        [pending, unlock, caseOpen] = await Promise.all([
+          escrow.sellerPending(orderId),
+          escrow.sellerPendingUnlockBlock(orderId),
+          escrow.afterSaleOpen(orderId),
+        ]);
+      } catch (e) {
+        log('pending-read-failed', row.order_no, e?.shortMessage || e?.message || e);
+        continue;
+      }
+      if (pending === 0n || caseOpen) continue;
+      if (latest < Number(unlock)) continue;
+      if (DRY) {
+        log('dry-run-would-release-pending', row.order_no, `amount=${pending.toString()} latest=${latest}`);
+        continue;
+      }
+      try {
+        const tx = await escrow.releaseSellerFunds(orderId);
+        log('sent-pending', row.order_no, tx.hash);
+        await tx.wait();
+        pendingReleased += 1;
+      } catch (e) {
+        log('pending-release-failed', row.order_no, e?.shortMessage || e?.message || e);
+      }
     }
-    if (pending === 0n || caseOpen) continue;
-    if (latest < Number(unlock)) continue;
-    if (DRY) {
-      log('dry-run-would-release-pending', row.order_no, `amount=${pending.toString()} latest=${latest}`);
-      continue;
-    }
-    try {
-      const tx = await escrow.releaseSellerFunds(orderId);
-      log('sent-pending', row.order_no, tx.hash);
-      await tx.wait();
-      pendingReleased += 1;
-    } catch (e) {
-      log('pending-release-failed', row.order_no, e?.shortMessage || e?.message || e);
-    }
+    if (settled.length < PAGE) break;
+    const last = settled[settled.length - 1];
+    cursor = { updatedAt: last.updated_at, orderId: last.order_id };
   }
   if (pendingReleased) log('pending-released', pendingReleased);
 }

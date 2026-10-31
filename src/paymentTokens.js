@@ -16,6 +16,7 @@
 import { Contract, isAddress } from 'ethers';
 import { getDb } from './db.js';
 import { assertPublicHttpTarget } from './netguard.js';
+import { redisGetJson, redisSetJson } from './redis.js';
 
 const PRICE_TTL_MS = 30_000;
 const priceCache = new Map(); // url -> { at, usdtMicroPerToken, stale }
@@ -148,6 +149,12 @@ async function oracleRate(token) {
     const res = await fetch(token.priceUrl, {
       headers: { accept: 'application/json' },
       signal: AbortSignal.timeout(3_000),
+      /*
+        禁止跟随重定向：3xx 可以把请求引到内网/云元数据（SSRF 校验只看了配置的 URL）。
+        DNS rebinding 窗口仍在（配置仅节点主可写，风险面已收窄）；要彻底闭环需 GET 版
+        pinnedRequest——这里至少不让"校验通过的公网 URL"自己 302 到内网。
+      */
+      redirect: 'error',
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body = await res.json();
@@ -204,7 +211,7 @@ export async function listPaymentMethods(totalUsdtMicro = null) {
         symbol: t.symbol,
         decimals: t.decimals,
         mode: t.mode,
-        unavailable: String(e?.message || e),
+        unavailable: '行情源暂时不可用（细节见节点日志）',
       });
     }
   }
@@ -233,25 +240,71 @@ export async function quotePaymentToken(tokenAddress, totalUsdtMicro) {
 /**
  * 链上白名单的唯一的按 token 检查（报价/草稿/公开列表共用）。
  * 读不到就抛错，由调用方按"本次不可支付"处理——不把 RPC 失败折成 false 或 true。
+ *
+ * 30 秒短缓存 + 2 秒硬超时：`GET /api/shop/payment-methods` 是匿名端点，每请求若对每个
+ * 已配置 token 都打一次 RPC，会被用来放大链上读。白名单变更是低频治理动作，30s 的陈旧窗口
+ * 不会让买家付出错误资产（真正的收款授权仍由 Escrow 在 `createOrderToken` 时校验）。
  */
+const TOKEN_SUPPORT_TTL_MS = 30_000;
+const TOKEN_SUPPORT_TIMEOUT_MS = 2_000;
+const _tokenSupportCache = new Map(); // token -> { at, supported }
+
+function withTokenSupportTimeout(promise) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`RPC timeout > ${TOKEN_SUPPORT_TIMEOUT_MS}ms`)),
+      TOKEN_SUPPORT_TIMEOUT_MS
+    );
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
 let _tokenSupportReader = async (tokenAddress) => {
   const { getEscrow } = await import('./chain.js');
   return !!(await getEscrow().supportedToken(tokenAddress));
 };
 
-/** 测试注入链上白名单读取器（传 null 恢复默认）——与 chainOrder.setChainOrderFetcher 同款 */
+/** 测试注入链上白名单读取器（传 null 恢复默认）；注入即清缓存，避免测试之间串读数。 */
 export function setTokenSupportReader(fn) {
   _tokenSupportReader = fn || (async (tokenAddress) => {
     const { getEscrow } = await import('./chain.js');
     return !!(await getEscrow().supportedToken(tokenAddress));
   });
+  _tokenSupportCache.clear();
 }
 
 export async function tokenSupportedOnChain(tokenAddress) {
-  return !!(await _tokenSupportReader(tokenAddress));
+  const key = String(tokenAddress || '').toLowerCase();
+  const mem = _tokenSupportCache.get(key);
+  if (mem && Date.now() - mem.at < TOKEN_SUPPORT_TTL_MS) return mem.supported;
+  /*
+    Redis 共享缓存：同一节点多进程/多实例共用链上白名单读数，避免每个进程各自打一次 RPC。
+    Redis 不可用就继续走内存/链上；缓存值只影响 30s 的陈旧窗口，真正收款授权仍由 Escrow 校验。
+  */
+  try {
+    const shared = await redisGetJson(`pay-support:${key}`);
+    if (shared && shared.supported === true) {
+      _tokenSupportCache.set(key, { at: Date.now(), supported: true });
+      return true;
+    }
+  } catch {
+    /* Redis 故障不阻塞链上读 */
+  }
+  const supported = !!(await withTokenSupportTimeout(Promise.resolve(_tokenSupportReader(key))));
+  _tokenSupportCache.set(key, { at: Date.now(), supported });
+  try {
+    await redisSetJson(`pay-support:${key}`, { supported }, TOKEN_SUPPORT_TTL_MS);
+  } catch {
+    /* 缓存写失败不影响本次结果 */
+  }
+  return supported;
 }
 
 /** 删除缓存（测试/运维重载用） */
 export function clearPaymentRateCache() {
   priceCache.clear();
+  _tokenSupportCache.clear();
 }

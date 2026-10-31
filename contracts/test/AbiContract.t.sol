@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {NodeFixture} from "./NodeFixture.sol";
 import {Escrow} from "../src/Escrow.sol";
 import {MarketplaceRegistry} from "../src/MarketplaceRegistry.sol";
-import {RuntimeCodeHash} from "../src/RuntimeCodeHash.sol";
+import {ContractCodeHash} from "../src/ContractCodeHash.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 /**
@@ -62,9 +62,9 @@ contract AbiContractTest is NodeFixture {
         assertEq(uint256(bytes32(_slice(ret, 0))), 32, "outer offset");
         assertEq(address(uint160(uint256(bytes32(_slice(ret, 1))))), operator);
         assertEq(address(uint160(uint256(bytes32(_slice(ret, 2))))), address(escrow));
-        assertEq(bytes32(_slice(ret, 3)), RuntimeCodeHash.forAddress(address(escrow)));
+        assertEq(bytes32(_slice(ret, 3)), ContractCodeHash.forAddress(address(escrow)));
         assertEq(address(uint160(uint256(bytes32(_slice(ret, 4))))), address(staking));
-        assertEq(bytes32(_slice(ret, 5)), RuntimeCodeHash.forAddress(address(staking)));
+        assertEq(bytes32(_slice(ret, 5)), ContractCodeHash.forAddress(address(staking)));
 
         MarketplaceRegistry.NodeInfo memory n = registry.getNode(operator);
         assertEq(n.endpoint, ENDPOINT);

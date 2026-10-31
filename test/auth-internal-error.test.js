@@ -48,6 +48,24 @@ test('角色判定的 DB 读失败 ⇒ 503 + 通用文案；内部原文不进�
   assert.doesNotMatch(String(res.body.message), /pool timeout|marketplace_node/, '不得回泄漏内部字符串');
 });
 
+test('logout 的会话撤销写失败 ⇒ 503，不能报成已退出', async () => {
+  const origRun = db.run.bind(db);
+  db.run = async () => {
+    throw new Error('pool timeout: acquire connection from marketplace_node');
+  };
+  let res;
+  try {
+    res = await request(app)
+      .post('/api/auth/logout')
+      .set('Authorization', `Bearer ${buyerToken}`);
+  } finally {
+    db.run = origRun;
+  }
+  assert.equal(res.status, 503);
+  assert.equal(res.body.code, 503);
+  assert.doesNotMatch(String(res.body.message), /pool timeout|marketplace_node/);
+});
+
 test('无请求头时的店铺清单读失败同样 503（不是"你没有店铺"403）', async () => {
   const origAll = db.all.bind(db);
   db.all = async () => {

@@ -469,7 +469,40 @@ async function acquireInstanceLock() {
       process.exit(1);
     }
     instanceLockConn = conn;
-    const release = () => { try { conn.destroy(); } catch { /* 进程正在退出，忽略 */ } };
+    /*
+      这条连接可能空闲很久（节点没有写操作时），MySQL 的 wait_timeout（默认 8 小时）会把它
+      在服务器侧断开，GET_LOCK 随之释放，而本进程毫不知情 —— 第二个节点就能拿到同一把锁，
+      正是本函数要消灭的"双进程写同库"。两件事：把会话超时设到很长；每 60 秒 `SELECT 1`
+      确认连接仍然活着，一旦失败就退出（宁可停服，也不能在没有互斥锁的情况下继续跑）。
+    */
+    try {
+      await conn.query('SET SESSION wait_timeout = 31536000');
+    } catch {
+      /* 权限不足时仍靠心跳兜底（心跳也失败就退出） */
+    }
+    let releasing = false;
+    const heartbeat = setInterval(() => {
+      conn.query('SELECT 1').catch((e) => {
+        console.error(`[db] 实例锁连接心跳失败（${e?.message || e}）：锁可能已被服务器释放，进程退出以免双写`);
+        process.exit(1);
+      });
+    }, 60_000);
+    if (typeof heartbeat.unref === 'function') heartbeat.unref();
+    conn.on('error', (e) => {
+      if (releasing) return;
+      console.error(`[db] 实例锁连接错误（${e?.message || e}）：锁可能已释放，进程退出以免双写`);
+      process.exit(1);
+    });
+    conn.on('end', () => {
+      if (releasing) return;
+      console.error('[db] 实例锁连接被服务器关闭：锁已释放，进程退出以免双写');
+      process.exit(1);
+    });
+    const release = () => {
+      releasing = true;
+      clearInterval(heartbeat);
+      try { conn.destroy(); } catch { /* 进程正在退出，忽略 */ }
+    };
     process.once('exit', release);
     process.once('SIGINT', release);
     process.once('SIGTERM', release);
@@ -1960,7 +1993,14 @@ const SCHEMA_DDL = `
     bty_usdt_rate DECIMAL(20,10) NOT NULL DEFAULT 0,
     -- 履约
     hold_qty      TINYINT UNSIGNED NOT NULL DEFAULT 0,
-    released_at   DATETIME(3) NULL,                     -- 释放幂等标记（非空 = 已释放）
+    /*
+      已释放件数（0..hold_qty）：**逐件**记账，支持多件订单的部分退货。
+      旧形状只有 released_at（布尔"整单已释放"），于是一张 3 件的单退 1 件也会把
+      committed 一次减 3，另外 2 件变成可再售 ⇒ 超卖。released_at 保留为
+      "整单释放完成的时刻"（审计/兼容读数），真正的判据是 released_qty < hold_qty。
+    */
+    released_qty  TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    released_at   DATETIME(3) NULL,                     -- 整单释放完成时刻（NULL = 还有占位在册）
     tracking_no   VARCHAR(100) NULL,
     carrier       VARCHAR(40) NULL,                     -- NULL = 店主没填（三态：没填就是没有这个事实）
     shipped_at    DATETIME(3) NULL,                     -- 已交付事实（含自提/线下交付的空单号形态）
@@ -2030,6 +2070,11 @@ const SCHEMA_DDL = `
       但那属于另一次以查询为准的索引调整，不在本次改造里顺手做。
     */
     KEY idx_orders_status (status),
+    /* 草稿清扫的锁定读必须只碰候选：旧查询只有 idx_orders_status(status) 可用，
+       SELECT ... status='draft' AND created_boot=? AND created_mono<=? FOR UPDATE 会锁住
+       整个 status='draft' 的 next-key 区间（含刚插入的新草稿），与下单 INSERT/商品占位形成
+       锁等待与死锁环。三元组索引把锁定范围收窄到"这一台机器启动以来、该时刻之前的草稿"。 */
+    KEY idx_orders_draft_sweep (status, created_boot, created_mono),
     /* 对账巡检的键集分页是 ORDER BY updated_at, id（见 chainReconcile 的游标）；没有它这条
        查询是 type=ALL + filesort。保留期扫描不接受它（排序键是表达式，理由见上）。 */
     KEY idx_orders_updated (updated_at, id),
@@ -2044,6 +2089,7 @@ const SCHEMA_DDL = `
     CONSTRAINT ck_orders_payment_token_lower CHECK (payment_token = LOWER(payment_token)),
     CONSTRAINT ck_orders_payment_decimals CHECK (payment_decimals <= 36),
     CONSTRAINT ck_orders_qty CHECK (quantity BETWEEN 1 AND 99),
+    CONSTRAINT ck_orders_released_qty CHECK (released_qty <= hold_qty),
     CONSTRAINT ck_orders_money CHECK (usdt_micro <= 9007199254740991 AND shipping_fee_usdt_micro <= 9007199254740991),
     -- 第二道网：计数器被绕过时（直连 SQL / 未来的新写入点）也存不下越界的账
     CONSTRAINT ck_orders_evidence_bytes CHECK (evidence_bytes <= 20971520)
@@ -2159,6 +2205,9 @@ const SCHEMA_DDL = `
     UNIQUE KEY uq_claims_active_token
       ((IF(status IN ('requested','approved','shipped','fulfilled'), CONCAT(token_contract, ':', token_id), NULL))),
     KEY idx_claims_shop (shop_code, status, id),
+    /* 公开端点按 (token_contract, token_id) 点查 + ORDER BY id；函数唯一索引
+       uq_claims_active_token 服务不了这两个裸列的等值查询（实测会退化成整索引扫描）。 */
+    KEY idx_claims_token (token_contract, token_id, id),
     KEY idx_claims_claimant (claimant, id),
     KEY idx_claims_order (order_id),
     KEY idx_claims_dispute (dispute_claim_id),
@@ -2304,16 +2353,26 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     order_id      BIGINT UNSIGNED NOT NULL,
     status        ENUM('open','shipped','received') NOT NULL DEFAULT 'open',
     waived        TINYINT(1) NOT NULL DEFAULT 0,        -- 卖家放弃追索（确认释放额度）
+    /*
+      本次退货覆盖的件数（1..订单 quantity）。多件订单允许**部分退货**；释放占位只能按
+      这个数，不能按整单 hold_qty。默认 1 只为兼容未显式传数的旧调用方；路由与 UI 必须
+      显式给出（createReturn 默认取订单 quantity，卖家可在收货前改小）。
+    */
+    quantity      TINYINT UNSIGNED NOT NULL DEFAULT 1,
     address       VARCHAR(300) NOT NULL DEFAULT '',
     note          VARCHAR(1000) NOT NULL DEFAULT '',
     tracking_no   VARCHAR(100) NULL,
     carrier       VARCHAR(40) NULL,                     -- 归一在 src/shipping.js（同一条路不留半条）
     received_at   DATETIME(3) NULL,                     -- 卖家确认收到（占位释放凭据）
+    /* 该退货单覆盖的件数已释放到 committed 的时刻（一次性认领；防止 watcher 终局释放与
+       receive 动作各释放一次，多件订单会被退一次却回补两次）。 */
+    released_at   DATETIME(3) NULL,
     created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
     UNIQUE KEY uq_returns_order (order_id),
-    CONSTRAINT fk_returns_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE
+    CONSTRAINT fk_returns_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE,
+    CONSTRAINT ck_returns_quantity CHECK (quantity BETWEEN 1 AND 99)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
   /* 告警去重：**一行一次已投递的告警**。
@@ -2567,7 +2626,7 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
       这与链上"未退款托管单"的语义一致，不是把"读不到"当 0。
     */
     o.amount_wei - COALESCE(c.refunded_amount_wei, 0) AS amount_net_wei,
-    o.hold_qty, o.released_at, o.tracking_no, o.carrier, o.shipped_at,
+    o.hold_qty, o.released_qty, o.released_at, o.tracking_no, o.carrier, o.shipped_at,
     o.timeout_blocks, o.age_ack, o.created_boot, o.created_mono,
     o.pii_erased_at, o.pii_cleanup_pending, o.created_at, o.updated_at,
     s.name            AS shipping_name,
@@ -2584,6 +2643,23 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
   FROM orders o
   LEFT JOIN order_shipping s ON s.order_id = o.id
   LEFT JOIN order_chain    c ON c.order_id = o.id;
+
+  /*
+    登录会话：令牌只回答“本节点签发的、未过期”，这张表回答“这个会话有没有被撤销”。
+    令牌里的 jti 是随机 32 字节 hex；退出登录写 revoked_at，不再只清浏览器 localStorage。
+    expires_at 与令牌 exp 同一时刻；清理任务按 expires_at 删旧行。
+  */
+  CREATE TABLE IF NOT EXISTS auth_sessions (
+    jti         CHAR(64) NOT NULL,
+    address     CHAR(42) NOT NULL,
+    expires_at  DATETIME(3) NOT NULL,
+    revoked_at  DATETIME(3) NULL,
+    created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (jti),
+    KEY idx_auth_sessions_address (address),
+    KEY idx_auth_sessions_expires (expires_at),
+    CONSTRAINT ck_auth_sessions_address_lower CHECK (address = LOWER(address))
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
 `;
 

@@ -44,9 +44,12 @@ const {
 
 const HERE = __dirname;
 const NODE_ROOT = path.resolve(HERE, '..');
-const CONTRACTS = fs.existsSync(path.join(NODE_ROOT, 'contracts', 'out'))
-  ? path.join(NODE_ROOT, 'contracts')
-  : path.resolve(NODE_ROOT, '..', 'contracts');
+/**
+ * 随本包提供**已编译**的字节码（`contract-artifacts.json`，由本仓
+ * `node/scripts/build-contract-artifacts.mjs` 从 contracts/out 生成）。主网部署不再要求
+ * 店主本地装 Foundry/编译：部署的就是这份清单里的完整 bytecode，runtime 哈希与它一一对应。
+ */
+const ARTIFACTS = path.join(NODE_ROOT, 'contract-artifacts.json');
 
 const RPC = process.env.MK_RPC_URL || 'https://node1.bityuan.com/eth';
 const CHAIN_ID = 2999;
@@ -109,18 +112,26 @@ function loadKey() {
 }
 
 function loadArtifact(name) {
-  const file = path.join(CONTRACTS, 'out', `${name}.sol`, `${name}.json`);
-  if (!fs.existsSync(file)) die(`缺少编译产物：${file}（先 cd contracts && forge build）`);
-  const j = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const object = j.bytecode && j.bytecode.object;
-  if (!object || object === '0x') die(`${name}: bytecode 为空`);
-  if (j.bytecode.linkReferences && Object.keys(j.bytecode.linkReferences).length) {
-    die(`${name}: bytecode 含未链接库引用`);
+  if (!fs.existsSync(ARTIFACTS)) {
+    die(`缺少公开编译产物：${ARTIFACTS}（仓库应随包提供；不要本地 forge build 后临时替换）`);
   }
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(ARTIFACTS, 'utf8'));
+  } catch (e) {
+    die(`编译产物清单不是合法 JSON：${e?.message || e}`);
+  }
+  const j = (manifest.contracts || []).find((c) => c.name === name);
+  if (!j) die(`${name}: 编译产物清单里没有这个合约`);
+  const object = j.bytecode;
+  if (!object || object === '0x') die(`${name}: bytecode 为空`);
+  if (keccak256(object) !== j.creationCodeHash) die(`${name}: creationCodeHash 与 bytecode 不一致（清单被篡改/损坏）`);
+  if (keccak256(j.deployedBytecode) !== j.runtimeCodeHash) die(`${name}: runtimeCodeHash 与 deployedBytecode 不一致`);
   return {
     abi: j.abi,
     iface: new Interface(j.abi),
     bytecode: object.startsWith('0x') ? object : `0x${object}`,
+    runtimeCodeHash: j.runtimeCodeHash,
   };
 }
 
@@ -188,11 +199,12 @@ async function main() {
   const operator = new Wallet(key).address;
   const arbiters = parseArbiters();
   const thresholdRaw = Number(process.env.ARBITER_THRESHOLD || Math.floor(arbiters.length / 2) + 1);
-  if (!Number.isInteger(thresholdRaw) || thresholdRaw < 1 || thresholdRaw >= arbiters.length) {
-    die(`ARBITER_THRESHOLD 必须是 1..${arbiters.length - 1} 的整数`);
-  }
-  if (arbiters.some((a) => same(a, operator)) && thresholdRaw < 2) {
-    die('owner 在委员会里时 ARBITER_THRESHOLD 必须 >= 2');
+  /*
+    无条件 >= 2：threshold=1 会让任意一名委员单独完成结算/罚没（合约层已拒绝这个形状，
+    脚本必须在发交易前给同一条拒因，而不是等链上 revert）。
+  */
+  if (!Number.isInteger(thresholdRaw) || thresholdRaw < 2 || thresholdRaw >= arbiters.length) {
+    die(`ARBITER_THRESHOLD 必须是 2..${arbiters.length - 1} 的整数（单人阈值会让任意一名委员单独裁决）`);
   }
   const threshold = thresholdRaw;
   const rejectGrace = envUint64('REJECT_GRACE_BLOCKS', 17280);
@@ -236,7 +248,7 @@ async function main() {
   console.log(`gasCost   : ${formatEther(gasCost)} BTY`);
   console.log(`balance   : ${formatEther(balance)} BTY`);
   console.log(`nonce     : ${nonce}`);
-  console.log(`contracts : ${CONTRACTS}`);
+  console.log(`artifacts : ${ARTIFACTS}`);
 
   if (balance < MIN_BALANCE) die(`余额 ${formatEther(balance)} BTY 低于下限 ${formatEther(MIN_BALANCE)} BTY`);
   if (balance < gasCost) {

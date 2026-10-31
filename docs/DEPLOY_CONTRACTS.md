@@ -13,28 +13,32 @@
 
 ## 前置
 
-- Foundry `1.8.6`：`forge --version` 为 `1.8.6`，只用来编译 `contracts/`；主网部署不走 `forge script`；
+- Foundry（版本以 CI `.github/workflows/ci.yml` 的 pin 为准）：**只有修改合约/重新生成公开编译产物时**才需要；主网部署直接使用随包 `contract-artifacts.json`，不走 `forge script`；
 - BTY EVM 主网 RPC，chainId `2999`。优先用 `https://node1.bityuan.com/eth`，不可用时依次换 `https://node2.bityuan.com/eth`、`https://mainnet.bityuan.com/eth`。部署前用 `cast chain-id --rpc-url <rpc>` 确认返回 `2999`；
 - gas 由 `eth_gasPrice` 给出（当前 `10 gwei`）。BTY 主网按 **gasLimit** 扣费，未用完不退，所以脚本用实测 gasUsed + 10% 的固定上限，`eth_estimateGas` 只用来确认交易不会被拒绝；不要把 gasLimit 拍高；
 - operator 钱包，余额要覆盖脚本打印的 `gasCost`；这个地址就是稍后的 `MK_SHOP_OWNER`；
-- 至少 3 个仲裁人地址，彼此独立；`ARBITER_THRESHOLD` 必须小于人数；
-- 原样使用本仓 `contracts/`。`foundry.toml` 固定了 solc 0.8.24 / optimizer runs 1 / evm_version paris；目录按 Escrow/Staking 的**实现哈希**（运行时字节码去掉 solc metadata）放行。改可执行代码或优化参数仍会导致登记被拒；Linux/Windows 的行尾、注释差异不影响——构建 metadata 不参与实现身份（`contracts/.gitattributes` 也把 `*.sol` 钉成 LF）。
+- 至少 3 个仲裁人地址，彼此独立；`ARBITER_THRESHOLD` 必须 ≥2 且小于人数（单人阈值会让任意一名委员单独裁决）；
+- 原样使用本仓 `contracts/`。`foundry.toml` 固定了 solc 0.8.24 / optimizer runs 1 / evm_version paris；目录按 Escrow/Staking 的**全量 runtime 哈希**（`keccak256(code)`，含 metadata）放行。任何字节变化（含 metadata、行尾、注释、优化参数）都会换哈希、需重新审批；公开节点仓随包的编译产物（ABI + creation/runtime bytecode + 哈希）就是给平台审批/第三方复核用的。
 
 ## 费用
 
 整个部署（四个合约 + 节点登记）建议钱包准备 **0.5 BTY 以上**。
 
-其中合约部署按 `10 gwei`、3 个委员计算：gasLimit 合计 `13,240,000`，约 **0.133 BTY**。BTY 按 gasLimit 扣费，失败/重试也会消耗 gasLimit；0.5 BTY 留出 gas 价波动、重试和节点登记的费用。`--check` 会按当前 `eth_gasPrice` 重新计算并拒绝余额不足。
+其中合约部署按 `10 gwei`、3 个委员计算：gasLimit 合计 `13,290,000`，约 **0.133 BTY**。BTY 按 gasLimit 扣费，失败/重试也会消耗 gasLimit；0.5 BTY 留出 gas 价波动、重试和节点登记的费用。`--check` 会按当前 `eth_gasPrice` 重新计算并拒绝余额不足。
 
 每多一个委员约增加 `25,000` gasLimit（`10 gwei` 下约 `0.00025 BTY`）。
 
-## 1. 编译
+## 1. 编译产物（随公开节点仓提供，无需本地 Foundry）
 
-```bash
-cd contracts
-forge build
-cd ..
-```
+公开节点仓根部的 `contract-artifacts.json` 是平台/发布者从 `contracts/out` 生成的完整产物：
+`{name, abi, creationCodeHash, runtimeCodeHash, bytecode, deployedBytecode}`，其中
+`runtimeCodeHash = keccak256(完整 runtime bytecode，含 solc metadata)`。部署脚本直接使用这份
+bytecode，并在本地校验 `keccak256(bytecode) == creationCodeHash`、
+`keccak256(deployedBytecode) == runtimeCodeHash`；清单被篡改/损坏会当场拒绝。
+
+只有**修改合约**时才需要重新生成：`cd contracts && forge build`，然后用生成脚本跑
+`node node/scripts/build-contract-artifacts.mjs`，同批提交 `node/contract-artifacts.json`。公开仓
+发布/CI 的 `build-contract-artifacts.mjs --check` 会拒绝"清单与源码构建不一致"。
 
 ## 2. 部署
 
@@ -83,7 +87,7 @@ node scripts/deploy-node-mainnet.cjs --broadcast
 
 `startBlock` 是 Escrow 的部署块，脚本直接给出。不要用当前最新块，否则节点会漏扫部署后到启动前的事件。
 
-`escrowCodeHash` 是 Staking 构造期互验用的**构建哈希**（`keccak256(escrow.code)`，含 metadata），不是目录白名单的实现哈希；目录的实现哈希由平台部署 Registry 时从产物算出，节点不需要上报。
+`escrowCodeHash` 是 Escrow 的**全量 runtime 哈希**（`keccak256(escrow.code)`，含 metadata）：既做 Staking 构造期互验，也是目录白名单/登记行钉住的同一个值。
 
 ## 4. 填进节点配置
 
@@ -134,10 +138,10 @@ cast call <Escrow> "governor()(address)" --rpc-url <rpc>
 目录登记会核对：
 
 - operator 等于 Escrow / Staking 的 owner；
-- 两个合约的**实现哈希**（运行时字节码去掉 solc metadata）都在目录白名单里；
+- 两个合约的**全量 runtime 哈希**（`keccak256(code)`，含 metadata）都在目录白名单里；
 - 同一个 Escrow / Staking 没有被别的 operator 占用。
 
-目录只放行本仓这一版 `contracts/` 的**可执行字节**；实现哈希不一致时登记会报 `ImplementationNotApproved`，不要改合约去绕过。
+目录只放行**完整 runtime 字节**；哈希不一致时登记会报 `ImplementationNotApproved`，不要改合约去绕过。
 
 ## 7. 留档
 

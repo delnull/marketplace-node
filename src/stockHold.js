@@ -85,63 +85,89 @@ export async function holdStock(productId, skuKey = '', quantity = 1) {
   return changes === 1;
 }
 
-/** 释放内核：把给定「已离开占用态」的本地订单内部键集合中**本次新释放**的行（status 命中调用方
- *  传入的终局状态白名单 且 released_at 为空 且 hold_qty > 0）置 released_at，
- *  并按 (商品, 组合) 聚合回补 committed（一次 UPDATE，仅扣真实占位的 hold_qty）。
- *  幂等：已置 released_at 的行（先前释放过/恢复后又释放）不会二次扣减。
+/**
+ * 「还有占位在册」的 SQL 谓词（**唯一拼法**）。
+ *
+ * 新形状以 `released_qty < hold_qty` 为准（支持多件订单部分退货）；`released_qty = 0 AND
+ * released_at IS NOT NULL` 是旧行/夹具的兼容读数：旧实现只有"整单已释放"布尔位，
+ * 读到非空即视为整单释放。两条并集之外才是"仍有占位"。
+ */
+function hasOutstandingHoldSql(alias = 'o') {
+  return `(${alias}.hold_qty > 0 AND NOT (${alias}.released_qty >= ${alias}.hold_qty OR (${alias}.released_qty = 0 AND ${alias}.released_at IS NOT NULL)))`;
+}
+
+/** 释放内核：把给定「已离开占用态」的本地订单内部键集合中**本次新释放**的件数记账，
+ *  并按 (商品, 组合) 聚合回补 committed。
+ *
+ *  - `quantities` 缺省 = 释放该行剩余全部占位（取消/超时等整单释放）；
+ *  - 传入 Map<orderId, qty> 时只释放指定件数（多件订单的部分退货），不会把整单占位清零；
+ *  - 幂等：`released_qty` 是唯一账本；已释放完的行不在候选里，重复触发不会二次扣减。
+ *  - `released_at` 只在**整单释放完成**时置位，保留"整单释放时刻"的审计读数；
+ *    部分释放的行 `released_at` 仍为 NULL，靠 `released_qty < hold_qty` 表达"还有占位"。
  *  状态白名单由各调用方按其业务语义提供——常规释放集为 cancelled/refunded/expired，
  *  D1 例外（货已回卖家侧的成交终局）另行传入 settled/confirmed（见 releaseHoldsForReturnReceived），
  *  防止误把仍占用/成交中的行释放。
  *  刻意**不动 `updated_at`**：释放是账目动作，不是订单状态迁移——`updated_at` 是入账窗口与
  *  列表排序的锚点，把它挪动等于让同一笔成交额在两个窗口里各出现一次。 */
-async function releaseCore(orderIds, statuses) {
+async function releaseCore(orderIds, statuses, quantities = null) {
   const ids = assertInternalOrderIds(orderIds);
   if (!ids.length) return 0;
   const marks = ids.map(() => '?').join(',');
   const statusMarks = (statuses || []).map(() => '?').join(',');
-  // 标记（置 released_at）与回补（减 committed）同事务：防进程中断造成「已标记未回补」的永久泄漏。
+  // 标记（写 released_qty/released_at）与回补（减 committed）同事务：防进程中断造成「已标记未回补」的永久泄漏。
   // 本函数可被调用方已在的分组（cancel/sweeper/watcher/sync）再包一层——嵌套由 withTransaction 降级为 SAVEPOINT。
   return await withTransaction(async () => {
     const db = getDb();
     /*
-      1) 先**锁住候选行**，再按锁到的 id 集合标记。MySQL 没有 `UPDATE … RETURNING`，
-      而"本批实际标记了哪些行"必须是一个**原子事实**，不能靠事后回查重建。
-
-      为什么不能用"released_at = 刚写下的那个时刻"回查（源码审计 2026-09 复审的同一处结论）：
-        · 时刻的粒度是毫秒：同一毫秒内的两批会**互相认领**对方的行，第 2 步据此多减 `committed`
-          ——多出来的额度变成可售库存（超卖，无错误码、无审计痕迹）；
-        · 更早的旧实现用**进程内**批次号（重启从 1 开始）却写进持久列 `released_at`，
-          同一个数值会指到上一轮进程标记的行，后果相同。
-      现在换成 `FOR UPDATE`：候选行在本事务内被锁住，从 SELECT 到 UPDATE 之间没有任何写者能插进来
-      （锁住的是这些行本身，不是全站——全局写锁已删），原子认领因此不依赖时钟也不依赖批次号；
-      `released_at` 也仍然只有一个含义——占位释放时刻。
+      先锁候选行，再按锁到的集合记账。MySQL 没有 `UPDATE … RETURNING`，而"本批实际释放了
+      哪几件"必须是一个原子事实，不能靠事后回查重建（同一毫秒的两批会互相认领）。
+      `FOR UPDATE` 锁住候选行，从 SELECT 到 UPDATE 之间没有写者能插进来。
     */
-    const candidates = await db.all(`SELECT id FROM orders
-           WHERE id IN (${marks}) AND status IN (${statusMarks}) AND hold_qty > 0 AND released_at IS NULL
-           FOR UPDATE`, ...ids, ...statuses);
+    const candidates = await db.all(`SELECT id, product_id, sku_key, hold_qty, released_qty
+           FROM orders
+          WHERE id IN (${marks}) AND status IN (${statusMarks}) AND ${hasOutstandingHoldSql('orders')}
+          FOR UPDATE`, ...ids, ...statuses);
     if (!candidates.length) return 0;
-    const markedIds = candidates.map((r) => r.id);
-    const markedMarks = markedIds.map(() => '?').join(',');
-    await db.run(`UPDATE orders SET released_at = CURRENT_TIMESTAMP(3) WHERE id IN (${markedMarks})`, ...markedIds);
-    // 2) 只对本批**锁到**的那些行按 (商品, 组合) 聚合回补（markedIds 即本轮的原子凭据）
+    /** (product_id, sku_key) → 本批释放件数 */
+    const perSku = new Map();
+    let touched = 0;
+    for (const row of candidates) {
+      const hold = Number(row.hold_qty) || 0;
+      const released = Number(row.released_qty) || 0;
+      const remaining = Math.max(0, hold - released);
+      if (remaining === 0) continue;
+      const wantRaw = quantities && quantities.has(Number(row.id)) ? Number(quantities.get(Number(row.id))) : remaining;
+      const qty = Math.min(remaining, Number.isFinite(wantRaw) && wantRaw > 0 ? Math.floor(wantRaw) : 0);
+      if (qty <= 0) continue;
+      const next = released + qty;
+      await db.run(
+        'UPDATE orders SET released_qty = ?, released_at = IF(?, CURRENT_TIMESTAMP(3), released_at) WHERE id = ?',
+        next,
+        next >= hold ? 1 : 0,
+        row.id
+      );
+      const key = `${row.product_id}\u0000${row.sku_key ?? ''}`;
+      perSku.set(key, (perSku.get(key) || 0) + qty);
+      touched += 1;
+    }
+    if (touched === 0) return 0;
     /*
       ⚠️ `CAST(committed AS SIGNED)` 是**必需**的，不是防御性写法：
       `committed` 是 `INT UNSIGNED`，而无符号数相减在 MySQL 里**结果仍是无符号**——
       "减到负数"会在 `GREATEST` 看到它之前就抛 `BIGINT UNSIGNED value is out of range`，
       整条释放语句随之失败（取消订单 / 交付 / 退款释放全走这条路）。
       也就是说：**本意是夹到 0，实际是抛错**。实测于 192.168.122.11（见 db.js 触发器的同一条说明）。
-      什么时候真会减到 0 以下：夹具或直连 SQL 造出的、从未加过量却同样走到释放路径的行。
     */
-    const { changes } = await db.run(`UPDATE product_skus SET committed = GREATEST(0, CAST(committed AS SIGNED) - (
-           SELECT COALESCE(SUM(o.hold_qty), 0) FROM orders o
-           WHERE o.product_id = product_skus.product_id
-             AND o.sku_key = product_skus.sku_key
-             AND o.id IN (${markedMarks})
-         ))
-         WHERE (product_id, sku_key) IN (
-           SELECT product_id, sku_key FROM orders WHERE id IN (${markedMarks})
-         )`, ...markedIds, ...markedIds);
-    return changes;
+    for (const [key, qty] of perSku) {
+      const [productId, skuKey] = key.split('\u0000');
+      await db.run(
+        'UPDATE product_skus SET committed = GREATEST(0, CAST(committed AS SIGNED) - ?) WHERE product_id = ? AND sku_key = ?',
+        qty,
+        productId,
+        skuKey
+      );
+    }
+    return touched;
   });
 }
 
@@ -195,7 +221,7 @@ export function isDelivered(row) {
  *
  * 判据是两个出口的**并集**，两个方向都故意取安全侧：
  *   · `o.status IN (在途集合)` —— 订单生命还没走完（草稿/托管中/已发货/争议中）；
- *   · 或者 `(o.hold_qty > 0 AND o.released_at IS NULL AND 退货未确认收到)` ——
+ *   · 或者 `(o.hold_qty > o.released_qty AND 退货未把剩余件数全部收回)` ——
  *     生命走完了但**占位还押着**，且货没回到店主手里。
  *
  * 第二个出口就是本次修的那个洞：**已交付后退款**（`status = 'refunded'`）的单
@@ -205,7 +231,7 @@ export function isDelivered(row) {
  * 同一件实物可被再卖一次（**超卖**，受害方是下一个买家，且无任何错误码或审计痕迹）。
  *
  * 为什么要并上"在途集合"（而不是只留第二个出口）：在途但**曾释放过占位**的行
- * （`released_at` 非空，例如取消后又恢复的单）同样是未结清的承诺，必须继续挡住改名。
+ * （`released_qty` 已推进，例如取消后又恢复的单）同样是未结清的承诺，必须继续挡住改名。
  * 方向是安全的：多算 ⇒ 更容易拒绝这次规格变更，而不是把 `committed` 记成偏小（那才会超卖）。
  *
  * 用法：`WHERE ${stockPromiseSql('o')}`。
@@ -214,18 +240,18 @@ export function isDelivered(row) {
  * "Unknown column"——这是刻意的，见文件头。
  */
 export function stockPromiseSql(alias = 'o') {
-  return `(${alias}.status IN ${DRAFT_OR_ACTIVE_IN} OR (${alias}.hold_qty > 0 AND ${alias}.released_at IS NULL AND NOT EXISTS (SELECT 1 FROM order_returns r WHERE r.order_id = ${alias}.id AND r.received_at IS NOT NULL)))`;
+  return `(${alias}.status IN ${DRAFT_OR_ACTIVE_IN} OR ${hasOutstandingHoldSql(alias)})`;
 }
 
 /**
- * 「**还押着占位**」的 SQL 谓词：`hold_qty > 0` ∧ `released_at IS NULL`。
+ * 「**还押着占位**」的 SQL 谓词：`released_qty < hold_qty`（旧行 `released_at` 非空也算已释放）。
  *
  * 与 `stockPromiseSql` 的分工：这个回答"占位还在不在册"（释放/回补类判据用它），
  * 那个回答"承诺结清了没有"（规格改名这类**拒绝性**判据用它，取并集更安全）。
  * 两个条件缺一不可，而且**状态列不是判据**：一条订单可以走到任何状态而占位仍在。
  */
 export function occupyingSql(alias = 'o') {
-  return `${alias}.hold_qty > 0 AND ${alias}.released_at IS NULL`;
+  return hasOutstandingHoldSql(alias);
 }
 
 /**
@@ -270,14 +296,61 @@ export function releaseHoldsForOrderIds(orderIds) {
  */
 export async function releaseHoldsForReturnReceived(escrowOrderId) {
   const db = getDb();
-  const rows = await db.all(`SELECT o.id
+  const rows = await db.all(`SELECT o.id, o.hold_qty, o.released_qty, r.id AS return_id, r.quantity AS return_quantity
        FROM orders o
        JOIN order_chain c ON c.order_id = o.id
        JOIN order_returns r ON r.order_id = o.id
-       WHERE c.escrow_order_id = ? AND r.received_at IS NOT NULL
+       WHERE c.escrow_order_id = ? AND r.received_at IS NOT NULL AND r.released_at IS NULL
          AND o.status IN ${INCOME_IN}
-         AND o.hold_qty > 0 AND o.released_at IS NULL`, String(escrowOrderId || '').toLowerCase());
-  return rows.length ? releaseCore(rows.map((r) => r.id), [...INCOME_STATUS]) : 0;
+         AND ${hasOutstandingHoldSql('o')}`, String(escrowOrderId || '').toLowerCase());
+  let changed = 0;
+  for (const r of rows) {
+    changed += await releaseReturnedUnits(r.id, Number(r.return_quantity) || 0, r.return_id);
+  }
+  return changed;
+}
+
+/**
+ * 退货单**已确认收到**时按该单的件数释放占位（多件订单的部分退货只释放退回的件数）。
+ *
+ * 这是 `settleReturn` 与两条终局回填路径共用的**唯一**入口：状态白名单覆盖 refunded 与
+ * 成交终局（settled/confirmed/expired），具体状态不影响"只释放退货件数"这条判据。
+ * `released_qty` 保证重复触发（先收货后终局、或终局先到后收货）只释放一次。
+ *
+ * @param {number|string} orderId 订单内部键
+ * @param {number} quantity 本次确认收到的件数（来自 `order_returns.quantity`）
+ */
+export async function releaseReturnedUnits(orderId, quantity, returnId = null) {
+  const [id] = assertInternalOrderIds([orderId]);
+  const qty = Number(quantity);
+  if (!Number.isSafeInteger(qty) || qty <= 0) return 0;
+  /*
+    **一次性认领**：watcher 的终局回填与卖家 receive 动作都会走这里；没有 return 级标记时，
+    多件订单会被退一次却回补两次（released_qty 只防"整单重复"，防不了两条路径各释放同一个
+    return.quantity）。标记与释放同一事务：释放失败（容量不足）时标记回滚，下次还能重试。
+  */
+  if (returnId !== null && returnId !== undefined) {
+    return await withTransaction(async () => {
+      // 已没有可释放的占位（例如另一条路径已整单释放）：不要留下 released_at 假标记
+      const state = await getDb().get(
+        `SELECT ${hasOutstandingHoldSql('o')} AS outstanding FROM orders o WHERE o.id = ? FOR UPDATE`,
+        id
+      );
+      if (!state || !Number(state.outstanding)) return 0;
+      const claimed = await getDb().run(
+        'UPDATE order_returns SET released_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND released_at IS NULL AND received_at IS NOT NULL',
+        returnId
+      );
+      if (claimed.changes !== 1) return 0;
+      const n = await releaseCore([id], ['refunded', 'settled', 'confirmed', 'expired'], new Map([[id, qty]]));
+      if (n === 0) {
+        // 容量不足等瞬时原因：回滚认领，下一次（占位腾出后）还能重试；不能把"没释放"写成已释放。
+        await getDb().run('UPDATE order_returns SET released_at = NULL WHERE id = ?', returnId);
+      }
+      return n;
+    });
+  }
+  return releaseCore([id], ['refunded', 'settled', 'confirmed', 'expired'], new Map([[id, qty]]));
 }
 
 /**
@@ -296,15 +369,29 @@ export async function releaseHoldsForReturnReceived(escrowOrderId) {
  */
 export async function releaseRefundedEscrow(escrowOrderId) {
   const db = getDb();
-  const rows = await db.all(`SELECT o.id, o.shipped_at, o.tracking_no, ${deliveredItemsSql('o')},
-              (SELECT received_at FROM order_returns r WHERE r.order_id = o.id) AS return_received_at
+  const rows = await db.all(`SELECT o.id, o.shipped_at, o.tracking_no, o.hold_qty, o.released_qty, ${deliveredItemsSql('o')},
+              (SELECT id FROM order_returns r WHERE r.order_id = o.id) AS return_id,
+              (SELECT received_at FROM order_returns r WHERE r.order_id = o.id) AS return_received_at,
+              (SELECT released_at FROM order_returns r WHERE r.order_id = o.id) AS return_released_at,
+              (SELECT quantity FROM order_returns r WHERE r.order_id = o.id) AS return_quantity
        FROM orders o
        JOIN order_chain c ON c.order_id = o.id
        WHERE c.escrow_order_id = ? AND o.status = 'refunded'`, String(escrowOrderId || '').toLowerCase());
-  const releaseIds = rows
-    .filter((r) => !isDelivered(r) || r.return_received_at != null)
-    .map((r) => r.id);
-  return releaseIds.length ? releaseHoldsForOrderIds(releaseIds) : 0;
+  const undelivered = [];
+  let changed = 0;
+  for (const r of rows) {
+    if (!isDelivered(r)) {
+      // 从未交付：整单退款，释放该行**剩余**占位（缺省 amount = 剩余全部）
+      undelivered.push(r.id);
+      continue;
+    }
+    // 已交付：只有退货已确认收到且该退货单的件数尚未释放过，才释放；只释放退货覆盖的件数
+    if (r.return_received_at != null && r.return_released_at == null) {
+      changed += await releaseReturnedUnits(r.id, Number(r.return_quantity) || 0, r.return_id);
+    }
+  }
+  if (undelivered.length) changed += await releaseCore(undelivered, ['refunded'], null);
+  return changed;
 }
 
 /**
@@ -327,12 +414,18 @@ export async function restockOrder(orderId) {
     // FOR UPDATE：同一单的两个恢复入口（watcher / sync / 对账）必须串行，否则 hold_qty=0 的
     // 补占位会各加一次 committed（幻影占额，和漏占一样是账目错误）。
     const row = await db.get(
-      'SELECT id, product_id, sku_key, quantity, hold_qty, released_at FROM orders WHERE id = ? FOR UPDATE',
+      'SELECT id, product_id, sku_key, quantity, hold_qty, released_qty, released_at FROM orders WHERE id = ? FOR UPDATE',
       id
     );
     if (!row || row.product_id == null) return false; // 商品已删：没有可占的库存行，由调用方告警
-    const hold = row.hold_qty || 0;
-    if (hold > 0 && row.released_at == null) return true; // 未释放过（未被取消流程回补），无需恢复
+    const hold = Number(row.hold_qty) || 0;
+    let released = Number(row.released_qty) || 0;
+    /*
+      旧行/夹具只有 `released_at` 布尔位（released_qty 仍为 0）：读到非空即视为整单已释放。
+      新行部分退货时 `released_at` 仍为 NULL，只有 `released_qty` 表达已退件数。
+    */
+    if (released === 0 && row.released_at != null) released = hold;
+    if (hold > 0 && released === 0) return true; // 一件都没释放：本来就在占用态，无需恢复
     const skuKey = String(row.sku_key ?? '');
     const p = await db.get('SELECT capacity FROM product_skus WHERE product_id = ? AND sku_key = ?', row.product_id, skuKey);
     if (!p) return false; // 组合已不存在：不能静默当成“没库存可占”
@@ -350,29 +443,34 @@ export async function restockOrder(orderId) {
         qty, row.product_id, skuKey, qty
       );
       if (held.changes !== 1) return abortTx(false);
-      const marked = await db.run('UPDATE orders SET hold_qty = ?, released_at = NULL WHERE id = ? AND hold_qty = 0', qty, row.id);
+      const marked = await db.run(
+        'UPDATE orders SET hold_qty = ?, released_qty = 0, released_at = NULL WHERE id = ? AND hold_qty = 0',
+        qty,
+        row.id
+      );
       if (marked.changes !== 1) return abortTx(false);
       return true;
     }
     if (p.capacity === null) {
       // 该组合已改为不限量：旧占位作废，标记该行无需再恢复（仍保持 released 语义）
-      await db.run('UPDATE orders SET hold_qty = 0 WHERE id = ?', row.id);
+      await db.run('UPDATE orders SET hold_qty = 0, released_qty = 0, released_at = NULL WHERE id = ?', row.id);
       return true;
     }
     /*
-      恢复 = **认领（清释放标记）+ 占位**，两条语句同一事务。两个理由都在这里：
-        · 同事务：进程中断造成"已占位未清标记"时，该行既占着额度又被视为已释放，
-          后续取消再也不会回补 ⇒ 永久幻影占额（那件货再也卖不出去）；
-        · **认领在前**：`released_at IS NOT NULL` 就是本次恢复的原子认领——两个并发恢复
-          （watcher 托管事件与 sync 兜底各来一次）里只有一个能让 `changes === 1`，
-          另一个在 abortTx 上退出，绝不会各自 `committed + hold` 一次凭空多出占位。
-          反过来先占位再清标记时，占位成功之后才发现标记已被别人清掉：多占的那一件只能靠回滚，
-          而那一刻读到的 `committed` 已经虚高。
-      容量不足（取消期间被卖完）时 abortTx 把认领一并回滚：该行保持"已释放"的原状，由调用方告警。
+      恢复 = **认领（把已释放件数清零）+ 按已释放件数重新占位**，同一事务。
+        · 认领在前：`released_qty` 是本次恢复的原子凭据，两个并发恢复（watcher 托管事件与
+          sync 兜底各来一次）里只有一个能成功，绝不会各自 `committed + released` 一次；
+        · 只补**已释放的件数**：部分退货后行里仍有剩余占位，重复按整单 hold 补会多占。
+      容量不足（取消期间被卖完）时 abortTx 把认领一并回滚，该行保持原状，由调用方告警。
     */
-    const claimed = await db.run('UPDATE orders SET released_at = NULL WHERE id = ? AND released_at IS NOT NULL', row.id);
+    const claimed = await db.run(
+      `UPDATE orders SET released_qty = 0, released_at = NULL
+        WHERE id = ? AND (released_qty = ? OR (released_qty = 0 AND released_at IS NOT NULL))`,
+      row.id,
+      released
+    );
     if (claimed.changes !== 1) return abortTx(false);
-    if (!(await holdStock(row.product_id, skuKey, hold))) return abortTx(false);
+    if (released > 0 && !(await holdStock(row.product_id, skuKey, released))) return abortTx(false);
     return true;
   });
 }

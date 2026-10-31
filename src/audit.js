@@ -69,7 +69,7 @@ export async function logAudit({ req, actor, actorRole, action, targetType, targ
     ? req.shopRole
     : actorRole;
   // 仅店主/店员的管理动作入审计（买家动作不进——资金/退款由链上事件史与证据覆盖）
-  if (roleHint === 'user') return;
+  if (roleHint === 'user' || roleHint === 'buyer') return;
   /*
     角色**逐字落库**（host/owner/staff），不再把非 owner 一律折成 operator。
     多店之后"以什么身份动的手"是审计要回答的核心问题之一：同一个地址可以是

@@ -73,9 +73,13 @@ contract DeployNodeScript is Script {
     }
 
     function _validateArbiters(address[] memory arbiters, uint256 threshold, address owner) internal pure {
-        require(arbiters.length >= 3, "arbiters: at least 3 (2-of-2 has no recovery path)");
+        require(arbiters.length >= 3, "arbiters: at least 3 (single-arbiter panels have no recovery path)");
         require(arbiters.length <= 20, "arbiters: max 20");
-        require(threshold >= 1 && threshold < arbiters.length, "threshold must be < member count");
+        /*
+          阈值至少 2：`threshold = 1` 会让任意一名委员单独完成结算/罚没。owner 在名单时
+          合约还额外要求 >=2（现在已统一为无条件 >=2），脚本在这里先给出同一条拒绝。
+        */
+        require(threshold >= 2 && threshold < arbiters.length, "threshold must be >= 2 and < member count");
         bool ownerInList = false;
         for (uint256 i = 0; i < arbiters.length; ++i) {
             require(arbiters[i] != address(0), "arbiter: zero");

@@ -2,13 +2,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { releaseExpiredDecision } from '../src/autoConfirm.js';
 
-test('releaseExpiredDecision：未到释放块不释放，并给出剩余块数', () => {
+test('releaseExpiredDecision：必须严格越过释放块（合约 block.number <= at 仍 revert）', () => {
   assert.deepEqual(releaseExpiredDecision(100n, 99n), {
+    eligible: false,
+    reason: 'not-yet',
+    remainingBlocks: 2,
+  });
+  // 等于阈值那一块仍不可释放：合约是 `block.number <= at` revert
+  assert.deepEqual(releaseExpiredDecision(100n, 100n), {
     eligible: false,
     reason: 'not-yet',
     remainingBlocks: 1,
   });
-  assert.equal(releaseExpiredDecision(100n, 100n).eligible, true);
   assert.equal(releaseExpiredDecision(100n, 101n).eligible, true);
 });
 

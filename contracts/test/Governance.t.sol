@@ -32,24 +32,20 @@ contract GovernanceTest is NodeFixture {
         return gov.proposalCount();
     }
 
-    function testEmptyCommitteeCannotExecuteAnyProposal() public {
+    function testGovernorCannotBeWiredBeforeCommittee() public {
         Escrow e2 = new Escrow(operator, GRACE, TIMEOUT, AFTER_SALE, address(0));
         Staking s2 = new Staking(address(e2), keccak256(address(e2).code), operator);
         NodeGovernance g2 = new NodeGovernance(address(e2), address(s2));
         vm.prank(operator);
         e2.setStaking(address(s2));
+        /*
+          先接线 governor 后设委员会 = 永久死锁：governor 接线后 owner 失去 setArbiters，
+          而 NodeGovernance 空委员会的 requiredVotes 恒为 0，提案永远执行不了。
+          合约必须在接线那一刻就拒绝，而不是靠部署脚本顺序。
+        */
         vm.prank(operator);
+        vm.expectRevert(Escrow.NoArbiter.selector);
         e2.setGovernor(address(g2));
-        vm.prank(operator);
-        s2.setGovernor(address(g2));
-
-        bytes memory data = abi.encodeWithSelector(Escrow.setRejectGraceBlocks.selector, uint64(20_000));
-        vm.prank(operator);
-        g2.propose(address(e2), data);
-        vm.warp(block.timestamp + g2.EXECUTION_DELAY() + 1);
-        vm.prank(operator);
-        vm.expectRevert(NodeGovernance.NotEnoughVotes.selector);
-        g2.execute(1);
     }
 
     function testGovernorMustPointAtThisNodePair() public {
@@ -58,6 +54,13 @@ contract GovernanceTest is NodeFixture {
         NodeGovernance wrongGov = new NodeGovernance(address(e2), address(staking));
         vm.prank(operator);
         e2.setStaking(address(s2));
+        // governor 接线前必须先有委员会（否则合约以 NoArbiter 拒绝，见另一个用例）
+        address[] memory members = new address[](3);
+        members[0] = arbiter1;
+        members[1] = arbiter2;
+        members[2] = arbiter3;
+        vm.prank(operator);
+        e2.setArbiters(members, 2);
         vm.prank(operator);
         vm.expectRevert(Escrow.GovernorMismatch.selector);
         e2.setGovernor(address(wrongGov));

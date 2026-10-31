@@ -1,26 +1,22 @@
 /**
- * 店铺编号（shop code）——**编号规则与校验的唯一实现**。
+ * 店铺编号（shop code）——**编号规则与校验的唯一实现**，node / frontend / 脚本共用。
  *
  * 形状：**9 位 = 8 位数据 + 1 位校验**
- *   数据位：`keccak256(abi.encode(chainId, registry, counter))` 的高 40 位 → 8 个 Crockford Base32 字符
+ *   数据位：节点生成的 8 个 Crockford Base32 字符（`node/src/ids.js` 用 CSPRNG 取字符）；
  *   校验位：**加权和** `Σ 值×位权(1..8) mod 37`，值域 0..36 映射到 Crockford 数据字母表，
  *           32..36 用 URL/IM 安全的 `-._~,`（官方写作 `*~$=U`——`*` 在聊天里触发斜体、
- *           `$`/`=` 常被转义，而编号最常贴进聊天）
+ *           `$`/`=` 常被转义，而编号最常贴进聊天）。
  *
  * 校验位为什么用**加权**而不是普通和：普通和对换位不敏感（换位不改变和），
  * 即 `K7QW…` 敲成 `7KQW…` 照样通过 —— 那正是"敲错一位落到另一家真店"的事故来源。
  * 加权后：单字符错 Δ = δ·w ≢ 0 (mod 37)（δ ∈ [1,31]、w ∈ [1,8]）；换位 Δ = (vᵢ−vⱼ)(wⱼ−wᵢ) ≢ 0
  * （值互异、位权互异且都小于质数 37）⇒ **单字符错误与任意换位都能检出**。
  *
- * 其余设计理由：
- *  - **唯一性来自计数器**（单调、永不复用），哈希只负责"看起来随机"——
- *    顺序编号（`00000001`/`00000010`）相邻可猜，敲错一位就会静默落到另一家真店；
- *  - 哈希掺入 chainId 与合约地址：同字节码在别的链/别处部署不会产出相同序列；
- *  - 前端解析编号前必须 `verifyShopCode()`，把"敲错"当成"编号不存在"，而不是打开别人家的店。
+ * 编号是**节点本地**事实：节点生成、写入 `shops.code`，不掺 chainId/registry，也不由链上铸造。
+ * 本文件只负责编码与校验，不生成随机数（生成器在 node/src/ids.js，便于用 CSPRNG）。
  *
- * **本文件不依赖任何库**（前端/节点/模拟链/脚本都能直接 import）：哈希那一步由各运行时
- * 用自己手上的 ethers 算好后传进来（`encodeShopCodeFromHash`）。
- * 改算法必须同步改合约 `_checkChar` 与 `contracts/test`、本文件的测试。
+ * **本文件不依赖任何库**（前端/节点/模拟链/脚本都能直接 import）。
+ * 改算法必须同步改 `node/src/ids.js` 的生成路径与测试；前端 `asShopCode` 直接调本文件。
  */
 
 /** Crockford Base32 数据字母表（无 I/L/O/U，避免 1/I、0/O 抄错） */
@@ -50,33 +46,6 @@ export function encodeShopCodeFromData(data) {
   }
   const c = sum % 37;
   return v + (c < 32 ? SHOP_CODE_ALPHABET[c] : SHOP_CODE_EXT[c - 32]);
-}
-
-/** 40 位数据（bigint / 0x 十六进制串）→ 8 个 Base32 数据字符 */
-export function encodeShopCodeData(v40) {
-  let v = typeof v40 === 'bigint' ? v40 : BigInt(v40);
-  v &= (1n << 40n) - 1n;
-  let out = '';
-  for (let i = 0; i < SHOP_CODE_DATA_LEN; i += 1) {
-    out = SHOP_CODE_ALPHABET[Number((v >> BigInt(5 * i)) & 31n)] + out;
-  }
-  return out;
-}
-
-/**
- * 哈希串（32 字节 hex）→ 9 位编号。
- *
- * 各运行时这样算哈希（与合约逐字对应）：
- *   `keccak256(AbiCoder.defaultAbiCoder().encode(['uint256','address','uint64'], [chainId, registry, seq]))`
- * **必须是 abi.encode（各字段补到 32 字节），不是 solidityPacked（紧凑打包）**——
- * 两者得到的是完全不同的哈希输入，混用会让同一序号在合约与前端算出不同编号
- * （这正是"跨语言对拍"测试第一次跑就抓到的 bug）。
- * 传进来即可——本文件不引入任何依赖。
- */
-export function encodeShopCodeFromHash(hashHex) {
-  const h = String(hashHex || '').replace(/^0x/, '');
-  if (h.length < 10) throw new Error('哈希至少需要 5 字节');
-  return encodeShopCodeFromData(encodeShopCodeData(BigInt(`0x${h.slice(0, 10)}`)));
 }
 
 /** 形状检查（长度 + 字符集），**不**验校验位 */

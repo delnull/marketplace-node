@@ -26,7 +26,7 @@
 import { Router } from 'express';
 import config from '../config.js';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
-import { verifyToken, roleOf, isHost } from '../auth.js';
+import { verifySession, roleOf, isHost } from '../auth.js';
 import { getDb } from '../db.js';
 import { logAudit } from '../audit.js';
 import {
@@ -38,8 +38,8 @@ import {
 } from '../nftClaim.js';
 
 const router = Router();
-const requireAuth = makeAuthMiddleware(verifyToken);
-const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true });
+const requireAuth = makeAuthMiddleware(verifySession);
+const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 // 公开状态查询是匿名可读的（买家/二级市场买家要能查），限流防脚本枚举 tokenId
 const byTokenLimiter = simpleRateLimit({ windowMs: 60_000, max: 120, message: '提货状态查询过于频繁，请稍后再试' });
 
@@ -49,7 +49,9 @@ router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
   const tokenId = String(req.query.tokenId ?? '').trim();
   if (!contract || !tokenId) return fail(res, '需要 contract 与 tokenId 两个参数');
   const rows = await getDb().all(
-    'SELECT * FROM nft_claims WHERE token_contract = ? AND token_id = ? ORDER BY id DESC LIMIT 20',
+    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+       FROM nft_claims n
+      WHERE n.token_contract = ? AND n.token_id = ? ORDER BY n.id DESC LIMIT 20`,
     contract.toLowerCase(),
     tokenId
   );
@@ -59,7 +61,8 @@ router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
 /** 我提交过的提货行（需登录；所有状态，新的在前） */
 router.get('/nft/mine', requireAuth, wrap(async (req, res) => {
   const rows = await getDb().all(
-    'SELECT * FROM nft_claims WHERE claimant = ? ORDER BY id DESC LIMIT 200',
+    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+       FROM nft_claims n WHERE n.claimant = ? ORDER BY n.id DESC LIMIT 200`,
     req.auth.address
   );
   ok(res, { claims: rows.map((r) => claimDto(r, { as: 'holder' })) });
@@ -79,12 +82,17 @@ router.get('/nft/seller', requireAuth, wrap(async (req, res) => {
   ).map((r) => String(r.shop_code));
   const rows = staffShops.length
     ? await getDb().all(
-        `SELECT * FROM nft_claims WHERE seller = ? OR shop_code IN (${staffShops.map(() => '?').join(',')})
-         ORDER BY id DESC LIMIT 200`,
+        `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+           FROM nft_claims n WHERE n.seller = ? OR n.shop_code IN (${staffShops.map(() => '?').join(',')})
+          ORDER BY n.id DESC LIMIT 200`,
         address,
         ...staffShops
       )
-    : await getDb().all('SELECT * FROM nft_claims WHERE seller = ? ORDER BY id DESC LIMIT 200', address);
+    : await getDb().all(
+        `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+           FROM nft_claims n WHERE n.seller = ? ORDER BY n.id DESC LIMIT 200`,
+        address
+      );
   ok(res, { claims: rows.map((r) => claimDto(r, { as: 'seller' })) });
 }));
 
@@ -138,7 +146,16 @@ router.post('/nft/:id/seller', requireAuth, wrap(async (req, res) => {
     action: 'claim.' + String(action),
     targetType: 'nft_claim',
     targetId: r.claim.id,
-    detail: { status: r.claim.status, trackingNo: r.claim.trackingNo, note: r.claim.note },
+    /*
+      审计只记**状态与是否存在**：运单号可反查收件人，卖家驳回原因可能含买家个人信息。
+      这两类内容住在 nft_claims，会随 PII 擦除清空；audit_logs 是 append-only（触发器拒绝
+      UPDATE/DELETE），一旦抄进来就永远删不掉。不要把 detail 当调试日志用。
+    */
+    detail: {
+      status: r.claim.status,
+      hasTracking: !!r.claim.trackingNo,
+      hasNote: !!r.claim.note,
+    },
   });
   ok(res, r.claim, `声明已更新为 ${r.claim.status}`);
 }));

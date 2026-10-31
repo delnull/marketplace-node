@@ -5,7 +5,7 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
-import {RuntimeCodeHash} from "./RuntimeCodeHash.sol";
+import {ContractCodeHash} from "./ContractCodeHash.sol";
 
 /// @dev EIP-1271：合约账户（多签/Safe/金库）对节点登记签名的标准验签入口
 interface IERC1271 {
@@ -18,8 +18,8 @@ interface IERC1271 {
  *
  * 平台不碰店铺、商品、订单、资金、费率、员工；这些都在节点自己的库里。
  * 每个节点部署自己的 Escrow（带委员会）与 Staking（保证金），到本合约登记：
- *   · Escrow/Staking 的**实现哈希**（运行时字节码去掉 solc metadata，见 `RuntimeCodeHash`）
- *     必须命中平台维护的白名单；
+ *   · Escrow/Staking 的**全量 runtime 哈希**（`keccak256(address.code)`，含 metadata，见
+ *     `ContractCodeHash`）必须命中平台维护的白名单；
  *   · 两个地址都必须是合约且不能相同；
  *   · 一个 Escrow 只能登记给一个节点（_escrowOperator 唯一，**在本目录内**）。
  *
@@ -45,9 +45,9 @@ contract MarketplaceRegistry is Ownable2Step {
     struct NodeInfo {
         address operator; // 节点运营者（目录身份/endpoint 归属人；登记时校验为 E/S 的 owner）
         address escrow; // 托管合约（节点部署）
-        bytes32 escrowCodeHash; // 登记时钉住的实现哈希（去 metadata 的运行时字节码）
+        bytes32 escrowCodeHash; // 登记时钉住的全量 runtime 哈希（含 metadata）
         address staking; // 保证金合约（节点部署）
-        bytes32 stakingCodeHash; // 登记时钉住的实现哈希（去 metadata 的运行时字节码）
+        bytes32 stakingCodeHash; // 登记时钉住的全量 runtime 哈希（含 metadata）
         string endpoint; // 节点 API 根地址
         uint64 registeredAtBlock; // 首次注册区块
         uint64 updatedAtBlock; // 最近更新区块
@@ -63,6 +63,10 @@ contract MarketplaceRegistry is Ownable2Step {
 
     /// @notice 被永久关闭的 operator 墓碑（不可再注册）
     mapping(address => bool) private forceClosedOperator;
+
+    /// @notice 被永久关闭行钉住的资金合约墓碑：同一个 Escrow/Staking 换 owner 也不能再回目录
+    mapping(address => bool) private forceClosedEscrow;
+    mapping(address => bool) private forceClosedStaking;
 
     /// @notice 可发现 operator 的紧凑数组（getActiveNodes 直接切片）
     address[] private _activeOperators;
@@ -150,6 +154,7 @@ contract MarketplaceRegistry is Ownable2Step {
     ) external {
         _checkRegisterSig(operator, endpoint, escrow, staking, signature);
         if (forceClosedOperator[operator]) revert OperatorForceClosed();
+        if (forceClosedEscrow[escrow] || forceClosedStaking[staking]) revert OperatorForceClosed();
 
         NodeInfo storage n = nodes[operator];
         bool isNew = n.registeredAtBlock == 0;
@@ -164,9 +169,9 @@ contract MarketplaceRegistry is Ownable2Step {
 
             n.operator = operator;
             n.escrow = escrow;
-            n.escrowCodeHash = RuntimeCodeHash.forAddress(escrow);
+            n.escrowCodeHash = ContractCodeHash.forAddress(escrow);
             n.staking = staking;
-            n.stakingCodeHash = RuntimeCodeHash.forAddress(staking);
+            n.stakingCodeHash = ContractCodeHash.forAddress(staking);
             n.endpoint = endpoint;
             n.registeredAtBlock = isNew ? uint64(block.number) : n.registeredAtBlock;
             n.updatedAtBlock = uint64(block.number);
@@ -198,6 +203,12 @@ contract MarketplaceRegistry is Ownable2Step {
         if (_escrowOperator[n.escrow] == msg.sender) delete _escrowOperator[n.escrow];
         if (_stakingOperator[n.staking] == msg.sender) delete _stakingOperator[n.staking];
         n.active = false;
+        /*
+          注销后必须清掉 suspended：否则"active=false + suspended=true"是一个不可表达态，
+          `isNodeOperator` 仍说"有登记行"、`transferRegistration` 又要求 active，
+          前端会稳定地走进一条必 revert 的转移路径。停用与注销是两个互斥的终态。
+        */
+        n.suspended = false;
         n.updatedAtBlock = uint64(block.number);
         _removeActive(msg.sender);
         emit NodeDeregistered(msg.sender, n.endpoint);
@@ -222,6 +233,7 @@ contract MarketplaceRegistry is Ownable2Step {
 
         NodeInfo storage old = nodes[previousOperator];
         if (old.registeredAtBlock == 0 || !old.active || old.suspended) revert NodeNotRegistered();
+        if (forceClosedEscrow[old.escrow] || forceClosedStaking[old.staking]) revert OperatorForceClosed();
         if (old.operator != previousOperator) revert OperatorMismatch();
         if (_escrowOperator[old.escrow] != previousOperator) revert EscrowAlreadyRegistered();
         if (_endpointOwner[old.endpoint] != previousOperator) revert EndpointTaken();
@@ -294,17 +306,19 @@ contract MarketplaceRegistry is Ownable2Step {
         _removeActive(operator);
         delete nodes[operator];
         forceClosedOperator[operator] = true;
+        if (escrow != address(0)) forceClosedEscrow[escrow] = true;
+        if (staking != address(0)) forceClosedStaking[staking] = true;
         emit NodeForceClosed(operator, endpoint, reason);
     }
 
-    /// @notice 批准/撤销一种 Escrow 实现；`codeHash` 用 `RuntimeCodeHash.forAddress(实现地址)`
+    /// @notice 批准/撤销一种 Escrow 实现；`codeHash` 用 `ContractCodeHash.forAddress(实现地址)`
     function approveEscrowImplementation(bytes32 codeHash, bool approved) external onlyOwner {
         if (codeHash == bytes32(0)) revert ZeroHash();
         _approvedEscrowCode[codeHash] = approved;
         emit EscrowImplementationApproved(codeHash, approved);
     }
 
-    /// @notice 批准/撤销一种 Staking 实现；`codeHash` 用 `RuntimeCodeHash.forAddress(实现地址)`
+    /// @notice 批准/撤销一种 Staking 实现；`codeHash` 用 `ContractCodeHash.forAddress(实现地址)`
     function approveStakingImplementation(bytes32 codeHash, bool approved) external onlyOwner {
         if (codeHash == bytes32(0)) revert ZeroHash();
         _approvedStakingCode[codeHash] = approved;
@@ -381,12 +395,12 @@ contract MarketplaceRegistry is Ownable2Step {
 
     /// @dev 登记行只有在“当前地址代码仍被本目录白名单认可”时才算 active
     function _codeStillApproved(NodeInfo memory n) private view returns (bool) {
-        return _approvedEscrowCode[RuntimeCodeHash.forAddress(n.escrow)]
-            && _approvedStakingCode[RuntimeCodeHash.forAddress(n.staking)];
+        return _approvedEscrowCode[ContractCodeHash.forAddress(n.escrow)]
+            && _approvedStakingCode[ContractCodeHash.forAddress(n.staking)];
     }
 
     /**
-     * @dev 地址、实现哈希、唯一占用与 **E/S owner == operator**。
+     * @dev 地址、合约哈希、唯一占用与 **E/S owner == operator**。
      *
      * `owner()` 是一次**只读**检查，用于阻止“目录主是 A、资金方是 B”的错位；它不代表
      * Registry 为资金方背书：staking 接线、委员会与真实资金事实仍由消费者核对。
@@ -396,8 +410,8 @@ contract MarketplaceRegistry is Ownable2Step {
         if (escrow == address(0) || escrow.code.length == 0) revert EscrowNotBound();
         if (staking == address(0) || staking.code.length == 0) revert StakingNotBound();
         if (escrow == staking) revert StakingNotBound();
-        if (!_approvedEscrowCode[RuntimeCodeHash.forAddress(escrow)]) revert ImplementationNotApproved();
-        if (!_approvedStakingCode[RuntimeCodeHash.forAddress(staking)]) revert ImplementationNotApproved();
+        if (!_approvedEscrowCode[ContractCodeHash.forAddress(escrow)]) revert ImplementationNotApproved();
+        if (!_approvedStakingCode[ContractCodeHash.forAddress(staking)]) revert ImplementationNotApproved();
 
         address current = _escrowOperator[escrow];
         if (current != address(0) && current != operator) revert EscrowAlreadyRegistered();
@@ -457,10 +471,32 @@ contract MarketplaceRegistry is Ownable2Step {
         if (hostEnd == 8) return false;
         if (hostEnd < b.length) {
             if (b.length == hostEnd + 1 || b[b.length - 1] == 0x2F) return false;
-            for (uint256 i = hostEnd + 1; i < b.length; i++) {
-                uint8 pc = uint8(b[i]);
-                // 路径允许大小写/数字/常见 URL 字符；查询、fragment、反斜杠一律拒绝。
-                if (pc < 0x21 || pc > 0x7E || pc == 0x3F || pc == 0x23 || pc == 0x5C) return false;
+            /*
+              路径唯一性必须按**规范化后**的段判断：`https://a.example/..` 与
+              `https://a.example` 在客户端解析到同一个 origin，但原始字符串不同，旧实现会让
+              同一 endpoint 被两个 operator 各占一行（目录去重/展示被点段绕过）。
+              这里拒绝 `.`/`..` 以及它们的 `%2e` 编码，也拒绝编码的 `/`、`\`（`%2f`/`%5c`）——
+              后者同样能在解析后制造新段。只做"精确段"判断，不误伤普通文件名里的 `%2e`。
+            */
+            uint256 segStart = hostEnd + 1;
+            for (uint256 i = hostEnd + 1; i <= b.length; i++) {
+                if (i < b.length && b[i] != 0x2F) {
+                    uint8 pc = uint8(b[i]);
+                    if (pc < 0x21 || pc > 0x7E || pc == 0x3F || pc == 0x23 || pc == 0x5C) return false;
+                    continue;
+                }
+                uint256 len = i - segStart;
+                if (len == 1 && b[segStart] == 0x2E) return false;
+                if (len == 2 && b[segStart] == 0x2E && b[segStart + 1] == 0x2E) return false;
+                if (len == 3 && _isPct(b, segStart, 0x32, 0x65)) return false; // %2e
+                if (len == 6 && _isPct(b, segStart, 0x32, 0x65) && _isPct(b, segStart + 3, 0x32, 0x65)) {
+                    return false; // %2e%2e
+                }
+                if (len >= 3 && b[segStart] == 0x25) {
+                    // 编码斜杠/反斜杠会改变路径分段（%2f / %5c），不接受
+                    if (_isPct(b, segStart, 0x32, 0x66) || _isPct(b, segStart, 0x35, 0x63)) return false;
+                }
+                segStart = i + 1;
             }
         }
 
@@ -492,6 +528,14 @@ contract MarketplaceRegistry is Ownable2Step {
         if (labels < 2) return false;
         if (_isIpLikeHost(b, hostEnd)) return false; // IPv4（含 0x/纯数字缩写）
         return true;
+    }
+
+    /// @dev `%XY`（大小写不敏感）是否从 start 开始
+    function _isPct(bytes memory b, uint256 start, uint8 hi, uint8 lo) private pure returns (bool) {
+        if (start + 2 >= b.length || b[start] != 0x25) return false;
+        uint8 h = uint8(b[start + 1]);
+        uint8 l = uint8(b[start + 2]);
+        return (h == hi || h == hi - 32 || h == hi + 32) && (l == lo || l == lo - 32 || l == lo + 32);
     }
 
     /// @dev host 的每一段都是十进制数字或 0x 十六进制 ⇒ 这是 IP，而不是域名

@@ -99,6 +99,15 @@ function trustProxyOf(raw) {
           `MK_TRUST_PROXY 的网段 ${JSON.stringify(p)} 非法：前缀长度需为 0..${max}（IPv${isIP(pieces[0])}）。`
         );
       }
+      /*
+        /0 = "信任全世界"：任何人都能自带 X-Forwarded-For 伪造来源，限流键与审计 IP 同时失效。
+        这不是一个有效配置，直接拒绝，不留"配错也静默跑"的路径。
+      */
+      if (bits === 0) {
+        throw new Error(
+          `MK_TRUST_PROXY 的网段 ${JSON.stringify(p)} 非法：/0 覆盖全部地址，等于信任任何来源的转发头。`
+        );
+      }
     }
   }
   return parts;
@@ -379,14 +388,12 @@ const config = {
     // nonce 有效期（秒）
     ttlSeconds: intEnv('MK_SIWE_TTL', 600),
     /*
-      登录令牌有效期（秒）。默认 30 天：前端把会话存在**本机**（localStorage），
-      所以"这台设备上签一次名"的窗口就是它；1 天会让每天第一次打开都要再签一次。
-
-      代价：令牌是无状态的 HMAC，服务端没有"吊销单个令牌"的入口——有效期多长，
-      一枚泄露的令牌就能用多长（能力仍受每个请求的实时角色/链上状态约束，动钱仍要钱包签名）。
-      要立刻让全部令牌失效只有换 `MK_TOKEN_SECRET`（所有人重新登录）。不想要这么长就调小。
+      登录令牌有效期（秒）。默认 1 天：前端把会话存在**本机**（localStorage），
+      所以"这台设备上签一次名"的窗口就是它。
+      服务端 auth_sessions 支持逐个撤销（退出登录），有效期多长，一枚泄露的令牌
+      就还能用到多长（能力仍受每个请求的实时角色/链上状态约束，动钱仍要钱包签名）。
     */
-    tokenTtlSeconds: intEnv('MK_TOKEN_TTL', 2592000),
+    tokenTtlSeconds: intEnv('MK_TOKEN_TTL', 86400),
     /*
       HMAC 签名密钥（生产必须设置强随机值）。
       **刻意没有默认值**：留空即走 server.js 的 fail-fast（<32 字符 / 缺失一律 exit(1)）。
@@ -466,6 +473,14 @@ const config = {
    * 这是 XFF 的**唯一**解析点，限流/审计/请求日志都只消费解析后的 `req.ip`。
    */
   trustProxy: trustProxyOf(process.env.MK_TRUST_PROXY),
+
+  /**
+   * Redis（共享限流/缓存）。空 = 单进程内存实现（测试/单机无 Redis）；生产多实例必须设
+   * `MK_REDIS_URL`，否则每个进程各自计数，"匿名读限流"会被实例数放大。
+   * 键前缀由 `MK_REDIS_PREFIX` 覆盖，默认按库名隔离（同机多个节点共用一个 Redis）。
+   */
+  get redisUrl() { return String(process.env.MK_REDIS_URL || '').trim(); },
+  get redisPrefix() { return String(process.env.MK_REDIS_PREFIX || 'mk').trim() || 'mk'; },
 
   /**
    * 允许在**类生产环境**下也反射任意 Origin（默认关）。

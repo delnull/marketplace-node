@@ -57,7 +57,7 @@ export const MAX_RAW_NAME = 120;
 /**
  * 证据附件的**策略**：收哪些类型、各自落盘的扩展名。
  *
- * 字节层面的判据**不在这里**：`sniffMediaMime`（`shared/media.js`）是"这段字节到底是什么"
+ * 字节层面的判据**不在这里**：`sniffMediaMime`（`node/src/mediaKinds.js`）是"这段字节到底是什么"
  * 的唯一实现，商品媒体与证据附件共用。本表只回答"证据附件允许收哪几种"——
  * 两张表曾各自维护一份魔数（改一处漏一处），现在只有策略是两套。
  * 注意它与商品媒体的策略**故意不同**：附件不收 gif（动图对举证没有价值、却更难核验），
@@ -577,16 +577,9 @@ export function evidencePhaseError(order, phase, role, { now = Date.now() } = {}
   return statementGateError(order, p, now);
 }
 
-/** evidence 行附件摘要（时间线输出用，不含下载 URL） */
-export async function filesOfEvidence(evidenceId) {
-  return (await getDb().all('SELECT id, filename, mime, size, sha256, created_at FROM evidence_files WHERE evidence_id = ? ORDER BY id ASC', Number(evidenceId)))
-    .map((f) => ({ id: f.id, name: f.filename, mime: f.mime, size: f.size, sha256: f.sha256, createdAt: f.created_at }));
-}
-
 /**
  * 批量取多条陈述的附件元数据（**一次查询**）——订单详情时间线专用。
- * 原实现逐行调用 filesOfEvidence 是 N+1 次查询（一单 60 行陈述就是 60 次往返），
- * 而详情是公开只读接口里最热的读路径之一；这里按 evidence_id IN (...) 一次取回并按
+ * 按 evidence_id IN (...) 一次取回并按
  * 陈述 id 分组，返回 Map<evidenceId, files[]>（无附件的 id 也会在 Map 里给出空数组）。
  */
 export async function filesOfEvidenceMany(evidenceIds) {

@@ -106,6 +106,14 @@ interface IEscrowMinimal {
     function afterSaleOpen(bytes32 orderId) external view returns (bool);
 
     /**
+     * @notice 售后案是否由**90 天强制到期**路径结案（不是买家撤诉/委员会裁决）。
+     *
+     * 强制结案只释放 pending，不消灭窗口内剩余的第二层罚没救济；买家主动撤诉/委员会裁决
+     * 结案仍按"买家已认可"收回罚没资格。Staking 的 `buyerConfirmed` 门槛同时看这两个活标志。
+     */
+    function afterSaleForcedClosed(bytes32 orderId) external view returns (bool);
+
+    /**
      * @notice 该单**结算给卖家**时的区块高度（0 = 从未判给卖家）。
      *
      * 与 `afterSaleWindowAtSettle` 一起构成售后窗口的**唯一判据**（Escrow 在 `_settle` 里
@@ -140,7 +148,7 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      *
      * **不可更换**：没有 setter，任何换源入口都不存在；换 Escrow 必须重部署 Staking 并做一次
      * 显式迁移。这里用 storage 而不是 immutable，是为了让**同一份源码在所有节点实例上产出
-     * 相同的实现哈希**（运行时字节码去掉 metadata）——平台 Registry 的白名单才能认证它。
+     * 相同的**全量 runtime 哈希**——平台 Registry 的白名单才能认证它。
      * immutable 会把每个实例的 escrow 地址嵌进字节码，使每个节点的哈希都不同。
      *
      * 构造期仍做形状探针 + 代码哈希互验（`escrowCodeHash_` 只用于构造期校验，不落 storage）。
@@ -244,12 +252,11 @@ contract Staking is Ownable2Step, ReentrancyGuard {
         uint256 cap; // 本窗口累计上限（开窗时按当时的质押池快照）
         uint256 penalized; // 本窗口内已累计罚没
         /**
-         * @notice **开窗那一单的裁决届次**（`Escrow.orderEpoch(orderId)`，不是开窗时的当前届）。
+         * @notice 开窗时的**当前委员会届次**（`Escrow.orderEpoch` 现在只返回当前届）。
          *
-         * 它是**诊断/审计**读数：出金锁只看 `revokedArbiter[penaltyWindowOpener]`（见
-         * `withdrawLock`），换届与届次比较都不再参与资金闸。它也不参与速率闸的额度判据：
-         * 累计按 operator 单调，只有窗口到期才重置；被吊销成员的票不再计入（`revokedArbiter`），
-         * 旧届成员若仍未被吊销，其对在途单的投票权保留，但已经用掉的额度不会回来。
+         * 它是**诊断/审计**读数：出金锁只看全局开关与窗口到期（见 `withdrawLock`），
+         * 届次比较不参与资金闸。它也不参与速率闸的额度判据：累计按 operator 单调，只有窗口
+         * 到期才重置；被吊销成员的票不再计入（`revokedArbiter`），但已经用掉的额度不会回来。
          */
         uint32 epochAtOpen;
     }
@@ -261,11 +268,9 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * @notice operator => 本活动窗口的**开窗人**（第一笔让窗口开启的罚没投票人；不因同窗口
      *         后续罚没改写）。
      *
-     * 它是出金锁的**唯一放人信号**：`withdrawLock` 只问 `revokedArbiter[penaltyWindowOpener]`。
-     * 为什么是"开窗人"而不是"最近一次投票人"：放人是一次**显式治理动作**（吊销），
-     * 被吊销的必须是那个让这扇窗开启的人；若让后续投票人覆盖，吊销对象就会漂移，
-     * "吊销谁才放人"又变成需要推断的第二套语义（2026-10-21 复审）。
-     * 换届/是否当前届成员都**不再**参与锁的判定（见 `withdrawLock`）。
+     * 仅供诊断/审计：2026-10 起 `withdrawLock` **不再**因吊销开窗人而解锁（吊销一个人
+     * 不能代表整个委员会，否则同一窗口其他委员继续罚没时卖家已把剩余质押提走）。窗口锁
+     * 只由 `penaltyWindowLocksWithdraw` 全局开关或窗口到期解除。
      */
     mapping(address => address) public penaltyWindowOpener;
 
@@ -363,9 +368,9 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     uint256 public constant ACCRUAL_GAS_HEADROOM = 60_000;
 
     /**
-     * @notice 撤资审批的**自动放行**窗口（秒）：0 = 必须管理员人工批准（默认，永不放行）。
+     * @notice 撤资审批的**自动放行**窗口（秒）：0 = 使用 365 天绝对上限（不是"永不放行"）。
      *
-     * 为什么留这个旋钮（默认关闭）：审批制把"店主能不能把钱拿走"交给了 owner，
+     * 为什么留这个旋钮：审批制把"店主能不能把钱拿走"交给了 owner，
      * 于是 owner 失联/丢钥就等于**所有店主的质押永久锁死**——本仓库对"单点能把资金锁死"
      * 一向要求有有界出口（罚没窗口、撤资冷却都各有一对上下限）。设一个 >0 的值即表示
      * "管理员在窗口内不处理就视为默认通过"，把无限期锁死变成有界延迟；默认 0 表示
@@ -400,8 +405,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      *      设成一个巨大的数，就等于把"owner 失联时的出口"关掉了，而那条出口存在的全部意义正是防这个。
      *      买家补偿 `penalize` **不受任何出金下限约束**（留存线、敞口都不）：它是买家拿到
      *      第二层补偿的唯一入口，用"该留多少钱"的参数去否决它等于把赔付关死（见 `penalize`）。
-     *      （owner 若想连自动放行也不放，正确的动作是把 `unstakeApprovalTimeout` 保持 0，而不是
-     *      用一个金额参数去否决它——两个旋钮不该互相矛盾。）
+     *      （`unstakeApprovalTimeout` 只能缩短等待，不能取消 365 天绝对上限；不要用一个金额参数
+     *      去否决它——两个旋钮不该互相矛盾。）
      *   ④ 留存的额度从"这个店主能提多少"里扣掉：`retainedState()` 直接给 `withdrawable`（走 ③ 的口径），
      *      `claimableState()` 给不依赖 owner 的那条口径。若罚没把池打到留存线之下，则**owner 审批的**
      *      出金会被 `BelowRequiredFloor` 拒（直到店主补质押或治理调低）；`claimUnstake` 只看敞口，
@@ -509,9 +514,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     /**
      * @param escrow_ 本节点托管合约（**唯一事实源**：订单终局/参与方/**仲裁人**都由它读）。
      *        **不可更换**：换 Escrow 必须重部署 Staking 并做一次显式迁移（见 `escrow` 的说明）。
-     * @param escrowCodeHash_ `escrow_` 的**构建哈希**（`keccak256(address(escrow).code)`，含
-     *        构建 metadata）：只用于构造期“地址与哈希是同一次部署的一对”的互验。它**不是**
-     *        Registry 的实现哈希（后者去掉 metadata，见 `RuntimeCodeHash`），两者不要混用。
+     * @param escrowCodeHash_ `escrow_` 的全量 runtime 哈希（`keccak256(address(escrow).code)`）：
+     *        构造期“地址与哈希是同一次部署的一对”的互验；与 Registry 白名单用的是同一个值。
      * @param initialOwner 合约 owner（只做参数、审批与冻结治理，**不能动用任何质押资金**）
      *
      * 注：原先还有 `arbiter_` 参数与对应的 `arbiter` 存储副本（单仲裁人时代），早已删除——
@@ -624,8 +628,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * **三条路径的唯一关系**（2026-10 第三批收口；旧 `releaseStake` 已删除）：
      *   · `requestUnstake`（店主）：只把 staked 挪进 pending 并按下 `releaseAt`，一分钱不出；
      *   · 本函数（owner）：冷却期满后把**整批** pending 打给店主；
-     *   · `claimUnstake`（店主自己）：只在治理配置了 `unstakeApprovalTimeout` 且该窗口也过了时，
-     *     把同一批 pending 领走——它是 owner 失联时的有界出口，判据比本函数**更窄**
+     *   · `claimUnstake`（店主自己）：在 `unstakeApprovalTimeout`（0 ⇒ 365 天绝对上限）
+     *     过后把同一批 pending 领走——它是 owner 失联时的有界出口，判据比本函数**更窄**
      *     （只受在途售后敞口约束，不受留存线约束）。
      * 三者都只动 `pending`、都不看 staked。**没有任何路径能在 `releaseAt` 之前把钱拿出池**：
      * 旧 `releaseStake` 曾是一条无申请、无冷却的旁路，现在连形状都不存在了。
@@ -681,7 +685,7 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * **为什么这里只受敞口约束、不受治理留存线约束（2026-10-13 复审）**：留存线是 owner 设的
      * **策略性**下限，而这条路径存在的意义正是"owner 不动作时的出口"。若留存线也能否决它，
      * 那么 owner 只要把留存线设成一个巨大的数，这条"有界出口"就名存实亡——**两个旋钮不该互相矛盾**
-     * （owner 若真的不想放自动放行，正确的动作是把 `unstakeApprovalTimeout` 保持 0）。
+     * （`unstakeApprovalTimeout` 只能缩短等待，不能取消 365 天绝对上限）。
      * 敞口不同：它是"买家已经真实主张、钱还冻在托管里"的等额部分，任何路径都必须留出来。
      */
     function claimUnstake() external nonReentrant {
@@ -703,7 +707,23 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     }
 
     /**
-     * @dev 是否已过自动放行窗口（`unstakeApprovalTimeout == 0` 时恒 false = 必须人工批准）。
+     * @dev 自动放行窗口（`unstakeApprovalTimeout == 0` 时取 `MAX_UNSTAKE_APPROVAL_TIMEOUT`）。
+     *
+     * **无 owner 出口是结构约束**：`setUnstakeApprovalTimeout` 只能由 governor 调，而
+     * `NodeGovernance.propose` 只认 owner——owner 丢钥时没有任何人能重新武装自动放行。
+     * 旧实现把 0 解释成"永远人工批准"，于是 owner 一丢钥，全部卖家的质押与在途申请永久锁死
+     * （委员会唯一的自发起提案是 fast unfreeze，够不着这个旋钮）。
+     * 现在 0 只表示"不用更短的窗口"，绝对上限 365 天始终存在：owner 仍可在窗口内批准/驳回，
+     * 但资金不会因为没有 owner 而永久锁死。代价如实写：owner 不能再用 0 把卖家的钱永久扣住；
+     * 真要阻止出金，应使用有上限的 freeze/罚没窗口，而不是关掉自动放行。
+     */
+    function _autoApproveWindow() internal view returns (uint256) {
+        uint256 t = unstakeApprovalTimeout;
+        return t > 0 ? t : MAX_UNSTAKE_APPROVAL_TIMEOUT;
+    }
+
+    /**
+     * @dev 是否已过自动放行窗口。
      *      `!approved` 这一条与 `unstakeState.autoApproveArmed` 里的同名字段共用同一口径：
      *      已获批准的那一批不该再走自动放行（两处判据必须一致，否则界面与链上会对同一状态说两种话）。
      *      注意 `autoApproveArmed` 只回答“窗口开着、还没批准”，**不回答“时间到了没有”**；
@@ -711,8 +731,7 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      */
     function _isAutoApproved(address operator) internal view returns (bool) {
         UnstakeRequest memory r = unstakeRequests[operator];
-        uint256 t = unstakeApprovalTimeout;
-        return t > 0 && !r.approved && r.requestedAt != 0 && block.timestamp >= uint256(r.requestedAt) + t;
+        return !r.approved && r.requestedAt != 0 && block.timestamp >= uint256(r.requestedAt) + _autoApproveWindow();
     }
 
     /// @notice 领取**挂账**的派发（仅在打款失败时才会产生挂账；见 `_payoutOrCredit`）
@@ -751,20 +770,21 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     }
 
     /**
-     * @dev **罚没单笔上限的基准（唯一实现）** = `min(托管毛额, 卖家实收净额)`。
+     * @dev **罚没单笔上限的基准（唯一实现）** = 结算时卖家实收净额 `sellerNetAtSettle`。
      *
      * 当前模型没有平台费/节点抽成，`sellerNetAtSettle` 就是卖家实际拿到的净额
-     * （全额结算 = amount；部分退款 = amount − refundedAmount）。用它作基准，
-     * 罚没不会超过卖家真实所得；用毛额则会把"卖家从来没收到的那部分"也罚走
-     * （旧模型里的费/抽成腿），制造"罚得比卖家赚得还多"的错位。
+     * （全额结算 = amount；部分退款 = amount − 结算时退款）。用毛额会把"卖家从来没收到的那部分"
+     * 也罚走，制造"罚得比卖家赚得还多"的错位。
      *
-     * 取 `min(毛额, 净额)` 而不是直接用净额：`sellerNetAtSettle` 只在 `toSeller > 0` 时写入，
-     * 未写入即 0 ⇒ 基准 0 ⇒ `ExceedsCap`——**fail-closed**（读不到就不许罚，而不是按毛额放行）。
+     * **不能再减 `o.refundedAmount`**：它在结算后还会被 votePenalty / voteClaim 累加，
+     * 而累计上限 `usedTotal` 已把同一笔算进去，再减一次会让同一笔罚没扣两遍
+     * （默认 5000 bps 下实际可用上限从 50% 掉到 33%，且与先后顺序相关）。
+     *
+     * `sellerNetAtSettle` 只在 `toSeller > 0` 时写入；未写入即 0 ⇒ 基准 0 ⇒ `ExceedsCap`，
+     * **fail-closed**（读不到就不许罚，而不是按毛额放行）。
      */
-    function _penaltyBase(bytes32 orderId, IEscrowMinimal.Order memory o) private view returns (uint256) {
-        uint256 gross = o.amount > o.refundedAmount ? o.amount - o.refundedAmount : 0;
-        uint256 net = escrow.sellerNetAtSettle(orderId);
-        return gross < net ? gross : net;
+    function _penaltyBase(bytes32 orderId) private view returns (uint256) {
+        return escrow.sellerNetAtSettle(orderId);
     }
 
     /// @dev 判据按**打款后**的池算：`poolOf - payoutAmount ≥ floor`（边界值相等**通过**）。
@@ -815,8 +835,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * @return pending 在途申请金额（wei）
      * @return releaseAt 冷却期到期时刻（unix 秒；0 = 无在途申请）
      * @return approved 是否已获批准（`approveUnstake` 是即打款的，所以读取时通常已清零）
-     * @return autoApproveArmed 是否配置了自动放行窗口且尚未放行
-     * @return autoApproveAt 自动放行时刻（0 = 未配置或已放行）
+     * @return autoApproveArmed 是否尚未放行（自动放行上限始终存在，见 `_autoApproveWindow`）
+     * @return autoApproveAt 自动放行时刻（0 = 无在途申请或已放行）
      */
     function unstakeState(address operator)
         external
@@ -826,9 +846,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
         Position storage p = _positions[operator];
         UnstakeRequest memory r = unstakeRequests[operator];
         approved = r.approved;
-        uint256 t = unstakeApprovalTimeout;
-        autoApproveArmed = !approved && t > 0 && r.requestedAt != 0;
-        autoApproveAt = autoApproveArmed ? uint256(r.requestedAt) + t : 0;
+        autoApproveArmed = !approved && r.requestedAt != 0;
+        autoApproveAt = autoApproveArmed ? uint256(r.requestedAt) + _autoApproveWindow() : 0;
         return (p.pending, p.releaseAt, approved, autoApproveArmed, autoApproveAt);
     }
 
@@ -964,17 +983,18 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * 紧急放人路径（怀疑仲裁人发疯时把被锁的诚实店主放出来），也是"实时读窗口长度"这个
      * 旧行为唯一真正需要保留的能力——它已经有专门的开关，不必再让数字承担救援职责。
      *
-     * **提前放人的唯一信号**（2026-10-21 复审）：`revokedArbiter[开窗人]` 为真，或
-     * `penaltyWindowLocksWithdraw` 被关掉。**换届本身不是信号**——旧届成员仍能裁旧单，
-     * 把"不在当前届"当解锁会让一次例行 `setArbiters` 顺手拆掉在途窗口的锁。
+     * **提前放人的唯一信号 = `penaltyWindowLocksWithdraw` 被治理关掉**（全局、实时）。
+     * 旧实现还有第二个信号"开窗人被 `revokeArbiter` 吊销"——那是一个**提权漏洞**：
+     * 吊销开窗人只停掉他一个，同窗口其他委员仍能继续罚没；解锁却把整个窗口的出金闸拆掉，
+     * 卖家可以在窗口结束前把剩余质押提走，后续受害者无钱可罚。窗口一旦开启，
+     * 锁就必须持续到 `w.end`（或治理显式关掉全局开关），不能由"某个人被吊销"代表整个委员会。
      *
      * 明确记录的代价（这是刻意的取舍）：
      *   · 被罚没过的店主，其已到期的撤资要**再多等**到窗口结束（最多 180 天）才能提取；
      *   · 这个闸由仲裁人的动作触发，所以一把被盗/恶意的仲裁人密钥可以用 1 wei 的罚没
      *     反复把某店主的出金窗口往后推（本质与它已经能做的"每窗口罚走 50%"同级，
-     *     但成本更低）。治理的应对是**显式 `revokeArbiter`**（同时停掉他的票并解除他开的窗口）
-     *     或 `setPenaltyWindowLock(false)`（全局、立即生效，不受快照影响）；常规
-     *     `removeArbiter`/`setArbiters` **不会**解除在途窗口。
+     *     但成本更低）。治理的应对是 `setPenaltyWindowLock(false)`（全局、立即生效，
+     *     不受快照影响）或直接冻结该店主；**不要**指望吊销单个委员来解除窗口锁。
      *   · 被 `freeze` 的店主本来也提不了（治理冻结），所以这道闸不引入新的权限类别。
      *
      * @return locked 是否被锁住
@@ -986,18 +1006,6 @@ contract Staking is Ownable2Step, ReentrancyGuard {
         if (w.end == 0) return (false, 0);
         uint256 end = uint256(w.end);
         if (block.timestamp >= end) return (false, 0);
-        /*
-          **唯一的提前放人信号 = 开窗人已被显式吊销**（`revokedArbiter`），不是"他是否还在
-          当前届"。换届是正常治理动作，而旧届成员仍能裁旧单：若把"不在当前届"当解锁，
-          一次例行 `setArbiters` 就会让旧届刚开的窗口**生来不锁**，卖家在窗口内把剩余质押
-          提走，速率闸的"罚掉一半后不能再跑"随之失效（2026-10-21 复审，已用回归钉住）。
-          显式吊销同时停掉他的票，语义一致：怀疑失陷 → 吊销 → 他开的窗口随之解除。
-          没有记录 opener 的历史窗口（opener == 0）按保守方向继续锁——`revokedArbiter[0]`
-          恒为 false，正好落在这个分支上。
-        */
-        if (IEscrowOwnerRoles(address(escrow)).revokedArbiter(penaltyWindowOpener[operator])) {
-            return (false, 0);
-        }
         return (true, end);
     }
 
@@ -1156,7 +1164,7 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * @return end 到期时刻（开窗时快照）
      * @return cap 本窗口累计上限（开窗时质押池快照 × capBps）
      * @return penalized 本窗口已累计罚没
-     * @return epochAtOpen 开窗时**该单的裁决届次**（`Escrow.orderEpoch`；纯留痕/诊断，不参与额度累计，也不参与出金锁）
+     * @return epochAtOpen 开窗时**当前委员会届次**（`Escrow.orderEpoch`；纯留痕/诊断，不参与额度累计，也不参与出金锁）
      */
     function penaltyWindowDetail(address operator)
         external
@@ -1173,13 +1181,12 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * 而链上 revert，或反过来）。
      *
      * **累计与窗口归属解耦（2026-10 第三批，P1）**：本函数**不读**当前届——
-     * 旧实现把"窗口属于开窗时的仲裁人"当成判据，于是 owner 一次换届（`setArbiters`/`addArbiter`/
-     * `removeArbiter`）就能让在途窗口作废、按当下池重开一个新额度，"单窗口 ≤ 50%"可以被循环
-     * 刷新到无上界。现在：额度按 operator **单调累计**，只在窗口**到期**时重置，与谁在任无关；
-     * 换届仍能立刻吊销失陷密钥（`revokeArbiter` 置 `revokedArbiter`，让被吊销者连旧届的票都不算），
+     * 旧实现把"窗口属于开窗时的仲裁人"当成判据，于是 owner 一次换届就能让在途窗口作废、
+     * 按当下池重开一个新额度，"单窗口 ≤ 50%"可以被循环刷新到无上界。现在：额度按 operator
+     * **单调累计**，只在窗口**到期**时重置，与谁在任无关；换届/吊销立即改变投票资格，
      * 但**不会**把已经用掉的额度还回去。`epochAtOpen` 只是窗口归属的诊断读数；
-     * `penaltyWindowOpener` 记录**开窗人**（只在开窗时写一次），`withdrawLock` 只问
-     * `revokedArbiter(opener)`——显式吊销才解除，换届/是否当前届不再参与。
+     * `penaltyWindowOpener` 记录**开窗人**（只在开窗时写一次），仅作诊断；
+     * `withdrawLock` 只认全局开关与窗口到期，不再因某个委员被吊销而提前解锁。
      *
      * 窗口的长度与额度都只在**开窗那一刻**定型：进行中的窗口（`block.timestamp < w.end`）按自己的
      * 快照执行完，不再看 `penaltyWindowSeconds`/`penaltyWindowCapBps` 的当下值；只有需要开新窗时
@@ -1189,7 +1196,7 @@ contract Staking is Ownable2Step, ReentrancyGuard {
         address operator,
         uint256 pool,
         uint256 amountWei,
-        uint32 orderEpochOf,
+        uint32 committeeEpochOf,
         address voter
     ) internal {
         PenaltyWindow storage w = penaltyWindows[operator];
@@ -1206,8 +1213,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
         w.start = uint64(block.timestamp);
         w.end = uint64(block.timestamp + win); // win ≤ MAX_PENALTY_WINDOW_SECONDS（180 天），不会溢出 uint64
         w.cap = (pool * bps) / 10000;
-        // 该单的裁决届次（`Escrow.orderEpoch`）：**诊断读数**，不参与出金锁与额度累计
-        w.epochAtOpen = orderEpochOf;
+        // 当前委员会届次（`Escrow.orderEpoch`）：**诊断读数**，不参与出金锁与额度累计
+        w.epochAtOpen = committeeEpochOf;
         penaltyWindowOpener[operator] = voter;
         if (amountWei > w.cap) revert ExceedsWindowCap();
         w.penalized = amountWei;
@@ -1244,11 +1251,12 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     }
 
     /**
-     * @notice 设置撤资审批的**自动放行**窗口（秒）：0 = 必须人工批准（默认），上限 365 天。
+     * @notice 设置撤资审批的**自动放行**窗口（秒）：0 = 使用 365 天绝对上限，上限 365 天。
      *
      * 语义：申请之后经过该窗口，管理员仍未批准也视为放行——**由店主自己调用 `claimUnstake()`
-     * 触发打款**（见该函数）。它**不是**给店主的常规快捷通道（默认 0 = 关闭），而是**给
-     * "管理员失联"留的有界出口**：设成 0（默认）表示明确接受"管理员不批就永远提不走"这个单点风险。
+     * 触发打款**（见该函数）。它**不是**给店主的常规快捷通道，而是**给"管理员失联"留的有界出口**：
+     * 0 只表示"不用更短的窗口"，`claimUnstake` 在 365 天后仍会放行；owner 不能把卖家的钱永久扣住。
+     * 设成小于 365 天的值可以缩短等待；不能延长到 365 天以上。
      */
     function setUnstakeApprovalTimeout(uint256 seconds_) external onlyGovernor {
         require(seconds_ <= MAX_UNSTAKE_APPROVAL_TIMEOUT, "unstake-approval-timeout");
@@ -1267,8 +1275,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * 只有补质押或调低留存线两条路）。
      *
      * **它管不到哪一条（刻意，见 `minRetainedStake` ③）**：店主不依赖 owner 的有界出口
-     * `claimUnstake` 只受在途售后敞口约束。owner 若想连自动放行也不放，正确的动作是把
-     * `unstakeApprovalTimeout` 保持 0，而不是用一个金额参数去否决它。
+     * `claimUnstake` 只受在途售后敞口约束。`unstakeApprovalTimeout` 只能缩短等待，不能取消
+     * 365 天绝对上限；不要用一个金额参数去否决它。
      */
     function setMinRetainedStake(uint256 value) external onlyGovernor {
         minRetainedStake = value;
@@ -1302,6 +1310,7 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     function _probeEscrow(address candidate) internal view returns (IEscrowMinimal) {
         if (candidate.code.length == 0) revert ZeroAddress();
         _probeBool(candidate, abi.encodeWithSignature("afterSaleOpen(bytes32)", bytes32(0)));
+        _probeBool(candidate, abi.encodeWithSignature("afterSaleForcedClosed(bytes32)", bytes32(0)));
         _probeWord(candidate, abi.encodeWithSignature("sellerOpenExposure(address)", address(0)), 1);
         // 提货争议敞口：出金下限读它；缺它则所有出金路径 revert。
         _probeWord(candidate, abi.encodeWithSignature("sellerClaimExposure(address)", address(0)), 1);
@@ -1313,7 +1322,7 @@ contract Staking is Ownable2Step, ReentrancyGuard {
         _probeWord(candidate, abi.encodeWithSignature("settledAtBlock(bytes32)", bytes32(0)), 1);
         _probeWord(candidate, abi.encodeWithSignature("afterSaleWindowAtSettle(bytes32)", bytes32(0)), 1);
         _probeWord(candidate, abi.encodeWithSignature("getOrder(bytes32)", bytes32(0)), ESCROW_ORDER_WORDS);
-        // 2026-10-18 修 P1 时加：罚没窗口的归属取 `orderEpoch`（该单的裁决届次），不是当前届。
+        // 2026-10 起：窗口归属只记当前委员会届次作诊断，不参与出金锁/额度；投票资格只看当前名单。
         // 缺它则 `penalize` 直接 revert（selector 不存在）——罚没整条路径在部署后第一次罚就没
         // 发现，所以必须进构造期探针，与其余读法同款。
         _probeWord(candidate, abi.encodeWithSignature("orderEpoch(bytes32)", bytes32(0)), 1);
@@ -1377,20 +1386,22 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      *   · `voteSettlement` 判卖家 / 卖家胜诉 → 可罚（买家没认可）；
      *   · `releaseExpired` 超时释放 → **可罚**（跑路卖家的主场景，正是本合约存在的理由）；
      *   · `confirmReceipt`（含争议中撤诉放款）→ **不可罚**（买家自己认可了这笔钱）；
-     *   · `approveRefund` → **不可罚**：它只能执行"全额"或"买家已授权的金额"，两种都是买家认可的
-     *     处置结果（全额退对买家只有好处；授权额是买家点过头的数）。若不排除，同一个仲裁人就能
-     *     与买家合谋制造一次"友好和解"、再对卖家质押罚没，罚走超出双方谈拢结果的金额。
-     *     取舍：仲裁人失能时，买家于是要在「撤诉放款结束订单」与「继续停在 Disputed 保留罚没资格」
-     *     之间选一个——文档与界面都应把这一点说出来，而不是替买家决定（见 ARCHITECTURE §2.4）。
+     *   · `approveRefund` **全额** → 不可罚：买家已全额受偿，订单状态是 Refunded（不在可罚集合里）；
+     *   · `approveRefund` **部分金额** → 仍可走 `openAfterSale` 后被罚：部分退款只补偿了已确认的
+     *     那一部分，不等于买家放弃剩余瑕疵的救济。边界由 Escrow 的订单级账本兜住——
+     *     `refundedAmount + 罚没/赔付 <= order.amount`，所以不会出现"退了 40% 又罚出 100%"；
+     *     这是刻意的取舍，不是"部分退款和解不可再追罚"（旧注释那句是假话）。
      *   · 全额退款（`Refunded`）→ 状态本身就不在可罚集合里（买家已全额受偿）。
      * 注意：这与"必须曾进入争议"**不是**同一条门槛——那样会把跑路卖家漏在门外。
      *
      * @dev **2026-10 第二批的放宽（"确认收货后发现商品有问题"）**：买家开过**售后案件**
-     * （`Escrow.afterSaleOpen(orderId)`）**且该单仍在窗口内**时，`buyerConfirmed` **不再**一票否决——
-     * 否则"收到货才发现是假货/少件"在整个机制内没有任何救济。放宽的边界：
-     *   · 必须是**买家本人**在链上开的案件，且 Escrow 的入口只接受"买家自己确认收货、
-     *     且**从未执行过退款**"的终局单（`openAfterSale` 的收口，见该函数）——所以
-     *     "双方谈拢的部分退款和解"**不可能**借这条放宽被重新追罚；
+     * （`Escrow.afterSaleOpen(orderId)`）**或案件由 90 天强制到期结案**（`afterSaleForcedClosed`）
+     * **且该单仍在窗口内**时，`buyerConfirmed` **不再**一票否决——否则"收到货才发现是假货/少件"
+     * 在整个机制内没有任何救济。强制到期只释放卖家 pending，不消灭窗口内剩余的罚没资格；
+     * 买家主动撤诉/委员会裁决结案仍按"买家已认可"收回资格。放宽的边界：
+     *   · 必须是**买家本人**在链上开的案件，且 `openAfterSale` 只拒绝"已全额退款"的单
+     *     （`refundedAmount >= amount`）；部分退款后仍可开案——这是刻意保留的救济，
+     *     不是"部分退款和解不可能被重新追罚"（旧注释已更正）；
      *   · **窗口是"可追罚期"，它在开案与罚没两处都成立**（2026-10-14 修复，见下面的判据注释）。
      *     窗口长度取该单**创建时**的快照（结算时由 `_writeSettle` 落库，2026-10 第三批），
      *     上限 `Escrow.MAX_AFTER_SALE_WINDOW_BLOCKS` = 360 天、生产默认 180 天，
@@ -1465,13 +1476,13 @@ contract Staking is Ownable2Step, ReentrancyGuard {
           买家自己认可过这笔钱 ⇒ 罚没无据——**除非**买家开过售后案件（`afterSaleOpen`）。
           窗口已在上一行对所有单校验；这里只保留"是否主张过异议"这一条。
         */
-        if (o.buyerConfirmed && !escrow.afterSaleOpen(escrowOrderId)) {
+        if (o.buyerConfirmed && !escrow.afterSaleOpen(escrowOrderId) && !escrow.afterSaleForcedClosed(escrowOrderId)) {
             revert OrderConfirmedByBuyer();
         }
 
         Position storage p = _positions[operator];
         uint256 pool = p.staked + p.pending;
-        uint256 cap = (_penaltyBase(escrowOrderId, o) * penaltyCapBps) / 10000;
+        uint256 cap = (_penaltyBase(escrowOrderId) * penaltyCapBps) / 10000;
         uint256 usedTotal = penalizedByOrderTotal[escrowOrderId];
         if (amountWei > cap || usedTotal + amountWei > cap) revert ExceedsCap();
         if (amountWei > pool) revert InsufficientStake();
@@ -1488,9 +1499,9 @@ contract Staking is Ownable2Step, ReentrancyGuard {
           否则一个超单笔上限的请求会先报 ExceedsWindowCap，让人误以为改小金额就能过。
         */
         /*
-          窗口归属取**该单的裁决届次**（`orderEpoch`）只作留痕/诊断：罚没权属于"裁决这一单的
-          那一届"，旧届成员在换届之后仍可能对旧单罚没并新开窗口；但窗口是否锁出金与届次无关
-          （2026-10-21 起只看 `revokedArbiter[开窗人]` 或全局开关，见 `withdrawLock`）。
+          窗口归属只把**当前委员会届次**作为诊断留痕（`epochAtOpen`）：罚没权属于当前名单，
+          换届后旧成员立即失去投票资格，新成员可以裁决旧单；但窗口是否锁出金与届次无关
+          （只看全局开关或窗口到期，见 `withdrawLock`）。
           `voter` 只在该笔罚没**开新窗**时被记为 `penaltyWindowOpener`；同窗口后续罚没不改写它。
         */
         _chargePenaltyWindow(operator, pool, amountWei, escrow.orderEpoch(escrowOrderId), voter);
@@ -1563,7 +1574,7 @@ contract Staking is Ownable2Step, ReentrancyGuard {
 
         Position storage p = _positions[seller];
         uint256 pool = p.staked + p.pending;
-        uint256 cap = (_penaltyBase(c.orderId, o) * penaltyCapBps) / 10000;
+        uint256 cap = (_penaltyBase(c.orderId) * penaltyCapBps) / 10000;
         uint256 usedTotal = penalizedByOrderTotal[c.orderId];
         if (amountWei > cap || usedTotal + amountWei > cap) revert ExceedsCap();
         if (amountWei > pool) revert InsufficientStake();

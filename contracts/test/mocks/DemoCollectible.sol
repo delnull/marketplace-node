@@ -16,19 +16,11 @@ import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
  * 刻意不加权限控制——本地演示里店主钱包直接 mint（等价于店主在自有合约上 mint）。
  */
 contract DemoERC721 is ERC721 {
-    uint256 public nextId = 1;
-
     constructor() ERC721("Demo Collectible", "DMOC") {}
 
     /// @notice 指定 tokenId 铸造（演示里由店主钱包调用）
     function mintTo(address to, uint256 tokenId) external {
         _mint(to, tokenId);
-    }
-
-    /// @notice 顺延铸造（返回新 tokenId）
-    function mintNext(address to) external returns (uint256 id) {
-        id = nextId++;
-        _mint(to, id);
     }
 }
 

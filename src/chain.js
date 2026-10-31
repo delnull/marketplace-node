@@ -137,28 +137,24 @@ export const ESCROW_ABI = [
       · `claimCase(claimId)` = (orderId, tokenRef, seller, claimant, amount, deadline, openedAt, closed)
         8 个字段，按位置解码；
       · `sellerClaimExposure(seller)` = 卖家在途提货争议敞口（开案锁定、结案释放）；
-      · `claimTallyOf(claimId, amountWei)` = 该金额的已投票数；`claimEpoch(claimId)` = 开案届次。
+      · `claimTallyOf(claimId, amountWei)` = 该金额的已投票数。
   */
   'function claimCase(bytes32 claimId) view returns (bytes32 orderId, bytes32 tokenRef, address seller, address claimant, uint256 amount, uint64 deadline, uint64 openedAt, bool closed)',
   'function sellerClaimExposure(address seller) view returns (uint256)',
   'function claimTallyOf(bytes32 claimId, uint256 amountWei) view returns (uint16)',
-  'function claimEpoch(bytes32 claimId) view returns (uint32)',
   /*
-    委员会只读面：`arbiters()` 返回**当前届**成员、`arbiterThreshold()` 是通过票数。
-    `isArbiter(addr)` 是当前届成员的 O(1) 判据——节点侧所有"仲裁人视角"鉴权只读它。
-    `orderEpoch/orderThreshold/orderArbiters` 是**按单**的裁决进度。
+    委员会只读面：`arbiters()` 返回**当前**成员、`arbiterThreshold()` 是通过票数。
+    `isArbiter(addr)` 是当前成员的 O(1) 判据——节点侧所有"仲裁人视角"鉴权只读它。
+    订单/提货案不再快照届次；裁决资格永远只看当前名单（见 `committeeForOrder`）。
   */
   'function arbiters() view returns (address[])',
   'function arbiterThreshold() view returns (uint16)',
   'function committeeEpoch() view returns (uint32)',
   'function isArbiter(address who) view returns (bool)',
-  // 治理身份 = 本节点 Escrow 的 owner 或当前届仲裁人（节点合约不读任何 Registry）
+  // 治理身份 = 本节点 Escrow 的 owner 或当前仲裁人（节点合约不读任何 Registry）
   'function isProtocolGovernance(address who) view returns (bool)',
   // 紧急吊销：只有 revokeArbiter 会置 true；节点侧用它把被吊销的成员挡在证据/PII 之外
   'function revokedArbiter(address who) view returns (bool)',
-  'function orderEpoch(bytes32 orderId) view returns (uint32)',
-  'function orderThreshold(bytes32 orderId) view returns (uint16)',
-  'function orderArbiters(bytes32 orderId) view returns (address[])',
   /// 本节点托管合约的 owner（= 节点 operator；注册表里三方 owner 必须一致）
   'function owner() view returns (address)',
   /// 本节点的 Staking（节点合约不依赖任何 Registry）
@@ -206,19 +202,15 @@ export const ESCROW_GENERATION_PROBES = [
   // 提货争议（watcher 与 /api/claims 的链上确认都读它；漏探 = 启动绿灯、提货争议读不到）
   { shape: 'claimCase(bytes32)', zeroArg: 'bytes32' },
   { shape: 'sellerClaimExposure(address)', zeroArg: 'address' },
-  { shape: 'claimEpoch(bytes32)', zeroArg: 'bytes32' },
   /*
-    委员会：`chain.getCommittee` / `chain.committeeForOrder` 在运行时真的会调这六个读法，
-    其中按单的三个是**订单级裁决资格**的唯一来源（争议发起时快照届次）。
+    委员会：`chain.getCommittee` / `chain.committeeForOrder` 在运行时真的会调这三个读法。
+    没有按单/按案届次读法——裁决资格永远取当前名单。
   */
   { shape: 'arbiters()', zeroArg: 'none' },
   { shape: 'arbiterThreshold()', zeroArg: 'none' },
   { shape: 'committeeEpoch()', zeroArg: 'none' },
-  // 被解除/换届移除的仲裁人即使还留在旧届 orderArbiters 名单里，也不能再读该单 PII/证据
+  // 被解除的仲裁人不能再读买家 PII/证据，也不能投票
   { shape: 'revokedArbiter(address)', zeroArg: 'address' },
-  { shape: 'orderEpoch(bytes32)', zeroArg: 'bytes32' },
-  { shape: 'orderArbiters(bytes32)', zeroArg: 'bytes32' },
-  { shape: 'orderThreshold(bytes32)', zeroArg: 'bytes32' },
 ];
 
 /** 按 `zeroArg` 造零值入参（探针入参的唯一构造处，与清单同源） */
@@ -490,26 +482,6 @@ export function getEscrow() {
  *  - `payoutFloors(operator)` = (exposure, required)，出金下限的唯一读数来源；
  *  - `positions` / `penaltyWindowState` / `penalizedOrders` / `penalizedClaims` 是诊断读数。
  */
-export const STAKING_ABI = [
-  'function escrow() view returns (address)',
-  'function owner() view returns (address)',
-  'function poolOf(address operator) view returns (uint256)',
-  'function payoutFloors(address operator) view returns (uint256 exposure, uint256 required)',
-  'function positions(address operator) view returns (uint256 staked, uint256 pending, uint64 releaseAt, bool frozen)',
-  'function penalizedOrders(bytes32 orderId) view returns (bool)',
-  'function penalizedClaims(bytes32 claimId) view returns (bool)',
-  'function claimPenalizedByOrder(bytes32 orderId) view returns (uint256)',
-  'function penaltyWindowState(address operator) view returns (bool limited, uint256 remaining, uint256 windowEndsAt)',
-];
-
-/** 获取本节点 Staking 合约实例（只读）；未配置即抛错——"读不到保证金"与"没有保证金层"是两件事 */
-export function getStaking() {
-  if (!config.chain.stakingAddress) {
-    throw new Error('MK_STAKING_ADDRESS 未配置（合约部署后填入）');
-  }
-  return new ethers.Contract(config.chain.stakingAddress, STAKING_ABI, getProvider());
-}
-
 /** 地址是否为 address(0)（零地址判定；NFT 合约地址非零校验用，见 routes/products.js） */
 export function isZeroAddress(addr) {
   return !addr || addr === '0x0000000000000000000000000000000000000000';
@@ -563,15 +535,23 @@ export function decimalToWei(decimalStr, decimals = 18) {
  * 这里返回一个可注入的 blockTag：生产 = `head - finality`，测试 = 'latest'（setup 注入，
  * 避免每个假 RPC 都要实现 eth_blockNumber）。读 head 失败时抛错，由调用方 fail-closed。
  */
-let _finalizedBlockTag = async () => {
+async function defaultFinalizedBlockTag() {
   const finality = Number(config.escrow.finalityBlocks || 0);
   if (finality <= 0) return 'latest';
   const head = Number(await getProvider().getBlockNumber());
   return Math.max(0, head - finality);
-};
+}
 
+let _finalizedBlockTag = defaultFinalizedBlockTag;
+
+/**
+ * 注入确认边界（测试），或**还原为生产默认**（`head - finality`）。
+ *
+ * 旧实现 `fn || (async () => 'latest')` 会让"传 null 还原"得到另一档语义：测试里以为还原了，
+ * 实际仍在跳过确认深度这道闸。传 `null` 必须恢复成与生产完全相同的那一个函数。
+ */
 export function setFinalizedBlockTagReader(fn) {
-  _finalizedBlockTag = fn || (async () => 'latest');
+  _finalizedBlockTag = fn || defaultFinalizedBlockTag;
 }
 
 export async function finalizedBlockTag() {
@@ -619,15 +599,12 @@ let _committeeLastOk = null;
 let _committeeInflight = null;
 const COMMITTEE_TTL_MS = 60_000;
 const COMMITTEE_ERROR_TTL_MS = 5_000;
+/** 单次委员会链上读的硬超时（公开详情页会 force 读，不能无限挂起） */
+const COMMITTEE_RPC_TIMEOUT_MS = 2_000;
 /*
-  按**届次**缓存的委员会（`committeeForOrder` 用）。键是链上届次（uint32）：
-  争议在 `requestDispute` 那一刻把当届快照进订单（`orderEpoch`），此后换届不会改变这一单的
-  裁决成员，所以"同一届只读一次链"既安全也必要——仲裁列表要给每一行判资格。
+  委员会缓存**只有当前名单一份**：订单/提货案不再快照届次，`committeeForOrder` 与
+  `getCommittee` 是同一个读数。缓存失效由 CommitteeUpdated/ArbiterRevoked 事件触发。
 */
-const _epochCommittees = new Map();
-
-/** 裁决种类（与 Escrow 的 `VOTE_*` 常量逐值对应；改合约顺序必须同批改这里） */
-export const VOTE_KIND = { SETTLEMENT: 0, PENALTY: 1, AFTER_SALE: 2 };
 
 /**
  * 委员会缓存立即失效（`escrowWatcher` 收到 `CommitteeUpdated` / `ArbiterRevoked` 时调用）。
@@ -637,7 +614,6 @@ export function invalidateCommitteeCache() {
   _committee = null;
   _committeeAt = 0;
   _committeeFailedAt = 0;
-  _epochCommittees.clear();
 }
 
 /**
@@ -683,7 +659,16 @@ function committeeShape({ arbiters, threshold, epoch }) {
 async function eligibleCommitteeMembers(members, revokedOf) {
   const list = Array.isArray(members) ? members.map((m) => String(m).toLowerCase()) : [];
   const keep = await Promise.all(list.map(async (m) => {
-    const revoked = revokedOf ? await Promise.resolve(revokedOf(m)).then((v) => v === true).catch(() => null) : false;
+    /*
+      每个 revokedArbiter 读都加超时：委员会最多 20 人，公开详情页（争议/售后单）会对
+      每个成员发一次读；RPC 卡住时不能让一个匿名请求把整条事件循环挂在这里。
+      超时/失败 ⇒ null ⇒ 该成员被排除（fail-closed）。
+    */
+    const revoked = revokedOf
+      ? await withTimeout(Promise.resolve(revokedOf(m)), COMMITTEE_RPC_TIMEOUT_MS)
+          .then((v) => v === true)
+          .catch(() => null)
+      : false;
     return revoked === false;
   }));
   return list.filter((_, i) => keep[i]);
@@ -697,9 +682,9 @@ async function _loadCommittee({ force = false } = {}) {
   }
   const escrow = getEscrow();
   const [members, threshold, epoch] = await Promise.all([
-    escrow.arbiters(),
-    escrow.arbiterThreshold(),
-    escrow.committeeEpoch(),
+    withTimeout(escrow.arbiters(), COMMITTEE_RPC_TIMEOUT_MS),
+    withTimeout(escrow.arbiterThreshold(), COMMITTEE_RPC_TIMEOUT_MS),
+    withTimeout(escrow.committeeEpoch(), COMMITTEE_RPC_TIMEOUT_MS),
   ]);
   const eligible = await eligibleCommitteeMembers(members, (m) => escrow.revokedArbiter(m));
   return committeeShape({ arbiters: eligible, threshold, epoch });
@@ -751,54 +736,24 @@ export async function isArbiterAddress(addr, { force = false } = {}) {
 }
 
 /**
- * **这一单**的裁决委员会（订单级资格的唯一读法）。
+ * **这一单**的裁决人集合：当前委员会（不再按订单/提货案快照届次）。
  *
- * 争议在 `requestDispute` 那一刻把当届成员**快照**进订单（`Escrow.orderEpoch` /
- * `orderArbiters` / `orderThreshold`）。换届之后旧届成员仍然是这一单有资格的裁决人，
- * 新届成员没有这一单的历史投票权——节点必须与链上同一条判据。
+ * 订单开案与首票都不落届次；换届/吊销后旧成员立即失去资格，当前成员（哪怕没参与开案）
+ * 可以裁决旧单。节点必须与链上同一条判据：这里直接复用 `getCommittee` 的当前名单。
+ * 读不到返回 null（调用方按"不是仲裁人"处理，fail-closed）。
  *
- * `orderEpoch(orderId) == 0`（未被争议快照过的单，含售后案件）回退当前届。
- * 缓存按**届次**；读不到返回 null（三态见上），失败不写缓存，下一次请求重试。
- *
- * @param {string} orderId 链上订单键（bytes32 hex）
- * @param {{force?: boolean}} [opts] `force=true` 跳过届次缓存并重读
+ * @param {string} orderId 链上订单键（bytes32 hex；仅做形状校验）
+ * @param {{force?: boolean}} [opts] `force=true` 跳过当前委员会缓存并重读
  * @returns {Promise<{arbiters:string[], threshold:number, epoch:number}|null>}
  */
 export async function committeeForOrder(orderId, { force = false } = {}) {
   const id = String(orderId || '').trim();
   if (!/^0x[0-9a-fA-F]{64}$/.test(id)) return null;
-  try {
-    if (_committeeReader) {
-      const c = committeeShape(await _committeeReader(id.toLowerCase()));
-      return { ...c, arbiters: await eligibleCommitteeMembers(c.arbiters, null, { force }) };
-    }
-    const escrow = getEscrow();
-    const epoch = Number(await escrow.orderEpoch(id));
-    if (!Number.isInteger(epoch) || epoch <= 0) return await getCommittee({ force });
-    if (!force) {
-      const hit = _epochCommittees.get(epoch);
-      if (hit) return hit;
-    }
-    const [members, threshold] = await Promise.all([
-      escrow.orderArbiters(id),
-      escrow.orderThreshold(id),
-    ]);
-    /*
-      旧届名单可能仍含**被紧急吊销**的地址。这类地址已不能再投票，也不能再读该单的
-      买家 PII/证据；资格只看本节点 Escrow 的 `revokedArbiter`，不读 Registry。合并为同一个
-      资格函数 `eligibleCommitteeMembers`（与 `_loadCommittee` 共用），读不到 ⇒ 排除（fail-closed）。
-    */
-    const live = await eligibleCommitteeMembers(members, (m) => escrow.revokedArbiter(m), { force });
-    const c = committeeShape({ arbiters: live, threshold, epoch });
-    _epochCommittees.set(epoch, c);
-    return c;
-  } catch (e) {
-    console.warn(
-      `[chain] 读不到订单 ${id} 的裁决委员会（orderEpoch/orderArbiters/orderThreshold）：${e?.message || e}——` +
-        '本次按"不是仲裁人"处理（fail-closed）'
-    );
-    return null;
-  }
+  /*
+    **当前名单是唯一裁决人集合**：订单开案时不再落届次，所以这里不需要按单读链。
+    读不到当前委员会 ⇒ null（调用方按"不是仲裁人"处理，fail-closed）。
+  */
+  return await getCommittee({ force });
 }
 
 // ── 委员会读取结束 ──
@@ -829,7 +784,6 @@ export function __resetCommitteeCacheForTest() {
   _committeeAt = 0;
   _committeeFailedAt = 0;
   _committeeLastOk = null;
-  _epochCommittees.clear();
 }
 
 /** 仅供测试：只让 60s 窗口过期，保留 `lastOk`（模拟"缓存自然过期、这次读不到"）。 */

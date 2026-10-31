@@ -5,6 +5,7 @@
 import config from './config.js';
 import { roleOf, isNodeAdmin, isHost, operatedShopCodes } from './auth.js';
 import { SHOP_HEADER, shopContextOf, shopRowByCode, shopSellable, notSellableReason } from './shops.js';
+import { redisHit } from './redis.js';
 
 /**
  * 是否"类生产"（未设 NODE_ENV 也算生产）。
@@ -111,16 +112,20 @@ export function bearerToken(req) {
 }
 
 /**
- * 轻量内存限流中间件（匿名/低频滥用防护）：单进程滑动窗口，按 IP 计数。
- * 说明：进程重启清零（演示/单实例够用；多实例/反代部署需在网关层限流，
- * 并显式配置 MK_TRUST_PROXY，否则这里取到的永远是代理那一个地址）。
+ * 限流中间件：配置了 Redis 时走**跨进程固定窗口**（INCR+PEXPIRE，按 IP + 限流器名），
+ * 未配置/Redis 故障时回退单进程滑动窗口。
+ *
+ * 为什么必须共享：多实例/多进程部署时，进程内 Map 各算一份，"每 IP 120 次/分"会被实例数
+ * 成倍放大。Redis 故障时回退内存是**可用性取舍**，不是第二套判据：计数窗口算法相同，
+ * 只是作用域从集群缩回单进程；日志会报一次，运维能从 /healthz 的 redis.connected 看到。
  */
-export function simpleRateLimit({ windowMs, max, message = '请求过于频繁，请稍后再试' } = {}) {
-  const hits = new Map(); // key: ip → number[]（时间戳）
-  return (req, res, next) => {
-    const ip = clientIp(req);
+let _rateLimitSeq = 0;
+export function simpleRateLimit({ windowMs, max, message = '请求过于频繁，请稍后再试', name = '' } = {}) {
+  const hits = new Map(); // key: ip → number[]（时间戳，Redis 不可用时的兜底）
+  const id = name || `rl-${++_rateLimitSeq}`;
+  const memoryHit = (res, ip, next) => {
     const now = Date.now();
-    // 内存护栏：条目数超阈值时惰性清扫整窗已过期条目（防唯一 IP 面大时 Map 无界增长——审计 F10）
+    // 内存护栏：条目数超阈值时惰性清扫整窗已过期条目（防唯一 IP 面大时 Map 无界增长）
     if (hits.size > 5000) {
       for (const [k, v] of hits) {
         if (v.length === 0 || now - v[v.length - 1] >= windowMs) hits.delete(k);
@@ -128,12 +133,28 @@ export function simpleRateLimit({ windowMs, max, message = '请求过于频繁�
     }
     const list = (hits.get(ip) || []).filter((t) => now - t < windowMs);
     if (list.length >= max) {
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil(windowMs / 1000))));
       fail(res, message, 429, 429);
       return;
     }
     list.push(now);
     hits.set(ip, list);
     next();
+  };
+  return (req, res, next) => {
+    const ip = clientIp(req);
+    // 300ms 预算：Redis 挂了/网络抖动时不能让每个匿名请求都挂住；超时即回退内存。
+    const redisBudget = new Promise((resolve) => setTimeout(() => resolve(null), 300));
+    Promise.race([redisHit(`${id}:${ip}`, windowMs), redisBudget])
+      .then((hit) => {
+        if (!hit) return memoryHit(res, ip, next);
+        if (hit.count > max) {
+          res.setHeader('Retry-After', String(Math.max(1, Math.ceil(hit.ttlMs / 1000))));
+          return fail(res, message, 429, 429);
+        }
+        return next();
+      })
+      .catch(() => memoryHit(res, ip, next));
   };
 }
 
@@ -248,7 +269,7 @@ function attachShopContext(req, shop) {
  * 令牌里的店铺声明与那次比对整段删除（令牌里已没有 `code`）。
  */
 export function makeAuthMiddleware(
-  verifyToken,
+  verify,
   { ownerOnly = false, staffOnly = false, nodeAdmin = false, hostOnly = false } = {}
 ) {
   // 卖家面的两档必须落在**某一家店**的上下文里：它们的判据是"他在那家店里是什么角色"
@@ -272,8 +293,13 @@ export function makeAuthMiddleware(
     */
     let payload;
     try {
-      payload = verifyToken(token);
-    } catch {
+      payload = await verify(token);
+    } catch (e) {
+      if (e?.code === 'SESSION_STORE_UNAVAILABLE') {
+        console.error(`[auth] 会话表读取失败：${e?.cause?.stack || e?.stack || e?.message || e}`);
+        fail(res, '鉴权依赖暂时不可用，请稍后重试', 503, 503);
+        return;
+      }
       fail(res, '登录令牌无效或已过期，请重新登录', 401, 401);
       return;
     }

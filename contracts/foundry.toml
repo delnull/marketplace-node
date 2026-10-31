@@ -20,11 +20,9 @@ fs_permissions = [{ access = "read", path = "./out" }]
 # 背景：`MarketplaceRegistry` 加多店逻辑后运行时字节码顶到 27.6 KB，超过 EIP-170 的 24 576 上限，
 # 部署直接 `CreateContractSizeLimit`（真链同样有这条限制，不是本机 anvil 的保守估计）。
 # viaIR 一开就降到 20.1 KB，看起来是解药——但它**改变了可观察行为**，因此被否决：
-#   `testClaimUnstakeRequiresApprovalTimeout` 与 `testSetRejectGraceCannotShrinkInFlightReleaseWindow`
-#   在 viaIR 下失败、关掉就通过（"自动放行时刻 = 申请时刻 + 窗口: 3601 != 7202" 这类读数**差一倍**），
-#   都落在"`vm.warp` 推进时间后、同一笔调用里多次读 `block.timestamp`/`block.number`"这条路径上。
-#   **资金合约的编译管线不该改变任何可观察行为**；一个只在优化器下出现的时间读数差异，
-#   没有任何理由相信它只影响测试。
+#   依赖 `block.timestamp`/`block.number` 的读法在 viaIR 下会出现"同一笔调用里多次读取
+#   得到不同值"的差异（自动放行时刻、释放窗口等读数会差一倍）。资金合约的编译管线不该
+#   改变任何可观察行为；一个只在优化器下出现的时间读数差异，没有理由相信它只影响测试。
 # 结论：尺寸问题必须用**不改 pipeline** 的办法解决（编号内部表示换成 bytes32、
 # 去掉按 host 反查店主的线性搜索、删死代码、收紧返回值的形状），而不是换编译器后端。
 via_ir = false

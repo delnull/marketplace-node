@@ -7,16 +7,54 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
+const { issueToken, verifyToken, verifySession, revokeSession, tokenAudience } = await import('../src/auth.js');
+const config = (await import('../src/config.js')).default;
 let ownerToken;
 let buyerToken;
 
 before(async () => {
   ownerToken = (await login(ctx, owner)).token;
   buyerToken = (await login(ctx, buyer)).token;
+});
+
+test('令牌受众绑定本节点；换 aud / 缺 exp / 已撤销会话都拒绝', async () => {
+  const token = await issueToken(owner.address);
+  const payload = await verifySession(token);
+  assert.equal(payload.address, owner.address.toLowerCase());
+  assert.equal(payload.aud, tokenAudience());
+
+  const sign = (obj) => {
+    const body = Buffer.from(JSON.stringify(obj)).toString('base64url');
+    const sig = crypto.createHmac('sha256', config.siwe.secret).update(body).digest('base64url');
+    return `${body}.${sig}`;
+  };
+  const exp = Math.floor(Date.now() / 1000) + 60;
+  assert.throws(() => verifyToken(sign({ address: owner.address.toLowerCase(), exp, aud: 'other-node' })), /受众/);
+  assert.throws(() => verifyToken(sign({ address: owner.address.toLowerCase(), aud: tokenAudience() })), /有效期/);
+
+  await revokeSession(payload.jti);
+  await assert.rejects(() => verifySession(token), /撤销/);
+});
+
+test('POST /auth/logout 撤销服务端会话：同一令牌随后 401', async () => {
+  const token = await issueToken(owner.address);
+  await request(app)
+    .get('/api/me/blocks')
+    .set('Authorization', `Bearer ${token}`)
+    .expect(200);
+  await request(app)
+    .post('/api/auth/logout')
+    .set('Authorization', `Bearer ${token}`)
+    .expect(200);
+  const after = await request(app)
+    .get('/api/me/blocks')
+    .set('Authorization', `Bearer ${token}`);
+  assert.equal(after.status, 401);
 });
 
 /**

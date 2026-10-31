@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {NodeFixture} from "./NodeFixture.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {MarketplaceRegistry} from "../src/MarketplaceRegistry.sol";
-import {RuntimeCodeHash} from "../src/RuntimeCodeHash.sol";
+import {ContractCodeHash} from "../src/ContractCodeHash.sol";
 import {Escrow} from "../src/Escrow.sol";
 import {Staking} from "../src/Staking.sol";
 import {TokenPayoutVault} from "../src/TokenPayoutVault.sol";
@@ -128,8 +128,8 @@ contract ProtocolTest is NodeFixture {
         assertEq(n.operator, operator);
         assertEq(n.escrow, address(escrow));
         assertEq(n.staking, address(staking));
-        assertEq(n.escrowCodeHash, RuntimeCodeHash.forAddress(address(escrow)));
-        assertEq(n.stakingCodeHash, RuntimeCodeHash.forAddress(address(staking)));
+        assertEq(n.escrowCodeHash, ContractCodeHash.forAddress(address(escrow)));
+        assertEq(n.stakingCodeHash, ContractCodeHash.forAddress(address(staking)));
         assertTrue(n.active);
         assertFalse(n.suspended);
         assertTrue(registry.isNodeActive(operator));
@@ -137,18 +137,18 @@ contract ProtocolTest is NodeFixture {
         assertEq(registry.getActiveNodes(0, 100).length, 1);
     }
 
-    function testWhitelistKeysOnImplementationHashNotBuildHash() public view {
-        // 白名单认的是可执行代码；构建产物里的 metadata（行尾/注释/构建机）不参与身份。
+    function testWhitelistKeysOnFullRuntimeHash() public view {
+        // 白名单认的是**完整 runtime**（含 metadata）：任何字节变化都必须重新审批。
         bytes32 raw = keccak256(address(escrow).code);
-        assertTrue(raw != RuntimeCodeHash.forAddress(address(escrow)), "artifact carries metadata");
-        assertFalse(registry.isApprovedEscrowImplementation(raw), "raw build hash is not a whitelist key");
+        assertEq(raw, ContractCodeHash.forAddress(address(escrow)));
+        assertTrue(registry.isApprovedEscrowImplementation(raw));
     }
 
     function testSameEscrowCanRegisterInTwoRegistries() public {
         MarketplaceRegistry r2 = new MarketplaceRegistry(
             address(this),
-            RuntimeCodeHash.ofBytes(vm.getDeployedCode("Escrow.sol:Escrow")),
-            RuntimeCodeHash.ofBytes(vm.getDeployedCode("Staking.sol:Staking"))
+            ContractCodeHash.ofBytes(vm.getDeployedCode("Escrow.sol:Escrow")),
+            ContractCodeHash.ofBytes(vm.getDeployedCode("Staking.sol:Staking"))
         );
         r2.registerNode(
             operator,
@@ -249,13 +249,18 @@ contract ProtocolTest is NodeFixture {
         Staking s2 = new Staking(address(e2), keccak256(address(e2).code), op);
         vm.stopPrank();
 
-        string[6] memory bad = [
+        string[10] memory bad = [
             "node.example.com",
             "http://node.example.com",
             "https://127.0.0.1",
             "https://0x7f.0.0.1",
             "https://node.example.com:443",
-            "https://node.example.com/api/"
+            "https://node.example.com/api/",
+            // 点段/编码点段：规范化后会与根 endpoint 重合，唯一性键必须拒绝
+            "https://node.example.com/..",
+            "https://node.example.com/.",
+            "https://node.example.com/a/../b",
+            "https://node.example.com/%2e%2e"
         ];
         for (uint256 i = 0; i < bad.length; i++) {
             vm.expectRevert(MarketplaceRegistry.EndpointNotNormalized.selector);
@@ -344,6 +349,32 @@ contract ProtocolTest is NodeFixture {
         );
     }
 
+    function testForceCloseTombstonesFundsContractsNotJustOperator() public {
+        uint256 newKey = 0xE1;
+        address newOp = vm.addr(newKey);
+        registry.forceCloseNode(operator, "fraud");
+
+        // 同一套资金合约换 owner 后，不能借新身份回到目录
+        vm.prank(operator);
+        escrow.transferOwnership(newOp);
+        vm.prank(operator);
+        staking.transferOwnership(newOp);
+        vm.prank(newOp);
+        escrow.acceptOwnership();
+        vm.prank(newOp);
+        staking.acceptOwnership();
+
+        vm.prank(newOp);
+        vm.expectRevert(MarketplaceRegistry.OperatorForceClosed.selector);
+        registry.registerNode(
+            newOp,
+            ENDPOINT,
+            address(escrow),
+            address(staking),
+            _signRegistration(ENDPOINT, address(escrow), address(staking), newKey)
+        );
+    }
+
     function testOwnerCanBeNodeOperator() public {
         // 平台 owner 可以同时是节点主：所有权转移不再拒绝节点主
         registry.transferOwnership(operator);
@@ -365,7 +396,7 @@ contract ProtocolTest is NodeFixture {
         address[] memory members = new address[](20);
         for (uint256 i = 0; i < 20; ++i) members[i] = address(uint160(0x10000 + i));
         vm.prank(operator);
-        escrow.setArbiters(members, 1);
+        escrow.setArbiters(members, 2);
         assertEq(escrow.arbiters().length, 20);
 
         address[] memory tooMany = new address[](21);
@@ -375,16 +406,31 @@ contract ProtocolTest is NodeFixture {
         escrow.setArbiters(tooMany, 1);
     }
 
-    function testClaimIdDoesNotOverwriteOrderEpoch() public {
+    function testCurrentCommitteeCanDecideOldOrderAfterRotation() public {
         _order(ORDER1, 1 ether);
-        _rollPastTimeout(ORDER1);
-        escrow.releaseExpired(ORDER1);
-        assertEq(escrow.orderEpoch(ORDER1), 0, "order epoch before claim");
+        vm.prank(buyer);
+        escrow.requestRefund(ORDER1);
+        vm.prank(seller);
+        escrow.rejectRefund(ORDER1);
+        vm.prank(buyer);
+        escrow.requestDispute(ORDER1);
 
-        // claimId 与 orderId 相同：两个命名空间必须互不覆盖
-        _openClaim(ORDER1, ORDER1, 0.1 ether);
-        assertEq(escrow.orderEpoch(ORDER1), 0, "claim must not write order epoch");
-        assertEq(escrow.claimEpoch(ORDER1), escrow.committeeEpoch(), "claim epoch");
+        address[] memory next = new address[](3);
+        next[0] = arbiter2;
+        next[1] = arbiter3;
+        next[2] = makeAddr("freshArbiter");
+        vm.prank(operator);
+        escrow.setArbiters(next, 2);
+
+        // 旧届成员立即失去投票资格；当前届可以裁决旧单，不再有“旧届失联即冻结”
+        vm.prank(arbiter1);
+        vm.expectRevert(Escrow.OnlyArbiter.selector);
+        escrow.voteSettlement(ORDER1, 0);
+        vm.prank(arbiter2);
+        escrow.voteSettlement(ORDER1, 0);
+        vm.prank(arbiter3);
+        escrow.voteSettlement(ORDER1, 0);
+        assertEq(uint8(escrow.getOrder(ORDER1).status), uint8(Escrow.OrderStatus.Settled));
     }
 
     function testRevokedArbiterOldVoteNotCounted() public {
@@ -472,8 +518,17 @@ contract ProtocolTest is NodeFixture {
         three[1] = arbiter1;
         three[2] = arbiter2;
         vm.prank(operator);
-        vm.expectRevert(Escrow.OwnerNeedsIndependentPanel.selector);
+        vm.expectRevert(Escrow.ThresholdOutOfBounds.selector);
         escrow.setArbiters(three, 1);
+
+        // 3 人、owner 不在名单、阈值 1 同样是单人可裁：形状必须拒绝
+        address[] memory panel = new address[](3);
+        panel[0] = arbiter1;
+        panel[1] = arbiter2;
+        panel[2] = arbiter3;
+        vm.prank(operator);
+        vm.expectRevert(Escrow.ThresholdOutOfBounds.selector);
+        escrow.setArbiters(panel, 1);
 
         // n-of-n 也不可表达：丢一把钥就永远凑不齐票
         vm.prank(operator);
@@ -481,7 +536,7 @@ contract ProtocolTest is NodeFixture {
         escrow.setArbiters(three, 3);
 
         vm.prank(operator);
-        escrow.setArbiters(three, 2);
+        escrow.setArbiters(panel, 2);
         assertEq(escrow.arbiters().length, 3);
     }
 
@@ -503,7 +558,7 @@ contract ProtocolTest is NodeFixture {
     }
 
     function testImplementationWhitelistToggle() public {
-        bytes32 h = RuntimeCodeHash.forAddress(address(escrow));
+        bytes32 h = ContractCodeHash.forAddress(address(escrow));
         assertTrue(registry.isApprovedEscrowImplementation(h));
         registry.approveEscrowImplementation(h, false);
         assertFalse(registry.isApprovedEscrowImplementation(h));
@@ -548,7 +603,7 @@ contract ProtocolTest is NodeFixture {
         escrow.confirmReceipt(ORDER1);
 
         uint64 settled = escrow.settledAtBlock(ORDER1);
-        uint64 window = escrow.afterSaleWindowAtCreate(ORDER1);
+        uint64 window = escrow.afterSaleWindowAtSettle(ORDER1);
         uint64 unlock = escrow.sellerPendingUnlockBlock(ORDER1);
         assertEq(unlock, uint64(settled + window + 1), "holdback must outlive the last openAfterSale block");
 
@@ -845,12 +900,20 @@ contract ProtocolTest is NodeFixture {
         vm.prank(operator);
         escrow.setArbiters(next, 2);
 
-        // arbiter1 已不在当前届，但仍是旧届成员；吊销必须仍然生效
+        // 旧届成员不在当前名单：投票直接 OnlyArbiter；吊销他只影响他本人
+        vm.prank(arbiter1);
+        vm.expectRevert(Escrow.OnlyArbiter.selector);
+        escrow.voteSettlement(ORDER1, 0);
         vm.prank(operator);
         escrow.revokeArbiter(arbiter1);
-        vm.prank(arbiter1);
-        vm.expectRevert(Escrow.NotArbiter.selector);
+        assertFalse(escrow.isArbiter(arbiter1));
+
+        // 当前届仍能完成旧单裁决
+        vm.prank(arbiter2);
         escrow.voteSettlement(ORDER1, 0);
+        vm.prank(arbiter3);
+        escrow.voteSettlement(ORDER1, 0);
+        assertEq(uint8(escrow.getOrder(ORDER1).status), uint8(Escrow.OrderStatus.Settled));
     }
 
     function testSellerCanRefundFromPending() public {
@@ -914,6 +977,82 @@ contract ProtocolTest is NodeFixture {
         assertEq(uint256(escrow.getOrder(ORDER1).status), uint256(Escrow.OrderStatus.Settled));
     }
 
+    function testClaimPayoutCountsTowardOrderCap() public {
+        vm.prank(seller);
+        staking.stake{value: 1 ether}();
+        _order(ORDER1, 1 ether);
+        vm.prank(buyer);
+        escrow.confirmReceipt(ORDER1);
+
+        bytes32 claimId = keccak256("claim-order-cap");
+        _openClaim(claimId, ORDER1, 0.4 ether);
+        _voteClaim(claimId, 0.4 ether);
+        assertEq(escrow.getOrder(ORDER1).refundedAmount, 0.4 ether, "claim payout must enter order credit");
+
+        vm.prank(buyer);
+        escrow.openAfterSale(ORDER1);
+        vm.prank(arbiter1);
+        vm.expectRevert(Escrow.InvalidAmount.selector);
+        escrow.voteAfterSale(ORDER1, 1 ether);
+
+        _voteAfterSale(ORDER1, 0.6 ether);
+        assertEq(escrow.getOrder(ORDER1).refundedAmount, 1 ether, "claim + after-sale must stop at amount");
+        assertEq(escrow.sellerPending(ORDER1), 0.4 ether);
+    }
+
+    function testPenaltyAndClaimShareDefaultCap() public {
+        vm.prank(seller);
+        staking.stake{value: 1 ether}();
+        _order(ORDER1, 1 ether);
+        _rollPastTimeout(ORDER1);
+        escrow.releaseExpired(ORDER1);
+        _votePenalty(ORDER1, 0.4 ether);
+
+        bytes32 claimId = keccak256("default-shared-cap");
+        _openClaim(claimId, ORDER1, 0.2 ether);
+        vm.prank(arbiter1);
+        escrow.voteClaim(claimId, 0.2 ether);
+        vm.prank(arbiter2);
+        vm.expectRevert(Staking.ExceedsCap.selector);
+        escrow.voteClaim(claimId, 0.2 ether);
+
+        // 0.4 + 0.1 = 0.5 = 默认 5000 bps 上限；同一笔罚没不能被重复扣成 0.3。
+        vm.prank(arbiter1);
+        escrow.voteClaim(claimId, 0.1 ether);
+        vm.prank(arbiter2);
+        escrow.voteClaim(claimId, 0.1 ether);
+        assertTrue(escrow.claimCase(claimId).closed);
+        assertEq(escrow.getOrder(ORDER1).refundedAmount, 0.5 ether);
+    }
+
+    function testAfterSaleExpiredForcesReleaseBeforeNormalUnlock() public {
+        Escrow e = new Escrow(operator, GRACE, TIMEOUT, 2_000_000, address(tokenVault));
+        Staking s = new Staking(address(e), keccak256(address(e).code), operator);
+        vm.startPrank(operator);
+        e.setStaking(address(s));
+        address[] memory members = new address[](3);
+        members[0] = arbiter1;
+        members[1] = arbiter2;
+        members[2] = arbiter3;
+        e.setArbiters(members, 2);
+        vm.stopPrank();
+        vm.deal(buyer, 10 ether);
+        vm.prank(buyer);
+        e.createOrder{value: 1 ether}(ORDER1, seller, 1 ether, TIMEOUT);
+        vm.prank(buyer);
+        e.confirmReceipt(ORDER1);
+        vm.prank(buyer);
+        e.openAfterSale(ORDER1);
+
+        // 正常留存解锁在 opened + 2,000,001，但案件满 90 天后必须先能强制结案释放。
+        vm.roll(block.number + 1_555_200 + 1);
+        uint256 before = seller.balance;
+        e.releaseSellerFunds(ORDER1);
+        assertEq(seller.balance, before + 1 ether);
+        assertEq(e.sellerPending(ORDER1), 0);
+        assertFalse(e.afterSaleOpen(ORDER1));
+    }
+
     function testAfterSalePenaltyFromPendingFirst() public {
         vm.prank(seller);
         staking.stake{value: 1 ether}();
@@ -925,7 +1064,7 @@ contract ProtocolTest is NodeFixture {
 
         uint256 buyerBefore = buyer.balance;
         _voteAfterSale(ORDER1, 0.4 ether);
-        // 留存货款优先赔付买家；保证金不动，只有不足部分才罚 Staking。
+        // 留存货款优先赔付买家；账本不变量保证 pending 足够，不再走 Staking 兜底。
         assertEq(buyer.balance, buyerBefore + 0.4 ether);
         assertEq(staking.poolOf(seller), 1 ether);
         assertEq(escrow.sellerPending(ORDER1), 0.6 ether);
@@ -1085,6 +1224,35 @@ contract ProtocolTest is NodeFixture {
         _voteAfterSale(ORDER1, 0.6 ether);
         assertEq(escrow.getOrder(ORDER1).refundedAmount, 1 ether, "refund + penalty must converge to order amount");
         assertEq(escrow.sellerPending(ORDER1), 0.4 ether, "penalty came from stake; after-sale paid the remaining pending");
+    }
+
+    function testRefundSettledCannotPushRefundedAboveAmount() public {
+        vm.prank(seller);
+        staking.stake{value: 1 ether}();
+        _order(ORDER1, 1 ether);
+        vm.prank(buyer);
+        escrow.confirmReceipt(ORDER1);
+        vm.prank(buyer);
+        escrow.openAfterSale(ORDER1);
+
+        _votePenalty(ORDER1, 0.4 ether);
+        assertEq(escrow.sellerPending(ORDER1), 1 ether, "penalty comes from stake; pending unchanged");
+        assertEq(escrow.getOrder(ORDER1).refundedAmount, 0.4 ether);
+
+        // 0.4 已受偿 + 0.7 > 1.0：必须拒绝，不能只看 sellerPending
+        vm.prank(seller);
+        vm.expectRevert(Escrow.RefundAmountOutOfRange.selector);
+        escrow.refundSettled(ORDER1, 0.7 ether);
+
+        vm.prank(seller);
+        escrow.refundSettled(ORDER1, 0.6 ether);
+        assertEq(escrow.getOrder(ORDER1).refundedAmount, 1 ether);
+        assertEq(escrow.sellerPending(ORDER1), 0.4 ether);
+
+        // 已经到订单额上限，剩余 pending 也不能再退给买家
+        vm.prank(seller);
+        vm.expectRevert(Escrow.RefundAmountOutOfRange.selector);
+        escrow.refundSettled(ORDER1, 0.1 ether);
     }
 
     function testClaimPenaltyCumulativeCap() public {

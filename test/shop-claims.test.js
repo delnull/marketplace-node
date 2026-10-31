@@ -29,7 +29,7 @@ const { CLAIM_KINDS, CLAIM_VALUE_MAX, buildClaimMessage, parseClaimMessage, chec
   await import('../src/claims.js');
 
 const CODE = TEST_SHOP_CODE; // 与 fixture 落的那一行**同一个编号**（句柄 = 它，见 setup.mjs 的说明）
-const OTHER_CODE = '0000OTHR1';
+const OTHER_CODE = '0000ZTH1Z';
 const OP = owner.address.toLowerCase();
 
 let ownerToken;

@@ -191,8 +191,3 @@ export function parseTermsColumn(raw) {
     invoice_supported: typeof v.invoice_supported === 'boolean' ? v.invoice_supported : null,
   };
 }
-
-/** 是否声明了任何一条（未声明的商品在买家侧显示"店主未声明"，而不是显示一排空值） */
-export function termsAreEmpty(t) {
-  return !t || (t.handling_days === null && t.return_policy === 'unspecified');
-}

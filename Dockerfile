@@ -44,7 +44,7 @@ VOLUME ["/data"]
 EXPOSE 8090
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.MK_PORT||8090)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.MK_PORT||8090)+'/healthz').then(r=>r.json()).then(j=>process.exit(j&&j.code===0?0:1)).catch(()=>process.exit(1))"
 
 # 入口脚本负责"把 /data 交给 node 用户再降权"（见 docker-entrypoint.sh 的说明）；
 # 配置来自 `docker --env-file`，容器里没有 .env 时入口脚本也不会去读（避免误导性日志）

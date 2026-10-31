@@ -120,13 +120,15 @@ import {
   PRE_PAID_IN,
   PII_ERASABLE_STATUS,
 } from '../orderStatus.js';
-import { verifyToken, roleOf, isStaff } from '../auth.js';
+import { verifySession, roleOf, isStaff } from '../auth.js';
 // `eventsForDto`：事件史对外的唯一折算点（库里的 at 是毫秒，出口一律 ISO）
 import { eventsForDto } from '../reputation.js';
 import { logAudit } from '../audit.js';
 import { getEscrow, getProvider, fetchOnchainOrder, finalizedBlockTag, isAddress, weiToDecimal, isArbiterForOrder } from '../chain.js';
 import { deliverDigitalFromPool, tryAutoDeliverByEscrowOrder } from '../autoDeliver.js';
 import { holdStock, releaseHoldsForOrderIds, releaseHoldsForReturnReceived, releaseRefundedEscrow, restockOrder } from '../stockHold.js';
+// 订单状态迁移与"迁移前状态"同一把行锁（见 src/orderTransition.js）
+import { claimOrderState } from '../orderTransition.js';
 // 两道免费草稿闸的**加量**唯一实现（减量在 orders 上的触发器里：见 db.js 的 TRIGGER_DDL）
 import { reserveDraftQuota } from '../draftQuota.js';
 // 池式商品占位的**加量**唯一实现（减量同样在触发器里）
@@ -140,7 +142,7 @@ import { ok, fail, wrap, bearerToken, makeAuthMiddleware, simpleRateLimit } from
 // 金额展示口径的唯一实现（usdtOf / goodsMicroOf）——不要再手写 (micro/1e6).toFixed(2)
 import { goodsMicroOf, usdtOf } from '../money.js';
 import { refundUsdtMicroOfRow } from '../stats.js';
-import { submitReview, replyReview, findReviewByOrder, reviewToPublic, parseReviewImages, reviewableAt, followupReview, removeReviewImage, REVIEWABLE_STATUS } from '../reviews.js';
+import { submitReview, replyReview, findReviewByOrder, reviewToPublic, parseReviewImages, reviewableAt, followupReview, removeReviewImage, REVIEWABLE_STATUS, reviewWriteRefusal } from '../reviews.js';
 // 评价图上传：复用商品媒体的字节判定/落盘内核，但只收图片、上限更低
 import { storeMediaStream, MediaUploadError, REVIEW_IMAGE_MIMES } from '../productMedia.js';
 import { MEDIA } from '../mediaKinds.js';
@@ -156,7 +158,7 @@ import {
 } from '../evidenceFiles.js';
 // 链上终局 → 本地终态的唯一实现（事件路径与快照路径共用；见 escrowWatcher 的 mapChainTerminal）
 // + 授权额落列的唯一实现（事件路径与 /sync 快照路径共用；同上）
-import { mapChainTerminal, applyAcceptedPartialRefund, readRefundedWei, isCanonicalEscrowLog, markEscrowDisputed } from '../escrowWatcher.js';
+import { mapChainTerminal, applyAcceptedPartialRefund, readRefundedWei, isCanonicalEscrowLog, markEscrowDisputed, setRefundedAmount } from '../escrowWatcher.js';
 // 确认收货后的售后案件：DTO 字段与链上真值回填的**唯一实现**（watcher/对账/sync 同源）
 import { afterSaleFieldsOf, isAfterSaleOpen, applyAfterSaleFromChain } from '../afterSale.js';
 // 售后案件的链上只读读数 + **交付闸**（可注入；三个手动交付入口与自动交付共用同一个判据，
@@ -179,10 +181,20 @@ import { findOrderInShop } from '../orderScope.js';
 import { sellerOrderFilters } from '../sellerOrderFilters.js';
 
 const router = Router();
-const requireAuth = makeAuthMiddleware(verifyToken);
-const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true });
-const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true });
-const staffOnly = makeAuthMiddleware(verifyToken, { staffOnly: true }); // P1-⑤：经营面=店主+操作员
+
+/*
+  公开读的预算：这两个端点无鉴权、且每行要取评价/退货/店铺/交付行（N+1），另外详情页
+  在争议/售后单上还会强制读链上委员会。没有限流时，一个匿名 IP 就能用巨大 OFFSET + 并发
+  把只有 10 条连接的 DB 池、事件循环与 RPC 配额一起打满（watcher/写请求也被拖住）。
+  限流放在**路由入口**（与既有 limiter 同款单进程滑动窗口），并给 offset 一个硬上限。
+*/
+const publicListLimiter = simpleRateLimit({ windowMs: 60_000, max: 120, message: '订单列表查询过于频繁，请稍后再试' });
+const publicDetailLimiter = simpleRateLimit({ windowMs: 60_000, max: 240, message: '订单详情查询过于频繁，请稍后再试' });
+
+const requireAuth = makeAuthMiddleware(verifySession);
+const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true });
+const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
+const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true }); // P1-⑤：经营面=店主+操作员
 // RPC 触碰型动作限流（按 IP）：paid 每次 = 1 次 eth_getTransactionReceipt、sync 每次 =
 // getOrder + queryFilter——防登录用户低频耗尽公共 RPC 配额（auth 端点另有专用限流）。
 // 每进程独立窗口、量级宽松（正常操作远低于阈值，仅挡脚本化滥用）。
@@ -261,10 +273,10 @@ const INCOME_STATUS = ORDER_INCOME_STATUS; // 唯一出处：src/orderStatus.js�
 const DELIVERED_STATUS = ['shipped', 'confirmed', 'settled', 'expired', 'disputed'];
 
 /** 可选鉴权：解析 Bearer（缺失/无效返回 null，不拦截）——用于码等敏感字段的"登录本人可见"渐进展示 */
-function optionalAuth(req) {
+async function optionalAuth(req) {
   try {
     const token = bearerToken(req);
-    return token ? verifyToken(token) : null;
+    return token ? await verifySession(token) : null;
   } catch {
     return null;
   }
@@ -631,8 +643,13 @@ async function orderToPublic(o, opts = {}) {
  */
 async function transition(orderId, from, to) {
   const fromList = Array.isArray(from) ? from : [from];
-  const marks = fromList.map(() => '?').join(',');
-  return (await getDb().run(`UPDATE orders SET status = ?, updated_at = ? WHERE id = ? AND status IN (${marks})`, to, new Date(), orderId, ...fromList)).changes;
+  /*
+    旧实现用普通 UPDATE 返回 changes，调用方再拿**事务外读到的** `order.status` 决定是否
+    补库存占位。并发下（sweeper/买家取消在 RPC 往返之间提交）UPDATE 会命中 `cancelled`，
+    而分支仍看旧 `draft`——占位永远漏补。`claimOrderState` 在事务内 `SELECT ... FOR UPDATE`，
+    返回的 `from` 就是本次迁移真正的前一状态。`/sync` 的调用点全部在 `withTransaction` 内。
+  */
+  return await claimOrderState(getDb(), orderId, fromList, to);
 }
 
 /**
@@ -648,11 +665,16 @@ async function transition(orderId, from, to) {
  * @returns {Promise<number>} changes（0 = 本地不是该终态，或值本来就相同）
  */
 async function backfillRefundedAmount(order, targetStatus, wei) {
+  const amount = readRefundedWei(order.amount_wei);
+  const total = readRefundedWei(wei);
+  // 超出托管额 / 读不到：不写。负净额会让流水与统计口径直接失真。
+  if (amount === null || total === null || total > amount) return 0;
+  const totalText = total.toString();
   return (await getDb().run(
-    `UPDATE order_chain c SET c.refunded_amount_wei = ?
-      WHERE c.escrow_order_id = ? AND c.refunded_amount_wei <> ?
+    `UPDATE order_chain c SET c.refunded_amount_wei = GREATEST(COALESCE(c.refunded_amount_wei, 0), ?)
+      WHERE c.escrow_order_id = ? AND (c.refunded_amount_wei IS NULL OR c.refunded_amount_wei <> ?)
         AND EXISTS (SELECT 1 FROM orders o WHERE o.id = c.order_id AND o.status = ?)`,
-    wei, order.escrow_order_id, wei, targetStatus
+    totalText, order.escrow_order_id, totalText, targetStatus
   )).changes;
 }
 
@@ -689,12 +711,26 @@ async function verifyPaidReceipt(order, txHash) {
     "稍后重试"（交易本身不会消失，只是还没到可回写深度）。finality=0（演示）时 finalizedBlockTag
     返回 'latest'，不做比较。
   */
+  const finality = Number(config.escrow.finalityBlocks || 0);
   const finalized = await finalizedBlockTag().catch(() => null);
-  if (typeof finalized === 'number' && Number(receipt.blockNumber) > finalized) {
-    return {
-      ok: false,
-      message: `该交易所在区块（${receipt.blockNumber}）尚未达到确认深度（当前终局块 ${finalized}，需 ${config.escrow.finalityBlocks} 块）：请稍后重试，链上资金已托管，状态会自动回写`,
-    };
+  if (finality > 0) {
+    /*
+      **读不到确认边界就拒绝**，不要 catch 成 null 后跳过比较（旧实现就是 fail-open）：
+      这道闸的全部意义是"未达终局不写不可逆状态"，读不到时放行等于把闸拆掉。
+      receipt 缺 blockNumber 同样无法证明深度 ⇒ 拒绝。
+    */
+    if (typeof finalized !== 'number') {
+      return { ok: false, message: '读不到链上确认深度（RPC 异常）：本次不确认托管，请稍后重试（链上资金已托管）' };
+    }
+    if (receipt.blockNumber === undefined || receipt.blockNumber === null) {
+      return { ok: false, message: '交易收据缺少区块号，无法验证确认深度：本次不确认托管，请稍后重试' };
+    }
+    if (Number(receipt.blockNumber) > finalized) {
+      return {
+        ok: false,
+        message: `该交易所在区块（${receipt.blockNumber}）尚未达到确认深度（当前终局块 ${finalized}，需 ${finality} 块）：请稍后重试，链上资金已托管，状态会自动回写`,
+      };
+    }
   }
   // 显式校验执行结果（源码审计 2026-09）：原来只靠「revert 的交易没有日志」这一在 BTY 兼容层
   // 未经验证的假设——收据若带 status 字段就按它判定，缺失（兼容层不带）时继续走日志判定。
@@ -1283,11 +1319,12 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
 // ── 查询 ──
 
 /** 买家视角列表（公开；订单归属由买家地址查询，信息量不敏感） */
-router.get('/', wrap(async (req, res) => {
+router.get('/', publicListLimiter, wrap(async (req, res) => {
   const { address } = req.query;
   if (!address || !isAddress(String(address))) return fail(res, '缺少 address 参数（买家地址）');
   const buyer = String(address).toLowerCase();
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  if (page > 10_000) return fail(res, 'page 过大：请缩小范围或使用更精确的筛选', 1, 400);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
   const offset = (page - 1) * pageSize;
   /*
@@ -1296,7 +1333,7 @@ router.get('/', wrap(async (req, res) => {
     “列表 → 详情 → escrowOrderId → 抢先 createOrder 占位”的支付 DoS。
     本人（令牌地址 == address）仍能看到自己的草稿；未登录/第三人只看已上链或终态单。
   */
-  const auth = optionalAuth(req);
+  const auth = await optionalAuth(req);
   const buyerSelf = !!auth && String(auth.address || '').toLowerCase() === buyer;
   let where = 'buyer = ?';
   const params = [buyer];
@@ -1655,10 +1692,10 @@ router.get('/seller/ledger', ownerOnly, wrap(async (req, res) => {
 }));
 
 /** 订单详情（公开只读；码仅对买家本人/店主/链上仲裁人可见；售后陈述同码可见矩阵） */
-router.get('/:id', wrap(async (req, res) => {
+router.get('/:id', publicDetailLimiter, wrap(async (req, res) => {
   const order = await findOrder(req.params.id);
   if (!order) return fail(res, '订单不存在', 404, 404);
-  const auth = optionalAuth(req);
+  const auth = await optionalAuth(req);
   // 经营人员判据取**这张订单所属店铺**（订单面的店铺上下文来自订单行，不是请求头）
   let as = null;
   if (auth) {
@@ -2770,16 +2807,18 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
         会让"读到 cancelled"与"补回占位"之间插进别的写者。
       */
       const createdOutcome = await withTransaction(async () => {
-        // 事务内重读状态（`order` 是进 RPC 之前那次读，链上往返期间本地可能已被取消/清扫）。
-        // 定位用内部 order_id：它就是那一行（不需要再 JOIN order_chain 反查 escrow_order_id）。
-        const localRow = await db.get('SELECT status FROM orders WHERE id = ?', order.order_id);
-        if (localRow?.status === 'cancelled') {
+        /*
+          迁移先认领：`claimOrderState` 在事务内 `SELECT ... FOR UPDATE`，返回的 `from` 是
+          这次真正被迁移的前一状态。旧实现先普通读 `localRow.status` 再 restock，清扫器/取消
+          在两次语句之间提交时，UPDATE 会命中 `cancelled`，而分支仍看旧 `draft`，占位漏补。
+        */
+        const claim = await claimOrderState(db, order.order_id, ['draft', 'cancelled'], 'escrowed');
+        if (claim.changed === 1 && claim.from === 'cancelled') {
           if (!(await restockOrder(order.order_id))) {
-            return abortTx({ fail: '订单恢复失败：该商品库存已在取消期间被占用（限量售罄），请联系店主扩容后重试' });
+            throw new Error('订单恢复失败：该商品库存已在取消期间被占用（限量售罄），请联系店主扩容后重试');
           }
         }
-        const movedToEscrowed = await transition(order.order_id, ['draft', 'cancelled'], 'escrowed');
-        if (movedToEscrowed) {
+        if (claim.changed === 1) {
           /*
             支付凭证**必须在迁移成功这一刻一并补写**（源码审计 2026-09 复审，P1）。
             上面那段注释承诺"cancelled 行的凭证改由迁移成功那一刻补写（见下方 Created 分支）"，
@@ -2803,7 +2842,7 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
         // 两级售后标记权威回填：链上 Created 单的 refundRequested/refundRejected 直接反映
         // 买家是否已申请退款/卖家是否拒绝（事件漏扫或本地与链上不一致时以链上为准，见 applyRefundFlags）
         await applyRefundFlags(order.escrow_order_id, onchain);
-        return { moved: movedToEscrowed };
+        return { moved: claim.changed === 1 };
       });
       if (createdOutcome.fail) return fail(res, createdOutcome.fail);
       if (createdOutcome.moved) notify('order.escrowed', order.order_no); // 卖家通知：watcher 漏扫时的 sync 兜底（幂等语义同 watcher）
@@ -2869,8 +2908,8 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
         from 集：draft（节点停机漏扫 Created/确认事件后的残镜像——此前漏 draft，与 Refunded/
         OrderExpiredReleased 分支口径不一致，sync 静默无动作）、escrowed/shipped（普通成交）、
         disputed（撤诉/仲裁判卖家的事件漏扫兜底）、cancelled（草稿被清扫/取消后链上才终局成交——
-        from 集缺口曾令其永不可迁移、卖家流水漏计；cancelled 行取消时已释放占位且从未交付，
-        迁移无占位副作用）。
+        from 集缺口曾令其永不可迁移、卖家流水漏计）。cancelled 行取消时已释放占位；若终态是
+        **成交/settled**，必须在同一事务里补回占位，否则限量货会被再次卖出（见下方 restockOrder）。
         **`expired` 刻意不在 from 集里**（P2-1 终态吸附）：超时释放是链上确凿的终局事件，
         而快照只有 status/refundedAmount、区分不了"超时释放"与"判给卖家"——把 expired 改写成
         settled 会重盖 updated_at（入账窗口）、重发通知、并推后 PII 保留期，而链上事实没有变化。
@@ -2883,13 +2922,25 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
       */
       const settledTarget = mapChainTerminal('Settled', chainRefundedWei, localAmountWei);
       const movedToTarget = await withTransaction(async () => {
-        const moved = await transition(
+        const claim = await transition(
           order.order_id,
           ['draft', 'escrowed', 'shipped', 'disputed', 'cancelled'],
           settledTarget
         );
-        if (moved) {
+        if (claim.changed === 1) {
           await appendSyncMirrorEvent(order.order_id, settledTarget, { block: onchain.createdAtBlock });
+          /*
+            本地是 cancelled 而链上最终成交：取消流程已经把库存占位还给别人，这里必须补回来。
+            **判据是本次认领的前一状态 `claim.from`，不是事务外读到的 `order.status`**；也不能
+            按 `refunded > 0` 过滤：refunded=0 的 Settled（超时释放/判卖家）同样是一笔成交，
+            同一个链上转移在 watcher 与 /sync 下必须得到同一个 committed。补不回来（限量库存
+            已被卖空）就整笔回滚并让用户重试——settled 是终态，静默放行等于永久超卖。
+          */
+          if (claim.from === 'cancelled') {
+            if (!(await restockOrder(order.order_id))) {
+              throw new Error('订单已在链上成交，但该商品库存已在取消期间售空，无法补回占位；请店主扩容后重试同步');
+            }
+          }
         }
         // 拆分结算的已退金额按链上真值回填（链上 Settled 也可能是「仲裁拆分：部分退款 +
         // 部分结算」，refundedAmount 是账本净额/退款口径的唯一依据）。
@@ -2898,7 +2949,7 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
         if (chainRefundedWei !== null) {
           await backfillRefundedAmount(order, settledTarget, chainRefundedWei);
         }
-        if (moved) {
+        if (claim.changed === 1) {
           // D1：成交终局但退货已确认收货/放弃追索（received_at 非空，货已实际回到卖家侧可再售）→
           // 占位回补（watcher 同规则；本行幂等，sync 重复触发不二次扣减，见 releaseHoldsForReturnReceived）
           await releaseHoldsForReturnReceived(order.escrow_order_id);
@@ -2906,7 +2957,7 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
         // 链上已终结（结算给卖家）：售后镜像无意义，清残留（确认/超时/判付任一路径都可能带 prior 申请）。
         // 与退款金额同一条 claim：本地状态不是该终态时（例如 expired）不碰它。
         await clearRefundMirrorForTerminal(order, settledTarget);
-        return moved;
+        return claim.changed;
       });
       if (movedToTarget) {
         notify('order.settled', order.order_no); // 卖家通知：sync 兜底（链上 Settled 无法区分确认/超时/判付，
@@ -2916,6 +2967,18 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
       break;
     }
     case 'Refunded': {
+      /*
+        与 Settled 分支同一前置：链上 Refunded 是“全额退买家”，但金额读不到时
+        仍可能是 RPC 形状漂移。旧实现先推进为 refunded、再跳过回填，页面就显示
+        “已退 0”，而 refunded 又不进退款统计——两套账同时消失。金额未知不得写终态。
+      */
+      if (chainRefunded === null) {
+        return fail(
+          res,
+          '链上「已退买家金额」本次读不到：无法确认这笔全额退款的实际金额，' +
+            '为避免把账目记成「已退 0」，本次不推进终态。请稍后重试，或改用链上直查核对。'
+        );
+      }
       // 全额退款（仲裁判退 / 卖家 approveRefund 全额和解）：迁移到 refunded 后按「仅未交付行释放」
       // 回补占位（stockHold.releaseRefundedEscrow：已交付后退款视为货在买家侧需线下回收，
       // 不自动回补——与 shipped→expired 不释放同口径）。
@@ -2927,8 +2990,8 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
       // 迁移 + 释放 + 镜像 + 标记同事务；金额/镜像列的写入与状态共用同一个 claim。
       const refundedTarget = mapChainTerminal('Refunded', chainRefundedWei, localAmountWei);
       const movedToRefunded = await withTransaction(async () => {
-        const moved = await transition(order.order_id, ['draft', 'escrowed', 'shipped', 'disputed', 'cancelled'], refundedTarget);
-        if (moved) {
+        const claim = await transition(order.order_id, ['draft', 'escrowed', 'shipped', 'disputed', 'cancelled'], refundedTarget);
+        if (claim.changed === 1) {
           await releaseRefundedEscrow(order.escrow_order_id);
           await appendSyncMirrorEvent(order.order_id, refundedTarget, { block: onchain.createdAtBlock });
         }
@@ -2940,7 +3003,7 @@ router.post('/:id/sync', requireAuth, syncLimiter, wrap(async (req, res) => {
         // 终态：售后标记回 none（订单状态已表达退款结果，陈述时间线仍在 evidence 中可溯）；
         // 与状态同一 claim，本地 expired 时不动。
         await clearRefundMirrorForTerminal(order, refundedTarget);
-        return moved;
+        return claim.changed;
       });
       if (movedToRefunded) notify('order.refunded', order.order_no); // 卖家通知：sync 兜底
       break;
@@ -3035,6 +3098,8 @@ router.post('/:id/review/images', requireAuth, reviewImageLimiter, wrap(async (r
   if (String(order.buyer || '').toLowerCase() !== buyer) {
     return fail(res, '只有买家本人可以为该订单上传评价图', 403, 403);
   }
+  const refused = reviewWriteRefusal(order);
+  if (refused) return fail(res, refused, 403, 403);
   if (!REVIEWABLE_STATUS.includes(order.status)) {
     return fail(res, '只有成交终局订单可以上传评价图');
   }

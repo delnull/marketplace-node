@@ -100,6 +100,23 @@ export async function findReviewByOrder(orderId) {
 }
 
 /**
+ * 评价写入口的**唯一门控**（提交评价 / 追评 / 上传评价图三处共用）。
+ *
+ * `pii_erased_at` 是擦除承诺的终态：擦除后订单的收货信息与既有评价图已被清掉，
+ * 若还允许买家把新的评价文字/图片写回，删除请求就被数据主体自己立即绕过（且图片重新公开落盘）。
+ * 判据放在这里而不是三个路由各写一个 `if`：新增一个评价写入口时忘不了。
+ *
+ * @returns {string|null} null = 可写；否则是可读拒绝原因
+ */
+export function reviewWriteRefusal(order) {
+  if (!order) return '订单不存在';
+  if (order.pii_erased_at != null) {
+    return '该订单的个人信息已按请求擦除：擦除是终态，不能再写入评价、追评或评价图';
+  }
+  return null;
+}
+
+/**
  * 买家提交评价。返回 {ok, error?} 语义（错误信息由调用方转 fail）。
  * @param {{order: object, buyer: string, rating: number|string, content?: string, images?: string[]}} p
  */
@@ -113,6 +130,8 @@ export async function submitReview({ order, buyer, rating, content, images }) {
   if (String(order.buyer || '').toLowerCase() !== String(buyer || '').toLowerCase()) {
     return { error: '仅买家本人可评价该订单', forbidden: true };
   }
+  const refused = reviewWriteRefusal(order);
+  if (refused) return { error: refused, forbidden: true };
   if (!REVIEWABLE_STATUS.includes(order.status)) {
     return { error: `当前状态(${order.status})不可评价——仅成交终局（确认收货/仲裁判付/超时释放）订单可评` };
   }
@@ -149,6 +168,8 @@ export async function followupReview({ order, buyer, content, images }) {
   if (String(order.buyer || '').toLowerCase() !== String(buyer || '').toLowerCase()) {
     return { error: '仅买家本人可追评该订单', forbidden: true };
   }
+  const refused = reviewWriteRefusal(order);
+  if (refused) return { error: refused, forbidden: true };
   const text = String(content ?? '').trim();
   if (text.length > 1000) return { error: '追评内容不能超过 1000 字' };
   const imgs = normalizeReviewImages(images);
@@ -331,9 +352,14 @@ export async function shopReviewStats(seller) {
   const sel = seller === null ? '' : String(seller).toLowerCase();
   const row = sel
     ? await db.get(`SELECT COUNT(*) AS c, COALESCE(SUM(r.rating),0) AS s
-             FROM reviews r JOIN orders o ON o.id = r.order_id
+             FROM reviews r
+             JOIN orders o ON o.id = r.order_id
+             JOIN shops s ON s.code = o.shop_code AND s.listed = 1
             WHERE lower(o.seller) = ?`, sel)
-    : await db.get('SELECT COUNT(*) AS c, COALESCE(SUM(rating),0) AS s FROM reviews');
+    : await db.get(`SELECT COUNT(*) AS c, COALESCE(SUM(r.rating),0) AS s
+             FROM reviews r
+             JOIN orders o ON o.id = r.order_id
+             JOIN shops s ON s.code = o.shop_code AND s.listed = 1`);
   const total = Number(row.c);
   return { count: total, avg: total > 0 ? Math.round((Number(row.s) / total) * 10) / 10 : null };
 }

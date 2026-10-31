@@ -11,13 +11,13 @@
  */
 import { Router } from 'express';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
-import { verifyToken } from '../auth.js';
+import { verifySession } from '../auth.js';
 import { getDb, withTransaction } from '../db.js';
 import { isShopCodeShape, shopDisplayName } from '../shops.js';
 import { usdtOf } from '../money.js';
 
 const router = Router();
-const requireAuth = makeAuthMiddleware(verifyToken);
+const requireAuth = makeAuthMiddleware(verifySession);
 // 公开按地址读可以被枚举，写又带一次登录；两条路径都限速，避免用收藏接口打库。
 router.use(simpleRateLimit({ windowMs: 60_000, max: 120 }));
 

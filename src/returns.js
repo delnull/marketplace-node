@@ -32,7 +32,7 @@
  *    一个荒谬的时刻，而且不报错。
  */
 import { getDb, withTransaction, abortTx } from './db.js';
-import { releaseHoldsForOrderIds, releaseHoldsForReturnReceived } from './stockHold.js';
+import { releaseReturnedUnits } from './stockHold.js';
 // 确认收货后的售后案件：在途判据的唯一实现（见 createReturn 的窗口说明）
 import { isAfterSaleOpen } from './afterSale.js';
 // 承运方名称的归一（与发货侧同一实现）：退回件与寄出件必须是同一种形状
@@ -76,12 +76,17 @@ export async function setReturnAddress({ returnRow, address }) {
  * 买家发起退货申请：仅创建一条 open 的空地址退货单，地址由卖家补。
  * 门控复用 createReturn（已交付 + 退款/售后窗口），这里只补买家身份。
  */
-export async function requestReturn({ order, buyer, note }) {
+export async function requestReturn({ order, buyer, note, quantity }) {
   if (!order) return { error: '订单不存在', notFound: true };
   if (String(order.buyer || '').toLowerCase() !== String(buyer || '').toLowerCase()) {
     return { error: '仅买家本人可发起退货申请', forbidden: true };
   }
-  return createReturn({ order, address: '', note: `买家申请退货：${String(note ?? '').trim().slice(0, 500)}` });
+  return createReturn({
+    order,
+    address: '',
+    note: `买家申请退货：${String(note ?? '').trim().slice(0, 500)}`,
+    quantity,
+  });
 }
 
 /** 对外字段（时间列是 Date → JSON 给出 ISO-8601；NULL 的三态原样透出为 null） */
@@ -90,6 +95,11 @@ export function returnToPublic(r) {
   return {
     status: r.status,
     waived: !!r.waived,
+    /*
+      本次退货覆盖的件数。多件订单可只退一部分；占位释放按这个数，而不是按整单 hold_qty。
+      对外必须下发：卖家在确认收货前要能核对"退回来的是几件"。
+    */
+    quantity: Number(r.quantity) || 1,
     address: r.address || '',
     note: r.note || '',
     trackingNo: r.tracking_no || null,
@@ -123,10 +133,13 @@ export function returnToPublic(r) {
  *
  * @param {{order: object, address?: string, note?: string}} p order = 读模型行（需 order_id/status/…）
  */
-export async function createReturn({ order, address, note }) {
+export async function createReturn({ order, address, note, quantity }) {
   if (!order) return { error: '订单不存在', notFound: true };
   const existing = await fetchReturnByOrder(order.order_id);
   if (existing) return { ok: true, data: existing }; // 幂等：返回既有单
+  if (order.pii_erased_at != null) {
+    return { error: '该订单的个人信息已按请求擦除：擦除是终态，不能再新建退货单写入退货地址/备注' };
+  }
   if (!(await hasDelivered(order))) {
     return { error: '该订单尚无交付记录（未发货/未交付），无需退货单——可直接同意退款，库存将自动回补' };
   }
@@ -138,6 +151,16 @@ export async function createReturn({ order, address, note }) {
         '或**有在途售后案件**（确认收货后由买家在链上 openAfterSale 开案）的订单可建单——' +
         '已终局且无售后案件的订单钱货两清，无需退货单（如需追回请线下协商或先开售后案件）',
     };
+  }
+  const maxQty = Number(order.quantity) || 0;
+  /*
+    退货件数是**占位释放的计量单位**：多件订单只退回一件时，只能释放一件的 committed，
+    否则剩下仍在买家手里的货会立刻变成"可再售"（超卖）。缺省 = 整单全部退回；
+    卖家要部分退货必须显式给 quantity（或后续 PATCH /return/quantity 改小）。
+  */
+  const qtyRaw = quantity === undefined || quantity === null || quantity === '' ? maxQty : Number(quantity);
+  if (!Number.isSafeInteger(qtyRaw) || qtyRaw < 1 || qtyRaw > maxQty) {
+    return { error: `退货件数需为 1..${maxQty} 的整数（本单共 ${maxQty} 件）` };
   }
   const addr = String(address ?? '').trim().slice(0, 300);
   const noteText = String(note ?? '').trim().slice(0, 1000);
@@ -152,12 +175,35 @@ export async function createReturn({ order, address, note }) {
     created_at / updated_at 不传：由列的 DEFAULT CURRENT_TIMESTAMP(3) 盖章。
   */
   await getDb().run(
-    `INSERT INTO order_returns (order_id, status, address, note)
-     VALUES (?, 'open', ?, ?)
+    `INSERT INTO order_returns (order_id, status, quantity, address, note)
+     VALUES (?, 'open', ?, ?, ?)
      ON DUPLICATE KEY UPDATE order_id = order_id`,
-    order.order_id, addr, noteText
+    order.order_id, qtyRaw, addr, noteText
   );
   return { ok: true, data: await fetchReturnByOrder(order.order_id) };
+}
+
+/**
+ * 修改退货件数（仅 open；卖家在确认收到前按实际退回数量修正）。
+ *
+ * 买家发起退货时默认整单；卖家实际只收到部分时必须在点 receive 之前改小——
+ * `settleReturn` 按这里的数字释放占位，写大了就是把买家仍持有的货变成可再售。
+ */
+export async function setReturnQuantity({ order, returnRow, quantity }) {
+  if (!returnRow) return { error: '退货单不存在' };
+  if (returnRow.status !== 'open') return { error: `退货单当前状态(${returnRow.status})不可修改件数（已寄出/已确认）` };
+  const maxQty = Number(order?.quantity) || 0;
+  const qty = Number(quantity);
+  if (!Number.isSafeInteger(qty) || qty < 1 || qty > maxQty) {
+    return { error: `退货件数需为 1..${maxQty} 的整数（本单共 ${maxQty} 件）` };
+  }
+  const moved = (await getDb().run(
+    "UPDATE order_returns SET quantity = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status = 'open'",
+    qty,
+    returnRow.id
+  )).changes;
+  if (moved !== 1) return { error: '退货单状态已变化，请刷新后重试' };
+  return { ok: true, data: await fetchReturnByOrder(returnRow.order_id) };
 }
 
 /**
@@ -222,14 +268,16 @@ export async function settleReturn({ order, returnRow, waived }) {
     */
     const fresh = await getDb().get('SELECT status FROM orders WHERE id = ? FOR UPDATE', order.order_id);
     if (!fresh) return abortTx({ error: '订单不存在' });
-    // 链上退款已终局（refunded）→ 占位回补；未终局由 releaseRefundedEscrow 在事件迁移时兜底
-    if (fresh.status === 'refunded') {
-      await releaseHoldsForOrderIds([order.order_id]);
-    }
-    // 订单已终局为成交态（settled/confirmed/expired——资金判给卖家）时才 receive/waive：
-    // 货已实际回到卖家侧/放弃追回 → 当场回补占位（released_at 幂等；判据含 received_at 非空）
-    else if (['settled', 'confirmed', 'expired'].includes(fresh.status)) {
-      await releaseHoldsForReturnReceived(order.escrow_order_id);
+    // 事务内重读退货件数：入口拿到的 returnRow 可能是改件数之前的快照；释放必须按落库值。
+    const freshReturn = await getDb().get('SELECT quantity FROM order_returns WHERE id = ? FOR UPDATE', returnRow.id);
+    const returnedQty = Number(freshReturn?.quantity) || 0;
+    /*
+      退货已确认收到 ⇒ 只释放**这次退回的件数**（多件订单的部分退货不能整单清零）。
+      状态覆盖面：refunded（全额退款终局）与成交终局（settled/confirmed/expired，D1 口径）。
+      顺序无关：先收货后终局、先终局后收货都由 `released_qty` 幂等保证只释放一次。
+    */
+    if (['refunded', 'settled', 'confirmed', 'expired'].includes(fresh.status) && returnedQty > 0) {
+      await releaseReturnedUnits(order.order_id, returnedQty, returnRow.id);
     }
     return { ok: true };
   });

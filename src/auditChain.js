@@ -126,7 +126,15 @@ export function auditEntryHash(prevHash, row) {
  * @returns {Promise<string|null>}
  */
 export async function chainHead(db = getDb()) {
-  const r = await db.get('SELECT entry_hash FROM audit_logs WHERE entry_hash IS NOT NULL ORDER BY id DESC LIMIT 1');
+  /*
+    **锁定读**：审计写入的"读链头 → 插行 → 回填哈希"必须对同一个前驱串行。
+    普通一致性读在 REPEATABLE READ 下会一直看事务开始时的快照 —— 若 logAudit 被放进外层事务，
+    撞键重试五次都读同一个旧链头，整条审计被静默吞掉。`FOR UPDATE` 是当前读，能看到并发
+    写者刚提交的新链头；事务外调用时 InnoDB 也会在语句结束前读到最新已提交版本。
+  */
+  const r = await db.get(
+    'SELECT entry_hash FROM audit_logs WHERE entry_hash IS NOT NULL ORDER BY id DESC LIMIT 1 FOR UPDATE'
+  );
   return r ? String(r.entry_hash) : null;
 }
 

@@ -25,7 +25,7 @@ const PNG = Buffer.from(
 );
 
 /**
- * 合成一个"MP4 容器"：偏移 4 起必须是 `ftyp` box（判据见 shared/media.js）。
+ * 合成一个"MP4 容器"：偏移 4 起必须是 `ftyp` box（判据见 node/src/mediaKinds.js）。
  * 测试不需要能解码的画面——服务端判的是容器（编码不可判，那由店主侧封面抓帧兜住）。
  */
 const MP4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisom'), Buffer.alloc(2048, 7)]);

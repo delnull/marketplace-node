@@ -91,6 +91,8 @@ import { tryAutoDeliverByEscrowOrder, flushAutoDeliverPending } from './autoDeli
 // `deliveredItemsSql` / `isDelivered`：「这一单的货交出去了没有」的唯一判据与**唯一列名**
 // （见 stockHold.js——列名写错会当场抛错，因为静默判成"未交付"就是把已发出的货回补占位 ⇒ 超卖）
 import { releaseHoldsForOrderIds, releaseHoldsForReturnReceived, releaseRefundedEscrow, isDelivered, restockOrder, deliveredItemsSql } from './stockHold.js';
+// 状态迁移的**唯一认领内核**：迁移与"迁移前是什么状态"必须同一把行锁（见文件头）
+import { claimOrderState } from './orderTransition.js';
 import { notify, notifyRaw, typeForChainEvent } from './webhook.js';
 import { alertPoolEmptyForOrder } from './poolAlert.js';
 // 一次性告警的「投递成功才留下幂等标记」（唯一实现；见 alertAck.js）
@@ -495,9 +497,35 @@ export function mapChainTerminal(chainStatus, refundedAmountWei, amountWei) {
  * "链上 Refunded/Settled → 本地状态 + refunded_amount_wei + 占位回补"的映射，
  * 两处迟早会漂移（这正是本仓库反复强调的"唯一实现"）。
  */
-export async function settleByRefundSplit(db, orderId, refundWeiArg) {
-  const local = await db.get(
-    `SELECT o.id AS order_id, o.amount_wei, o.status
+/**
+ * 写 `order_chain.refunded_amount_wei` 的**唯一出口**（事件/快照路径共用）。
+ *
+ * 契约：这个数是"买家**累计**已受偿"，不是"本次结算退了 Friendly 多少"。
+ *   · 超过托管额 ⇒ 拒绝（否则视图 `amount_net_wei` 会变成负数，流水出现负净额）；
+ *   · 只增不减（`GREATEST`）⇒ 重放 `Arbitrated`（事件里是结算时刻的 refundWei）不能把
+ *     之后 `SellerRefunded` 写大的累计值改小；隔离事件"修好根因后重放"也不再制造金额回退。
+ *
+ * @returns {Promise<number>} changes（0 = 值未变/超界被拒）
+ */
+export async function setRefundedAmount(db, orderId, amountWei, totalWei) {
+  const amount = readRefundedWei(amountWei);
+  const total = readRefundedWei(totalWei);
+  if (amount === null || total === null) return 0;
+  if (total > amount) return 0;
+  const totalText = total.toString();
+  const result = await db.run(
+    `UPDATE order_chain
+        SET refunded_amount_wei = GREATEST(COALESCE(refunded_amount_wei, 0), ?)
+      WHERE order_id = ? AND (refunded_amount_wei IS NULL OR refunded_amount_wei <> ?)`,
+    totalText,
+    Number(orderId),
+    totalText
+  );
+  return result.changes;
+}
+
+export async function settleByRefundSplit(db, orderId, refundWeiArg) {  const local = await db.get(
+    `SELECT o.id AS order_id, o.amount_wei
        FROM orders o JOIN order_chain c ON c.order_id = o.id
       WHERE c.escrow_order_id = ?`,
     String(orderId).toLowerCase()
@@ -526,20 +554,36 @@ export async function settleByRefundSplit(db, orderId, refundWeiArg) {
   // 否则「同一笔单走事件回写 vs 走兜底同步」会得到两种本地终态。
   const fullRefund = amount > 0n && refunded >= amount;
   const status = fullRefund ? 'refunded' : 'settled';
-  const changed = (await db.run(`UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP(3)
-        WHERE id = ? AND status IN ('draft','cancelled','escrowed','shipped','disputed','expired')`, status, local.order_id)).changes;
+  /*
+    **迁移与"要不要补占位"必须共用同一把行锁**（2026-10-31 并发收口）：
+    旧实现先普通 SELECT 拿 `local.status`，再用它决定是否 restock；草稿清扫器/买家取消
+    可能在两次语句之间提交，UPDATE 命中 `cancelled` 成功后分支仍看旧 `draft`，占位永久漏补。
+    `claimOrderState` 在事务内 `SELECT ... FOR UPDATE`，`from` 就是本次认领的前一状态。
+  */
+  const { changed, from } = await claimOrderState(
+    db,
+    local.order_id,
+    ['draft', 'cancelled', 'escrowed', 'shipped', 'disputed', 'expired'],
+    status
+  );
   if (changed > 0) {
-    await db.run(
-      "UPDATE order_chain SET refund_status = 'none', refunded_amount_wei = ? WHERE order_id = ?",
-      refunded.toString(),
-      local.order_id
-    );
+    await db.run("UPDATE order_chain SET refund_status = 'none' WHERE order_id = ? AND refund_status <> 'none'", local.order_id);
+    await setRefundedAmount(db, local.order_id, amount, refunded);
     if (fullRefund) {
       // 全额退款：占位按「未交付行」口径回补（已交付后退款视为货在买家侧，需线下回收，防超卖）
       await releaseRefundedEscrow(orderId);
     } else {
       // 拆分/判卖家：成交向终态——已交付行若退货已确认收货/放弃追索则回补占位（D1 口径）
       await releaseHoldsForReturnReceived(orderId);
+      /*
+        取消时占位已经释放；链上随后才结算给卖家（拆分/判付）时，本地不能继续把这件货
+        标成“可再售”。补占位失败只告警（资金已上链，订单必须收敛），由店主核账扩容。
+      */
+      if (from === 'cancelled' && !(await restockOrder(local.order_id))) {
+        console.error(
+          `[escrowWatcher] 恢复已取消订单 ${String(local.order_id).slice(0, 8)}… 的库存占位失败（限量库存不足），请店主核账扩容`
+        );
+      }
     }
   }
   return changed;
@@ -562,7 +606,7 @@ export async function settleByRefundSplit(db, orderId, refundWeiArg) {
  */
 export async function markEscrowDisputed(db, orderId) {
   const local = await db.get(
-    'SELECT o.id AS order_id, o.order_no, o.status, o.shop_code FROM orders o JOIN order_chain c ON c.order_id = o.id WHERE c.escrow_order_id = ?',
+    'SELECT o.id AS order_id, o.order_no, o.shop_code FROM orders o JOIN order_chain c ON c.order_id = o.id WHERE c.escrow_order_id = ?',
     String(orderId).toLowerCase()
   );
   if (!local) return 0;
@@ -576,11 +620,13 @@ export async function markEscrowDisputed(db, orderId) {
     库存被一件已经退款的单永久占住（商品看起来卖光了）。`restockOrder` 自身的
     `released_at IS NOT NULL` 认领只能防重复，防不了"为不该占的单占位"。
   */
-  const changed = (await db.run(
-    "UPDATE orders SET status = 'disputed', updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status IN ('draft','escrowed','shipped','cancelled')",
-    local.order_id
-  )).changes;
-  if (changed === 0 || local.status !== 'cancelled') return changed;
+  const { changed, from } = await claimOrderState(
+    db,
+    local.order_id,
+    ['draft', 'escrowed', 'shipped', 'cancelled'],
+    'disputed'
+  );
+  if (changed === 0 || from !== 'cancelled') return changed;
   /*
     **从 cancelled 复活必须把库存占位补回来**（2026-10-22 复审）。
 
@@ -886,17 +932,45 @@ async function applyEventCore(name, args, meta = {}) {
       }
       break;
     }
-    case 'ReceiptConfirmed':
+    case 'ReceiptConfirmed': {
       // 买家确认收货可发生在退款申请后（链上 confirmReceipt 不要求未申请）——终局同时复位售后镜像；
       // v2+ 争议中买家撤诉放款同样发本事件（Escrow.confirmReceipt 扩 Disputed 态）→ disputed → confirmed
       // from 集对齐 /sync 的 Settled 口径（源码审计 2026-09）：draft/cancelled 行是「节点漏扫
       // OrderCreated」的残镜像——链上既已收到本事件，说明该单确实托管过且已结算给卖家，
       // 本地必须收敛到成交终局（此前这些行永远停在 draft/cancelled，卖家流水漏计）。
-      changed = (await db.run(
-        "UPDATE orders SET status = 'confirmed', updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status IN ('draft','cancelled','escrowed','shipped','disputed','expired')",
-        local.order_id
-      )).changes;
+      // settled 也要收：/sync 在漏扫事件时可能先落 settled，真实 ReceiptConfirmed 到达后
+      // 必须能补成 confirmed（确认率/文案依赖它）。
+      const claim = await claimOrderState(
+        db,
+        local.order_id,
+        ['draft', 'cancelled', 'escrowed', 'shipped', 'disputed', 'expired', 'settled'],
+        'confirmed'
+      );
+      changed = claim.changed;
       if (changed > 0) {
+        // 取消时占位已释放；链上既然成交/确认，必须把占位补回来，否则同一件限量货可再次卖出。
+        if (claim.from === 'cancelled' && !(await restockOrder(local.order_id))) {
+          console.error(
+            `[escrowWatcher] 恢复已取消订单 ${String(local.order_no).slice(0, 8)}… 的库存占位失败（限量库存不足），请店主核账扩容`
+          );
+          try {
+            await alertOnceDelivered({
+              orderId: local.order_id,
+              kind: 'hold_missing',
+              label: '[escrowWatcher]',
+              what: `（order.hold_missing，order=${String(local.order_no).slice(0, 8)}…，确认收货复活时占位失败）`,
+              send: () =>
+                notifyRaw('order.hold_missing', {
+                  shopCode: local.shop_code,
+                  orderId: local.order_no,
+                  escrowOrderId: orderId,
+                  reason: '订单取消后链上才确认收货，本地复活时库存占位失败（限量库存已被他人买走）——请核对商品余量并扩容或退款处理',
+                }),
+            });
+          } catch {
+            /* 告警失败不能阻断状态收敛 */
+          }
+        }
         // 终局复位退款镜像（链上列，见文件头的两表说明）：只在迁移真的发生了的时候写
         await db.run("UPDATE order_chain SET refund_status = 'none' WHERE order_id = ?", local.order_id);
         // D1：已交付行若退货已确认收货/放弃追索（received_at 非空，货已实际回卖家侧/卖家放弃追回），
@@ -904,6 +978,7 @@ async function applyEventCore(name, args, meta = {}) {
         await releaseHoldsForReturnReceived(orderId);
       }
       break;
+    }
     case 'DisputeRequested':
       // from 集与对账（chainReconcile 按链上 Disputed 修复）共用 markEscrowDisputed（唯一实现）
       changed = await markEscrowDisputed(db, orderId);

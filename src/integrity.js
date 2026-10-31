@@ -156,8 +156,10 @@ export async function findIntegrityIssues(db = getDb()) {
       · products.reserved_codes = Σ 该商品「在途四态（draft/escrowed/shipped/disputed）订单
         尚未交付的件数」，每单先按 0 夹逼——与触发器 ④/⑤ 的 GREATEST(...) 同一个算式；
         reserved_tokens 同理（kind 决定哪一列该有值，另一列期望 0）。
-      · product_skus.committed = Σ 该 (商品, 组合) 仍押着的占位（hold_qty > 0 ∧ released_at IS NULL）。
+      · product_skus.committed = Σ 该 (商品, 组合) 仍押着的占位（released_qty < hold_qty；
+        旧行 released_at 非空视为整单已释放）。
       · orders.hold_qty 只可能是 0 或 quantity（占位成功写 quantity，否则 0；切回限量时补记 quantity）。
+      · orders.released_qty 只可能是 0..hold_qty（多件订单部分退货时逐件推进）。
       · 押着占位却找不到对应 SKU 行 / 商品行已删 ⇒ **不可对拍**，如实报出来而不是折成 0。
     SQL 里的 CAST(quantity AS SIGNED) 不能省：quantity 是 UNSIGNED，无符号减法在负数上会抛错
     （与触发器那边同一条坑）。
@@ -278,12 +280,12 @@ async function checkReservationCounters(db) {
 
   /*
     B. product_skus.committed 的真值：该 (商品, 组合) 仍押着的占位合计
-    （`hold_qty > 0 AND released_at IS NULL`，与 stockHold.occupyingSql 同一条谓词——
-    状态列不是判据：一条订单可以走到任何状态而占位仍在）。
+    （`released_qty < hold_qty`，与 stockHold.occupyingSql 同一条谓词——
+    状态列不是判据：一条订单可以走到任何状态而占位仍在；部分退货只释放 released_qty 件）。
   */
-  const held = await db.all(`SELECT product_id AS productId, sku_key AS skuKey, SUM(hold_qty) AS held
+  const held = await db.all(`SELECT product_id AS productId, sku_key AS skuKey, SUM(hold_qty - released_qty) AS held
          FROM orders
-        WHERE hold_qty > 0 AND released_at IS NULL AND product_id IS NOT NULL
+        WHERE hold_qty > released_qty AND NOT (released_qty = 0 AND released_at IS NOT NULL) AND product_id IS NOT NULL
         GROUP BY product_id, sku_key`);
   const heldBySku = new Map(held.map((r) => [skuKeyOf(r.productId, r.skuKey), Number(r.held || 0)]));
   const skus = await db.all(`SELECT s.product_id AS productId, s.sku_key AS skuKey, s.committed AS committed, p.slug AS slug
@@ -309,7 +311,8 @@ async function checkReservationCounters(db) {
               o.sku_key AS skuKey, o.hold_qty AS holdQty
          FROM orders o
     LEFT JOIN product_skus s ON s.product_id = o.product_id AND s.sku_key = o.sku_key
-        WHERE o.hold_qty > 0 AND o.released_at IS NULL AND o.product_id IS NOT NULL AND s.id IS NULL`);
+        WHERE o.hold_qty > o.released_qty AND NOT (o.released_qty = 0 AND o.released_at IS NOT NULL)
+          AND o.product_id IS NOT NULL AND s.id IS NULL`);
   for (const r of unpaired) {
     issues.push({
       kind: 'hold-without-sku',
@@ -337,7 +340,8 @@ async function checkReservationCounters(db) {
 
   // E. 押着占位却连商品归属都没有（product_id 为 NULL）：无法与任何 SKU 行对拍，如实报
   const unattributable = await db.all(`SELECT id AS orderId, order_no AS orderNo, hold_qty AS holdQty
-         FROM orders WHERE hold_qty > 0 AND released_at IS NULL AND product_id IS NULL`);
+         FROM orders WHERE hold_qty > released_qty AND NOT (released_qty = 0 AND released_at IS NOT NULL)
+          AND product_id IS NULL`);
   for (const r of unattributable) {
     issues.push({
       kind: 'counter-not-comparable',

@@ -20,7 +20,7 @@
  */
 import { Router } from 'express';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
-import { roleOf, verifyToken } from '../auth.js';
+import { roleOf, verifySession } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { MediaUploadError, findMedia, storeMediaStream } from '../productMedia.js';
 // 单次上传的**硬上限**（类型表里最大的那个）与字节额度内核（预留/结算/释放）
@@ -29,7 +29,7 @@ import { UploadByteBudget } from '../uploadBudget.js';
 
 const router = Router();
 // 与 products 路由同权限：商品经营面 = 店主 + 操作员
-const staffOnly = makeAuthMiddleware(verifyToken, { staffOnly: true });
+const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true });
 
 // 上传限流：单 IP 每分钟 20 个（正常上架远低于此；挡脚本刷盘）
 const uploadLimiter = simpleRateLimit({ windowMs: 60_000, max: 20, message: '媒体上传过于频繁，请稍后再试' });

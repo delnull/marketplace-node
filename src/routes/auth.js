@@ -21,12 +21,12 @@
  * 与任何店铺都对不上的值（那正是本次要删掉的那类假话）。
  */
 import { Router } from 'express';
-import { issueSiwe, verifySiwe, issueToken, roleOf, isHost, operatedShopCodes, isNodeStaffOf } from '../auth.js';
+import { issueSiwe, verifySiwe, issueToken, verifySession, revokeSession, roleOf, isHost, operatedShopCodes, isNodeStaffOf } from '../auth.js';
 import { isAddress } from '../chain.js';
 import { shopDto, shopRowByCode, nodeOwner } from '../shops.js';
 import config from '../config.js';
 // clientIp：来源 IP 的唯一实现（trust proxy 只解析一次，见 http.js）
-import { ok, fail, wrap, clientIp } from '../http.js';
+import { ok, fail, wrap, clientIp, bearerToken } from '../http.js';
 import { notifyRaw } from '../webhook.js';
 
 /** "节点主没开店 ⇒ 没有告警收件人"只报一次（见登录告警那段） */
@@ -48,7 +48,7 @@ async function loginPayload(address, hostNow) {
     if (role === 'owner' || role === 'staff') shops.push({ ...shopDto(row, nodeAddr), role });
   }
   return {
-    token: issueToken(recovered),
+    token: await issueToken(recovered),
     address: recovered,
     isHost: hostNow,
     isNodeStaff: nodeStaff,
@@ -154,6 +154,33 @@ router.post('/login', rateLimit('/login'), originProtocolGuard, wrap(async (req,
   const hostNow = await isHost(recovered, { force: true });
   await alertOwnerLogin(recovered, hostNow, req);
   ok(res, await loginPayload(recovered, hostNow));
+}));
+
+/**
+ * 退出登录：撤销**当前令牌**对应的服务端会话。未登录/令牌已失效也返回成功（幂等），
+ * 前端在清理本地令牌之前调用它；只清 localStorage 的旧行为会让泄露令牌继续可用到 TTL。
+ */
+router.post('/logout', wrap(async (req, res) => {
+  const token = bearerToken(req);
+  if (token) {
+    let payload;
+    try {
+      payload = await verifySession(token);
+    } catch (e) {
+      if (e?.code === 'SESSION_STORE_UNAVAILABLE') {
+        return fail(res, '鉴权依赖暂时不可用，请稍后重试', 503, 503);
+      }
+      /* 已经过期/撤销/无效：退出是幂等的 */
+      return ok(res, { loggedOut: true });
+    }
+    try {
+      await revokeSession(payload.jti);
+    } catch {
+      // 撤销写失败不能报成功：用户会以为会话已经失效。
+      return fail(res, '撤销会话失败，请稍后重试', 503, 503);
+    }
+  }
+  return ok(res, { loggedOut: true });
 }));
 
 export default router;

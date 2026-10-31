@@ -129,7 +129,7 @@ test('表与视图清单被钉住：少建一张或多建一张都要当场现�
     而且日志里一个字都没有。这条断言就是防那一类静默错账。
   */
   const expected = [
-    'audit_logs', 'buyer_blocks', 'buyer_draft_quota', 'buyer_favorites', 'buyer_product_quota', 'dispute_evidence',
+    'audit_logs', 'auth_sessions', 'buyer_blocks', 'buyer_draft_quota', 'buyer_favorites', 'buyer_product_quota', 'dispute_evidence',
     'evidence_files', 'nft_claims', 'node', 'node_staff', 'order_alerts', 'order_chain',
     'order_delivery_claims', 'order_delivery_items', 'order_returns', 'order_shipping',
     'orders', 'payment_tokens', 'product_codes', 'product_nft_tokens', 'product_skus', 'products', 'proxy_drafts',

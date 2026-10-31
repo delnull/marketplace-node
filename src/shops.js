@@ -43,27 +43,20 @@
  * 都没法处理。落实方式：只有**影响未来销售**的动作（上架/改价/码池与 token 池导入、建单）
  * 检查 `assertSellable`，履约类动作一律不检查。
  */
-import config, { DEFAULT_NODE_NAME, resolveNodeDomain } from './config.js';
+import { DEFAULT_NODE_NAME, resolveNodeDomain } from './config.js';
 import { getDb } from './db.js';
 import { isAddress, isZeroAddress } from './chain.js';
 import { tanxinAddressOf } from './tanxin.js';
+import { isShopCodeShape } from './shopCode.js';
 
 /** 店铺句柄的请求头（卖家面的**范围提示**：带了必须指得中；不带则取唯一经营的那家，多店时必须点名——见 http.js） */
 export const SHOP_HEADER = 'x-mk-shop';
 
-/** 店铺编号的形状（9 位；字符集见 shared/shopCode.js——校验位可能落在 -._~, 上） */
-const CODE_SHAPE = /^[0-9A-HJKMNP-TV-Z.\-_~,]{9}$/i;
-
 /**
- * 是不是一个**形状合法**的店铺编号（**唯一实现**：`resolveShopRef` 的句柄形状判据，
- * `isShopCodeShape` 只判形状、不判存在）。
- *
- * 只判形状、不判存在：存在性只有库能回答（`shopRowByCode`）。分成两层是因为两处的失败
- * 语义不同——"抄错了形状"是 400（参数问题），"没有这家店"是 404（事实问题）。
+ * 是不是一个**形状合法**的店铺编号（**唯一实现**：./shopCode.js）。
+ * 只判形状、不判存在；编码/解析入口用 `verifyShopCode`（含校验位）。
  */
-export function isShopCodeShape(v) {
-  return CODE_SHAPE.test(String(v ?? '').trim());
-}
+export { isShopCodeShape };
 
 /* ─────────────────────────── 节点单例（node 表）─────────────────────────── */
 
@@ -286,9 +279,4 @@ export function productSellableSql(alias = '') {
 export function productPublicSql(alias = '') {
   const col = (name) => (alias ? `${alias}.${name}` : name);
   return `${productSellableSql(alias)} AND ${col('shop_code')} IN (SELECT code FROM shops WHERE listed = 1)`;
-}
-
-/** 配置里是否声明了节点身份（只有它决定"能不能开店"这类节点级动作，不是店铺的属性） */
-export function nodeConfigured() {
-  return Boolean(String(config.shop.owner || '').trim());
 }

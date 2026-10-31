@@ -9,11 +9,11 @@
  */
 import { Router } from 'express';
 import { ok, fail, wrap, makeAuthMiddleware } from '../http.js';
-import { verifyToken } from '../auth.js';
+import { verifySession } from '../auth.js';
 import { addBuyerBlock, listBuyerBlocks, removeBuyerBlock } from '../blocks.js';
 
 const router = Router();
-const requireAuth = makeAuthMiddleware(verifyToken);
+const requireAuth = makeAuthMiddleware(verifySession);
 
 router.get('/', requireAuth, wrap(async (req, res) => {
   ok(res, { blocks: await listBuyerBlocks(req.auth.address) });

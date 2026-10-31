@@ -285,6 +285,8 @@ export async function verifySiwe(address, message, signature) {
 /** 清理过期 nonce（登录成功会删当前行，此处兜底防表无限膨胀）。返回清理行数。 */
 export async function cleanupExpiredSiwe(now = new Date()) {
   const { changes } = await getDb().run('DELETE FROM siwe WHERE expires_at < ?', now);
+  // 会话表与 nonce 同一趟清理；revoked 行保留到过期即可，便于审计。
+  await getDb().run('DELETE FROM auth_sessions WHERE expires_at < ?', now);
   return changes;
 }
 
@@ -469,16 +471,34 @@ function signPayload(payloadB64) {
  * 与库里那些 `DATETIME(3)` 列无关——本仓"时间一律 Date"的口径针对的是**进 SQL 列的值**
  * 与**下发的报文**，令牌内部的过期判定是它自己的协议（与 SIWE 消息里的 RFC 3339 文本同理）。
  */
-export function issueToken(address) {
+/**
+ * 令牌受众：链 + 节点 operator + 该节点 Escrow。令牌只在本节点有效；
+ * 两个节点即使复用同一个 `MK_TOKEN_SECRET`，也不会互相认对方的令牌。
+ */
+export function tokenAudience() {
+  return `${config.chain.chainId}:${String(config.shop.owner || '').toLowerCase()}:${String(config.chain.escrowAddress || '').toLowerCase()}`;
+}
+
+export async function issueToken(address) {
+  const exp = Math.floor(Date.now() / 1000) + config.siwe.tokenTtlSeconds;
+  const jti = crypto.randomBytes(32).toString('hex');
   const payload = {
     address: address.toLowerCase(),
-    exp: Math.floor(Date.now() / 1000) + config.siwe.tokenTtlSeconds,
+    exp,
+    aud: tokenAudience(),
+    jti,
   };
+  await getDb().run(
+    'INSERT INTO auth_sessions (jti, address, expires_at) VALUES (?, ?, ?)',
+    jti,
+    address.toLowerCase(),
+    new Date(exp * 1000)
+  );
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
   return `${payloadB64}.${signPayload(payloadB64)}`;
 }
 
-/** 校验令牌；失败抛 Error，成功返回 {address, exp} */
+/** 校验令牌；失败抛 Error，成功返回 {address, exp, aud, jti}。 */
 export function verifyToken(token) {
   const parts = String(token || '').split('.');
   if (parts.length !== 2) throw new Error('令牌格式无效');
@@ -489,6 +509,38 @@ export function verifyToken(token) {
   const b = Buffer.from(expect);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) throw new Error('令牌签名无效');
   const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+  if (!Number.isInteger(payload.exp)) throw new Error('令牌缺少有效期');
   if (payload.exp < Math.floor(Date.now() / 1000)) throw new Error('令牌已过期');
+  if (payload.aud !== tokenAudience()) throw new Error('令牌受众不匹配（不是本节点签发）');
+  if (typeof payload.jti !== 'string' || !/^[0-9a-f]{64}$/.test(payload.jti)) throw new Error('令牌缺少会话标识');
   return payload;
+}
+
+/**
+ * 令牌签名 + **服务端会话**校验。所有鉴权入口都应走这个函数，而不是只调 `verifyToken`：
+ * 退出登录/撤权后 `auth_sessions.revoked_at` 一写，令牌立刻失效，不必等 TTL。
+ */
+export async function verifySession(token) {
+  const payload = verifyToken(token);
+  let row;
+  try {
+    row = await getDb().get('SELECT revoked_at, expires_at FROM auth_sessions WHERE jti = ?', payload.jti);
+  } catch (e) {
+    const err = new Error('鉴权依赖不可用（会话表读取失败）');
+    err.code = 'SESSION_STORE_UNAVAILABLE';
+    err.cause = e;
+    throw err;
+  }
+  if (!row || row.revoked_at) throw new Error('登录会话已撤销，请重新登录');
+  if (row.expires_at.getTime() < Date.now()) throw new Error('登录会话已过期，请重新登录');
+  return payload;
+}
+
+/** 撤销一个会话（退出登录）；幂等。 */
+export async function revokeSession(jti) {
+  if (!/^[0-9a-f]{64}$/.test(String(jti || ''))) return 0;
+  return (await getDb().run(
+    'UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP(3) WHERE jti = ? AND revoked_at IS NULL',
+    String(jti)
+  )).changes;
 }

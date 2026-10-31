@@ -59,9 +59,10 @@ import { ethers } from 'ethers';
 import config from '../config.js';
 import { getDb, withTransaction, abortTx } from '../db.js';
 import { getRates } from '../rates.js';
-import { verifyToken } from '../auth.js';
+import { verifySession } from '../auth.js';
 import { isAddress, isZeroAddress } from '../chain.js';
-import { ok, fail, wrap, makeAuthMiddleware, bearerToken, listedShopScope } from '../http.js';import { productReviews, productReviewSummary } from '../reviews.js';
+import { ok, fail, wrap, makeAuthMiddleware, bearerToken, listedShopScope, simpleRateLimit } from '../http.js';
+import { productReviews, productReviewSummary } from '../reviews.js';
 import { logAudit } from '../audit.js';
 import { notifyRaw } from '../webhook.js';
 import { roleOf, isStaff, isHost } from '../auth.js';
@@ -234,9 +235,15 @@ async function moderateNodeProducts({ req, slugs, hidden, reason, batch = false 
 }
 
 const router = Router();
-const staffOnly = makeAuthMiddleware(verifyToken, { staffOnly: true }); // P1-⑤：商品经营面=店主+店员
-const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true }); // 池清空/敏感资源批量作废=仅店主
-const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true }); // 节点侧强制下架/恢复（节点主∪员工）
+
+/*
+  `/api/products` 是匿名公开面，`q` 用前导 `%...%` 扫 description（无索引）。不限流时
+  一个 IP 就能用并发模糊搜索打满 DB 池；这里给它独立的读预算，并把 cursor 限制在合理范围。
+*/
+const publicProductListLimiter = simpleRateLimit({ windowMs: 60_000, max: 120, message: '商品查询过于频繁，请稍后再试' });
+const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true }); // P1-⑤：商品经营面=店主+店员
+const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true }); // 池清空/敏感资源批量作废=仅店主
+const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true }); // 节点侧强制下架/恢复（节点主∪员工）
 
 /**
  * 卖家面按 slug 取商品行 —— **唯一入口**（取行 + 归属校验 + 写动作的"能不能卖"闸一起做）。
@@ -1116,8 +1123,9 @@ function validateProduct(v) {
  *  调用方据此即可准确判断到底，无需再发一次空请求。 */
 const PRODUCT_KINDS = new Set(['digital', 'physical', 'nft']);
 
-router.get('/', listedShopScope, wrap(async (req, res) => {
+router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res) => {
   const cursor = Math.max(0, parseInt(req.query.cursor, 10) || 0);
+  if (cursor > 100_000) return fail(res, 'cursor 过大：请改用筛选条件缩小范围', 1, 400);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
   const q = String(req.query.q ?? '').trim().slice(0, 60);
   const order = String(req.query.order ?? '').toLowerCase() === 'desc' ? 'desc' : 'asc';
@@ -1952,7 +1960,7 @@ router.get('/:slug', wrap(async (req, res) => {
   let authed = null;
   try {
     const t = bearerToken(req);
-    if (t) authed = verifyToken(t);
+    if (t) authed = await verifySession(t);
   } catch {
     authed = null;
   }
@@ -2266,6 +2274,19 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     // 已建交付池的商品禁止跨类型变更（码池/tokenId 池与 kind 绑定，避免履约语义错乱）；
     // 清空池 = DELETE /api/products/:slug/codes 或 /tokens（ownerOnly，见文件头与对应路由）
     if (merged.kind !== row.kind) {
+      /*
+        在途池订单的计数器必须为 0：`reserved_codes/reserved_tokens` 是"池式商品尚未交付的
+        在途件数"，而释放/恢复触发器带 `p.kind` 条件。改型后旧计数不再被这些触发器触及，
+        计数器会永久漂移（physical 行带着 >0 的 reserved_codes，integrity 恒报，且再切回
+        digital 时永久少一个可卖位）。这是**形状**约束：有在途池需求就不允许改型，而不是
+        在触发器里补 kind 条件（那会允许两套计数器并存）。
+      */
+      const counters = await db.get('SELECT reserved_codes, reserved_tokens FROM products WHERE id = ? FOR UPDATE', row.id);
+      if (Number(counters?.reserved_codes) > 0 || Number(counters?.reserved_tokens) > 0) {
+        return abortTx({
+          fail: '该商品仍有在途池订单（兑换码/NFT 尚未交付），不可变更类型；请等待这些订单交付或取消后再改',
+        });
+      }
       if (row.kind === 'digital') {
         const pool = await db.get('SELECT COUNT(*) AS c FROM product_codes WHERE product_id = ?', row.id);
         if (Number(pool.c) > 0) return abortTx({ fail: '该数字商品已配置兑换码池，不可变更类型；请先清空码池（DELETE /api/products/:slug/codes?confirm=1）' });
@@ -2396,14 +2417,15 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
       */
       const addCommittedSql = 'UPDATE product_skus SET committed = committed + ? WHERE product_id = ? AND sku_key = ?';
       /*
-        补记 hold_qty 时**必须同时清 released_at**（源码审计 2026-09 修复）：该列是
-        「本行已释放」的幂等标记，releaseCore 只处理 released_at IS NULL 的行
-        （stockHold.js）。而 hold_qty=0 ∧ released_at 非空 这一组合是 restockOrder 在
-        「组合当前不限量」分支下**刻意**产生的（占位作废但保留已释放语义）。若此处只补
+        补记 hold_qty 时**必须同时清 released_qty/released_at**（源码审计 2026-09 修复）：
+        `released_qty` 是逐件释放账本，`released_at` 是整单释放时刻；releaseCore 只处理
+        `released_qty < hold_qty` 的行（stockHold.js）。而 hold_qty=0 ∧ released_qty>0 这一组合是
+        restockOrder 在「组合当前不限量」分支下刻意产生的（占位作废但保留已释放语义）。若此处只补
         hold_qty 不清标记，该行将永远无法再被释放：后续取消/退款/超时时 releaseCore 直接跳过，
-        committed 永久虚高 1 件（= 一件货再也卖不出去，且没有任何订单与之对应）。
+        committed 永久虚高（= 一件货再也卖不出去，且没有任何订单与之对应）。
       */
-      const markHeldSql = `UPDATE orders AS o SET hold_qty = quantity, released_at = NULL WHERE o.product_id = ? AND o.sku_key = ? AND o.hold_qty = 0 AND ${IN_FLIGHT}`;
+      const markHeldSql = `UPDATE orders AS o SET hold_qty = quantity, released_qty = 0, released_at = NULL
+        WHERE o.product_id = ? AND o.sku_key = ? AND o.hold_qty = 0 AND ${IN_FLIGHT}`;
       for (const p of plans) {
         if (p.inFlight > 0) {
           await db.run(markHeldSql, row.id, p.key);

@@ -18,7 +18,7 @@
  */
 import { Router } from 'express';
 import { getDb } from '../db.js';
-import { verifyToken, roleOf } from '../auth.js';
+import { verifySession, roleOf } from '../auth.js';
 import { fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
 import { refundUsdtMicroOfRow } from '../stats.js';
 import { sendCsv } from '../csv.js';
@@ -28,7 +28,7 @@ import { INCOME_STATUS as ORDER_INCOME_STATUS } from '../orderStatus.js';
 import { sellerOrderFilters } from '../sellerOrderFilters.js';
 
 const router = Router();
-const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true });
+const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true });
 
 /** 时间单元格：`Date` → ISO-8601；空值 → 空串（"没有这个时刻"） */
 const isoCell = (v) => (v instanceof Date ? v.toISOString() : '');

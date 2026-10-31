@@ -28,7 +28,7 @@
  */
 import { Router } from 'express';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit, bearerToken } from '../http.js';
-import { verifyToken, isHost } from '../auth.js';
+import { verifySession, isHost } from '../auth.js';
 import config from '../config.js';
 import { getDb, withTransaction, abortTx } from '../db.js';
 import { logAudit } from '../audit.js';
@@ -48,8 +48,8 @@ import {
 } from '../shops.js';
 
 const router = Router();
-const requireAuth = makeAuthMiddleware(verifyToken);
-const nodeAdmin = makeAuthMiddleware(verifyToken, { nodeAdmin: true });
+const requireAuth = makeAuthMiddleware(verifySession);
+const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 // 开店申请是免费 SIWE 的写入口：不限流时可用大量地址填满申请队列与库（节点主审核面 DoS）
 const applicationLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '开店申请过于频繁，请稍后再试' });
 
@@ -57,11 +57,11 @@ const applicationLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message:
  * 可选登录：目录公开可读。带令牌时同时用于两件事——
  * 按该钱包在本节点的屏蔽过滤店铺，以及下发它自己的开店状态（`mine`）。
  */
-function optionalBuyer(req) {
+async function optionalBuyer(req) {
   const token = bearerToken(req);
   if (!token) return null;
   try {
-    const payload = verifyToken(token);
+    const payload = await verifySession(token);
     return String(payload?.address || '').toLowerCase() || null;
   } catch {
     return null;
@@ -230,7 +230,7 @@ async function mineAtNode(seller, host) {
 /** 公开：本节点在售店铺列表（`listed = 0` 的店**不进**这个列表——它已经不接单也不该被聚合） */
 router.get('/', wrap(async (req, res) => {
   const nodeAddr = await nodeOwner();
-  const buyer = optionalBuyer(req);
+  const buyer = await optionalBuyer(req);
   let rows = await listListedShopRows();
   const totalListed = rows.length;
   if (buyer) {

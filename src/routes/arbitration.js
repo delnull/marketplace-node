@@ -40,7 +40,7 @@
 import { Router } from 'express';
 import { getDb } from '../db.js';
 import { ok, wrap, simpleRateLimit, bearerToken } from '../http.js';
-import { verifyToken } from '../auth.js';
+import { verifySession } from '../auth.js';
 import { weiToDecimal, isArbiterForOrder } from '../chain.js';
 // 金额展示口径的唯一实现（usdtOf / goodsMicroOf）——不要手写 (micro/1e6).toFixed(2)
 import { goodsMicroOf, usdtOf } from '../money.js';
@@ -79,12 +79,12 @@ const pendingLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '�
  * 逐行判定（见 disputeToPublic）——拿当前届给整页判资格会在换届后把权限判反：
  * 旧届成员仍有这一单的裁决权，新届非该单成员没有。
  */
-function verifiedArbiterAddress(req) {
+async function verifiedArbiterAddress(req) {
   const token = bearerToken(req);
   if (!token) return null;
   let payload;
   try {
-    payload = verifyToken(token);
+    payload = await verifySession(token);
   } catch {
     return null;
   }
@@ -240,7 +240,7 @@ router.get('/pending', pendingLimiter, wrap(async (req, res) => {
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
   const offset = (page - 1) * pageSize;
   const db = getDb();
-  const actor = verifiedArbiterAddress(req);
+  const actor = await verifiedArbiterAddress(req);
   const total = Number((await db.get("SELECT COUNT(*) AS c FROM v_orders WHERE status = 'disputed'")).c);
   const rows = await db.all("SELECT * FROM v_orders WHERE status = 'disputed' ORDER BY updated_at DESC LIMIT ? OFFSET ?", pageSize, offset);
   /*
@@ -276,7 +276,7 @@ router.get('/after-sales', pendingLimiter, wrap(async (req, res) => {
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
   const offset = (page - 1) * pageSize;
   const db = getDb();
-  const actor = verifiedArbiterAddress(req);
+  const actor = await verifiedArbiterAddress(req);
   const total = Number((await db.get(`SELECT COUNT(*) AS c FROM v_orders WHERE ${AFTER_SALE_OPEN_SQL}`)).c);
   const rows = await db.all(`SELECT * FROM v_orders WHERE ${AFTER_SALE_OPEN_SQL} ORDER BY after_sale_opened_at DESC LIMIT ? OFFSET ?`, pageSize, offset);
   ok(res, {

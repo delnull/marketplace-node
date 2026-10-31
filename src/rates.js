@@ -51,7 +51,12 @@ async function fetchJson(url, timeoutMs = 8000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: ctrl.signal, headers: { 'user-agent': UA, accept: 'application/json' } });
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: { 'user-agent': UA, accept: 'application/json' },
+      // 固定官方 ticker 也不跟随重定向：同一类 SSRF 面（跳到内网）不该留第二条路。
+      redirect: 'error',
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   } finally {

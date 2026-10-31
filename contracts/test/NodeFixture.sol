@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {MarketplaceRegistry} from "../src/MarketplaceRegistry.sol";
-import {RuntimeCodeHash} from "../src/RuntimeCodeHash.sol";
+import {ContractCodeHash} from "../src/ContractCodeHash.sol";
 import {Escrow} from "../src/Escrow.sol";
 import {Staking} from "../src/Staking.sol";
 import {TokenPayoutVault} from "../src/TokenPayoutVault.sol";
@@ -53,8 +53,8 @@ abstract contract NodeFixture is Test {
         vm.deal(seller, 1000 ether);
         vm.deal(claimant, 10 ether);
 
-        bytes32 escrowHash = RuntimeCodeHash.ofBytes(vm.getDeployedCode("Escrow.sol:Escrow"));
-        bytes32 stakingHash = RuntimeCodeHash.ofBytes(vm.getDeployedCode("Staking.sol:Staking"));
+        bytes32 escrowHash = ContractCodeHash.ofBytes(vm.getDeployedCode("Escrow.sol:Escrow"));
+        bytes32 stakingHash = ContractCodeHash.ofBytes(vm.getDeployedCode("Staking.sol:Staking"));
         registry = new MarketplaceRegistry(address(this), escrowHash, stakingHash);
 
         vm.startPrank(operator);

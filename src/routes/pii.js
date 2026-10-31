@@ -33,14 +33,14 @@
 import { Router } from 'express';
 import config, { PII_RETENTION_REUSE_MS } from '../config.js';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
-import { verifyToken, roleOf, isHost } from '../auth.js';
+import { verifySession, roleOf, isHost } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { eraseOrderPii, runPiiRetention } from '../piiErase.js';
 import { findOrderInShop } from '../orderScope.js';
 
 const router = Router();
-const ownerOnly = makeAuthMiddleware(verifyToken, { ownerOnly: true });
-const hostOnly = makeAuthMiddleware(verifyToken, { hostOnly: true });
+const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true });
+const hostOnly = makeAuthMiddleware(verifySession, { hostOnly: true });
 
 /** 手动保留期运行的响应里最多回列多少个订单号（防一次 1000 单的响应体把面板撑爆） */
 const MAX_REPORTED_NOS = 50;

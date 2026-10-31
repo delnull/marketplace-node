@@ -8,9 +8,9 @@
  *  - 不存 `origin`/节点主：一台节点多店，按节点主屏蔽会连带隐藏无关店铺，产品上不做。
  */
 import { getDb } from './db.js';
+import { isShopCodeShape } from './shopCode.js';
 
 const ADDRESS_RE = /^0x[0-9a-f]{40}$/;
-const SHOP_CODE_RE = /^[0-9A-HJKMNP-TV-Z]{8}[0-9A-HJKMNP-TV-Z\-._~,]$/;
 
 export function blockDto(row) {
   return {
@@ -75,8 +75,8 @@ export async function addBuyerBlock({ buyer, targetType, target, reason } = {}) 
   let shopCode = null;
   let value;
   if (type === 'shop') {
-    value = raw.toUpperCase();
-    if (!SHOP_CODE_RE.test(value)) return { error: '店铺编号非法' };
+    value = String(raw ?? '').trim().toUpperCase();
+    if (!isShopCodeShape(value)) return { error: '店铺编号非法' };
     const shop = await getDb().get('SELECT code FROM shops WHERE code = ?', value);
     if (!shop) return { error: '本节点没有这家店', notFound: true };
     shopCode = value;

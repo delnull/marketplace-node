@@ -66,13 +66,13 @@ let dropState = 'idle'; // idle → running → done | failed
 export const shopRef = { value: '' };
 
 /**
- * 测试用的店铺编号（9 位 Crockford Base32 形状，与 shared/shopCode.js 的校验一致）。
+ * 测试用的店铺编号（9 位 Crockford Base32 形状，与 node/src/shopCode.js 的校验一致）。
  *
  * **导出是刻意的**：句柄与店铺行必须指同一个编号——用例若自己另编一个编号写进 `shops.code`，
  * 而 `shopRef.value` 还停在旧值上，卖家面请求就会一路 404（"这家店不存在"），
  * 而现象看起来像鉴权坏了。要用别的编号的用例请**同时**改 `shopRef.value`。
  */
-export const TEST_SHOP_CODE = '0000TEST1';
+export const TEST_SHOP_CODE = '0000TEST5';
 
 export async function makeCtx() {
   const owner = Wallet.createRandom();

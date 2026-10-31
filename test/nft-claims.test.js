@@ -101,6 +101,25 @@ const body = (tokenId, over = {}) => ({
   ...over,
 });
 
+test('expired 订单交付过 NFT 仍可提货（releaseExpired 不消灭已交付的提货权）', async () => {
+  const p = await createNftProduct();
+  await request(app)
+    .post(`/api/products/${p.slug}/tokens`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ tokens: ['4'] })
+    .expect(200);
+  const o = await deliverToken(p.slug, '4', buyer2.address);
+  await db.run(
+    "UPDATE orders SET status = 'expired', updated_at = CURRENT_TIMESTAMP(3) WHERE order_no = ?",
+    o.id
+  );
+  currentOwner = buyer2.address.toLowerCase();
+  const res = await submit(buyer2Token, body('4')).expect(200);
+  currentOwner = buyer.address.toLowerCase();
+  assertOk(res);
+  assert.equal(res.body.data.tokenId, '4');
+});
+
 test('提货声明的判据链：未交付的 token 拒绝；非持有人拒绝；未开提货拒绝', async () => {
   const notDelivered = await submit(buyerToken, body('99')).expect(200);
   assert.notEqual(notDelivered.body.code, 0);

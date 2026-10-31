@@ -25,7 +25,7 @@
  *
  * 店铺编号 = 8 位随机数据 + 1 位**加权校验** = **9 字符**（`newShopCode`）：
  *   · 店铺是**节点链下**的事实（平台目录只登记节点），编号由本节点铸造、写入 `shops.code`；
- *   · 校验位的形状契约在 `shared/shopCode.js`（前端在解析 `/shop/<code>` 前用它校验，
+ *   · 校验位的形状契约在 `./shopCode.js`（前端在解析 `/shop/<code>` 前用它校验，
  *     单测 `test/shopCode.test.js` 会拿本函数生成的编号去过那份实现）。本文件只负责**铸造**，
  *     读路径从不解析编号里的任何含义——存在性只有库能回答。
  *
@@ -34,14 +34,12 @@
  * 读路径不得假设"标识一定是这个形状"（形状校验只在这些生成器的输出上成立）。
  */
 import crypto from 'node:crypto';
+import { SHOP_CODE_ALPHABET, encodeShopCodeFromData } from './shopCode.js';
 
 /** Crockford Base32（无 I L O U，避免与 1 0 看混） */
-const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
-/** 校验位的扩展符号（与 shared/shopCode.js 的 SHOP_CODE_EXT 逐字一致） */
-const SHOP_CODE_EXT = '-._~,';
+const ALPHABET = SHOP_CODE_ALPHABET;
 const RE_ORDER = /^B[0-9A-HJKMNP-TV-Z]{20}$/;
 const RE_SLUG = /^P[0-9A-HJKMNP-TV-Z]{10}$/;
-const RE_CLAIM = /^C[0-9A-HJKMNP-TV-Z]{20}$/;
 
 /** 无偏 random 整数（拒绝采样，避免取模引入偏差） */
 function randomInt(max) {
@@ -89,15 +87,11 @@ export function newClaimNo(now = Date.now()) {
  * 新店铺编号：8 位随机数据 + 1 位**加权校验**（`Σ 值×位权(1..8) mod 37`）。
  *
  * 店铺是节点链下的事实，编号由本节点铸造（平台 Registry 不认识"店"）。校验位的算法契约见
- * `shared/shopCode.js`：前端解析 `/shop/<code>` 前要过它，所以本函数**必须产出能通过那份校验**
+ * `./shopCode.js`：前端解析 `/shop/<code>` 前要过它，所以本函数**必须产出能通过那份校验**
  * 的编号——`test/shopCode.test.js` 拿它生成的编号过 shared 的 `verifyShopCode` 守住这条。
  */
 export function newShopCode() {
-  const data = randomChars(8);
-  let sum = 0;
-  for (let i = 0; i < 8; i += 1) sum += ALPHABET.indexOf(data[i]) * (i + 1);
-  const c = sum % 37;
-  return data + (c < 32 ? ALPHABET[c] : SHOP_CODE_EXT[c - 32]);
+  return encodeShopCodeFromData(randomChars(8));
 }
 
 /** 是否新式订单号（仅用于展示层"这是新格式"的判断，不用于校验/拒绝） */
@@ -108,11 +102,6 @@ export function isNewOrderId(v) {
 /** 是否新式商品标识 */
 export function isNewProductSlug(v) {
   return RE_SLUG.test(String(v || ''));
-}
-
-/** 是否新式提货声明号（仅展示层判断） */
-export function isNewClaimNo(v) {
-  return RE_CLAIM.test(String(v || ''));
 }
 
 /**

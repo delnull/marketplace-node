@@ -5,8 +5,9 @@
 import express from 'express';
 import cors from 'cors';
 import config from './config.js';
-import { ok, fail, wrap, isProdLike, clientIp } from './http.js';
+import { ok, fail, wrap, isProdLike, clientIp, simpleRateLimit } from './http.js';
 import { getDb, serverCapabilities } from './db.js';
+import { redisHealth } from './redis.js';
 // 审计哈希链的**只读校验器**（唯一实现，见 auditChain.js）：healthz 只用最近一段窗口，见下方 readAuditChain
 import { verifyAuditChain } from './auditChain.js';
 // 节点叫什么由**节点资料**回答（`node` 单例行的 name/notice，与任何一家店无关）
@@ -271,7 +272,13 @@ export function createApp() {
     原样塞进 `ok(res, {...})`——JSON 序列化把 Promise 变成 `{}`，于是 `/healthz` 永远返回
     一个**看起来正常**的响应（`shops: {}`、`node: {}`），而健康检查照样绿。
   */
-  app.get('/healthz', wrap(async (req, res) => {
+  /*
+    /healthz 是探活，不是免费的全量读数口：它每次都要读库、读 watcher 状态并拼 capabilities。
+    编排/反代每秒一次足够；这里的上限远高于正常探活频率，但能挡住"用探活当免费全量查询"的滥用。
+  */
+  const healthLimiter = simpleRateLimit({ windowMs: 60_000, max: 300, message: '探活请求过于频繁' });
+  app.get('/healthz', healthLimiter, wrap(async (req, res) => {
+    try {
     const shopRows = await listShopRows();
     const node = await nodeRow();
     const owner = nodeOwnerOf(node);
@@ -303,8 +310,18 @@ export function createApp() {
     */
     const watcherStaleMs = Math.max(90_000, Number(config.escrow.pollIntervalMs || 15_000) * 3);
     const watcherStarted = Number(watcher.startedAt) > 0;
+    const watcherLastOk = Number(watcher.lastOkAt || 0);
+    /*
+      首轮扫描可能远超 90 秒（积压时先扫 2000 块再逐单预取）。在还没有任何成功读数时
+      用 startedAt 给一个 4×stale 的宽限，避免 Docker 在首轮进行中反复重启；宽限过后仍无
+      成功读数才算停滞。
+    */
     const watcherStalled =
-      watcher.configured && watcherStarted && Date.now() - Number(watcher.lastOkAt || 0) >= watcherStaleMs;
+      watcher.configured &&
+      watcherStarted &&
+      (watcherLastOk > 0
+        ? Date.now() - watcherLastOk >= watcherStaleMs
+        : Date.now() - Number(watcher.startedAt) >= watcherStaleMs * 4);
     const quarantinedOk = Number(watcher.quarantined) === 0;
     const healthy = !watcherStalled && quarantinedOk;
     if (!healthy) {
@@ -321,6 +338,16 @@ export function createApp() {
         healthy: false,
         reason: why.join('；'),
         watcher,
+        // 503 也要给隔离条数：否则运维只能从 watcher 里猜，node 读数在故障时反而消失。
+        node: node
+          ? {
+              quarantinedEvents: node.quarantined_events && typeof node.quarantined_events === 'object'
+                ? Array.isArray(node.quarantined_events)
+                  ? node.quarantined_events.length
+                  : Object.keys(node.quarantined_events).length
+                : null,
+            }
+          : null,
       });
     }
     ok(res, {
@@ -349,7 +376,11 @@ export function createApp() {
             watcherHash: node.watcher_hash || null,
             reconcileAt: node.reconcile_at ?? null,
             reconcileOrderId: node.reconcile_order_id ?? null,
-            quarantinedEvents: Array.isArray(node.quarantined_events) ? node.quarantined_events.length : null,
+            quarantinedEvents: node.quarantined_events && typeof node.quarantined_events === 'object'
+              ? Array.isArray(node.quarantined_events)
+                ? node.quarantined_events.length
+                : Object.keys(node.quarantined_events).length
+              : null,
             updatedAt: node.updated_at ?? null,
           }
         : null,
@@ -415,8 +446,23 @@ export function createApp() {
           （Docker HEALTHCHECK / deploy.sh / deploy-node.ps1 的 `"code":0`）只认 HTTP 码与顶层 code。
         */
         auditChain: await readAuditChain(),
+        // Redis 是限流/共享缓存的依赖；未配置/掉线只报状态，不把整个节点判死（内存兜底）
+        redis: await redisHealth(),
       },
     });
+    } catch (e) {
+      /*
+        健康端点必须**响亮地**失败：通用 wrap 的约定是“业务失败=HTTP 200 + code!=0”，
+        但探活消费端（Docker HEALTHCHECK / deploy.sh / deploy-node.ps1）会把 200 当健康。
+        读库/RPC/审计链任一 await 抛错时，这里直接 503 + code!=0，不让“节点死了”显示成绿色。
+      */
+      console.error(`[healthz] 健康读数读取失败：${e?.stack || e?.message || e}`);
+      res.status(503);
+      return fail(res, '节点不健康：健康读数读取失败（数据库或依赖不可用）', 1, 503, {
+        healthy: false,
+        reason: '健康读数读取失败（数据库或依赖不可用）',
+      });
+    }
   }));
 
   app.use('/api/auth', authRouter);

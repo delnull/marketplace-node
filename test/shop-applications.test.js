@@ -42,7 +42,7 @@ test('通过开店申请：建店 + 分配编号 + 申请人立即可用', async
   /*
     编号形状：8 位数据 + 1 位校验，校验位可以是扩展符号 `-._~,`（对应校验值 32..36）。
     这里曾经只收数据字母表，13% 的合法编号会被判成"形状不对"——随机通过的假绿比失败更难查。
-    完整校验（形状 + 加权和）的唯一实现在 shared/shopCode.js，由 test/shopCode.test.js 对拍。
+    完整校验（形状 + 加权和）的唯一实现在 node/src/shopCode.js，由 test/shopCode.test.js 对拍。
   */
   assert.match(code, /^[0-9A-HJKMNP-TV-Z._~,-]{9}$/i);
 
