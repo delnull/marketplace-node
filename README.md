@@ -52,8 +52,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/mai
 3. **是否使用你自己的 MySQL**：
    - 有：输入地址（`host` 或 `host:port`）、库名、用户名、密码；
    - 没有：脚本自动创建 `mysql:8.4` 容器、命名数据卷和独立网络。
+4. **Redis 地址**（必填）：`--redis-url redis://[:密码@]主机:6379/0`，或先 `export MK_REDIS_URL=…`。
 
-不需要先 clone；但首次安装必须给上面三项（或先 clone 再改 `deploy-constants.json`）。想改代码或离线审阅时才用：
+不需要先 clone；但首次安装必须给上面四项（或先 clone 再改 `deploy-constants.json`）。想改代码或离线审阅时才用：
 
 ```bash
 git clone https://github.com/delnull/marketplace-node.git && cd marketplace-node && bash deploy.sh
@@ -68,7 +69,8 @@ MK_DB_PASSWORD='你的密码' bash <(curl -fsSL https://raw.githubusercontent.co
   --escrow 0x你的Escrow --staking 0x你的Staking --start-block <Escrow 的部署块高> \
   --owner 0x你的节点主钱包 --domain shop.example.com --email you@example.com \
   --db-mode external --db-host db.example.com --db-port 3306 \
-  --db-name marketplace_node --db-user marketplace_node --yes
+  --db-name marketplace_node --db-user marketplace_node \
+  --redis-url 'redis://:你的Redis密码@redis.example.com:6379/0' --yes
 ```
 
 由脚本部署 MySQL：
@@ -77,7 +79,7 @@ MK_DB_PASSWORD='你的密码' bash <(curl -fsSL https://raw.githubusercontent.co
 bash <(curl -fsSL https://raw.githubusercontent.com/delnull/marketplace-node/main/install.sh) \
   --escrow 0x你的Escrow --staking 0x你的Staking --start-block <Escrow 的部署块高> \
   --owner 0x你的节点主钱包 --domain shop.example.com --email you@example.com \
-  --db-mode container --yes
+  --db-mode container --redis-url 'redis://:你的Redis密码@redis.example.com:6379/0' --yes
 ```
 
 密码优先用 `MK_DB_PASSWORD` 环境变量传，不要写进命令行历史。

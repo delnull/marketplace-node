@@ -34,6 +34,7 @@
 #      -Bind 0.0.0.0           监听地址（配了本机 TLS 默认 127.0.0.1；证书在别处时默认 0.0.0.0）
 #      -Dir C:\marketplace-node   代码/配置/数据/日志所在目录
 #      -Service marketplace-node  计划任务名与数据目录名（同机开第二家店必须换）
+#      -RedisUrl redis://:密码@主机:6379/0   外部 Redis（必填；也可先写 MK_REDIS_URL）
 #      -NodeVersion 24.21.0    没有 Node 时要装的版本（默认取常量里的 24 线）
 #      -Mirror https://npmmirror.com/mirrors/node   国内下载 Node 的镜像（默认走官方 nodejs.org）
 # =============================================================================
@@ -55,6 +56,7 @@ param(
   [string]$Bind = '',
   [string]$Dir = '',
   [string]$Service = '',
+  [string]$RedisUrl = '',
   [ValidateSet('caddy', 'none', '')][string]$TlsMode = '',
 
   # 没有 Node 时才用到
@@ -308,14 +310,14 @@ function Write-EnvFile {
     这条直接在进程环境里给）——否则同一家店在两种宿主上行为不同，而差异是静默的。
     沿用规则也一致：已存在的 MK_TOKEN_SECRET 与店主自加的键原样保留（重跑不该让店主登录态失效）。
   #>
-  param([string]$OwnerAddr, [string]$DomainName, [string]$Secret)
+  param([string]$OwnerAddr, [string]$DomainName, [string]$Secret, [string]$Redis)
 
   $MANAGED = @(
     'MK_PORT', 'MK_SHOP_OWNER', 'MK_RPC_URL', 'MK_CHAIN_ID', 'MK_ESCROW_ADDRESS',
     'MK_STAKING_ADDRESS', 'MK_ESCROW_START_BLOCK', 'MK_ESCROW_TIMEOUT_BLOCKS', 'MK_ESCROW_FINALITY_BLOCKS', 'MK_ESCROW_POLL_MS',
     'MK_CHAIN_RECONCILE_MS', 'MK_CORS_ORIGIN', 'MK_CORS_ALLOW_ALL', 'MK_ATTACH_DIR',
     'MK_AUTO_DELIVER', 'MK_PII_RETENTION_DAYS', 'MK_BTY_TTL_MS', 'MK_DRAFT_TTL_MINUTES', 'MK_REVIEW_TTL_DAYS',
-    'MK_TOKEN_TTL', 'MK_SIWE_TTL', 'MK_TOKEN_SECRET', 'MK_SIWE_DOMAIN'
+    'MK_TOKEN_TTL', 'MK_SIWE_TTL', 'MK_TOKEN_SECRET', 'MK_SIWE_DOMAIN', 'MK_REDIS_URL'
   )
   $extra = @()
   if (Test-Path -LiteralPath $ENV_FILE) {
@@ -368,6 +370,7 @@ function Write-EnvFile {
     "MK_SIWE_TTL=$($C.appDefaults.MK_SIWE_TTL)"
     "MK_TOKEN_SECRET=$Secret"
     "MK_SIWE_DOMAIN=$DomainName"
+    "MK_REDIS_URL=$Redis"
   )
   if ($extra.Count -gt 0) {
     $lines += ''
@@ -597,7 +600,10 @@ if ($secret.Length -lt 32) {
 } else {
   Write-Ok '沿用已有 MK_TOKEN_SECRET（店主登录态不失效）'
 }
-Write-EnvFile -OwnerAddr $Owner -DomainName $Domain -Secret $secret
+# Redis 是硬依赖：升级沿用已有 .env；首次必须显式传 --RedisUrl 或先写 MK_REDIS_URL。
+if (-not $RedisUrl) { $RedisUrl = Read-EnvValue -Path $ENV_FILE -Key 'MK_REDIS_URL' }
+if (-not $RedisUrl) { throw 'Redis 是节点必需依赖：请加 --RedisUrl redis://[:密码@]主机:6379/0（或先写 MK_REDIS_URL）' }
+Write-EnvFile -OwnerAddr $Owner -DomainName $Domain -Secret $secret -Redis $RedisUrl
 
 # =============================================================================
 # ⑤ 装依赖

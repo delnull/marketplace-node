@@ -31,7 +31,11 @@ export async function getRedis() {
   _connecting = (async () => {
     let c;
     try {
-      c = createClient({ url: config.redisUrl });
+      c = createClient({
+        url: config.redisUrl,
+        // 启动/请求都不能挂在无限重连上：连不上就失败，由 startup/健康检查 loud 地报出来。
+        socket: { connectTimeout: 3_000, reconnectStrategy: false },
+      });
     } catch (e) {
       throw new Error(`Redis 客户端创建失败：${e?.message || e}`);
     }

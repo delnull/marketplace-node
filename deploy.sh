@@ -53,6 +53,8 @@
 #      --db-container NAME               内置 MySQL 容器名（默认 <service>-mysql）
 #      --db-volume NAME                  内置 MySQL 数据卷（默认 <service>-mysql-data）
 #      --db-image IMAGE                  内置 MySQL 镜像（默认 mysql:8.4）
+#      --redis-url URL                   外部 Redis（必填；如 redis://:密码@主机:6379/0，
+#                                        也可用 MK_REDIS_URL 环境变量传，避免密码进 history）
 #      --image marketplace-node:latest   镜像名:标签
 #      --escrow 0x… --staking 0x… --start-block N
 #                                         本节点 Escrow / Staking / 起始扫描块；不填则读 deploy-constants.json
@@ -252,6 +254,7 @@ ESCROW_ARG=''; STAKING_ARG=''; START_BLOCK_ARG=''
 DB_MODE=''; DB_MODE_GIVEN=0
 DB_HOST_VALUE=''; DB_PORT_VALUE=''; DB_NAME=''; DB_USER=''; DB_PASSWORD=''
 DB_CONTAINER=''; DB_VOLUME=''; DB_IMAGE=''; DB_ROOT_PASSWORD=''
+REDIS_URL_VALUE="${MK_REDIS_URL:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -283,6 +286,8 @@ while [ $# -gt 0 ]; do
     --db-container) DB_CONTAINER="${2:-}"; shift 2 ;;
     --db-volume) DB_VOLUME="${2:-}"; shift 2 ;;
     --db-image) DB_IMAGE="${2:-}"; shift 2 ;;
+    # Redis 是节点硬依赖：外部 Redis 的 URL（密码不要出现在命令行历史里，优先用 MK_REDIS_URL）
+    --redis-url) REDIS_URL_VALUE="${2:-}"; shift 2 ;;
     --pull) PULL=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
@@ -1055,9 +1060,17 @@ fi
 step "③ 写配置（$ENV_FILE）"
 umask 077
 resolve_db_config
+# Redis 是硬依赖：升级时沿用已有 .env 的 URL；首次必须显式给 --redis-url 或 MK_REDIS_URL。
+if [ -z "$REDIS_URL_VALUE" ] && [ -f "$ENV_FILE" ]; then
+  REDIS_URL_VALUE="$(env_val MK_REDIS_URL)"
+fi
+if [ -z "$REDIS_URL_VALUE" ] && [ "$TTY" = 1 ] && [ "${ASSUME_YES:-0}" != 1 ]; then
+  REDIS_URL_VALUE="$(ask '  > ' '' 'Redis 地址（必填，redis://[:密码@]主机:6379/0）')"
+fi
+[ -n "$REDIS_URL_VALUE" ] || die "Redis 是节点必需依赖：请加 --redis-url redis://[:密码@]主机:6379/0（或先 export MK_REDIS_URL）"
 DATA_MOUNT='/data'
 KEEP_EXTRA=''
-MANAGED_KEYS='MK_PORT MK_SHOP_OWNER MK_RPC_URL MK_CHAIN_ID MK_ESCROW_ADDRESS MK_STAKING_ADDRESS MK_ESCROW_START_BLOCK MK_ESCROW_TIMEOUT_BLOCKS MK_ESCROW_FINALITY_BLOCKS MK_ESCROW_POLL_MS MK_CHAIN_RECONCILE_MS MK_CORS_ORIGIN MK_CORS_ALLOW_ALL MK_ATTACH_DIR MK_AUTO_DELIVER MK_PII_RETENTION_DAYS MK_BTY_TTL_MS MK_DRAFT_TTL_MINUTES MK_REVIEW_TTL_DAYS MK_TOKEN_TTL MK_SIWE_TTL MK_TOKEN_SECRET MK_SIWE_DOMAIN MK_DB_HOST MK_DB_PORT MK_DB_NAME MK_DB_USER MK_DB_PASSWORD'
+MANAGED_KEYS='MK_PORT MK_SHOP_OWNER MK_RPC_URL MK_CHAIN_ID MK_ESCROW_ADDRESS MK_STAKING_ADDRESS MK_ESCROW_START_BLOCK MK_ESCROW_TIMEOUT_BLOCKS MK_ESCROW_FINALITY_BLOCKS MK_ESCROW_POLL_MS MK_CHAIN_RECONCILE_MS MK_CORS_ORIGIN MK_CORS_ALLOW_ALL MK_ATTACH_DIR MK_AUTO_DELIVER MK_PII_RETENTION_DAYS MK_BTY_TTL_MS MK_DRAFT_TTL_MINUTES MK_REVIEW_TTL_DAYS MK_TOKEN_TTL MK_SIWE_TTL MK_TOKEN_SECRET MK_SIWE_DOMAIN MK_DB_HOST MK_DB_PORT MK_DB_NAME MK_DB_USER MK_DB_PASSWORD MK_REDIS_URL'
 if [ -f "$ENV_FILE" ]; then
   KEEP_SECRET="$(env_val MK_TOKEN_SECRET)"
   cp -a "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
@@ -1127,6 +1140,8 @@ MK_TOKEN_TTL=$(constN MK_TOKEN_TTL)
 MK_SIWE_TTL=$(constN MK_SIWE_TTL)
 MK_TOKEN_SECRET=$KEEP_SECRET
 MK_SIWE_DOMAIN=$DOMAIN
+# Redis：节点启动时必连；容器内 127.0.0.1 指容器自己，外部 Redis 请填可达的主机名/IP。
+MK_REDIS_URL=$REDIS_URL_VALUE
 EOF
 # 数据库五项单独用 printf 写：密码可能含 $、反引号、反斜杠，不能经过 here-doc 展开。
 {
