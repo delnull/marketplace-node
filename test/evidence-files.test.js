@@ -200,11 +200,10 @@ test('仲裁阶段附件：仲裁人（disputed 单）可下载；争议外不�
     .expect(404);
 });
 
-test('换届后：旧届成员仍能读该单详情/附件；新届非该单成员不能（订单级届次快照）', async () => {
+test('换届后：旧成员立即失去该单详情/附件权限；当前委员会成员可以处理旧单', async () => {
   /*
-    2026-10-18：裁决资格从"当前届"改为"**该单落定届**"（争议发起时快照）。
-    旧实现拿当前届给所有单判资格，换届后旧成员打不开正在处理的争议（详情证据/附件全断），
-    而新成员能读到自己根本裁不了的单。这里用注入 reader 的 `orderId` 参数模拟两届同时存在。
+    2026-10：裁决资格只认**当前委员会名单**，不再按订单快照届次。
+    旧成员在换届后不能再读证据/拿本地句柄；当前成员即使没参与开案，也能处理旧单。
   */
   const oldArbiter = Wallet.createRandom();
   const newArbiter = Wallet.createRandom();
@@ -223,44 +222,41 @@ test('换届后：旧届成员仍能读该单详情/附件；新届非该单成�
   const fileId = (await db.get('SELECT id FROM evidence_files WHERE evidence_id = ?', evId)).id;
 
   const historical = String(order.escrowOrderId).toLowerCase();
-  setCommitteeReader(async (orderId) =>
-    orderId === historical
-      ? { arbiters: [oldArbiter.address.toLowerCase()], threshold: 1, epoch: 1 }
-      : { arbiters: [newArbiter.address.toLowerCase()], threshold: 1, epoch: 2 }
-  );
+  // 当前名单只有新成员；旧成员已不在名单
+  setCommitteeReader(async () => ({ arbiters: [newArbiter.address.toLowerCase()], threshold: 1, epoch: 2 }));
   try {
-    // 旧届成员：详情里能看到陈述/附件元数据，附件可下载
+    // 旧成员：详情不开放证据，附件统一 404，仲裁队列不提供本地句柄
     const oldDetail = await request(app)
       .get(`/api/orders/${order.id}`)
       .set('Authorization', `Bearer ${oldToken}`).set('X-Mk-Shop', shopRef.value)
       .expect(200);
     assertOk(oldDetail);
-    assert.ok(oldDetail.body.data.evidence?.some((e) => e.id === evId), '旧届成员必须仍能读这一单的陈述');
+    assert.equal(oldDetail.body.data.evidence, undefined, '旧成员拿不到陈述');
     await request(app)
       .get(`/api/orders/${order.id}/evidence/${evId}/files/${fileId}`)
       .set('Authorization', `Bearer ${oldToken}`).set('X-Mk-Shop', shopRef.value)
-      .expect(200);
+      .expect(404);
 
-    // 新届非该单成员：详情不开放证据，附件统一 404
+    // 当前成员：详情能看到陈述/附件元数据，附件可下载
     const newDetail = await request(app)
       .get(`/api/orders/${order.id}`)
       .set('Authorization', `Bearer ${newToken}`).set('X-Mk-Shop', shopRef.value)
       .expect(200);
     assertOk(newDetail);
-    assert.equal(newDetail.body.data.evidence, undefined, '新届非该单成员拿不到陈述');
+    assert.ok(newDetail.body.data.evidence?.some((e) => e.id === evId), '当前成员必须能读这一单的陈述');
     await request(app)
       .get(`/api/orders/${order.id}/evidence/${evId}/files/${fileId}`)
       .set('Authorization', `Bearer ${newToken}`).set('X-Mk-Shop', shopRef.value)
-      .expect(404);
+      .expect(200);
 
-    // 仲裁列表的 orderNo 也按**每单**判：旧届拿得到，新届拿不到
+    // 仲裁列表的 orderNo 按当前委员会判：新成员拿得到，旧成员拿不到
     const listOld = await request(app).get('/api/arbitration/pending?pageSize=100').set('Authorization', `Bearer ${oldToken}`).expect(200);
     const rowOld = listOld.body.data.disputes.find((r) => String(r.escrowOrderId).toLowerCase() === historical);
     assert.ok(rowOld, '前置：这一单在待仲裁队列里');
-    assert.equal(rowOld.orderNo, order.id, '旧届成员应拿到这一单的本地句柄');
+    assert.equal(rowOld.orderNo, null, '旧成员不是当前委员会成员，不应拿到本地句柄');
     const listNew = await request(app).get('/api/arbitration/pending?pageSize=100').set('Authorization', `Bearer ${newToken}`).expect(200);
     const rowNew = listNew.body.data.disputes.find((r) => String(r.escrowOrderId).toLowerCase() === historical);
-    assert.equal(rowNew.orderNo, null, '新届非该单成员的令牌不是这一单的句柄凭证');
+    assert.equal(rowNew.orderNo, order.id, '当前委员会成员应拿到这一单的本地句柄');
   } finally {
     // 恢复本文件其余用例的当前届注入
     setCommitteeReader(async () => ({ arbiters: [arbiter.address.toLowerCase()], threshold: 1, epoch: 1 }));

@@ -620,8 +620,8 @@ export function invalidateCommitteeCache() {
  * 测试注入点：让单测不起假 JSON-RPC 也能验证"读不到/读到"的分支。
  * 生产路径永远是链上读取；注入点只替换**取值**，判据与控制流仍是被测代码。
  *
- * 注入函数可选接收 `orderId`：不传 = 读当前届（`getCommittee`），传了 = 读**该单落定届**的成员
- * （`committeeForOrder`）。现有调用方忽略参数即可。
+ * 注入函数只返回**当前委员会**读数（没有按单届次参数）；`committeeForOrder` 与
+ * `getCommittee` 消费同一份。
  */
 let _committeeReader = null;
 export function setCommitteeReader(reader) {

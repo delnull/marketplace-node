@@ -75,9 +75,8 @@ const pendingLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '�
  * 但 `orderNo` 是**本地可继续探测的句柄**（时间前缀 + 50 bit 随机段，拿到它就能试
  * `/api/orders/:orderNo` 的详情面），它不是链上事实，只该给真正处理**这一单**的人。
  *
- * 注意这里只回答"令牌是谁"；"他能不能处理**这一行**"由 `isArbiterForOrder` 按**该单落定届**
- * 逐行判定（见 disputeToPublic）——拿当前届给整页判资格会在换届后把权限判反：
- * 旧届成员仍有这一单的裁决权，新届非该单成员没有。
+ * 注意这里只回答"令牌是谁"；"他能不能处理**这一行**"由 `isArbiterForOrder` 按**当前委员会名单**
+ * 逐行判定（见 disputeToPublic）——换届后旧成员立即失去资格，当前成员可以处理旧单。
  */
 async function verifiedArbiterAddress(req) {
   const token = bearerToken(req);
@@ -96,7 +95,7 @@ async function verifiedArbiterAddress(req) {
  * 字段口径必须一致，否则仲裁台的两份数据面会各长一套名字（见文件头"为什么独立路由"）。
  * @param {object} o `v_orders` 行
  * @param {'dispute'|'after_sale'} kind 判别位
- * @param {{actor?: string|null}} [opts] `actor` = 已确证令牌地址；**逐行**按该单落定届判资格
+ * @param {{actor?: string|null}} [opts] `actor` = 已确证令牌地址；**逐行**按当前委员会判资格
  * @returns {Promise<object>}
  */
 async function disputeToPublic(o, kind = 'dispute', { actor = null } = {}) {
@@ -124,8 +123,8 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null } = {}) {
       **但 orderNo 只给有权处理这一单的仲裁人**（`null` = 这一行不提供本地句柄）：
       它是"时间前缀 + 50 bit 随机段"的本地句柄，拿到它就可以继续探测详情面；
       匿名队列只需要链上事实（下面那些字段），不需要它。非 null 时仲裁台才能打开详情。
-      判据是 `isArbiterForOrder(actor, escrowOrderId)`——**这一单落定届**的成员，不是当前届：
-      换届后旧届成员仍要有句柄去处理在途争议，新届非该单成员不该拿到。
+      判据是 `isArbiterForOrder(actor, escrowOrderId)`——**当前委员会名单**，不是任何按单快照：
+      换届后旧成员不能再拿到句柄，当前成员可以处理旧单。
       拿不到链上订单键（`escrow_order_id` 为空）的行：**不下发** orderNo（没有订单键就无法
       回答"这一单是谁的"；按当前届给一个句柄就是把"本地可探测面"交给不该看的人）。
       代价如实写明：匿名轮询仍能拿到金额/双方地址（链上公开），但拿不到可探测的句柄；
