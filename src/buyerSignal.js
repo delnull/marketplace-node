@@ -1,0 +1,247 @@
+/**
+ * 买家履约信号（**本店视角**，ownerOnly 只读）——`GET /api/shop/buyer-signal?address=0x…`。
+ *
+ * 回答的问题只有一个：**这个买家在本店的历史长什么样**（成交/确认/退款/争议/超时释放的分布），
+ * 好让店主在面对一笔新订单时有一条可查的线索。它**不是**跨店信用分，也**不是**判定。
+ *
+ * 三条边界，写在这里免得被"顺手扩展"改掉：
+ *  1. **只做本店视角**：节点只数自己镜像的订单，绝不拿一个地址去联邦其它节点查询。
+ *     别人的顾客数据不在本店的数据面上；"替卖家打听这个人在别家怎么样"正是隐私面。
+ *     所以响应里给的是 `scope: 'this_shop_only'`，note 里也把这句话说给店主听。
+ *  2. **口径必须可独立复算**：每个计数都对应一个**链上事实**，第三方扫链即可复算——
+ *     `settledToSeller` ← `getOrder.status ∈ Settled`（本地 confirmed/settled/expired）；
+ *     `refundedToBuyer` ← `getOrder.refundedAmount > 0`（本地 refunded_amount_wei）；
+ *     `disputed` / `expiredReleased` ← `DisputeRequested` / `OrderExpiredReleased` 日志
+ *     （本地事件镜像 onchain_events，最权威的是当前状态本身）；
+ *     `afterSaleOpen/Closed` ← `afterSaleOpenedAtBlock != 0` / 已结案；
+ *     `refundRequested` ← `RefundRequested` 日志（本地耐久痕迹 refund_requested_at）。
+ *  3. **三态纪律**：读不到的单**单列**（`unverified`），既不进分子分母、也不当作"没有发生"；
+ *     小样本（默认 < 3 张成交单）时比率一律 `null` 而不是 0——"1 张单 1 次退款"读出来是 100%，
+ *     那是指数级的误导。
+ *
+ * 为什么**不**复用 `/api/shop/reputation` 的 `computeReputation`：那是**按事件发生次数**、
+ * 且只统计"事件史里有 OrderCreated"的单（为了不让分子脱离分母而整单跳过，见 reputation.js）。
+ * 买家信号要回答的是"这个人在本店一共成交几单、退过几单"，用事件计数会：
+ *   · 把**没有事件镜像**的单整张丢掉（那是"读不到"，应当单列而不是消失）；
+ *   · 把"一次退款"与"一次争议"混成同一类事件计数（这里要的是**每单恰好计一次**的分布）。
+ * 所以这里用**列口径**（本地镜像自己的真值，逐项对应链上 getOrder/事件），只借用 reputation.js
+ * 的 `parseOnchainEvents`（事件 JSON 的唯一解析入口）读两处"历史事实"。
+ *
+ * 响应形状的另一端（前端）：`frontend/src/types.ts` 的 `BuyerSignal` 与
+ * `frontend/src/utils/buyerSignal.ts`（不提供 ≠ 0、小样本不出比率、限定语只有一份）。
+ *
+ * 文案纪律（本仓硬要求）：这是**可疑信号，不是结论**。所以响应里只有计数与比率，
+ * 没有一个判定词，也不提供"是否拉黑"这类结论字段；解读的责任在店主，判断的依据是订单明细。
+ */
+import { getDb } from './db.js';
+import { INCOME_STATUS } from './orderStatus.js';
+import { rowEverDisputed } from './orderFacts.js';
+import { parseOnchainEvents } from './reputation.js';
+
+/**
+ * 比率的最小样本量（不足则比率置 null）。
+ * 3 是"至少有两张单可以互相对照"的下限；样本量本身（`sample`）随响应下发，
+ * 前端的展示阈值必须读它（两处不一致会出现"服务端给了数、界面说样本不足"）。
+ */
+export const SIGNAL_MIN_SAMPLES = 3;
+
+/** 比率：分母 0 → null；4 位小数（与履约画像同款，防浮点尾巴） */
+const ratio = (num, den) => (den > 0 ? Math.round((num / den) * 10000) / 10000 : null);
+
+/**
+ * 该单是否退过钱给买家（`refunded_amount_wei - claim_paid_wei > 0`；含全额与部分/仲裁拆分）。
+ * 提货赔付的 claimant 不一定是买家，不能把 claim_paid_wei 算成买家退款。
+ * 列是 `DECIMAL(38,0)` ⇒ 驱动给**字符串**，一律 BigInt；
+ * NULL（没有链上镜像行）按 0 处理——进得了样本的单必然有那一行。
+ */
+function hasRefundedToBuyer(row) {
+  try {
+    const total = BigInt(row?.refunded_amount_wei || '0');
+    const claim = BigInt(row?.claim_paid_wei || '0');
+    return total - claim > 0n;
+  } catch {
+    return false; // 脏值不当成"退过款"（宁可低报，也不凭空指控一次退款）
+  }
+}
+
+/**
+ * 纯函数：给定**该买家的全部订单行**（orders 行）→ 履约信号（不触链、不查库，可单测）。
+ *
+ * **样本**（比率的分子分母同源，这是本仓反复强调的那条纪律）= 该买家在本店**真实发生过托管**
+ * 的订单，判据是 `paid_tx_hash` 非空（支付凭证不变量：escrowed 及以上必有凭证，见 routes/orders.js
+ * 文件头）。刻意**不用** `escrow_order_id`：那一列在**下单草稿**时就已生成（orderId 随草稿落库），
+ * 拿它当"成交"会把一堆从未付款的草稿算进分母——"5 张单 0 次履约"就会看起来像履约记录。
+ *
+ * @param {Array<object>} rows 该买家在**本店**的订单行（读模型 `v_orders`）
+ * @param {{address?: string, seller?: string|null, minSamples?: number, now?: number}} opts
+ *        `seller` = 本店店主地址（端点解析出来的那一个）：只用于响应里的 `shopOwner`，
+ *        不参与判据——`seller === null` 表示"该节点全部店铺的合计"（节点级读数）。
+ */
+export function computeBuyerSignal(rows, { address, seller = null, minSamples = SIGNAL_MIN_SAMPLES, now = Date.now() } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const addr = String(address || '').toLowerCase();
+  const min = Number.isFinite(Number(minSamples)) && Number(minSamples) > 0 ? Math.floor(Number(minSamples)) : SIGNAL_MIN_SAMPLES;
+
+  let localOrders = 0;
+  let sample = 0;
+  let unverified = 0;
+  let settledToSeller = 0;
+  let refundedBuyer = 0;
+  let disputed = 0;
+  let expiredReleased = 0;
+  let confirmed = 0;
+  let refundRequested = 0;
+  let afterSaleOpen = 0;
+  let afterSaleClosed = 0;
+  for (const r of list) {
+    localOrders += 1;
+    if (!r?.paid_tx_hash) continue; // 未付款（草稿/已取消）：没有履约可谈，不进样本
+    sample += 1;
+    const status = String(r?.status || '');
+    // ① 钱判给店主（链上 Settled）：确认收货 / 仲裁判卖家 / 超时释放 / 双方和解
+    if (INCOME_STATUS.includes(status)) settledToSeller += 1;
+    // ② 钱退给买家（链上 refundedAmount > 0，含部分退款与拆分裁决）
+    if (hasRefundedToBuyer(r)) refundedBuyer += 1;
+    // ③ 买家自己确认过收货（链上 ReceiptConfirmed → 本地 confirmed 是它唯一的来源）
+    if (status === 'confirmed') confirmed += 1;
+    // ④ 超时释放：本地 expired 只由 OrderExpiredReleased 回写；事件史里再兜一次（漏扫后被 /sync 收敛成 settled 的单）
+    const events = parseOnchainEvents(r?.onchain_events);
+    const hasEvent = (name) => events.some((e) => e && e.name === name);
+    if (status === 'expired' || hasEvent('OrderExpiredReleased')) expiredReleased += 1;
+    // ⑤ 曾进入争议：**唯一判据** `orderFacts.rowEverDisputed`（状态 ∨ DisputeRequested ∨ Arbitrated）——
+    // 与公开履约画像共用同一份实现（此前两边各写一遍且判据不同：一边只看事件，于是被 /sync
+    // 修好的争议读成 0，而这边读出 7；同一批单两个答案）
+    if (rowEverDisputed(r, events)) disputed += 1;
+    /*
+      ⑤ 的"读不到"单独计数：本单**已终局**（钱已判走）却**没有 OrderCreated 镜像**
+      （paid 与 watcher 两条路径都会补写它：没有它，这一单在本地的链上过程就无从复算）——
+      它到底有没有争议过 / 超时释放过，本地没有可复算的痕迹。这类单不进分子，也不当作"从没发生过"。
+      在途单（escrowed/shipped）排除在外：链上还在 Created 的单不可能已经争议过
+      （合约不允许从争议退回 Created）。
+      2026-10-15 修一处判据与说明不一致：旧实现把它写成 `else if`，挂在"争议"那一支后面 ⇒
+      **有争议、又恰好丢了镜像的单**被判成"已验证"，而本字段的说明写着"已终局却没有镜像的单数"。
+      镜像缺失与争议史是**两件独立的事**，各自计数（缺失这件事不会因为"反正知道它争过"而消失）。
+    */
+    if (!hasEvent('OrderCreated') && status !== 'escrowed' && status !== 'shipped') unverified += 1;
+    /*
+      ⑥ 提出过退款申请：取**耐久痕迹** `refund_requested_at`（而不是数 RefundRequested 事件）——
+      终局迁移会复位 refund_status，却刻意保留这一列时刻（见 escrowWatcher 的两级售后分支），
+      所以它比"事件史里还有没有那条事件"更可靠（事件史只保留最近 20 条，会被挤掉）。
+      列是 `DATETIME(3)`（`Date` 或 NULL，见 db.js 的三层时间口径），所以判据是"有没有这个时刻"，
+      不再与 0 比大小——`Number(Date)` 会得到毫秒数而**恰好**能比，但那让"NULL 被当成 0"
+      这一档悄悄溜过去（NULL → `Number(null)` = 0 → 判成"没申请过"）。
+    */
+    if (r?.refund_requested_at != null || String(r?.refund_status) === 'requested') refundRequested += 1;
+    // ⑦ 售后案件（本地列状态；案件是叠加在终局之上的第二层，不动 orders.status）
+    const as = String(r?.after_sale_status || 'none');
+    if (as === 'open') afterSaleOpen += 1;
+    else if (as === 'closed') afterSaleClosed += 1;
+  }
+
+  const enough = sample >= min;
+  const rate = (n) => (enough ? ratio(n, sample) : null);
+  return {
+    // ===== 前端契约字段（frontend/src/types.ts 的 BuyerSignal）=====
+    /*
+      ⚠️ 这里**没有** `available` 字段（2026-10-15 删）：本读数全部来自本地镜像，对合法地址
+      **恒可读**，所以"不提供"这个状态不存在——旧实现恒下发 `available: true`，而前端按它分了一条
+      `kind:'unavailable'` 的死分支，读起来像真的（后来者会以为能用它表达"这家店没开这个索引"）。
+      真正会发生的三种情形各有表达：请求失败 ⇒ 载荷为空；确实没有成交 ⇒ `sample: 0`；
+      某单的链上过程复算不出 ⇒ `unverified`（见下）。
+    */
+    note: enough
+      ? `样本 ${sample} 单（本店与该买家的订单共 ${localOrders} 张，其中真实发生托管的 ${sample} 张）：比率以它为分母。`
+      : `本店与该买家共 ${localOrders} 张订单，其中真实发生托管的只有 ${sample} 张，不足 ${min} 张：` +
+        '比率一律置 null——小样本下任何比例都不构成信号，请直接看分项计数与订单明细。',
+    sample,
+    settledToSeller,
+    refundedToBuyer: refundedBuyer,
+    disputed,
+    afterSaleOpen,
+    afterSaleClosed,
+    expiredReleased,
+    // 「确认收货占比」：买家自己确认过收货的比例（confirmed 只由真实 ReceiptConfirmed 事件产生）
+    confirmRate: rate(confirmed),
+    // 「退款率」：**实际退过款**的单占比（含部分退款；钱真的退回去了，比"申请过"更硬）
+    refundRate: rate(refundedBuyer),
+    // 「退款申请率」：提出过退款申请的单占比（含被拒/撤回——申请本身也是信号，且与上一条不同义）
+    refundRequestRate: rate(refundRequested),
+    disputeRate: rate(disputed),
+
+    // ===== 口径与三态（附加字段；前端不消费，供人工核对与后续扩展）=====
+    /** 三个比率的分子里那两个**没有**契约字段的计数（原始计数照给，读者可自行标注 n 笔） */
+    confirmed,
+    refundRequested,
+    /** 比率的分母（= sample）与阈值；前端若把阈值写死在本地，务必与这里保持一致 */
+    ratioBasis: { denominator: 'sample', value: sample, minSamples: min },
+    minSamples: min,
+    localOrders,
+    unverified: {
+      /**
+       * 已终局、却没有 `OrderCreated` 镜像的单数（事件史为空，或那条事件被 20 条上限挤出）：
+       * 它们的**争议史/超时释放史读不到**（本地只留下终局状态本身）——所以上面这两个计数是**下界**，
+       * 而这批单既不计入分子分母、也不当作"从没发生过"。
+       */
+      terminalWithoutEventMirror: unverified,
+      note:
+        '这些单已终局，但本地事件史里没有 OrderCreated（paid/watcher 都会补写它）：' +
+        '它们是否曾经争议/超时释放**读不到**，不计入 disputed / expiredReleased，也不当作"没发生过"。',
+    },
+    scope: 'this_shop_only',
+    /*
+      本店店主地址 = 端点解析出来的**这家店的 seller**（不是 `config.shop.owner`）：
+      多店之下后者是**节点主**（谁提供基础设施），而被查询的这家店可能属于别的店主——
+      拿节点主冒充"本店店主"就是一句关于别人的断言。节点级合计读数（seller=null）如实给 null。
+    */
+    shopOwner: seller ? String(seller).toLowerCase() : null,
+    scopeNote:
+      '本读数只统计**本店**与该买家的历史：节点不会为任意地址去其他店铺查询（那是别人的数据面，也是隐私面）。' +
+      '你看到的就是"该买家在本店的表现"，不代表他在别处如何。',
+    signalNote:
+      '这些是**可疑信号，不是结论**：退款/争议偏多也可能来自商品描述不清、物流问题或规则分歧；' +
+      '本读数不构成对任何买家的判定，也不应作为自动拒单/降权/封禁的唯一依据——' +
+      '判断请结合订单明细、沟通记录与平台规则，并按适用法律处理个人信息。',
+    caveats: [
+      '计数逐项对应一个链上事实：settledToSeller ← getOrder.status=Settled；refundedToBuyer ← refundedAmount>0；disputed/expiredReleased ← DisputeRequested/OrderExpiredReleased 日志；afterSaleOpen/Closed ← afterSaleOpenedAtBlock 与结案事件；refundRequested ← RefundRequested（本地耐久痕迹）。第三方扫链可逐项复算。',
+      `disputed 与 expiredReleased 依赖本地事件镜像：已终局却没有事件史的单（当前 ${unverified} 单）一律计入 unverified，因此这两个计数是**下界**。`,
+      'afterSaleClosed 也是下界：链上快照（afterSaleOpen=false）分不清"从未开案"与"开过又结了"，这类单本地停在 none（见 src/afterSale.js）。',
+      '样本 = 真实发生过托管的单（paid_tx_hash 非空）；草稿与本地取消单不进分母（没付款就谈不上履约），它们在 localOrders 里如实计数。',
+    ],
+    generatedAt: now,
+  };
+}
+
+/**
+ * 端点用入口：读该买家在**指定店铺**的订单行 → 纯函数（无链上读取、无跨店查询）。
+ *
+ * **必须按卖家地址限定"本店"**（2026-10-15 修 D6；2026-10 多店改造改为显式传参）：
+ * `orders.seller` 是逐行写入的（= 该单所属店铺的 `shops.seller`），而这个读数的 `scope`
+ * 自称 `this_shop_only` —— 不带这个过滤，多店之下会把**别家店**与该买家的往来算进
+ * "他在本店的表现"（`localOrders`/`sample` 一起被抬高，店主据此误判风险）。
+ *
+ * `seller` 是**必传**（三态，与 reputationSummary 同款）：`undefined` ⇒ 抛错（不给默认值，
+ * 让"忘了传"不可表达）；`null` = 该节点全部在售店铺的合计（**只在节点级读数里用**，
+ * 店铺级端点一律传该店 seller）。
+ * @param {string} address
+ * @param {string|null|undefined} seller
+ * @param {object} [opts]
+ */
+export async function buyerSignal(address, seller, opts = {}) {
+  if (seller === undefined) {
+    throw new Error('buyerSignal 需要显式的 seller（店铺级端点必须传该店 seller）；漏传会静默跨店混算');
+  }
+  const addr = String(address || '').toLowerCase();
+  const sel = seller === null ? '' : String(seller).toLowerCase();
+  /*
+    整单读走读模型 `v_orders`：这一份读数要同时看订单事实（status/buyer/seller/created_at）、
+    链上镜像（paid_tx_hash / refund_* / after_sale_* / events）与退款金额——三张表里的列，
+    视图一次给全（列名与旧形状一致，只有事件史那一列在这里叫 `onchain_events`）。
+    `seller = ?` 不带 `lower()`：地址列的大小写不敏感排序规则已经在那了（见 db.js 第 8 条），
+    函数包住列只会让索引失效。
+  */
+  const rows = await getDb().all(
+    `SELECT * FROM v_orders WHERE buyer = ? ${sel ? 'AND seller = ?' : ''} ORDER BY created_at DESC`,
+    ...(sel ? [addr, sel] : [addr])
+  );
+  return computeBuyerSignal(rows, { address: addr, seller: sel || null, ...opts });
+}

@@ -1,0 +1,33 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 本地配置与密钥（真实 .env / 备份都不得入库——备份里含 MK_TOKEN_SECRET）
+.env*
+.env.rollback
+.env.*
+.env.bak*
+!.env.example
+
+# 数据与附件（店主的经营数据只存在于本机；库在 MySQL 里，不在仓库内）
+data/
+attachments/
+uploads/
+.uploads/
+
+# 部署状态（deploy.sh 写在安装目录里：记下本套安装的服务名/端口，供 --update/--status/--health 复用）
+.deploy-state
+# 内置 MySQL/Redis 的凭据（写在安装目录；in-repo 安装时就是 node/ 下）
+.mysql-root
+.redis-password
+.redis.conf
+
+# 云上开店（provision/cli.mjs）的状态：买了哪台机器/哪个域名、生成的 SSH 私钥、发布包。
+# 它是**每个部署者自己的资产状态**（这台机器是谁的、域名指向哪），所以不入库；
+# 这条跟着 node/ 一起发布出去 —— 公开仓里 provision/ 与 node/ 同级，状态目录就在仓库根下。
+.provision/
+
+# 日志与临时产物
+*.log
+.tmp-*

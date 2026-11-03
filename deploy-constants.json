@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "部署期常量：**唯一真相**。deploy.sh（Linux/macOS，容器路径）与 deploy.ps1（Windows，原生路径）都从这里读。",
+    "平台 Registry 只是前端发现层；每个节点自己部署 Escrow + Staking。",
+    "contracts 三项必须与**本节点** `node scripts/deploy-node-mainnet.cjs --broadcast` 的输出一致：escrow / staking / startBlock。",
+    "startBlock 取 Escrow 的部署块（脚本直接输出该块；0 = 未部署，两条部署脚本都会拒绝）。",
+    "店铺、商品、订单、员工与任何费率全部在节点自己的库里；平台不登记店铺、不收平台费。",
+    "appDefaults 是两条路径都必须写进 .env 的运行参数；runtime.stopGraceSeconds 必须大于 MK_SHUTDOWN_DRAIN_MS。"
+  ],
+  "network": {
+    "rpcUrl": "https://node1.bityuan.com/eth,https://node2.bityuan.com/eth,https://mainnet.bityuan.com/eth",
+    "chainId": 2999,
+    "frontendOrigin": "https://fedmall.bityuan.com"
+  },
+  "contracts": {
+    "escrow": "",
+    "staking": "",
+    "startBlock": 0
+  },
+  "runtime": {
+    "containerPort": 8090,
+    "serviceName": "marketplace-node",
+    "image": "marketplace-node:latest",
+    "stopGraceSeconds": 30
+  },
+  "appDefaults": {
+    "MK_ESCROW_TIMEOUT_BLOCKS": 120960,
+    "MK_ESCROW_FINALITY_BLOCKS": 12,
+    "MK_ESCROW_POLL_MS": 15000,
+    "MK_CHAIN_RECONCILE_MS": 600000,
+    "MK_CORS_ALLOW_ALL": 0,
+    "MK_AUTO_DELIVER": 1,
+    "MK_PII_RETENTION_DAYS": 180,
+    "MK_BTY_TTL_MS": 60000,
+    "MK_DRAFT_TTL_MINUTES": 30,
+    "MK_REVIEW_TTL_DAYS": 30,
+    "MK_TOKEN_TTL": 86400,
+    "MK_SIWE_TTL": 600,
+    "MK_SHUTDOWN_DRAIN_MS": 10000
+  }
+}
