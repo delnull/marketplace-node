@@ -65,14 +65,16 @@ const POLL_INTERVAL_MS = 3000;
   固定，估算只用来确认这笔交易不会 revert，不用估算值当上限。
 */
 const GAS = {
-  vault: 660_000n,
-  escrow: 6_100_000n,
+  // BTY mempool 的 minimum fee 按交易字节数计算，不是按 gasPrice。TokenPayoutVault 的
+  // creation bytecode 让 660k 触发 ErrTxFeeTooLow；eth_estimateGas 给 900k，留到 1M。
+  vault: 1_000_000n,
+  escrow: 9_000_000n,
   setEscrow: 55_000n,
-  staking: 4_170_000n,
+  staking: 7_000_000n,
   setStaking: 50_000n,
   setArbitersBase: 270_000n,
   setArbitersPerExtra: 25_000n,
-  governance: 1_830_000n,
+  governance: 3_000_000n,
   setEscrowGovernor: 45_000n,
   setStakingGovernor: 60_000n,
 };

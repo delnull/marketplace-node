@@ -20,7 +20,7 @@ ABI/字节码/哈希清单与部署脚本**，不含 Foundry 工程或编译步�
 
 完整步骤、参数、`startBlock` 取法与启动自检见 [docs/DEPLOY_CONTRACTS.md](docs/DEPLOY_CONTRACTS.md)；
 先 `--check`，再 `--broadcast`。整个部署
-（四个合约）建议钱包准备 **0.5 BTY 以上**；合约本身在 `10 gwei`、3 个委员下约 **0.133 BTY**。
+（四个合约）建议钱包准备 **0.5 BTY 以上**；合约本身在 `10 gwei`、3 个委员下约 **0.205 BTY**。
 节点登记在浏览器钱包里完成，部署脚本不登记 Registry。
 
 `deploy-constants.json` 的 `contracts` 三项（Escrow / Staking / startBlock）默认留空；部署完填

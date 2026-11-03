@@ -24,7 +24,7 @@
 
 整个部署（四个合约）建议钱包准备 **0.5 BTY 以上**；节点登记由 operator 钱包在目录页完成，不属于部署脚本。
 
-其中合约部署按 `10 gwei`、3 个委员计算：gasLimit 合计 `13,240,000`，约 **0.133 BTY**。BTY 按 gasLimit 扣费，失败/重试也会消耗 gasLimit；0.5 BTY 留出 gas 价波动、重试和节点登记的费用。`--check` 会按当前 `eth_gasPrice` 重新计算并拒绝余额不足。
+其中合约部署按 `10 gwei`、3 个委员计算：gasLimit 合计 `20,480,000`，约 **0.205 BTY**。BTY 按 gasLimit 扣费，失败/重试也会消耗 gasLimit；0.5 BTY 留出 gas 价波动、重试和节点登记的费用。`--check` 会按当前 `eth_gasPrice` 重新计算并拒绝余额不足。
 
 每多一个委员约增加 `25,000` gasLimit（`10 gwei` 下约 `0.00025 BTY`）。
 
