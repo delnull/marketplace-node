@@ -121,6 +121,12 @@ const ESCROW_ABI = [
   'function createOrder(bytes32 orderId, address seller, uint256 amount, uint64 timeoutBlocks) payable',
   'function confirmReceipt(bytes32 orderId)',
 ];
+/*
+  BTY 主网的 eth_estimateGas 对 >10 万 gas 的调用固定失败且不带 revert data；
+  createOrder / confirmReceipt 实测 19.5 万 / 16 万 gas，脚本必须显式给上限。
+*/
+const GAS_CREATE_ORDER = 300_000n;
+const GAS_CONFIRM_RECEIPT = 230_000n;
 async function waitOrderStatus(id, token, targets, tries = 20, intervalMs = 4000) {
   let order = null;
   for (let i = 0; i < tries; i++) {
@@ -173,7 +179,10 @@ async function main() {
     没有店铺条款、没有抽成收款人。店铺/商品/订单明细全在节点链下。
   */
   await broadcast(
-    escrow.createOrder(draft.escrowOrderId, draft.seller, amount, BigInt(draft.timeoutBlocks ?? 0), { value: amount }),
+    escrow.createOrder(draft.escrowOrderId, draft.seller, amount, BigInt(draft.timeoutBlocks ?? 0), {
+      value: amount,
+      gasLimit: GAS_CREATE_ORDER,
+    }),
     'createOrder'
   );
 
@@ -191,7 +200,7 @@ async function main() {
   if (!shippedOrder.paidTxHash) throw new Error('缺链上支付凭证（paid_tx_hash）');
 
   step('6. 买家 confirmReceipt → watcher 回写 confirmed → 流水入账');
-  await broadcast(escrow.confirmReceipt(draft.escrowOrderId), 'confirmReceipt');
+  await broadcast(escrow.confirmReceipt(draft.escrowOrderId, { gasLimit: GAS_CONFIRM_RECEIPT }), 'confirmReceipt');
   const finalOrder = await waitOrderStatus(draft.id, buyerToken, ['confirmed', 'settled', 'expired'], 15);
   if (finalOrder.status !== 'confirmed') throw new Error(`预期 confirmed，实际 ${finalOrder.status}`);
   const ledger = await api('GET', '/api/orders/seller/ledger', undefined, ownerToken);

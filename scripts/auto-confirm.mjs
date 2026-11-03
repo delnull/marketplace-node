@@ -32,6 +32,14 @@ const ABI = [
   'function releaseSellerFunds(bytes32 orderId)',
 ];
 
+/*
+  BTY 主网的 eth_estimateGas 对 >10 万 gas 的调用固定返回 -32000 且不带 revert data，
+  keeper 会看到 `missing revert data` 而永远释放不了。两个动作实测约 13 万/12.5 万 gas
+  （forge test --gas-report），显式给上限后不再走节点估算。
+*/
+const GAS_RELEASE_EXPIRED = 190_000n;
+const GAS_RELEASE_SELLER_FUNDS = 190_000n;
+
 const ONCE = process.argv.includes('--once');
 const DRY = process.argv.includes('--dry-run');
 const INTERVAL_MS = Math.max(5_000, Number(process.env.MK_AUTO_CONFIRM_INTERVAL_MS || 60_000));
@@ -100,7 +108,7 @@ async function tick() {
         continue;
       }
       try {
-        const tx = await escrow.releaseExpired(orderId);
+        const tx = await escrow.releaseExpired(orderId, { gasLimit: GAS_RELEASE_EXPIRED });
         log('sent', row.order_no, tx.hash);
         await tx.wait();
         released += 1;
@@ -160,7 +168,7 @@ async function tick() {
         continue;
       }
       try {
-        const tx = await escrow.releaseSellerFunds(orderId);
+        const tx = await escrow.releaseSellerFunds(orderId, { gasLimit: GAS_RELEASE_SELLER_FUNDS });
         log('sent-pending', row.order_no, tx.hash);
         await tx.wait();
         pendingReleased += 1;
