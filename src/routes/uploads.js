@@ -22,10 +22,15 @@ import { Router } from 'express';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
 import { roleOf, verifySession } from '../auth.js';
 import { logAudit } from '../audit.js';
-import { MediaUploadError, findMedia, storeMediaStream } from '../productMedia.js';
-// 单次上传的**硬上限**（类型表里最大的那个）与字节额度内核（预留/结算/释放）
+import { findMedia } from '../productMedia.js';
+import {
+  MediaUploadError,
+  UploadQuotaError,
+  UploadUnavailableError,
+  storeRequestMedia,
+} from '../uploadFlow.js';
+// 单次上传的**硬上限**（类型表里最大的那个）
 import { MAX_UPLOAD_BYTES } from '../mediaKinds.js';
-import { reserveUploadBytes, commitUploadBytes, releaseUploadBytes } from '../uploadBudget.js';
 
 const router = Router();
 // 与 products 路由同权限：商品经营面 = 店主 + 操作员
@@ -43,12 +48,11 @@ const readLimiter = simpleRateLimit({ windowMs: 60_000, max: 2000, message: '媒
  * 同一家店的店主换网络照旧受自己的额度约束。
  *
  * 判据形状：先**预留**单次硬上限（MAX_UPLOAD_BYTES，50MB），流式上传结束后按实际字节结算、
- * 失败则释放（唯一实现在 src/uploadBudget.js）。旧实现是"上传前查一次、成功后记账"——
+ * 失败则释放（唯一实现在 src/uploadFlow.js）。旧实现是"上传前查一次、成功后记账"——
  * 查与写之间隔着整段流式上传，N 个并发请求都能通过，超出上限最多 N×50MB。
  * 现在超限在**读请求体之前**就被拒（连一次写盘都不发生）。
  */
 const UPLOAD_BYTES_PER_HOUR = 1024 * 1024 * 1024;
-const MB = (n) => Math.round(Number(n) / 1024 / 1024);
 
 /** 上传一段商品媒体（图片或视频，类型由字节判定） */
 router.post(
@@ -57,36 +61,19 @@ router.post(
   uploadLimiter,
   wrap(async (req, res) => {
     const actor = req.auth?.address || '';
-    /*
-      **先占位再读字节**：单次最多会写 MAX_UPLOAD_BYTES，所以按这个上限预留；预留成功才继续。
-      Redis Lua 原子判上限，多后端共享同一份额度。
-    */
-    let reserved;
-    try {
-      reserved = await reserveUploadBytes(actor, MAX_UPLOAD_BYTES, UPLOAD_BYTES_PER_HOUR);
-    } catch (e) {
-      if (e?.code === 'REDIS_UNAVAILABLE') return fail(res, '上传依赖暂时不可用，请稍后重试', 503, 503);
-      throw e;
-    }
-    if (!reserved.ok) {
-      return fail(
-        res,
-        `本小时上传额度不足以容纳本次上传（已用 ${MB(reserved.used)}MB / 上限 ${MB(reserved.limitBytes)}MB；` +
-          `单次最多 ${MB(MAX_UPLOAD_BYTES)}MB）——请稍后再试，或先压缩/裁剪媒体`
-      );
-    }
     let stored;
     try {
-      stored = await storeMediaStream(req);
+      stored = await storeRequestMedia(req, actor, {
+        maxUploadBytes: MAX_UPLOAD_BYTES,
+        limitBytes: UPLOAD_BYTES_PER_HOUR,
+      });
     } catch (e) {
-      // 失败必须**归还预留**（类型不符/超限/连接中断都不该吃掉额度）
-      await releaseUploadBytes(reserved.reservation);
-      // 类型不符/超限/空文件都是**用户可修的输入错误**（不是内部异常）：按业务失败回给前端
+      // 额度/类型/连接中断都是业务失败；额度不足在**读请求体之前**就返回
+      if (e instanceof UploadUnavailableError) return fail(res, e.message, 503, 503);
+      if (e instanceof UploadQuotaError) return fail(res, e.message);
       if (e instanceof MediaUploadError) return fail(res, e.message);
       throw e;
     }
-    // 成功 ⇒ 把预留下调为实际字节（多留的部分立即归还给同一人的下一次上传）
-    await commitUploadBytes(reserved.reservation, stored.size);
     await logAudit({
       req,
       actor,

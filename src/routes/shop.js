@@ -46,7 +46,13 @@ import { isAddress, isZeroAddress } from '../chain.js';
 import { assertPublicHttpTarget } from '../netguard.js';
 import { sweepOrphanUploads } from '../mediaSweep.js';
 import { withRedisLock } from '../redis.js';
-import { mediaUsage } from '../productMedia.js';
+import { mediaUsage, REVIEW_IMAGE_MIMES, removeMediaByUrl } from '../productMedia.js';
+import {
+  MediaUploadError,
+  UploadQuotaError,
+  UploadUnavailableError,
+  storeRequestMedia,
+} from '../uploadFlow.js';
 import { getRates, usdtMicroToPayWei, isPayableAmount } from '../rates.js';
 import {
   listPaymentMethods,
@@ -70,6 +76,9 @@ import {
   nodeOwner,
   nodeOwnerOf,
   nodeRow,
+  avatarUrlOf,
+  setShopAvatar,
+  setNodeAvatar,
 } from '../shops.js';
 // 节点级运营读数（nodeAdmin）：只出"这台机器有没有在干活"，不出任何店铺经营明细
 import { escrowWatcherStatus } from '../escrowWatcher.js';
@@ -106,6 +115,23 @@ const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true });
 const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 // 增删节点员工是权限授予本身：只允许节点主，避免员工自行扩权/互授。
 const hostOnly = makeAuthMiddleware(verifySession, { hostOnly: true });
+
+/** 头像单文件上限：2MB（与图片类型的上限一致；头像不需要视频/大图） */
+const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
+
+/** 头像上传限流：单 IP 每分钟 10 个（字节额度之外的第二道闸，挡脚本反复写盘） */
+const avatarLimiter = simpleRateLimit({ windowMs: 60_000, max: 10, message: '头像上传过于频繁，请稍后再试' });
+
+/**
+ * 头像上传的失败形状与商品媒体一致：额度不足 / Redis 不可用 / 类型不符都是业务失败，
+ * 未知异常继续冒泡给统一错误兜底。额度不足在**读请求体之前**就返回（见 uploadFlow.js）。
+ */
+function avatarUploadFail(res, e) {
+  if (e instanceof UploadUnavailableError) return fail(res, e.message, 503, 503);
+  if (e instanceof UploadQuotaError) return fail(res, e.message);
+  if (e instanceof MediaUploadError) return fail(res, e.message);
+  throw e;
+}
 
 /* ── 节点资料（`node` 单例行的 name/notice）──
  *
@@ -240,6 +266,7 @@ router.get('/', optionalShop, wrap(async (req, res) => {
     */
     name: nodeDisplayName(node),
     notice: shopDisplayNotice(node),
+    avatarUrl: avatarUrlOf(node),
     /** 节点自己的谈信地址（公开客服联系方式）；null = 没设置过 */
     tanxinAddress: tanxinAddressOf(node),
     chainId: config.chain.chainId,
@@ -266,6 +293,7 @@ router.get('/node-identity', wrap(async (req, res) => {
     owner: owner || null,
     name: nodeDisplayName(node),
     notice: shopDisplayNotice(node),
+    avatarUrl: avatarUrlOf(node),
     tanxinAddress: tanxinAddressOf(node),
     chainId: config.chain.chainId,
     escrowAddress: config.chain.escrowAddress || null,
@@ -409,6 +437,7 @@ router.get('/node', nodeAdmin, wrap(async (req, res) => {
     // 节点资料（名称/公告/谈信地址）：与任何一家店无关，见 nodeNameOf 的说明
     name: nodeDisplayName(node),
     notice: shopDisplayNotice(node),
+    avatarUrl: avatarUrlOf(node),
     tanxinAddress: tanxinAddressOf(node),
     shops: rows.map((r) => shopDto(r, owner)),
     counts: {
@@ -543,6 +572,86 @@ router.put('/', staffOnly, wrap(async (req, res) => {
 }));
 
 /**
+ * 店铺头像（ownerOnly）：请求体就是图片字节（与 /api/uploads 同一种传输形状）。
+ *
+ * 头像是**店铺对买家的身份**，和店名/谈信地址同级：只有店主能改（店员改头像同样能把
+ * 买家导流/冒充），所以这里用 ownerOnly 而不是 staffOnly。上传成功后把旧文件删掉——
+ * 头像没有订单快照引用，不适用"孤儿媒体刻意不删"那条（见 productMedia.js）。
+ */
+router.post('/avatar', ownerOnly, avatarLimiter, wrap(async (req, res) => {
+  const shop = req.shop;
+  const old = avatarUrlOf(shop);
+  let stored;
+  try {
+    stored = await storeRequestMedia(req, req.auth.address, {
+      maxUploadBytes: AVATAR_MAX_BYTES,
+      allowedMimes: REVIEW_IMAGE_MIMES,
+      label: '头像',
+    });
+  } catch (e) {
+    return avatarUploadFail(res, e);
+  }
+  try {
+    await setShopAvatar(shop.code, stored.url);
+  } catch (e) {
+    // 写库失败就把刚落的文件删掉：不能让一个没人引用的头像占着盘
+    removeMediaByUrl(stored.url);
+    throw e;
+  }
+  if (old && old !== stored.url) removeMediaByUrl(old);
+  await audit(req, 'shop.avatar.update', 'shop', shop.code, { size: stored.size, mime: stored.mime }, shop.code);
+  ok(res, { avatarUrl: stored.url }, '店铺头像已更新（旧头像文件已清理）');
+}));
+
+/** 店铺头像移除（ownerOnly；幂等） */
+router.delete('/avatar', ownerOnly, wrap(async (req, res) => {
+  const shop = req.shop;
+  const old = avatarUrlOf(shop);
+  await setShopAvatar(shop.code, '');
+  if (old) removeMediaByUrl(old);
+  await audit(req, 'shop.avatar.clear', 'shop', shop.code, { hadAvatar: !!old }, shop.code);
+  ok(res, { avatarUrl: '' }, '店铺头像已移除（回退为按身份生成的色块）');
+}));
+
+/**
+ * 节点头像（hostOnly）：与节点名/公告同级，是节点对外身份；员工不能改写。
+ * 节点可以一家店都没有，所以这里不要求也不消费 X-Mk-Shop。
+ */
+router.post('/node/avatar', hostOnly, avatarLimiter, wrap(async (req, res) => {
+  const node = await nodeRow();
+  const old = avatarUrlOf(node);
+  let stored;
+  try {
+    stored = await storeRequestMedia(req, req.auth.address, {
+      maxUploadBytes: AVATAR_MAX_BYTES,
+      allowedMimes: REVIEW_IMAGE_MIMES,
+      label: '头像',
+    });
+  } catch (e) {
+    return avatarUploadFail(res, e);
+  }
+  try {
+    await setNodeAvatar(stored.url);
+  } catch (e) {
+    removeMediaByUrl(stored.url);
+    throw e;
+  }
+  if (old && old !== stored.url) removeMediaByUrl(old);
+  await audit(req, 'node.avatar.update', 'node', 'node', { size: stored.size, mime: stored.mime }, null);
+  ok(res, { avatarUrl: stored.url }, '节点头像已更新（旧头像文件已清理）');
+}));
+
+/** 节点头像移除（hostOnly；幂等） */
+router.delete('/node/avatar', hostOnly, wrap(async (req, res) => {
+  const node = await nodeRow();
+  const old = avatarUrlOf(node);
+  await setNodeAvatar('');
+  if (old) removeMediaByUrl(old);
+  await audit(req, 'node.avatar.clear', 'node', 'node', { hadAvatar: !!old }, null);
+  ok(res, { avatarUrl: '' }, '节点头像已移除（回退为按身份生成的色块）');
+}));
+
+/**
  * 店主自助歇业/复业。
  *
  * 与节点管理员 `PATCH /api/shops/admin/:code/listing` 是两件事：
@@ -615,6 +724,7 @@ router.get('/settings', ownerOnly, wrap(async (req, res) => {
     seller: shop.seller,
     name: shopDisplayName(shop),
     notice: shopDisplayNotice(shop),
+    avatarUrl: avatarUrlOf(shop),
     tanxinAddress: tanxinAddressOf(shop),
     listed: dto.listed,
     listedReason: dto.listedReason,

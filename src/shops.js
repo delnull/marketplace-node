@@ -132,6 +132,45 @@ export function shopDisplayNotice(row) {
 }
 
 /**
+ * 头像 URL 的唯一判据：只收**本节点上传目录**里的相对路径。
+ *
+ * 为什么不允许外链：头像是买家第一眼看到的东西，外链可被换成任意内容；而 `/api/uploads/`
+ * 的文件由本节点自己写盘、不可枚举，内容和 URL 同生同死。空串 = 没设置（前端回退到
+ * 按身份地址生成的色块，不是"读不到"）。
+ */
+const AVATAR_URL_RE =
+  /^\/api\/uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:png|jpe?g|webp|gif)$/i;
+
+/** 一行 → 可展示的头像 URL（非法/缺失一律空串；渲染层据此回退生成头像） */
+export function avatarUrlOf(row) {
+  const v = String(row?.avatar_url || '').trim();
+  return AVATAR_URL_RE.test(v) ? v : '';
+}
+
+/** 写入口断言：只接受本节点 /api/uploads/ 下的图片 URL（空串 = 清除） */
+export function assertAvatarUrl(url) {
+  const v = String(url ?? '').trim();
+  if (v !== '' && !AVATAR_URL_RE.test(v)) {
+    throw new Error('头像 URL 必须是本节点 /api/uploads/ 下的图片地址');
+  }
+  return v;
+}
+
+/** 写店铺头像（空串 = 清除）。单独于资料更新：头像是上传动作的产物，不是可手填的文本字段 */
+export async function setShopAvatar(code, url) {
+  const v = assertAvatarUrl(url);
+  await getDb().run('UPDATE shops SET avatar_url = ? WHERE code = ?', v, code);
+  return v;
+}
+
+/** 写节点头像（空串 = 清除） */
+export async function setNodeAvatar(url) {
+  const v = assertAvatarUrl(url);
+  await getDb().run('UPDATE node SET avatar_url = ? WHERE id = 1', v);
+  return v;
+}
+
+/**
  * 一行 shops → 对外形状（**唯一一份**：公开列表、店铺详情、卖家面板共用）。
  *
  * `nodeAddr` = 节点主地址（`hostOperator()` 或 `await nodeOwner()`）。它是"这家店挂在哪台机器下"
@@ -146,6 +185,7 @@ export function shopDto(row, nodeAddr) {
     host: node || null,
     name: shopDisplayName(row),
     notice: shopDisplayNotice(row),
+    avatarUrl: avatarUrlOf(row),
     tanxinAddress: tanxinAddressOf(row),
     listed: Number(row.listed) === 1,
     /** 暂停原因（`''` = 当前没有暂停）；店主在设置页读它，节点管理面在店铺行读它 */

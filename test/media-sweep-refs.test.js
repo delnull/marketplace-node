@@ -17,7 +17,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { insertOrder, insertProduct, makeCtx } from './setup.mjs';
+import { insertOrder, insertProduct, makeCtx, TEST_SHOP_CODE } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { db, owner, buyer } = ctx;
@@ -61,6 +61,17 @@ test('清单里的表/列都真实存在（列改名/被删要当场红，而不
     }
   }
   assert.deepEqual(problems, [], `MEDIA_REF_SOURCES 指向了不存在的列：${problems.join('、')}`);
+});
+
+test('节点头像与店铺头像的 URL 也算"被引用"（否则清扫会删掉在用的头像）', async () => {
+  const nodeAvatar = mediaUrl();
+  const shopAvatar = mediaUrl('webp');
+  await db.run('UPDATE node SET avatar_url = ? WHERE id = 1', nodeAvatar);
+  await db.run('UPDATE shops SET avatar_url = ? WHERE code = ?', shopAvatar, TEST_SHOP_CODE);
+
+  const refs = await referencedMediaUrls();
+  assert.ok(refs.has(nodeAvatar), `节点头像 ${nodeAvatar} 没被清扫的引用面收到`);
+  assert.ok(refs.has(shopAvatar), `店铺头像 ${shopAvatar} 没被清扫的引用面收到`);
 });
 
 test('商品主图 / 详情图 / 规格图 / 订单快照里的 URL 都算"被引用"', async () => {

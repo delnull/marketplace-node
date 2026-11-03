@@ -33,6 +33,9 @@ export const MEDIA_REF_SOURCES = Object.freeze([
   { table: 'product_skus', columns: Object.freeze(['image_url']) },
   { table: 'orders', columns: Object.freeze(['product_snapshot']) },
   { table: 'reviews', columns: Object.freeze(['images', 'followup_images']) },
+  // 头像也是 /api/uploads/ 的引用落点；漏掉会把在用头像当孤儿删掉
+  { table: 'node', columns: Object.freeze(['avatar_url']) },
+  { table: 'shops', columns: Object.freeze(['avatar_url']) },
 ]);
 
 function collect(value, out) {

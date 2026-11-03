@@ -250,7 +250,10 @@ export function createApp() {
   const isFilesUpload = (req) =>
     req.method === 'POST' &&
     (/^\/api\/orders\/[^/]+\/evidence\/[^/]+\/files$/.test(normPath(req.path)) ||
-      normPath(req.path) === '/api/uploads');
+      normPath(req.path) === '/api/uploads' ||
+      // 头像同样是原始字节流（见 routes/shop.js）：漏掉会被 1MB JSON 解析器顶掉
+      normPath(req.path) === '/api/shop/avatar' ||
+      normPath(req.path) === '/api/shop/node/avatar');
   app.use((req, res, next) => {
     if (isFilesUpload(req)) return next();
     express.json({ limit: '1mb' })(req, res, next);

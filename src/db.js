@@ -1659,6 +1659,8 @@ const SCHEMA_DDL = `
       形状校验的唯一入口是 src/tanxin.js（写入口），库列只负责存。
     */
     tanxin_address VARCHAR(64) NULL,
+    /* 节点头像：只存本节点 /api/uploads/ 下的相对 URL；空串 = 没设置（前端回退到确定性色块） */
+    avatar_url    VARCHAR(500) NOT NULL DEFAULT '',
     escrow_address CHAR(42) NULL,                       -- 托管合约地址锚（换址门禁读它）
     /*
       本节点的保证金合约地址锚（MK_STAKING_ADDRESS）。它与 escrow 一对一（链上 Registry
@@ -1745,6 +1747,8 @@ const SCHEMA_DDL = `
     notice        VARCHAR(500) NOT NULL DEFAULT '',
     /* 本店谈信地址（公开客服联系方式）；形状与保存口径见 node 表的同名列说明 */
     tanxin_address VARCHAR(64) NULL,
+    /* 本店头像：同 node.avatar_url，只存本节点 /api/uploads/ 下的相对 URL */
+    avatar_url    VARCHAR(500) NOT NULL DEFAULT '',
     /*
       listed = 0 = **不能接单 + 不进前端聚合**（节点主/员工暂停）。
       它不是"店下线"：该店的发货、同意/拒绝退款、售后案件、个人信息擦除、自有资料维护
