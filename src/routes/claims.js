@@ -49,7 +49,8 @@ router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
   const tokenId = String(req.query.tokenId ?? '').trim();
   if (!contract || !tokenId) return fail(res, '需要 contract 与 tokenId 两个参数');
   const rows = await getDb().all(
-    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+         (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
        FROM nft_claims n
       WHERE n.token_contract = ? AND n.token_id = ? ORDER BY n.id DESC LIMIT 20`,
     contract.toLowerCase(),
@@ -61,7 +62,8 @@ router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
 /** 我提交过的提货行（需登录；所有状态，新的在前） */
 router.get('/nft/mine', requireAuth, wrap(async (req, res) => {
   const rows = await getDb().all(
-    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+         (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
        FROM nft_claims n WHERE n.claimant = ? ORDER BY n.id DESC LIMIT 200`,
     req.auth.address
   );
@@ -82,14 +84,16 @@ router.get('/nft/seller', requireAuth, wrap(async (req, res) => {
   ).map((r) => String(r.shop_code));
   const rows = staffShops.length
     ? await getDb().all(
-        `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+        `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+         (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
            FROM nft_claims n WHERE n.seller = ? OR n.shop_code IN (${staffShops.map(() => '?').join(',')})
           ORDER BY n.id DESC LIMIT 200`,
         address,
         ...staffShops
       )
     : await getDb().all(
-        `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+        `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+         (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
            FROM nft_claims n WHERE n.seller = ? ORDER BY n.id DESC LIMIT 200`,
         address
       );

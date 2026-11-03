@@ -108,7 +108,8 @@ export async function claimRowByNo(claimNo) {
   const v = String(claimNo ?? '').trim();
   if (!v) return undefined;
   return await getDb().get(
-    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id
+    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+              (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
        FROM nft_claims n WHERE n.claim_no = ?`,
     v
   );
@@ -137,6 +138,8 @@ export function claimDto(row, { as = 'public' } = {}) {
      * `openClaimDispute` 前必须用它复核订单的卖家/状态，不能只信节点返回的 `args[1]`。
      */
     escrowOrderId: row.escrow_order_id ? String(row.escrow_order_id).toLowerCase() : null,
+    /** 交付这枚 NFT 的链上转账哈希（卖家交付时登记；用于持有人独立核对 token 来源） */
+    deliveryTxHash: row.delivery_tx_hash ? String(row.delivery_tx_hash).toLowerCase() : null,
     seller: row.seller,
     claimant: row.claimant,
     status: row.status,
