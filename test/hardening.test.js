@@ -166,9 +166,11 @@ test('汇率换算：纯整数向上取整（防少付），无死代码修正�
   const num = 1n * 10n ** 20n;
   assert.ok(num % scaled > 0n, '选这个汇率就是为了让除法除不尽——否则测不到"向上取整"');
   const floor = num / scaled;
+  const UNIT = 10n ** 10n;
   const v = BigInt(usdtMicroToPayWei(1, { btyUsdt: 0.022778 }));
-  assert.ok(v >= floor, '向上取整结果 ≥ 精确值（防少付）');
-  assert.equal(v, floor + 1n, '恰好是最小的可行整数（不是截断，也不多加）');
+  assert.equal(v % UNIT, 0n, '结果必须对齐 BTY 原生最小单位 1e10 wei');
+  assert.ok(v >= floor + 1n, '向上取整结果 ≥ 精确值（防少付）');
+  assert.ok(v < floor + 1n + UNIT, '只向上对齐到最小单位，不多取整一次');
 });
 
 test('履约画像同源窗口：窗外创建、窗内确认的旧单不再污染窗内比率', () => {

@@ -40,27 +40,33 @@ test('isPayableAmount：0 与非法串一律不可建单，正的整数 wei 串�
   assert.equal(isPayableAmount('1000000000000000000'), true);
 });
 
-test('usdtMicroToPayWei：向上取整（绝不少付 1 wei），且整条链路走整数运算', () => {
+test('usdtMicroToPayWei：向上取整到 1e10 wei（BTY 原生最小单位），且整条链路走整数运算', () => {
   // 能被整除的锚点：1 BTY = 0.1 USDT ⇒ 1 USDT = 10 BTY = 1e19 wei
   assert.equal(usdtMicroToPayWei(1_000_000, { btyUsdt: 0.1 }), (10n ** 19n).toString());
-  // 最小标价单位 1 微 USDT = 1e-6 USDT = 1e-5 BTY = 1e13 wei（无余数）
+  // 最小标价单位 1 微 USDT = 1e-6 USDT = 1e-5 BTY = 1e13 wei（本身已是 1e10 的整数倍）
   assert.equal(usdtMicroToPayWei(1, { btyUsdt: 0.1 }), (10n ** 13n).toString());
   assert.equal(usdtMicroToPayWei(0, { btyUsdt: 0.1 }), '0');
   assert.equal(usdtMicroToPayWei(-5, { btyUsdt: 0.1 }), '0', '负数没有应付语义');
 
-  // 除不尽的汇率：ceil 的定义就是「不小于精确值的最小整数」——用两条不等式钉住，
-  // 而不是在测试里把实现重抄一遍。
+  // 除不尽的汇率：先按 1 wei ceil，再向上取整到 BTY 原生单位 1e10 wei。
+  // 用两条不等式钉住，而不是在测试里把实现重抄一遍。
   //   精确值 = micro/1e6 USDT ÷ btyUsdt BTY/USDT × 1e18 wei
-  //   汇率在实现里被放大成整数 scaled = round(btyUsdt × 1e8)（保留 8 位有效精度，
-  //   远超行情源实际精度），于是精确值 = micro × 1e20 / scaled。
+  //   汇率在实现里被放大成整数 scaled = round(btyUsdt × 1e8)（保留 8 位有效精度），
+  //   于是精确值 = micro × 1e20 / scaled。
   const rate = 0.022778;
   const scaled = BigInt(Math.round(rate * 1e8));
+  const UNIT = 10n ** 10n;
   for (const micro of [1, 3, 999_999, 12_345_678, 88_000_000, 10n ** 15n]) {
     const wei = BigInt(usdtMicroToPayWei(micro, { btyUsdt: rate }));
     const num = BigInt(micro) * 10n ** 20n;
+    assert.equal(wei % UNIT, 0n, `${micro} 微 USDT：必须对齐 BTY 原生单位 1e10 wei`);
     assert.ok(wei * scaled >= num, `${micro} 微 USDT：向上取整不得少付`);
-    assert.ok((wei - 1n) * scaled < num, `${micro} 微 USDT：不得比"最小可行整数"再多付 1 wei`);
+    assert.ok((wei - UNIT) * scaled < num, `${micro} 微 USDT：不得比"最小可行单位"再多取整一次`);
   }
+
+  // BTY 主网实测（2026-11-03）：非 1e10 整数倍的 amount 会让原生 value 转账 revert
+  assert.equal(usdtMicroToPayWei(1, { btyUsdt: 0.022778 }), '43910000000000');
+  assert.equal(usdtMicroToPayWei(999_999_999_999, { btyUsdt: 0.02323 }), '43047783039130440000000000');
 
   /*
     大额不丢精度：1e15 微 = 1e9 USDT（单价上限）× 10 BTY/USDT = 1e10 BTY = 1e28 wei。

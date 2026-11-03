@@ -215,10 +215,17 @@ export async function getRates() {
 
 /**
  * 将 USDT 金额（**微 USDT**，6 位小数）换算为原生 BTY wei（decimals=18）。
- * 纯整数运算 + 无条件向上取整（ceil），与文档契约「向上取整 1 wei 防少付」一致：
+ *
+ * **必须对齐 BTY 原生转账的最小单位 `1e10 wei`（8 位小数）**：
+ * 链上 `createOrder` 的 `value` 若不是 1e10 的整数倍，EVM 在原生转账阶段就会
+ * revert；BTY 网关不返回 revert data，钱包只显示 `missing revert data`。
+ * 2026-11-03 实测：44,740,727,484,229 wei 失败，44,740,000,000,000 /
+ * 44,750,000,000,000 成功。因此先按 1 wei 向上取整，再向上取整到 1e10 wei。
+ *
+ * 纯整数运算 + 向上取整，与文档契约「向上取整防少付」一致：
  *   wei = ceil( micro/1e6 USDT ÷ btyUsdt BTY/USDT × 1e18 )
  * 上游汇率为浮点，先放大 1e8 转整数（保留 8 位有效精度，远超行情源实际精度），
- * 再做 BigInt 除法取整。旧实现用 double toFixed 截断会低付 ≤1 wei 量级且修正分支为死代码。
+ * 再做 BigInt 除法取整。
  * @returns {string} wei 字符串
  */
 export function usdtMicroToPayWei(usdtMicro, rates) {
@@ -237,7 +244,10 @@ export function usdtMicroToPayWei(usdtMicro, rates) {
   // wei = ceil( micro × 1e18 ÷ (btyUsdt × 1e6) ) = ceil( micro × 1e18 × 1e8 ÷ (scaled × 1e6) )
   const numerator = micro * 10n ** 18n * 100_000_000n;
   const denominator = BigInt(scaled) * 1_000_000n;
-  return ((numerator + denominator - 1n) / denominator).toString();
+  const exact = (numerator + denominator - 1n) / denominator;
+  // BTY 原生最小单位 1e10 wei：再向上取整一次，避免链上 value 转账 revert
+  const unit = 10n ** 10n;
+  return (((exact + unit - 1n) / unit) * unit).toString();
 }
 
 /**
