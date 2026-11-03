@@ -62,6 +62,23 @@ let escrow;
 let provider;
 let conn;
 
+/**
+ * BTY 的 `tx.wait()` 会在回执里遇到系统交易字段时解析失败（本仓 e2e 已改用原始
+ * `eth_getTransactionReceipt` 轮询）。keeper 只认链上 status=1，不依赖 ethers 的回执解析。
+ */
+async function waitConfirmed(hash, label) {
+  for (let i = 0; i < 40; i++) {
+    const rc = await provider.send('eth_getTransactionReceipt', [hash]);
+    if (rc && rc.blockNumber) {
+      const status = Number.parseInt(rc.status, 16);
+      if (status !== 1) throw new Error(`${label} reverted (status=${rc.status}, block=${rc.blockNumber})`);
+      return rc;
+    }
+    await new Promise((r) => setTimeout(r, 2500));
+  }
+  throw new Error(`${label} timeout: ${hash}`);
+}
+
 async function tick() {
   const latest = await provider.getBlockNumber();
   /*
@@ -110,7 +127,7 @@ async function tick() {
       try {
         const tx = await escrow.releaseExpired(orderId, { gasLimit: GAS_RELEASE_EXPIRED });
         log('sent', row.order_no, tx.hash);
-        await tx.wait();
+        await waitConfirmed(tx.hash, 'releaseExpired');
         released += 1;
       } catch (e) {
         log('release-failed', row.order_no, e?.shortMessage || e?.message || e);
@@ -170,7 +187,7 @@ async function tick() {
       try {
         const tx = await escrow.releaseSellerFunds(orderId, { gasLimit: GAS_RELEASE_SELLER_FUNDS });
         log('sent-pending', row.order_no, tx.hash);
-        await tx.wait();
+        await waitConfirmed(tx.hash, 'releaseSellerFunds');
         pendingReleased += 1;
       } catch (e) {
         log('pending-release-failed', row.order_no, e?.shortMessage || e?.message || e);
