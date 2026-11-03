@@ -89,6 +89,16 @@ bash deploy.sh --update
 
 会重建镜像，用同一个数据卷和同一套 MySQL 重建容器，数据不动。`--update` 默认只用安装目录里的代码；要拉公开仓最新版用 `bash deploy.sh --update --pull`（不要只重跑 `install.sh`：非更新模式会沿用现有代码目录重建镜像）。新容器健康检查失败时脚本会自动回滚到上一个镜像；回滚也失败时看上面的日志手工介入。
 
+本次升级把商品规格改为**恒至少有 1 个规格维度**。升级前先对既有库跑一次默认规格迁移（幂等；只补 `specs=[]` 的商品，并重算快照哈希）：
+
+```bash
+cd /data/app/marketplace-node   # 或安装目录
+node --env-file=.env scripts/migrate-default-spec.mjs          # 只预检
+node --env-file=.env scripts/migrate-default-spec.mjs --apply  # 写入
+```
+
+不跑迁移就发布，旧商品在编辑时会因“缺少规格维度”被拒绝；商品页也拿不到默认规格。
+
 ## 5. 数据库结构
 
 节点启动时会把期望 schema 在临时库里执行一遍，再与真实库逐项对拍。缺列、缺索引、缺触发器、排序规则不符都会拒绝启动，并打印可执行的修复 SQL。

@@ -3,7 +3,7 @@
  *
  * - product_skus.capacity 列 = 该组合的总量（NULL=不限量）；
  * - product_skus.committed 列 = 该组合的销量/已占位（件数口径）；
- *   定位键是 (product_id, sku_key) —— 无规格商品的 sku_key 为 ''；
+ *   定位键是 (product_id, sku_key) —— 默认规格（唯一组合）的 sku_key 为 ''；
  * - orders.hold_qty（TINYINT UNSIGNED）= 该订单「应占位件数」：下单事务内商品限量且占位成功
  *   → quantity，不限量/池式商品 → 0。随订单行存续，是释放/恢复的唯一记账依据——
  *   商品任意切换限量/不限量都不会产生账目漂移：
@@ -78,7 +78,7 @@ function assertInternalOrderIds(orderIds) {
 
 /** 占位：该组合销量 +quantity（默认 1），成功返回 true
  *  （committed + qty ≤ capacity 校验失败、或该组合不限量时返回 false——不限量不占位）
- *  skuKey 为 '' 表示无规格商品的唯一组合。 */
+ *  skuKey 为 '' 表示默认规格的唯一组合。 */
 export async function holdStock(productId, skuKey = '', quantity = 1) {
   const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
   const { foundRows } = await getDb().run('UPDATE product_skus SET committed = committed + ? WHERE product_id = ? AND sku_key = ? AND capacity IS NOT NULL AND committed + ? <= capacity', qty, productId, String(skuKey ?? ''), qty);

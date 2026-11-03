@@ -192,7 +192,7 @@ test('NFT quantity=2：同单 tokenId 重复申报 / 一次超量申报 → 链�
     kind: 'nft',
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出：无规格商品就是 key='' 的唯一组合
-    specs: [],
+    specs: [{ name: '规格', options: ['默认'] }],
     skus: [{ key: '', priceUsdtMicro: 66_000_000, capacity: null }],
   });
   const importRes = await request(app)

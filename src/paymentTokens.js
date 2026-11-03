@@ -96,8 +96,25 @@ export async function upsertPaymentToken(input) {
 export async function deletePaymentToken(address) {
   const addr = String(address ?? '').trim().toLowerCase();
   if (!isAddress(addr)) throw new Error('支付资产地址非法');
+  /* 删除前取回被删的那一行：审计要记下 symbol/精度/报价方式，否则只剩一个地址，
+     操作记录里看不出"删的是哪种资产"（保存时本来就有这些字段，删除没有理由丢掉）。 */
+  const row = await getDb().get(
+    `SELECT address, symbol, decimals, mode,
+            fixed_usdt_micro_per_token AS fixed_usdt_micro, price_url
+       FROM payment_tokens WHERE address = ?`,
+    addr
+  );
+  if (!row) return null;
   const r = await getDb().run('DELETE FROM payment_tokens WHERE address = ?', addr);
-  return r.foundRows === 1;
+  if (r.foundRows !== 1) return null;
+  return {
+    address: String(row.address),
+    symbol: String(row.symbol),
+    decimals: Number(row.decimals),
+    mode: row.mode === 'oracle' ? 'oracle' : 'fixed',
+    fixed: row.fixed_usdt_micro == null ? null : String(row.fixed_usdt_micro),
+    priceUrl: row.price_url ? String(row.price_url) : '',
+  };
 }
 
 /**

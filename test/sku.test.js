@@ -75,12 +75,14 @@ test('SKU 必须恰好覆盖全部组合：少一个 / 多一个 / 键不属于�
   assert.match(wrongKey.body.message, /不属于当前规格/);
 });
 
-test('规格定义边界：单维少于 2 个选项 / 超过 3 维 → 拒绝', async () => {
+test('规格定义边界：单维 1 个选项可上架（单规格）/ 超过 3 维 → 拒绝', async () => {
   const one = await post(
     productPayload({ specs: [{ name: '颜色', options: ['黑'] }], skus: [{ key: '黑', priceUsdtMicro: 1_000_000 }] })
   );
-  assert.notEqual(one.body.code, 0);
-  assert.match(one.body.message, /至少需要 2 个选项/);
+  assertOk(one);
+  assert.deepEqual(one.body.data.specs, [{ name: '颜色', options: ['黑'] }]);
+  assert.equal(one.body.data.skus.length, 1);
+  assert.equal(one.body.data.skus[0].key, '黑');
 
   const four = await post(
     productPayload({
@@ -92,14 +94,26 @@ test('规格定义边界：单维少于 2 个选项 / 超过 3 维 → 拒绝', 
   assert.match(four.body.message, /最多 3 个维度/);
 });
 
-test("无规格商品 = 唯一组合 sku_key=''（与多规格同一条路径）", async () => {
-  const res = await post(productPayload({ title: '无规格商品' }));
+test('上架必须至少有一个规格维度；空 specs 被拒绝', async () => {
+  const res = await post(productPayload({ title: '无规格商品', specs: [] }));
+  assert.notEqual(res.body.code, 0);
+  assert.match(res.body.message, /至少需要一个规格维度/);
+});
+
+test("显式默认规格（规格：默认）= 唯一组合 sku_key=''", async () => {
+  const res = await post(
+    productPayload({
+      title: '默认规格商品',
+      specs: [{ name: '规格', options: ['默认'] }],
+      skus: [{ key: '', priceUsdtMicro: 1_000_000 }],
+    })
+  );
   assertOk(res);
   const p = res.body.data;
-  assert.deepEqual(p.specs, []);
+  assert.deepEqual(p.specs, [{ name: '规格', options: ['默认'] }]);
   assert.equal(p.skus.length, 1);
-  assert.equal(p.skus[0].key, '', '无规格商品的组合键为空串');
-  assert.deepEqual(p.skus[0].specs, {});
+  assert.equal(p.skus[0].key, '', '默认规格的组合键为空串');
+  assert.deepEqual(p.skus[0].specs, { 规格: '默认' });
 });
 
 // ── 定价 ──
@@ -129,7 +143,15 @@ test('按所选 SKU 定价：不同组合不同价，与商品级「起价」无
 
 test('多规格商品必须指定 skuKey；单组合商品可省略', async () => {
   const multi = (await post(productPayload({ title: '需选规格', specs: SPECS, skus: SKUS }))).body.data;
-  const single = (await post(productPayload({ title: '单组合' }))).body.data;
+  const single = (
+    await post(
+      productPayload({
+        title: '单组合',
+        specs: [{ name: '规格', options: ['默认'] }],
+        skus: [{ key: '', priceUsdtMicro: 66_000_000 }],
+      })
+    )
+  ).body.data;
 
   const noKey = await draftAs(newBuyer(), multi.slug);
   assert.equal(noKey.status, 400);

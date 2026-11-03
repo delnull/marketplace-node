@@ -64,8 +64,8 @@ function nftPayload(overrides = {}) {
     media: [{ type: 'image', url: 'https://example.com/n.jpg' }],
     kind: 'nft',
     nftContract: NFT_CONTRACT,
-    // 价格与库存逐组合给出；无规格商品就是 key='' 的唯一组合
-    specs: specs ?? [],
+    // 价格与库存逐组合给出；单一默认规格就是 key='' 的唯一组合
+    specs: specs ?? [{ name: '规格', options: ['默认'] }],
     skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
     ...rest,
   };

@@ -84,10 +84,18 @@ export async function stakingShortfall({ force = false } = {}) {
   if (!force && cache.value && Date.now() - cache.at < TTL_MS) return cache.value;
   try {
     const staking = new ethers.Contract(stakingAddress, STAKING_ABI, getProvider());
-    const [poolRaw, floors] = await Promise.all([staking.poolOf(operator), staking.payoutFloors(operator)]);
+    const poolRaw = await staking.poolOf(operator);
+    const floors = await staking.payoutFloors(operator);
+    /*
+      `payoutFloors` 返回 (exposure, required)；任一字段缺失 = ABI/合约形状漂移，
+      不能 `?? 0` 折成"没有下限"（那会得出"池子够用"的假结论），按读不到处理。
+    */
+    if (floors?.exposure == null || floors?.required == null) {
+      return unavailable('payoutFloors 返回形状异常（读不到 exposure/required）');
+    }
     const poolWei = BigInt(poolRaw).toString();
-    const exposureWei = BigInt(floors?.exposure ?? 0).toString();
-    const requiredWei = BigInt(floors?.required ?? 0).toString();
+    const exposureWei = BigInt(floors.exposure).toString();
+    const requiredWei = BigInt(floors.required).toString();
     const { below, shortfallWei } = shortfallOf(poolWei, requiredWei);
     const value = {
       available: true,

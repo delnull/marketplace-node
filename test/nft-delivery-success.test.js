@@ -140,7 +140,7 @@ async function nftOrderInEscrow() {
       media: [{ type: 'image', url: 'https://example.com/n.jpg' }],
       kind: 'nft',
       nftContract: NFT_CONTRACT,
-      specs: [],
+      specs: [{ name: '规格', options: ['默认'] }],
       skus: [{ key: '', priceUsdtMicro: 66_000_000, capacity: null }],
     })
     .expect(200);
@@ -231,7 +231,7 @@ test('NFT 部分交付并发：三笔同时登记 1 枚（quantity=2）⇒ 只�
       media: [{ type: 'image', url: 'https://example.com/n3.jpg' }],
       kind: 'nft',
       nftContract: NFT_CONTRACT,
-      specs: [],
+      specs: [{ name: '规格', options: ['默认'] }],
       skus: [{ key: '', priceUsdtMicro: 66_000_000, capacity: null }],
     })
     .expect(200);
@@ -306,7 +306,7 @@ test('NFT 部分交付（未到数量）：交付行照常落，订单保持 esc
       media: [{ type: 'image', url: 'https://example.com/n2.jpg' }],
       kind: 'nft',
       nftContract: NFT_CONTRACT,
-      specs: [],
+      specs: [{ name: '规格', options: ['默认'] }],
       skus: [{ key: '', priceUsdtMicro: 66_000_000, capacity: null }],
     })
     .expect(200);

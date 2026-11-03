@@ -424,7 +424,13 @@ router.delete('/payment-tokens/:address', hostOnly, wrap(async (req, res) => {
   if (!isAddress(address)) return fail(res, '支付资产地址非法');
   const deleted = await deletePaymentToken(address);
   if (!deleted) return fail(res, '该支付资产配置不存在', 404, 404);
-  await audit(req, 'payment_token.delete', 'node', address, {}, null);
+  await audit(req, 'payment_token.delete', 'node', address, {
+    symbol: deleted.symbol,
+    decimals: deleted.decimals,
+    mode: deleted.mode,
+    fixedUsdtMicroPerToken: deleted.fixed,
+    priceUrl: deleted.priceUrl || null,
+  }, null);
   ok(res, { address }, '已删除配置（链上 supportedToken 仍由节点主自行关停）');
 }));
 

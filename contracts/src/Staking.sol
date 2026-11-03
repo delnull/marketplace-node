@@ -72,7 +72,7 @@ interface IEscrowMinimal {
     /**
      * @notice 当前委员会届次（`Escrow.orderEpoch` 只返回当前届；不再有按单快照）。
      *
-     * `penalize` 仅把它写进 `PenaltyWindow.epochAtOpen` 作诊断留痕；窗口归属/出金锁
+     * `penalize`/`penalizeClaim` 仅把它写进 `PenaltyWindow.epochAtOpen` 作诊断留痕；窗口归属/出金锁
      * 不依赖届次（投票资格只看当前名单）。
      */
     function orderEpoch(bytes32 orderId) external view returns (uint32);
@@ -81,7 +81,8 @@ interface IEscrowMinimal {
      * @notice 该卖家当前的**在途售后敞口**（wei）= Σ 在途单（退款申请待决 + 争议中 + 被拒后尚未终局）的 `amount`。
      *
      * 这是本合约**出金下限**的唯一读数之一（2026-10-13 复审由"笔数"改为"金额"）：
-     * 任何一笔打款之后 `poolOf(卖家)` 都不得低于该敞口（与治理留存线取较大者，见 `payoutFloors`）。
+     * 出金下限是 `max(在途退款敞口 + 在途提货争议敞口, 治理留存线)`（见 `payoutFloors`）；
+     * `approveUnstake` 用完整下限，`claimUnstake` 刻意只用敞口（不受留存线约束）。
      * 敞口由 Escrow 幂等维护（只有终局 `_settle` 会放掉；拒绝退款**不**放掉，之后发起争议也不会重复累加）。
      *
      * **为什么必须是金额**：按笔数记账时判据只能是 `> 0`；攻击者用一笔 1 wei 的订单并申请退款
@@ -104,7 +105,8 @@ interface IEscrowMinimal {
      * 它放宽的是罚没资格门槛：`buyerConfirmed` 原本一票否决（买家自己点过确认收货的单不得追罚，
      * 那是源码审计 2026-09 的 P1 修复）；但"收货后才发现是假货"必须有一条救济路径，
      * 所以买家开案之后，`buyerConfirmed` 不再阻止罚没。
-     * 注意：售后案件**不**计入 `sellerOpenExposure`（它不阻塞卖家出金）。
+     * 注意：售后案件**不**计入 `sellerOpenExposure`（它不阻塞卖家出金）；**提货争议**另计
+     * `sellerClaimExposure`，会压住出金下限。
      *
      * **它只是门槛的一半（2026-10-14 修正）**：案件一旦开启就**永不自动过期**
      * （`closeAfterSale` 只有买家能调，委员会一侧走 `voteAfterSale` 票决），所以单看这个活标志等于"窗口没有上限"——
@@ -114,10 +116,20 @@ interface IEscrowMinimal {
     function afterSaleOpen(bytes32 orderId) external view returns (bool);
 
     /**
-     * @notice 售后案是否由**90 天强制到期**路径结案（不是买家撤诉/委员会裁决）。
+     * @notice 该单的支付资产：address(0) = 原生 BTY，否则是节点白名单 ERC20。
      *
-     * 强制结案只释放 pending，不消灭窗口内剩余的第二层罚没救济；买家主动撤诉/委员会裁决
-     * 结案仍按"买家已认可"收回罚没资格。Staking 的 `buyerConfirmed` 门槛同时看这两个活标志。
+     * `penalize` 用它区分**赔付基准**：原生单按 `sellerNetAtSettle * penaltyCapBps` 限额
+     * （同币种）；代币单没有同币种基准，上限取卖家当前质押池（BTY 赔付给买家，
+     * 与订单币种不同）。不读它就会把代币金额当 BTY 用——金额量级完全错位。
+     */
+    function orderToken(bytes32 orderId) external view returns (address);
+
+    /**
+     * @notice 售后案是否由**到期强制结案**路径结案（不是买家撤诉/委员会裁决）。
+     *
+     * 到期出口取“开案 + 90 天（投票上限）”与“结算 + 窗口”的**先到者**；强制结案只释放
+     * 卖家 pending，不消灭窗口内剩余的第二层罚没救济；买家主动撤诉/委员会裁决结案仍按
+     * "买家已认可"收回罚没资格。Staking 的 `buyerConfirmed` 门槛同时看这两个活标志。
      */
     function afterSaleForcedClosed(bytes32 orderId) external view returns (bool);
 
@@ -223,9 +235,6 @@ contract Staking is Ownable2Step, ReentrancyGuard {
 
     /// @notice 已执行赔付的提货争议（幂等）
     mapping(bytes32 => bool) public penalizedClaims;
-
-    /// @notice 同一订单的提货赔付累计（多枚 NFT 的提货争议共享订单净额上限）
-    /// @dev 提货赔付的幂等标记由 `penalizedClaims` 承担；累计上限由 `penalizedByOrderTotal` 承担。
 
     /// @notice 同一订单的**全部罚没累计**（订单罚没 + 提货赔付），跨两种路径共享一个上限
     mapping(bytes32 => uint256) public penalizedByOrderTotal;
@@ -370,8 +379,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * push 花掉那笔钱之后挂账反而写不下 ⇒ 整笔 `penalize`/`claimUnstake` OOG 回滚。
      * 回滚方向是安全的（罚没资格与窗口记账一并撤销，不会罚错），但"罚不了"确实发生了。
      *
-     * 口径如实：这是**预算**不是证明；判据由 `Escrow.t.sol::testNoGasBudgetLosesMoney`
-     * 那条预算扫描承担（两个合约的 `_payoutOrCredit` 是同一形状，扫描覆盖其行为）。
+     * 口径如实：这是**预算**不是证明（当前没有覆盖 push 失败→挂账→自领的用例；
+     * 两个合约的 `_payoutOrCredit` 形状相同，改阈值时两处必须同批改）。
      * 偏高是安全方向：gas 紧张时更倾向挂账，钱仍挂在账上、由收款方自领。
      */
     uint256 public constant ACCRUAL_GAS_HEADROOM = 60_000;
@@ -689,8 +698,9 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     }
 
     /**
-     * @notice 管理员在**自动放行窗口**内未处理时，由**店主自己**触发打款（`unstakeApprovalTimeout > 0`
-     * 才有这条路径；默认 0 ⇒ 恒 revert `UnstakeNotApproved`）。
+     * @notice 管理员在**自动放行窗口**内未处理时，由**店主自己**触发打款（自动放行窗口始终存在：
+     * `unstakeApprovalTimeout == 0` 时取 365 天绝对上限，见 `_autoApproveWindow`；只有到了该
+     * 上限仍未被批准才 revert `UnstakeNotApproved`）。
      *
      * 它存在的唯一理由是"owner 失联/丢钥不能等于所有店主的质押永久锁死"。闸门：
      * 冷却期满、未冻结、未被罚没窗口锁住、**打款后不低于在途售后敞口**。
@@ -852,7 +862,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * @notice 某店主的撤资申请全貌（**唯一实现**：前端"等待管理员批准/已可批准"的展示共用）。
      * @return pending 在途申请金额（wei）
      * @return releaseAt 冷却期到期时刻（unix 秒；0 = 无在途申请）
-     * @return approved 是否已获批准（`approveUnstake` 是即打款的，所以读取时通常已清零）
+     * @return approved 是否已获批准（**最近一批**的留痕：`approveUnstake` 打款后会保留 true，
+     *  被清零的是 `pending`；前端按它渲染"已批准"那一态）
      * @return autoApproveArmed 是否尚未放行（自动放行上限始终存在，见 `_autoApproveWindow`）
      * @return autoApproveAt 自动放行时刻（0 = 无在途申请或已放行）
      */
@@ -1337,10 +1348,10 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     // 候选合约自报的裁决者，因此不可能成立。**不要**以"加一条更严的判据/白名单"的形式把它带回来。
 
     /**
-     * @dev 托管地址探针（**唯一实现，且只剩构造期一个调用点**）：本合约**实际依赖的十二个读法**
+     * @dev 托管地址探针（**唯一实现，且只剩构造期一个调用点**）：本合约**实际依赖的读法**
      *      必须都在（`getOrder` / `sellerOpenExposure` / `sellerClaimExposure` / `orderClaimExposure` /
      *      `claimCase` / `sellerNetAtSettle` / `afterSaleOpen` / `afterSaleForcedClosed` /
-     *      `settledAtBlock` / `afterSaleWindowAtSettle` / `orderEpoch` / `revokedArbiter`）。
+     *      `orderToken` / `settledAtBlock` / `afterSaleWindowAtSettle` / `orderEpoch` / `revokedArbiter`）。
      *
      * 为什么不能只探一两个读法：`penalize` 与出金下限还依赖其余读法。只探一两个函数时，
      * 一个"有那个读法、但没有其余读法"的地址会被写进 `escrow`（storage，构造后无 setter），
@@ -1358,6 +1369,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
     function _probeEscrow(address candidate) internal view returns (IEscrowMinimal) {
         if (candidate.code.length == 0) revert ZeroAddress();
         _probeBool(candidate, abi.encodeWithSignature("afterSaleOpen(bytes32)", bytes32(0)));
+        // 罚没单笔上限按币种分档的判据：缺它则所有 penalize 直接 revert（无条件读）。
+        _probeWord(candidate, abi.encodeWithSignature("orderToken(bytes32)", bytes32(0)), 1);
         _probeBool(candidate, abi.encodeWithSignature("afterSaleForcedClosed(bytes32)", bytes32(0)));
         _probeWord(candidate, abi.encodeWithSignature("sellerOpenExposure(address)", address(0)), 1);
         // 提货争议敞口：出金下限与罚没容量都读它；缺它则所有出金/罚没路径直接 revert。
@@ -1376,7 +1389,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
         // 缺它则 `penalize` 直接 revert（selector 不存在）——罚没整条路径在部署后第一次罚就没
         // 发现，所以必须进构造期探针，与其余读法同款。
         _probeWord(candidate, abi.encodeWithSignature("orderEpoch(bytes32)", bytes32(0)), 1);
-        // `revokedArbiter`：owner 转移闸与出金锁的提前解除都读它。
+        // `revokedArbiter`：owner 转移闸（拒绝把 Staking 交给被吊销的仲裁人）读它。
+        // "吊销开窗人即提前解锁"那条机制已删除——出金锁只看窗口/全局开关，不再读它。
         _probeBool(candidate, abi.encodeWithSignature("revokedArbiter(address)", address(0)));
         return IEscrowMinimal(candidate);
     }
@@ -1445,7 +1459,8 @@ contract Staking is Ownable2Step, ReentrancyGuard {
      * 注意：这与"必须曾进入争议"**不是**同一条门槛——那样会把跑路卖家漏在门外。
      *
      * @dev **2026-10 第二批的放宽（"确认收货后发现商品有问题"）**：买家开过**售后案件**
-     * （`Escrow.afterSaleOpen(orderId)`）**或案件由 90 天强制到期结案**（`afterSaleForcedClosed`）
+     * （`Escrow.afterSaleOpen(orderId)`）**或案件由到期强制结案**（`afterSaleForcedClosed`：
+     * 开案满 90 天或窗口结束，先到者）
      * **且该单仍在窗口内**时，`buyerConfirmed` **不再**一票否决——否则"收到货才发现是假货/少件"
      * 在整个机制内没有任何救济。强制到期只释放卖家 pending，不消灭窗口内剩余的罚没资格；
      * 买家主动撤诉/委员会裁决结案仍按"买家已认可"收回资格。放宽的边界：
@@ -1532,10 +1547,20 @@ contract Staking is Ownable2Step, ReentrancyGuard {
 
         Position storage p = _positions[operator];
         uint256 pool = p.staked + p.pending;
-        uint256 cap = (_penaltyBase(escrowOrderId) * penaltyCapBps) / 10000;
+        /*
+          单笔上限的**基准按币种分档**（唯一实现）：原生单用 `sellerNetAtSettle * penaltyCapBps`
+          （同币种，语义是"罚得不超过卖家实际赚到的"）；代币单没有同币种基准——用它的
+          代币金额乘 bps 再当 BTY 付出去，量级完全错位（6 位小数的代币会把上限压到 0，
+          18 位小数的代币会放大到荒谬的数）。所以代币单的上限取**卖家当前质押池**：
+          委员会能判多少由票决决定，能不能兑现由池子决定，Escrow 的代币账本不参与。
+        */
+        uint256 cap = escrow.orderToken(escrowOrderId) == address(0)
+            ? (_penaltyBase(escrowOrderId) * penaltyCapBps) / 10000
+            : pool;
         uint256 usedTotal = penalizedByOrderTotal[escrowOrderId];
         // 未结案提货争议的预留额度先占住累计上限；否则普通罚没先花光 cap，
         // claim 即使已在 Escrow 预留买家受偿额度，执行时仍会因 Staking 的同一 cap 回滚。
+        // 代币单开不了提货争议（Escrow 的 TokenClaimsNotSupported），该项恒为 0。
         if (amountWei > cap || usedTotal + amountWei + escrow.orderClaimExposure(escrowOrderId) > cap) revert ExceedsCap();
         if (amountWei > pool) revert InsufficientStake();
         /*
@@ -1636,6 +1661,18 @@ contract Staking is Ownable2Step, ReentrancyGuard {
         IEscrowMinimal.Order memory o = escrow.getOrder(c.orderId);
         if (o.status != 3) revert OrderNotSettled(); // Settled
         if (o.seller != seller) revert PartiesMismatch();
+        /*
+          提货赔付也服从"买家已确认收货"的门槛（与 `penalize` 同式）：`claimant` 可以是买家
+          本人，而 `openClaimDispute` 不禁止它。不判这一条，owner + 阈值委员就能用一个
+          "提货争议"在买家已确认、且从未开售后案的单上从保证金赔给买家，绕过
+          `openAfterSale` 这条唯一入口。小号仍无法在链上识别——那属于 owner+委员会共谋的
+          信任模型；这里堵的是"买家本人"这条合法外衣。
+        */
+        if (c.claimant == o.buyer && o.buyerConfirmed
+            && !escrow.afterSaleOpen(c.orderId) && !escrow.afterSaleForcedClosed(c.orderId))
+        {
+            revert OrderConfirmedByBuyer();
+        }
         // 提货争议也受该单售后窗口约束；否则 owner 可在任意时间开案并追罚卖家。
         if (!_afterSaleInWindow(c.orderId)) revert PenaltyWindowElapsed();
 

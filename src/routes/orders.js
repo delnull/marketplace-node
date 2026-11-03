@@ -67,20 +67,20 @@
  *   （事件漏扫兜底；落列逻辑与 watcher 的 PartialRefundAccepted 分支共用 applyAcceptedPartialRefund）。
  *
  * **确认收货后的售后案件**（契约 2026-10 第二批；本地判据的唯一实现在 `src/afterSale.js`）：
- *   终局（链上 Settled，货款进入售后留存期）——买家在窗口内（默认 180 天/上限 360 天，自结算块起算）
+ *   终局（链上 Settled，货款进入 7 天留存期）——买家在窗口内（默认 180 天/上限 360 天，自结算块起算）
  *   链上 `openAfterSale(orderId)` 开案 --> 本地 order_chain.after_sale_status=open（**orders.status 不变**：
  *   订单仍旧是 confirmed/settled/expired）
  *     ├--双方在 `phase='after_sale'` 提交售后陈述（有在途案件时才受理，见 evidenceFiles.js）
- *     ├--卖家在留存期内主动 `refundSettled`，或仲裁人 `voteAfterSale` 只从留存货款退买家（超出则回滚；不调用 Staking）
+ *     ├--卖家在留存期内主动 `refundSettled`，或仲裁人 `voteAfterSale` 从卖家保证金赔给买家（不碰留存货款）
  *     └--买家 `closeAfterSale(orderId, note)` 撤诉，或委员会 `voteAfterSale(orderId, penaltyWei)` 结案
  *        --> after_sale_status=closed（**终态**：合约不允许重开；说明只随买家撤诉事件上链）
  *   它与**退款/争议**的关系（三者互不替代，别混着用）：
- *     · 确认收货后货款先进入 Escrow 售后留存期；案件在途时**不释放留存货款**，裁决**只从留存退买家**，
- *       超出留存额整笔回滚；要动用 Staking 保证金必须另走 `votePenalty`；
+ *     · 确认收货后货款先进入 7 天留存期（不超过本单窗口）；案件在途时**不释放留存货款**（重新冻结到结案），
+ *       赔款**只从 Staking 的卖家保证金出**（BTY，代币单也是 BTY）；
  *     · **不阻塞卖家出金**——出金下限只读链上 `Escrow.sellerOpenExposure`（退款申请/争议中的
  *       Σ amount），售后案件不计入；能追罚的口子由窗口长度限制（没有窗口就等于作废"买家点过头的单不再被追罚"）；
  *     · 它**不是** disputed：争议单资金仍在托管里、仲裁走 `Escrow.voteSettlement` 票决；案件走的是
- *       售后留存货款 + 保证金兜底。
+ *       保证金赔付 + 7 天留存期冻结。
  *   三条回填路径同源：事件（watcher 的 AfterSaleOpened/Closed）、本文件的 `/sync`
  *   （读 afterSaleOpen/afterSaleOpenedAtBlock）、后台对账（chainReconcile 的售后案件复查）——
  *   都经 `applyAfterSaleOpened`/`applyAfterSaleClosed`/`applyAfterSaleFromChain` 落列。
@@ -270,7 +270,7 @@ const EVIDENCE_PHASE_LABEL = EVIDENCE_PHASE_LABEL_OF;
  */
 const EVIDENCE_DETAIL_LIMIT = 100;
 
-/** 已成交状态（确认收货 / 仲裁判付 / 超时释放）；确认收货的货款可能仍在售后留存期 */
+/** 已成交状态（确认收货 / 仲裁判付 / 超时释放）；确认收货的货款可能仍在 7 天留存期 */
 const INCOME_STATUS = ORDER_INCOME_STATUS; // 唯一出处：src/orderStatus.js（看板/CSV/可评价同源）
 
 /** 买家侧兑换码可见状态（卖家已交付；退款/取消后码隐藏） */
@@ -448,9 +448,9 @@ async function orderToPublic(o, opts = {}) {
     productSlug: o.product_slug,
     productSnapshot: snapshot,
     snapshotHash: o.snapshot_hash,
-    /** 所选规格组合标识（无规格商品为空串） */
+    /** 所选规格组合标识（默认规格为空串） */
     skuKey: o.sku_key,
-    /** 所选规格快照：{ 颜色:'黑', 尺寸:'65' }（下单时冻结；无规格为 {}）。
+    /** 所选规格快照：{ 颜色:'黑', 尺寸:'65' }（下单时冻结；默认规格为 {规格:'默认'}）。
      *  `sku_specs` 是 JSON 列，驱动已解析成对象——再 JSON.parse 一次会抛错并静默变成 {}。 */
     skuSpecs: (() => {
       const v = o.sku_specs;
@@ -1123,7 +1123,7 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
   */
   const quotaSeller = target === me ? null : owner;
   // ── 所选 SKU：价格与库存的权威来源 ──
-  // 无规格商品的唯一组合 sku_key 为 ''，故这里不需要「有无规格」的分支。
+  // 默认规格的唯一组合 sku_key 为 ''，故这里不需要「有无规格」的分支。
   // 未指定 skuKey 时：只有一个组合就自动选中（简化调用仍可用）；
   // 多组合则必须显式选择 —— 否则金额无法确定，宁可拒单也不猜。
   const skuRows = await loadSkus(product.id);
@@ -1960,7 +1960,7 @@ router.post('/:id/paid', requireAuth, paidLimiter, wrap(async (req, res) => {
     const cur = await fetchOnchainOrder(order.escrow_order_id);
     const st = String(cur?.status || 'Created');
     if (st === 'Refunded' || st === 'Settled' || st === 'Disputed') {
-      const label = st === 'Refunded' ? '已退款' : st === 'Settled' ? '已成交（货款已结算，可能仍在售后留存期）' : '已进入争议（资金冻结）';
+      const label = st === 'Refunded' ? '已退款' : st === 'Settled' ? '已成交（货款已结算，可能仍在 7 天留存期）' : '已进入争议（资金冻结）';
       return fail(
         res,
         `链上该托管单当前状态为「${label}」，但本地仍是未支付草稿（疑似事件漏扫/竞态）——请勿按支付确认处理；` +

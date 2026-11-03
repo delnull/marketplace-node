@@ -159,7 +159,7 @@ export async function sellerTodoCounts(seller) {
   const pendingDispute = byStatus.disputed || 0;
   /*
     在途**售后案件**（确认收货后开案）计数：与 disputed 并列进店主徽标。
-    为什么必须给：案件在途意味着"这笔仍在售后留存期的货款可能被判给买家；要动用保证金还可在结案前另投 votePenalty"，
+    为什么必须给：案件在途意味着"赔款可能从店主保证金里扣，且 7 天留存期内的货款会冻结到结案"，
     而订单状态仍是终局（settled/confirmed/expired）——只按 status 分组的徽标永远看不见它，
     店主会一直以为这单已经了结。判据与仲裁队列/退货门控同一处（afterSale.js）。
   */

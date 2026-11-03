@@ -27,7 +27,7 @@
  *
  * 链上读取怎么伪造：与 test/order-sync-paths.test.js 同款——ethers v6 在 Node 下用 node:http 发
  * JSON-RPC（不走 globalThis.fetch），故起一个本地假 JSON-RPC 服务器（按 selector/topic0 分发），
- * 把 config.chain.rpcUrl 指过去。
+ * 把 config.chain.rpcUrls 指过去。
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';

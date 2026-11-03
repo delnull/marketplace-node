@@ -104,7 +104,7 @@ export async function makeCtx() {
     （paid/sync 的 getOrder、getArbiterAddress、账本的全局兜底口径）都会真的打一次公网。
     这里指向一个必然"连接被拒"的本地端口：链上路径快速失败，与真实 RPC 不可达时同形
     （各处都已 try/catch 降级），测试不再触网也不再被外网抖动拖慢。
-    需要"链上可用"的用例请自建本地假 JSON-RPC 服务器并改写 config.chain.rpcUrl——
+    需要"链上可用"的用例请自建本地假 JSON-RPC 服务器并改写 config.chain.rpcUrls——
     见 test/order-sync-paths.test.js 与 test/fees-per-order.test.js。
   */
   process.env.MK_RPC_URL = 'http://127.0.0.1:1/';
@@ -345,7 +345,7 @@ export function productPayload(overrides = {}) {
     description: '单测上架的商品描述，用于校验快照与下单流程。',
     media: [{ type: 'image', url: 'https://example.com/a.jpg' }],
     kind: 'digital',
-    specs: specs ?? [],
+    specs: specs ?? [{ name: '规格', options: ['默认'] }],
     skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
     ...rest,
   };
@@ -353,7 +353,7 @@ export function productPayload(overrides = {}) {
 
 /**
  * 默认组合（sku_key=''）的库存行 —— 价格与库存现在都在 product_skus 上。
- * 无规格商品的唯一组合就是它，所以单规格用例仍可像以前一样读「这个商品的库存」。
+ * 单一默认规格的唯一组合就是它，所以单规格用例仍可像以前一样读「这个商品的库存」。
  * 多规格用例请直接查 product_skus 并带上具体 sku_key。
  */
 export async function skuInv(db, slug) {

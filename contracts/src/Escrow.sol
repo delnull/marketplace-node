@@ -28,9 +28,10 @@ interface IERC20 {
 /**
  * @title Escrow —— 每个节点一个托管合约（正常商城的资金流 + 本节点委员会）
  *
- * 资金流：买家锁定货款 → 卖家发货 → 买家确认收货后货款先进入售后留存期（覆盖整段售后窗口），
- *         窗口结束且无在途售后才释放给卖家；退款回买家；超时释放给卖家。
- * 售后：确认收货后的案件优先从留存货款退买家；账本不变量保证留存足够，不足即回滚。
+ * 资金流：买家锁定货款 → 卖家发货 → 买家确认收货后货款进入**最多 7 天**的留存期
+ *         （取 `min(本单窗口, 7 天)`；窗口更短时按窗口），到期且无在途售后才释放给卖家；
+ *         退款回买家；超时释放给卖家。
+ * 售后：确认收货后 180 天（上限 360 天）内买家可开案；赔款**只从 Staking 的卖家保证金出**（BTY）。
  * 争议：买家发起 → 本节点委员会按阈值票决（可全额退 / 全额判卖家 / 任意拆分）。
  * 罚没：委员会票决达到阈值后，由本合约调本节点 Staking 从卖家保证金赔给买家。
  * 提货争议：NFT 提货人（当前持有人）与卖家的纠纷，由节点运营方开案、委员会票决，
@@ -40,8 +41,8 @@ interface IERC20 {
  * 店铺、商品、订单明细与任何费率全部在节点链下，合约不读店铺、不读费率。
  *
  * ERC20 支付（节点白名单）：订单的支付资产由 orderToken 固定，退款/结算/留存/卖家退款全部同币种。
- * 因为 Staking 只有原生 BTY，ERC20 单没有同币种保证金：售后赔付以 sellerPending 为上限，
- * 提货争议与旧 votePenalty 入口对 ERC20 单明确拒绝。
+ * 售后赔付是**跨币种**的：Staking 只有原生 BTY，所以代币单的赔款也是 BTY（从卖家 BTY 保证金出）。
+ * 提货争议仍拒绝代币单（提货人不是买家，订单的代币账本没有对应预留额度）。
  */
 contract Escrow is Ownable2Step, ReentrancyGuard {
     enum OrderStatus {
@@ -68,11 +69,11 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     /// @dev 提货争议案件（节点运营方开案，委员会票决赔给提货人）
     struct ClaimCase {
         bytes32 orderId;
-        bytes32 tokenRef; // keccak256(nftContract, tokenId)，仅留痕
+        bytes32 tokenRef; // keccak256(nftContract, tokenId)；同一订单同一 tokenRef 只允许一个未结案
         address seller;
         address claimant;
-        uint256 amount; // 争议金额上限（<= 订单净额）
-        uint64 deadline; // 最晚开案时间（提货窗口 + 争议宽限期）
+        uint256 amount; // 开案时的争议金额上限（还受 _freeBuyerCredit 与 Staking 容量双重约束）
+        uint64 deadline; // 裁决/投票截止（开案时夹到 90 天；过期票不生效，owner 可撤销）
         uint64 openedAt;
         bool closed;
     }
@@ -93,13 +94,13 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     /// @dev 卖家拒绝退款的区块（0 = 从未拒绝）
     mapping(bytes32 => uint64) public refundRejectedAtBlock;
 
-    /// @dev 卖家在途售后敞口 = Σ 退款待决/争议中/被拒未终局订单的 amount
+    /// @dev 卖家**结算前**在途敞口 = Σ 退款待决/争议中/被拒未终局订单的 amount（不含结算后的售后案；提货争议另有 `sellerClaimExposure`）
     mapping(address => uint256) public sellerOpenExposure;
 
-    /// @dev 订单是否有在途售后（幂等开/关；内部账本，外部读它没有消费方）
+    /// @dev 订单是否有在途**结算前**退款/争议（幂等开/关；售后案件是另一层，不写这里）
     mapping(bytes32 => bool) private caseOpen;
 
-    /// @dev 全局在途售后敞口（诊断/不变量对拍）
+    /// @dev 全局在途**结算前**退款/争议敞口（仅原生单；不含售后案件与提货赔付）
     uint256 public totalOpenExposure;
 
     /// @dev 订单判给卖家的实收净额（罚款单笔上限基准）
@@ -108,7 +109,7 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     /// @dev 确认收货后暂存、尚未释放给卖家的货款（售后留存期）
     mapping(bytes32 => uint256) public sellerPending;
 
-    /// @dev 暂存货款最早可释放区块（确认收货/部分退款结算时锁定；与售后窗口同长）
+    /// @dev 暂存货款最早可释放区块（结算时按 `min(本单窗口, 7 天)` 锁定）
     mapping(bytes32 => uint64) public sellerPendingUnlockBlock;
 
     /// @dev 订单判给卖家的区块（售后窗口起算）
@@ -195,16 +196,18 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     uint64 public minTimeoutBlocks;
     uint64 public afterSaleWindowBlocks;
     /**
-     * @dev 卖家货款在确认收货后的留存期 = 本单售后窗口。
+     * @dev 卖家货款在确认收货后的**最长留存期**：7 天（BTY 5 秒/块 = 120,960 块）。
      *
-     * 旧实现只留 7 天，售后窗口余下时间靠 Staking 兜底：原生币卖家没质押、ERC20 单又
-     * 没有同币种保证金时，买家在 7 天后开案只能拿到 0。现在货款在窗口内始终留在 Escrow，
-     * 第一赔付层不会提前消失；代价是卖家回款要等到窗口结束（当前常量上限 360 天，
-     * 生产常用 180 天）。
+     * 售后窗口可能很长（生产默认 180 天），卖家回款不能等半年：留存最多 7 天，窗口余下的
+     * 时间由 Staking 保证金兜底。留存期内若有在途售后案件，`releaseSellerFunds` 会被
+     * `PendingCaseOpen` 挡住——钱**重新冻结到案件结案**（或到期强制结案）为止；
+     * 结案后不需要再等，到点即可释放。
      */
-    // 售后案件的绝对裁决上限（90 天，按 BTY 5 秒/块 = 1_555_200）。
-    // 案件在窗口内开案后可把货款挡住，但没有绝对出口就等于“买家开案后消失，货款永久
-    // 留在 Escrow”；到期后任何人可释放货款并结案。
+    uint64 public constant SELLER_HOLDBACK_BLOCKS = 120_960;
+    // 售后案件的**投票**上限（90 天，按 BTY 5 秒/块 = 1_555_200）。
+    // 案件开在 7 天留存期内时会把货款冻结到结案；没有绝对出口就等于“买家开案后消失、
+    // 留存货款永久留在 Escrow”。强制结案出口取**先到者**：开案 + 90 天（本上限，投票已关）
+    // 或 结算 + 窗口（Staking 侧也不再受理罚没）——两者任一到期，任何人可结案并释放余款。
     // 强制结案会置 `afterSaleForcedClosed`：只释放 pending，**不消灭**原窗口内剩余的
     // 第二层罚没救济（Staking.buyerConfirmed 门槛同时看 afterSaleOpen/afterSaleForcedClosed）。
     // 因此 90 天是“留存货款”的实际期限，不是“罚没资格”的期限；后者仍以结算时快照的窗口为准。
@@ -301,7 +304,6 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     error CommitteeTooLarge();
     error ThresholdOutOfBounds();
     error RoleConflict();
-    error OwnerNeedsIndependentPanel();
     error AlreadyConfigured();
     error StakingNotConfigured();
     error OrdersPaused();
@@ -329,7 +331,6 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     error TokenNotSupported();
     error TokenAmountMismatch();
 
-    error TokenPenaltyNotSupported();
     error TokenClaimsNotSupported();
     error TokenTransferFailed();
     error InvalidRejectGrace();
@@ -455,7 +456,7 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
         afterSaleWindowAtCreate[orderId] = afterSaleWindowBlocks;
     }
 
-    /// @notice 买家确认收货（或争议中撤诉放款）→ 结算；货款进入售后留存期（无售后窗口时即时给卖家）
+    /// @notice 买家确认收货（或争议中撤诉放款）→ 结算；货款进入 7 天留存期（不超过本单窗口）
     function confirmReceipt(bytes32 orderId) external nonReentrant {
         Order storage o = _orders[orderId];
         if (o.status != OrderStatus.Created && o.status != OrderStatus.Disputed) revert NotCreated();
@@ -507,7 +508,7 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
         emit DisputeRequested(orderId);
     }
 
-    /// @notice 确认收货后就商品问题开一个链上售后案件（只接受买家自己确认、从未退款的单）
+    /// @notice 确认收货后就商品问题开一个链上售后案件（只接受买家自己确认、**未全额退款**的单）
     function openAfterSale(bytes32 orderId) external {
         Order storage o = _orders[orderId];
         if (msg.sender != o.buyer) revert NotBuyer();
@@ -593,8 +594,10 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     /**
      * @notice 释放确认收货后的留存货款给卖家。
      * @dev **任何人可调**（owner/seller/keeper 都行）：钱只会打给订单卖家，调用者拿不到。
-     *      条件：结算已过留存期，且没有在途售后案件；在途案件由仲裁/撤诉结案后再释放。
-     *      这样卖家不需要为“到期提现”再签一笔交易，节点 keeper 也能代触发。
+     *      条件：结算已过留存期（7 天），且没有在途售后案件。案件在途时有两个到期出口，
+     *      **以先到者为准**：开案满 90 天（委员会投票上限，`MAX_AFTER_SALE_CASE_BLOCKS`），
+     *      或本单窗口结束（`settledAtBlock + afterSaleWindowAtSettle`，窗口一过 Staking 侧
+     *      也不再接受罚没）。到期后任何人可强制结案并释放余款——不让案件无限期压住卖家回款。
      */
     function releaseSellerFunds(bytes32 orderId) external nonReentrant {
         Order storage o = _orders[orderId];
@@ -606,7 +609,14 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
         bool forcedClose = false;
         uint64 opened = afterSaleOpenedAtBlock[orderId];
         if (opened != 0) {
-            if (block.number < uint256(opened) + MAX_AFTER_SALE_CASE_BLOCKS) revert PendingCaseOpen();
+            /*
+              两个到期出口取**先到者**：开案满 90 天（投票已关），或本单窗口结束
+              （`block.number > settled + window`；Staking 侧从下一刻起也不再受理罚没）。
+            */
+            bool voteDeadlinePassed = block.number >= uint256(opened) + MAX_AFTER_SALE_CASE_BLOCKS;
+            if (!voteDeadlinePassed && block.number <= uint256(settledAtBlock[orderId]) + uint256(afterSaleWindowAtSettle[orderId])) {
+                revert PendingCaseOpen();
+            }
             _closeAfterSaleCase(orderId);
             afterSaleForcedClosed[orderId] = true;
             forcedClose = true;
@@ -617,8 +627,7 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
             if (opened != 0) return; // 只完成了到期结案，没有钱可放
             revert NothingSellerPending();
         }
-        // 案件满 90 天后的绝对出口必须绕过普通留存解锁；否则结案写入会被下面的
-        // PendingLocked 回滚，案件永远不会到期关闭。
+        // 强制结案是绝对出口，绕过普通留存解锁；否则结案写入会被下面的 PendingLocked 回滚。
         if (!forcedClose && block.number < uint256(sellerPendingUnlockBlock[orderId])) revert PendingLocked();
         sellerPending[orderId] = 0;
         _payoutOrCredit(orderId, o.seller, pending);
@@ -664,61 +673,67 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
         Order storage o = _orders[orderId];
         if (amountWei == 0) revert InvalidAmount();
         if (o.status != OrderStatus.Settled) revert OrderNotSettled();
-        if (orderToken[orderId] != address(0)) revert TokenPenaltyNotSupported();
         if (staking == address(0)) revert StakingNotConfigured();
-        // 未结案提货争议已预留的额度不能被罚没吃掉；否则 claim 在投票执行时会因订单上限回滚。
-        if (amountWei > _freeBuyerCredit(orderId, o)) revert InvalidAmount();
         /*
-          罚没是买家的受偿，必须写进 refundedAmount，与退款/售后共用订单级“已受偿”上限。
-          条文上的单笔上限仍由 Staking 的 `_penaltyBase * penaltyCapBps` 负责（它同样
-          扣掉 refundedAmount），这里只补记账：先 votePenalty 再 voteAfterSale 时，
-          售后必须看到这笔已赔，不能按“未退款”再赔一次。
+          原生单：未结案提货争议已预留的额度不能被罚没吃掉；否则 claim 在投票执行时会因订单上限回滚。
+          代币单：赔付从 BTY 保证金出，与订单的代币账本**不同币种**，`refundedAmount` 不参与，
+          上限只由 Staking 的池子与票决决定（见 `_penalizeFromStake`）。
         */
+        if (orderToken[orderId] == address(0) && amountWei > _freeBuyerCredit(orderId, o)) revert InvalidAmount();
         _rejectSelfVote(o);
         (uint16 votes, uint16 threshold) = _castVote(orderId, VOTE_PENALTY, amountWei);
         emit PenaltyVoted(orderId, msg.sender, amountWei, votes, threshold);
-        if (votes >= threshold) {
-            /*
-              **先记账、再外部付款**（CEI）：Staking.penalize 会把钱付给买家（合约账户可能回调
-              Escrow 的状态机入口）。旧顺序先付款后记账，回调里的 openAfterSale/openClaimDispute
-              看到的是"这笔罚没还没发生"的旧 refundedAmount，可以绕过案件/额度判据。
-              现在回调看到的是已写入的账本；若 Staking 付款 revert，整笔（含记账）回滚。
-            */
-            _accountBuyerCredit(orderId, o, amountWei);
-            IStakingPenalize(staking).penalize(orderId, o.seller, o.buyer, amountWei, msg.sender);
-            /*
-              罚没的钱由 Staking 直接付给买家，但订单级“已受偿”账本仍必须在 Escrow 记：
-              后续 voteAfterSale / openClaimDispute 都按 refundedAmount 收敛。事件复用
-              SellerRefunded（payload 是“本次金额 + 累计已受偿”），watcher 才能把
-              refunded_amount_wei 写回；只发 PenaltyVoted 会让本地账本永久少记。
-            */
-            emit SellerRefunded(orderId, o.buyer, amountWei, o.refundedAmount);
-        }
+        if (votes >= threshold) _penalizeFromStake(orderId, o, amountWei, msg.sender);
     }
 
+    /**
+     * @notice 售后结案：委员会票决赔付金额（0 = 判卖家无责），达到阈值后**一次完成**赔付与结案。
+     *
+     * 赔付款**只从 Staking 的卖家保证金出**（原生单付 BTY；代币单也付 BTY）——7 天留存期
+     * 只决定卖家什么时候能拿走货款，不是买家的赔付资金池。代币单的这笔钱不进以支付代币计的
+     * `refundedAmount`，累计上限由 Staking 的 `penalizedByOrderTotal` 单独记。
+     *
+     * 时间窗两条：案件开案后 90 天内可票决（`MAX_AFTER_SALE_CASE_BLOCKS`）；强制结案出口取
+     * “开案 + 90 天”与“结算 + 窗口”的**先到者**（见 `releaseSellerFunds`）。赔付本身仍受
+     * 该单快照窗口约束（Staking 的 `_afterSaleInWindow`）。
+     */
     function voteAfterSale(bytes32 orderId, uint256 penaltyWei) external nonReentrant {
         Order storage o = _orders[orderId];
         uint64 opened = afterSaleOpenedAtBlock[orderId];
         if (opened == 0) revert AfterSaleNotOpen();
         if (block.number >= uint256(opened) + MAX_AFTER_SALE_CASE_BLOCKS) revert AfterSaleWindowClosed();
-        if (penaltyWei > _freeBuyerCredit(orderId, o)) revert InvalidAmount();
+        if (penaltyWei > 0) {
+            if (staking == address(0)) revert StakingNotConfigured();
+            if (orderToken[orderId] == address(0) && penaltyWei > _freeBuyerCredit(orderId, o)) revert InvalidAmount();
+        }
         _rejectSelfVote(o);
         (uint16 votes, uint16 threshold) = _castVote(orderId, VOTE_AFTER_SALE, penaltyWei);
         emit AfterSaleVoted(orderId, msg.sender, penaltyWei, votes, threshold);
         if (votes >= threshold) {
-            /*
-              售后结案的第一赔付顺位是卖家的留存货款。提货争议会先在
-              orderClaimExposure 里占住额度，所以 _freeBuyerCredit 已扣掉未结案的提货赔付；
-              这里不再走 Staking 兜底——留存货款不足只可能是账本已被破坏，宁可整笔回滚，
-              也不能让同一订单的退款与罚没各记一套上限。
-            */
-            if (penaltyWei > 0) {
-                _creditBuyerFromPending(orderId, o, penaltyWei);
-                emit SellerRefunded(orderId, o.buyer, penaltyWei, o.refundedAmount);
-            }
+            if (penaltyWei > 0) _penalizeFromStake(orderId, o, penaltyWei, msg.sender);
             _closeAfterSaleCase(orderId);
             emit AfterSaleClosed(orderId, msg.sender, "");
         }
+    }
+
+    /**
+     * @dev 委员会判赔的**唯一付款腿**：`votePenalty` 与 `voteAfterSale` 共用，钱只从 Staking 出。
+     *
+     * 原生单：先记账（订单级"买家已受偿 ≤ amount"）再付款，并复用 `SellerRefunded` 让 watcher
+     * 把 `refunded_amount_wei` 写回——CEI 顺序：回调里的 `openAfterSale`/`openClaimDispute`
+     * 必须看到已写入的账本；Staking 付款 revert 时记账随整笔回滚。
+     * 代币单：赔偿是 BTY，不能写进以支付代币计的 `refundedAmount`（同一列混两种单位会让
+     * `_freeBuyerCredit` 与 watcher 都读到错数字）；累计上限由 Staking 的
+     * `penalizedByOrderTotal` 单独记，Escrow 不发 `SellerRefunded`。
+     */
+    function _penalizeFromStake(bytes32 orderId, Order storage o, uint256 amountWei, address voter) private {
+        if (orderToken[orderId] == address(0)) {
+            _accountBuyerCredit(o, amountWei);
+            IStakingPenalize(staking).penalize(orderId, o.seller, o.buyer, amountWei, voter);
+            emit SellerRefunded(orderId, o.buyer, amountWei, o.refundedAmount);
+            return;
+        }
+        IStakingPenalize(staking).penalize(orderId, o.seller, o.buyer, amountWei, voter);
     }
 
     /* ── 提货争议 ───────────────────────────────────────────────────── */
@@ -794,7 +809,8 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
             revert InvalidArbiter();
         }
         _claimVoted[claimId][committeeEpoch] = true;
-        (uint16 votes, uint16 threshold) = _castClaimVote(claimId, amountWei);
+        // 与订单票同一判据：当前委员会名单，不再有 claim 届次快照
+        (uint16 votes, uint16 threshold) = _castVote(claimId, VOTE_CLAIM, amountWei);
         emit ClaimVoted(claimId, msg.sender, amountWei, votes, threshold);
         if (votes >= threshold) {
             if (amountWei > 0) {
@@ -803,7 +819,7 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
                   refundedAmount / orderClaimExposure；旧顺序先付款后记账会让回调看到旧账本。
                   付款 revert 时记账随整笔回滚，不会留下假账。
                 */
-                _accountBuyerCredit(c.orderId, claimOrder, amountWei);
+                _accountBuyerCredit(claimOrder, amountWei);
                 IStakingPenalize(staking).penalizeClaim(claimId, c.seller, c.claimant, amountWei, msg.sender);
                 claimPaidByOrder[c.orderId] += amountWei;
                 emit ClaimPaid(
@@ -842,13 +858,13 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
         _writeCommittee(members, threshold);
     }
 
-    /// @notice 紧急吊销：立即失去当前届投票资格；旧票不再计入。重新任命（`setArbiters`）会清回。
     /**
      * @notice 吊销某地址的当前裁决资格。
      * @dev **不要求它是当前名单成员**：被换下的失陷密钥仍可被拉黑，旧票也不再计入。
-     *      墓碑在当前届内全局生效；当前名单成员缩表后若会跌破阈值则保留墓碑位
-     *      （`isArbiter`/计票跳过）。`setArbiters` 是显式重新任命，会清回墓碑——
-     *      这不是永久封禁；需要永久排除就使用新地址。
+     *      墓碑在当前届内全局生效；若吊销会让**活跃委员**跌破阈值，本函数直接 revert
+     *      （不再留墓碑位）——否则计票永远凑不齐，结算/罚没/售后/提货赔付会永久卡死。
+     *      要换掉失陷成员请用 `setArbiters` 显式重新任命（它同时清回墓碑）；
+     *      这不是永久封禁，需要永久排除就使用新地址。
      */
     function revokeArbiter(address member) external onlyGovernor {
         if (member == address(0)) revert InvalidArbiter();
@@ -865,6 +881,18 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
                 break;
             }
         }
+        /*
+          墓碑/移除都不能把**活跃人数**降到阈值以下：`_countVotes` 跳过墓碑，一旦 active < threshold
+          就永远凑不齐票——结算/罚没/售后/提货赔付全部永久卡死，而委员名单还能靠 `setArbiters`
+          换人。`NodeGovernance` 的提案路径本来就有同样的检查（`_checkRevokeKeepsQuorum`）；
+          这里补在唯一写入口上，接线前的 owner 直调与自定义 governor 也走同一条判据。
+        */
+        uint256 activeAfter = 0;
+        for (uint256 i = 0; i < c.members.length; ++i) {
+            address m = c.members[i];
+            if (m != member && !revokedArbiter[m]) ++activeAfter;
+        }
+        if (activeAfter < c.threshold) revert ThresholdOutOfBounds();
         revokedArbiter[member] = true;
         emit ArbiterRevoked(member);
     }
@@ -899,6 +927,8 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
         if (IStakingPenalize(staking_).escrow() != address(this)) revert StakingNotConfigured();
         _probeBytes32Arg(staking_, IStakingPenalize.penalizedOrders.selector);
         _probeBytes32Arg(staking_, IStakingPenalize.penalizedClaims.selector);
+        // openClaimDispute 的唯一外部读：缺它则提货争议开案永久 revert，而接线是一次性的。
+        _probeBytes32Arg(staking_, IStakingPenalize.claimCapacityRemaining.selector);
         (bool ok, bytes memory ret) =
             staking_.staticcall(abi.encodeWithSelector(IStakingPenalize.owner.selector));
         if (!ok || ret.length < 32 || abi.decode(ret, (address)) != owner()) revert RoleConflict();
@@ -1037,13 +1067,14 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     /* ── 内部：结算 ─────────────────────────────────────────────────── */
 
     /**
-     * @dev 订单级买家受偿的**唯一记账内核**。
-     * 所有路径（结算时的退款、留存期退款、罚没、售后赔付）都必须先过这里，
-     * 才能保证 `refundedAmount <= amount`；旧实现由各路径自己 `+=`，于是
+     * @dev 订单级买家受偿的**唯一记账内核**（只对以订单币种赔付的路径调用：结算退款、
+     * 留存期退款、原生单的罚没/售后、提货赔付 `ClaimPaid`；代币单的 BTY 赔付不进这一列）。
+     * 所有这类路径都必须先过这里，才能保证 `refundedAmount <= amount`，后续
+     * `amount - refundedAmount` 不会下溢。旧实现由各路径自己 `+=`，于是
      * `votePenalty` 加了 refundedAmount 却不减 sellerPending，卖家再退整个 pending
-     * 就会把累计值推过订单额，后续 `amount - refundedAmount` 下溢。
+     * 就会把累计值推过订单额。
      */
-    function _accountBuyerCredit(bytes32, Order storage o, uint256 amount) private {
+    function _accountBuyerCredit(Order storage o, uint256 amount) private {
         uint256 remaining = o.amount > o.refundedAmount ? o.amount - o.refundedAmount : 0;
         if (amount > remaining) revert RefundAmountOutOfRange();
         o.refundedAmount += amount;
@@ -1056,11 +1087,11 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
         return remaining > reserved ? remaining - reserved : 0;
     }
 
-    /// @dev 从售后留存里退给买家：先占订单级额度，再减留存，再付款。
+    /// @dev 从售后留存里退给买家：先减留存，再占订单级额度，再付款（顺序不影响回滚，但注释要与代码一致）。
     function _creditBuyerFromPending(bytes32 orderId, Order storage o, uint256 amount) private {
         if (amount > sellerPending[orderId]) revert PendingAmountTooLarge();
         sellerPending[orderId] -= amount;
-        _accountBuyerCredit(orderId, o, amount);
+        _accountBuyerCredit(o, amount);
         _payoutOrCredit(orderId, o.buyer, amount);
     }
 
@@ -1080,11 +1111,11 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
         emit SellerPendingAccrued(orderId, o.seller, sellerNet, unlock);
     }
 
-    /// @dev 只有买家确认收货（或卖家按买家授权部分退款）才进入留存期；留存期覆盖整个售后窗口。
+    /// @dev 只有买家确认收货（或卖家按买家授权部分退款）才进入留存期；留存最多 7 天，且不超过本单窗口。
     function _holdbackBlocks(bytes32 orderId, Order storage o) private view returns (uint64) {
         if (!o.buyerConfirmed) return 0;
-        // +1：售后窗口的最后一个块仍可 openAfterSale；卖家不能在同一块先释放再被开案。
-        return afterSaleWindowAtCreate[orderId] + 1;
+        uint64 window = afterSaleWindowAtCreate[orderId];
+        return window < SELLER_HOLDBACK_BLOCKS ? window : SELLER_HOLDBACK_BLOCKS;
     }
 
     function _writeSettle(bytes32 orderId, Order storage o, uint256 refundWei, uint256 sellerNet) internal {
@@ -1171,9 +1202,9 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     function _validateMember(address member) private view {
         if (member == address(0) || member == address(this)) revert InvalidArbiter();
         /*
-          节点主（Escrow owner）可以兼任仲裁人；owner 在委员会里时由 `_writeCommittee` 强制
-          至少 3 人/阈值 2。本合约不读任何 Registry：其他节点主/目录 owner 的互斥属于节点
-          自己的选人/披露规则，不在托管合约里做跨目录判断。
+          节点主（Escrow owner）可以兼任仲裁人；委员会形状（至少 3 人、阈值 ≥2 且 < 人数）由
+          `_validateCommittee` **无条件**强制，与 owner 是否在名单里无关。本合约不读任何
+          Registry：其他节点主/目录 owner 的互斥属于节点自己的选人/披露规则。
         */
     }
 
@@ -1208,14 +1239,6 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
         _voteValue[orderId][kind][committeeEpoch][msg.sender] = value;
         _voted[orderId][kind][committeeEpoch][msg.sender] = true;
         return _countVotes(orderId, kind, value);
-    }
-
-    function _castClaimVote(bytes32 claimId, uint256 value)
-        private
-        returns (uint16 votes, uint16 threshold)
-    {
-        // 与订单票同一判据：当前委员会名单，不再有 claim 届次快照
-        return _castVote(claimId, VOTE_CLAIM, value);
     }
 
     function _countVotes(bytes32 orderId, uint8 kind, uint256 value)
@@ -1253,13 +1276,15 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
             return;
         }
         /*
-          标准 ERC20 的 false 是“未转账”，转给 vault 再记账是既有兜底；
-          非标准 token“返回 false 但已经改了余额”的重复转账风险由节点白名单承担
-          （见文件头的支付资产边界），这里不改变既有 fallback 语义。
+          直接付款也必须用 `_tryTokenTransfer`，不能写成
+          `try IERC20(token).transfer(...) returns (bool)`：Solidity 的 try/catch **不捕获返回
+          数据解码失败**（issue #11886）。对"成功但不返回任何数据"的非标准 ERC20（白名单允许
+          这类代币），那种写法会在解码 `bool` 时直接 revert，整笔结算/退款/释放永久失败，
+          钱锁在 Escrow 里。`_tryTokenTransfer` 对空返回按成功、对 false/回滚按失败。
+          标准 ERC20 的 false 是"未转账"，转给 vault 再记账是既有兜底；
+          非标准 token"返回 false 但已经改了余额"的重复转账风险由节点白名单承担。
         */
-        try IERC20(token).transfer(to, value) returns (bool ok) {
-            if (ok) return;
-        } catch {}
+        if (_tryTokenTransfer(token, to, value)) return;
         // 非零地址必须有代码：否则 EOA 会收下 token，随后对 EOA 的 credit 空调用也会"成功"，账目丢失。
         if (tokenVault.code.length != 0 && _tryTokenTransfer(token, tokenVault, value)) {
             TokenPayoutVault(tokenVault).credit(token, to, value);
@@ -1270,8 +1295,8 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
 
     /**
      * @dev 兼容不返回 bool 的非标准 ERC20；返回值缺失按成功，返回 false/回滚按失败。
-     *      只在“直接转给收款人失败、改转 vault”这一条兜底路径使用；正常路径仍走标准 ABI，
-     *      避免把非标准 token 的成功语义扩散到所有转账。
+     *      **直接付款与 vault 兜底都走它**：`try ... returns (bool)` 无法捕获"成功但无返回数据"
+     *      的解码失败（solidity issue #11886），那会让这类代币的订单永久锁死。
      */
     function _tryTokenTransfer(address token, address to, uint256 value) private returns (bool ok) {
         assembly {
@@ -1312,11 +1337,14 @@ contract Escrow is Ownable2Step, ReentrancyGuard {
     function _transferOwnership(address newOwner) internal override {
         if (newOwner != address(0)) {
             if (revokedArbiter[newOwner]) revert RoleConflict();
-            // 新 owner 可以兼仲裁人，但不能让委员会退化成 owner 1-of-1。
-            if (isArbiter(newOwner)) {
-                Committee storage c = _committees[committeeEpoch];
-                if (c.members.length < 3 || c.threshold < 2) revert OwnerNeedsIndependentPanel();
-            }
+            /*
+              转给本合约或 Staking 会把 `onlyOwner` 入口（setSupportedToken / setAcceptingOrders /
+              openClaimDispute，以及接线前的 setArbiters）永久砖死：没有任何外部账户能再以那个
+              地址发交易。委员会形状不需要在这里再判——`_validateCommittee` 对**任何**一届都无条件
+              要求 n≥3、threshold≥2，所以"owner 兼任仲裁人导致 1-of-1"不可表达。
+              `staking == 0` 时与 `newOwner == 0` 的比较已被外层排除，故不必再判非零。
+            */
+            if (newOwner == address(this) || newOwner == staking) revert RoleConflict();
         }
         super._transferOwnership(newOwner);
     }

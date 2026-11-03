@@ -70,7 +70,7 @@ const nftPayload = (overrides = {}) => ({
   media: [{ type: 'image', url: 'https://example.com/n.jpg' }],
   kind: 'nft',
   nftContract: NFT_CONTRACT,
-  specs: [],
+  specs: [{ name: '规格', options: ['默认'] }],
   skus: [{ key: '', priceUsdtMicro: 66_000_000, capacity: null }],
   ...overrides,
 });

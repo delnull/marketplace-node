@@ -34,8 +34,9 @@ test('releaseExpiredDecision：非法读数按不可释放处理（不猜）', (
 test('BTY gas：keeper 与主网 E2E 的写调用都显式给 gasLimit（估算对 >10 万 gas 失效）', () => {
   /*
     BTY 的 eth_estimateGas 对 >10 万 gas 固定返回 -32000 且无 revert data；
-    keeper 的 releaseExpired / releaseSellerFunds 实测约 13 万 / 12.5 万，
-    E2E 的 createOrder / confirmReceipt 约 19.5 万 / 16 万，都不能再靠估算。
+    keeper 的 releaseExpired / releaseSellerFunds 动作本身约 5 万 gas，但上限给到 40 万：
+    `Escrow._payoutNativeOrCredit` 只在 gasleft() > 16 万时直接 push，否则转挂账
+    （卖家要自己 withdraw）。E2E 的 createOrder / confirmReceipt 也不能靠估算。
   */
   const root = path.resolve(import.meta.dirname, '..');
   const keeper = fs.readFileSync(path.join(root, 'scripts/auto-confirm.mjs'), 'utf8');

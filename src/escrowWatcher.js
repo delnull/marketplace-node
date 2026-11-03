@@ -31,8 +31,8 @@
  * 两级售后为链上强制流程（合约状态机），本地 refund_status 仅为其镜像：
  * 迁移失败（foundRows=0）的事件不记录事件史，幂等重复扫描不重复记账。
  *
- * 售后案件（AfterSaleOpened/Closed）同样只是**叠加在终局之上的第二层**镜像：确认收货后货款先进入
- * Escrow 售后留存期；案件在途时不释放留存货款，赔付只从留存出，超过留存额回滚，不调用 Staking。
+ * 售后案件（AfterSaleOpened/Closed）同样只是**叠加在终局之上的第二层**镜像：确认收货后货款进入
+ * 7 天留存期，案件在途时这笔货款不释放（重新冻结到结案）；赔款只从 Staking 的卖家保证金出。
  * 因此这两个分支刻意**不碰 orders.status**（见 src/afterSale.js 文件头的完整理由）；
  * 人工 /sync 与后台对账按链上 afterSaleOpen/afterSaleOpenedAtBlock 回填同几列，判据同源。
  *
@@ -348,8 +348,8 @@ export const EVENTS = [
   'ClaimPaid',
   // 确认收货后的**售后案件**（契约 2026-10 第二批，本地镜像见 src/afterSale.js）：
   // 开案/结案只写售后案件那几列，**不改 orders.status**（订单仍是 confirmed/settled/expired 终局——
-  // 链上 Escrow.Order.status 全程停在 Settled，货款仍在售后留存期；改成本地 disputed
-  // 会把仍在留存的货款重新算进在途窗口，见 afterSale.js 文件头）。
+  // 链上 Escrow.Order.status 全程停在 Settled，货款在 7 天留存期内仍由 Escrow 持有；改成本地 disputed
+  // 会把仍在托管里的钱重新算进在途窗口，见 afterSale.js 文件头）。
   // **漏挂即静默**：买家开了案、仲裁台队列里却没有这一单，而店主/仲裁人完全无从知道。
   'AfterSaleOpened',
   'AfterSaleClosed',
@@ -1695,8 +1695,14 @@ async function pollOnceWithProvider({ provider, url, head }) {
         提货争议事件：**不落到订单状态**，只把链上 `ClaimCase` 的结论写回 `nft_claims` 的
         dispute_* 列（按节点自己在开案时记下的 `dispute_claim_id` 匹配）。
         节点没有这一行（不是本节点开的案 / 钱包直接开的案）⇒ 0，不建行、不猜。
+
+        ⚠️ `ClaimPaid` 必须以 `Claim` 开头、但它**不是** ClaimCase 的结论事件：它是订单级
+        赔付（写 `order_chain.refunded_amount_wei` / `claim_paid_wei`，见 applyEventCore 的
+        `case 'ClaimPaid'`）。把它一起路由进 `applyClaimChainEvent` 会让那一整块永不执行
+        （`ClaimPaid` 不在它的四个分支里 ⇒ return 0），本地退款额永久少记——所以这里与
+        `applyEventCore` 的分派条件逐字同式（`&& name !== 'ClaimPaid'`）。
       */
-      if (String(ev.name).startsWith('Claim')) {
+      if (String(ev.name).startsWith('Claim') && ev.name !== 'ClaimPaid') {
         updated += await applyClaimChainEvent(ev.name, ev.args);
         quarantined.delete(fp);
         continue;

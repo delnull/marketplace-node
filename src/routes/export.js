@@ -257,7 +257,7 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
          (SELECT COUNT(*) FROM product_nft_tokens t WHERE t.product_id = p.id AND t.status = 'unused') AS tokens_unused
        FROM products p WHERE p.shop_code = ? ORDER BY p.id ASC`, String(req.shop.code));
   // 商品 CSV 按「商品 × SKU」展开：一行一个规格组合 —— 价格与库存本来就逐组合不同，
-  // 压成一行会让「哪个组合还剩几件」在导出里彻底丢失。无规格商品即 sku_key 为空的那一行。
+  // 压成一行会让「哪个组合还剩几件」在导出里彻底丢失。默认规格就是 sku_key 为空的那一行。
   const skuRows = await getDb().all('SELECT s.* FROM product_skus s JOIN products p ON p.id = s.product_id WHERE p.shop_code = ? ORDER BY s.product_id, s.sku_key', String(req.shop.code));
   const skuByProduct = new Map();
   for (const s of skuRows) {

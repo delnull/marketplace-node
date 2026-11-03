@@ -107,7 +107,7 @@ let buyerToken;
 let ownerToken;
 /*
   假 RPC 的接线与登录都在**一个 before() 里**完成：node:test 在本文件还没求值完就可能开始跑已注册的
-  用例，顶层的 `config.chain.rpcUrl = …` 会与用例体的第一次 `await` 交错（写进来的时机不确定）。
+  用例，顶层的 `config.chain.rpcUrls = …` 会与用例体的第一次 `await` 交错（写进来的时机不确定）。
   多个顶层 before 之间也存在并发交错（见仓库测试惯例），所以只留一个。
 */
 before(async () => {

@@ -31,7 +31,7 @@ const snapshot = JSON.stringify({
   title: '状态矩阵实物商品',
   description: 'order-status-matrix',
   media: [],
-  specs: [],
+  specs: [{ name: '规格', options: ['默认'] }],
   skus: [{ key: '', priceUsdtMicro: 1_000_000, capacity: null }],
 });
 

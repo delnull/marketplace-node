@@ -198,15 +198,20 @@ contract MarketplaceRegistry is Ownable2Step {
     function deregisterNode() external {
         NodeInfo storage n = nodes[msg.sender];
         if (n.registeredAtBlock == 0 || !n.active) revert NodeNotRegistered();
+        /*
+          被停用的节点**不能自己注销**：`suspendNode` 只置 `suspended`、不动 `active`，
+          而注销会把 `suspended` 清成 false——两者相加就是一条"停用 → 自己注销 → 重新登记"
+          的解除路径，平台唯一的可逆处置手段当场失效。解除停用只能由平台走 `unsuspendNode`。
+        */
+        if (n.suspended) revert SuspendedNode();
 
         if (_endpointOwner[n.endpoint] == msg.sender) delete _endpointOwner[n.endpoint];
         if (_escrowOperator[n.escrow] == msg.sender) delete _escrowOperator[n.escrow];
         if (_stakingOperator[n.staking] == msg.sender) delete _stakingOperator[n.staking];
         n.active = false;
         /*
-          注销后必须清掉 suspended：否则"active=false + suspended=true"是一个不可表达态，
-          `isNodeOperator` 仍说"有登记行"、`transferRegistration` 又要求 active，
-          前端会稳定地走进一条必 revert 的转移路径。停用与注销是两个互斥的终态。
+          注销后清掉 suspended：走到这里它必然为 false（上面已拒绝 isSuspended）；这行保留
+          是为了让"active=false + suspended=true"这个不可表达态在代码里没有第二个来源。
         */
         n.suspended = false;
         n.updatedAtBlock = uint64(block.number);

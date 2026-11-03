@@ -52,7 +52,7 @@ export ARBITER_THRESHOLD=2              # 必须小于 ARBITERS 人数
 # 可选窗口，括号里是默认值（单位：块）
 export REJECT_GRACE_BLOCKS=17280        # 拒绝退款后的释放静置期
 export MIN_TIMEOUT_BLOCKS=17280         # 下单允许的最小超时
-export AFTER_SALE_WINDOW_BLOCKS=3110400 # 确认收货后的售后窗口
+export AFTER_SALE_WINDOW_BLOCKS=3110400 # 确认收货后的售后窗口（买家可开案/可追罚的期限；卖家回款留存期固定 7 天，不受此值影响）
 
 node scripts/deploy-node-mainnet.cjs --check
 node scripts/deploy-node-mainnet.cjs --broadcast

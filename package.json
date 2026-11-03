@@ -1,6 +1,6 @@
 {
   "name": "marketplace-node",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "BitYuan 联邦商城节点：任何人可部署的店铺 API 服务（Express + MySQL 8）",
@@ -12,6 +12,7 @@
     "dev": "node --watch --env-file-if-exists=.env src/server.js",
     "test": "node scripts/test-all.mjs",
     "check:integrity": "node --env-file-if-exists=.env scripts/check-integrity.js",
+    "migrate:default-spec": "node --env-file-if-exists=.env scripts/migrate-default-spec.mjs",
     "auto-confirm": "node --env-file-if-exists=.env scripts/auto-confirm.mjs",
     "e2e": "node --env-file-if-exists=.env scripts/e2e-mainnet.mjs"
   },

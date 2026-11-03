@@ -29,8 +29,8 @@ function nftPayload(overrides = {}) {
     media: [{ type: 'image', url: 'https://example.com/nft.jpg' }],
     kind: 'nft',
     nftContract: NFT_CONTRACT,
-    // 价格与库存逐组合给出；无规格商品就是 key='' 的唯一组合
-    specs: specs ?? [],
+    // 价格与库存逐组合给出；单一默认规格就是 key='' 的唯一组合
+    specs: specs ?? [{ name: '规格', options: ['默认'] }],
     skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
     ...rest,
   };
@@ -105,7 +105,7 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
     media: [],
     kind: 'digital',
     description_blocks: [],
-    specs: [],
+    specs: [{ name: '规格', options: ['默认'] }],
     skus: [{ sku_key: '', price_usdt_micro: 100 }],
     nft_contract: null, // 非 NFT 商品的该列是 **NULL**（三态：'没有'不等于空串）
   };
@@ -127,7 +127,7 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
   const canonical = JSON.stringify({
     slug: 'p-abc', title: '旧商品', description: 'd', description_blocks: [], media: [], kind: 'digital',
     shipping_fee_usdt_micro: 0, age_restricted: 0,
-    specs: [], skus: [['', 100]],
+    specs: [{ name: '规格', options: ['默认'] }], skus: [['', 100]],
     attributes: [],
     terms: {
       handling_days: null, return_policy: 'unspecified', return_window_days: null, return_freight: null,

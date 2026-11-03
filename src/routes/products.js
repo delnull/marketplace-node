@@ -467,13 +467,35 @@ async function refreshSnapshotHash(productId) {
 }
 
 // ══ SKU（规格组合）═══════════════════════════════════════════════════
-// 模型：**每个商品恒有 ≥1 个组合**。无规格商品就是「只有一个 sku_key='' 的组合」，
-// 因此全链路只有一条代码路径，不存在 if (有规格) 的分叉。
+// 模型：**每个商品恒有 ≥1 个规格组合**。没有可选规格的商品不是“没有规格”，
+// 而是只有一个系统默认规格「规格：默认」；因此全链路只有一条代码路径。
+// 默认组合的 `sku_key` 仍为 ''：订单/库存占位/api 调用方都用它定位唯一组合，
+// 迁移不需要改写历史订单。
 
-/** 规格定义规范化：[{ name, options[] }]，最多 3 维、每维 2..20 个选项 */
+/** 系统默认规格：一次性迁移为既有商品补齐的唯一组合（上架/编辑时禁止提交空 specs）。 */
+export const DEFAULT_SPEC = Object.freeze([{ name: '规格', options: Object.freeze(['默认']) }]);
+
+/** 是否就是系统默认规格（决定 `sku_key` 用空串而不是把「默认」拼进 key） */
+export function isDefaultSpec(specs) {
+  return (
+    Array.isArray(specs) &&
+    specs.length === 1 &&
+    specs[0]?.name === '规格' &&
+    Array.isArray(specs[0]?.options) &&
+    specs[0].options.length === 1 &&
+    specs[0].options[0] === '默认'
+  );
+}
+
+/** 规格定义规范化：[{ name, options[] }]，最多 3 维、每维 1..20 个选项。
+ *  上架/编辑**必须至少给一个规格维度**；空数组不再自动补默认规格——默认规格只由
+ *  一次性迁移为既有商品补齐，新商品缺规格会被明确拒绝。 */
 function normalizeSpecs(input) {
   const errors = [];
-  if (input === undefined || input === null) return { errors, specs: [] };
+  if (!Array.isArray(input) || input.length === 0) {
+    errors.push('至少需要一个规格维度（如「规格：默认」或「颜色：黑、白」）');
+    return { errors, specs: [] };
+  }
   if (!Array.isArray(input)) {
     errors.push('specs 需为数组（[{ name, options: [] }]）');
     return { errors, specs: [] };
@@ -503,8 +525,8 @@ function normalizeSpecs(input) {
     names.add(name);
     const rawOpts = Array.isArray(rawSpec?.options) ? rawSpec.options : [];
     const options = [...new Set(rawOpts.map((o) => String(o).trim()).filter(Boolean))];
-    if (options.length < 2) {
-      errors.push(`规格「${name}」至少需要 2 个选项`);
+    if (options.length < 1) {
+      errors.push(`规格「${name}」至少需要 1 个选项`);
       continue;
     }
     if (options.length > 20) {
@@ -524,23 +546,28 @@ function normalizeSpecs(input) {
   return { errors, specs };
 }
 
-/** 规格的全部组合（笛卡尔积）；specs 为空返回 [{}]（无规格商品的唯一组合） */
+/**
+ * 规格的全部组合（笛卡尔积）。规格恒 ≥1 维；默认规格也走同一条路径（1 个组合）。
+ * 保留空规格入参的 `[{}]` 分支：`snapshotObject` 仍需能描述历史订单/旧库行。
+ */
 export function skuCombos(specs) {
   if (!specs.length) return [{}];
   return specs.reduce((acc, s) => acc.flatMap((combo) => s.options.map((o) => ({ ...combo, [s.name]: o }))), [{}]);
 }
 
 /**
- * 组合 → 稳定标识：按 specs 声明顺序用 '|' 拼接（改选项名才变，改顺序不变）；无规格为 ''。
+ * 组合 → 稳定标识：按 specs 声明顺序用 '|' 拼接。
  *
- * 长度上界就是列宽：3 维 × 每维最多 20 字 + 2 个分隔符 = **62 字**，正是 `product_skus.sku_key`
- * 的 `VARCHAR(62)`（校验里的 3/20 两个上限和它是同一件事，改一处就要改另一处）。
+ * **系统默认规格的组合键是空串**：它是“没有可选规格”的唯一组合，订单/库存占位/api
+ * 一直用 `sku_key=''` 定位它；迁移既有无规格商品时因此不必改写历史订单。
+ * 其余规格（含手动建的单维单选项）照常拼接。
  */
 export function skuKeyOf(specs, combo) {
+  if (isDefaultSpec(specs)) return '';
   return specs.map((s) => combo[s.name]).join('|');
 }
 
-/** SKU 列表校验：必须**恰好覆盖**全部组合（无规格商品 = 恰好 1 条 key='' 的） */
+/** SKU 列表校验：必须**恰好覆盖**全部组合（默认规格 = 恰好 1 条 key='' 的） */
 function normalizeSkus(input, specs, kind) {
   const erc20 = kind === 'erc20';
   const errors = [];
@@ -668,7 +695,7 @@ async function withSkus(row) {
   return { ...row, skus: await loadSkus(row.id) };
 }
 
-/** 解析商品的规格定义（`products.specs`，JSON 列；形状不对当作无规格） */
+/** 解析商品的规格定义（`products.specs`，JSON 列；坏形状当作空数组，仅用于读旧行/历史快照） */
 function parseSpecsColumn(row) {
   const v = assertParsedJsonColumn(row?.specs, 'products.specs');
   return Array.isArray(v) ? v : [];
@@ -714,7 +741,7 @@ async function rowToPublic(row) {
   const snap = snapshotObject(r);
   const skus = (r.skus || []).map((s) => ({
     key: s.sku_key,
-    // `specs_json` 是 JSON 列（驱动已解析成对象）；无规格商品是 {}。
+    // `specs_json` 是 JSON 列（驱动已解析成对象）；默认规格是 {规格:'默认'}。
     // 形状兜底只为手搓行对象——快照不含该字段，所以这里归一不影响哈希。
     specs: s.specs_json && typeof s.specs_json === 'object' && !Array.isArray(s.specs_json) ? s.specs_json : {},
     priceUsdtMicro: s.price_usdt_micro,
@@ -995,8 +1022,8 @@ function validateProduct(v) {
     if (!isAddress(c) || isZeroAddress(c)) errors.push('ERC20 商品需填写合法的 token 合约地址（0x 开头，不可为 0x0）');
     else tokenContract = c;
   }
-  // 价格与库存下沉到 SKU：specs 定义维度，skus 必须**恰好覆盖**全部组合
-  // （无规格商品 = 恰好 1 条 key='' 的组合，与有规格商品走同一条校验路径）
+  // 价格与库存下沉到 SKU：specs 定义维度，skus 必须**恰好覆盖**全部组合。
+  // 未提交规格 / 空规格 ⇒ 规范化为默认规格「规格：默认」，唯一组合 key 为空串。
   const { errors: specErrs, specs } = normalizeSpecs(v.specs);
   errors.push(...specErrs);
   const { errors: skuErrs, skus } = normalizeSkus(v.skus, specs, kind);

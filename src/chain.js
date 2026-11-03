@@ -39,7 +39,7 @@ export const ESCROW_ABI = [
   // 买家对**具体金额**的部分退款授权（= 让"双方已谈拢的部分退款"不必绕道仲裁人）。
   'event PartialRefundAccepted(bytes32 indexed orderId, uint256 refundWei)',
   // 确认收货后的**售后案件**（本地镜像的唯一判据见 src/afterSale.js）：
-  // 它只影响售后裁决；补偿只从 Escrow 留存的卖家货款出，超过留存额整笔回滚，不调用 Staking。
+  // 它只影响售后裁决；赔款只从 Staking 的卖家保证金出（BTY），不在留存货款里扣。
   'event AfterSaleOpened(bytes32 indexed orderId, address indexed buyer, address indexed seller)',
   'event AfterSaleClosed(bytes32 indexed orderId, address indexed by, string note)',
   'event SellerPendingAccrued(bytes32 indexed orderId, address indexed seller, uint256 amount, uint64 unlockBlock)',
@@ -75,7 +75,8 @@ export const ESCROW_ABI = [
     ESCROW_ORDER_WORDS、frontend/src/chain.ts、node/src/chainReconcile.js。
   */
   'function getOrder(bytes32 orderId) view returns (address buyer, address seller, uint256 amount, uint64 timeoutBlocks, uint64 createdAtBlock, bool refundRequested, bool refundRejected, uint256 refundedAmount, uint8 status, bool buyerConfirmed)',
-  // 写（节点不经手资金/不持私钥；真正调用在买家/卖家/仲裁人/节点主的钱包侧，此处仅供脚本/测试参考）
+  // 写函数（节点不持私钥、**从不调用**）：保留只为让 `getEscrow()` 的调试/只读脚本能复用
+  // 同一份 ABI；它们不是"节点会发交易"的证据，真正的写调用在钱包侧。
   'function createOrder(bytes32 orderId, address seller, uint256 amount, uint64 timeoutBlocks) payable',
   'function createOrderToken(bytes32 orderId, address seller, address token, uint256 amount, uint64 timeoutBlocks) payable',
   'function orderToken(bytes32 orderId) view returns (address)',
@@ -169,7 +170,7 @@ export const ESCROW_STATUS = ['None', 'Created', 'Disputed', 'Settled', 'Refunde
 /**
  * **代次探针清单：本节点在运行时真正调用的、且只存在于当前这一代 Escrow 上的读法。**
  *
- * 判据与 `Staking._probeEscrow`（探六个读法 + `getOrder` 确切字数）同一条纪律：
+ * 判据与 `Staking._probeEscrow`（十几个读法 + `getOrder` 确切字数）同一条纪律：
  * **探的必须是会调用的**；分散写三处必然漏，所以清单只能有一份。
  *
  * 入清单的三个条件（缺一不可）：

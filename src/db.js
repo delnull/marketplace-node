@@ -1876,7 +1876,7 @@ const SCHEMA_DDL = `
     token_contract CHAR(42) NULL,                       -- kind='erc20' 必填（小写）
     token_decimals TINYINT UNSIGNED NULL,               -- kind='erc20' 必填（0..36）
     token_symbol  VARCHAR(32) NULL,                     -- kind='erc20' 必填（链上 symbol）
-    specs         JSON NOT NULL DEFAULT ('[]'),                        -- [{name,options[]}]，入快照
+    specs         JSON NOT NULL DEFAULT ('[]'),                        -- [{name,options[]}]，入快照；应用层写入恒 ≥1 维
     /*
       attributes 的 pair 是**刻意冗余**：多值索引只能索引"JSON 里已存在的数组元素"，
       而按 (参数名,值) 精确筛选需要把两者拼成一个可索引的键。冗余放在**同一列**里，
@@ -1937,7 +1937,7 @@ const SCHEMA_DDL = `
   CREATE TABLE IF NOT EXISTS product_skus (
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     product_id    BIGINT UNSIGNED NOT NULL,
-    sku_key       VARCHAR(62) NOT NULL,                 -- 按 specs 声明顺序用 '|' 拼接；无规格为 ''
+    sku_key       VARCHAR(62) NOT NULL,                 -- 按 specs 声明顺序用 '|' 拼接；默认规格为空串（唯一组合）
     specs_json    JSON NOT NULL DEFAULT ('{}'),
     price_usdt_micro BIGINT UNSIGNED NOT NULL,
     image_url     VARCHAR(500) NOT NULL DEFAULT '',

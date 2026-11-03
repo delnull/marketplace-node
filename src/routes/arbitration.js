@@ -13,8 +13,9 @@
  *
  * **为什么售后案件是独立路由而不是并进 /pending 的一个 `kind`**：
  *  1. 两者是**不同的钱、不同的链上动作、不同的收口**：争议单资金还锁在托管里，裁决走
- *     `Escrow.voteSettlement` 票决；售后案件只从 Escrow 留存的卖家货款退款（超出则回滚），
- *     收口走 `voteAfterSale`/`closeAfterSale`；Staking 保证金补偿另走 `votePenalty`。合成一个列表后每个调用点都得按 kind 再分叉一次
+ *     `Escrow.voteSettlement` 票决；售后案件的钱**只从 Staking 的卖家保证金出**（BTY），
+ *     收口走 `voteAfterSale`/`closeAfterSale`（`voteAfterSale` 内部就是调 `Staking.penalize`）。
+ *     合成一个列表后每个调用点都得按 kind 再分叉一次
  *     ——那正是本仓反对的"在调用点补判据"。
  *  2. 队列语义也不同：/pending 的候选是 `status='disputed'`（本地在途状态），
  *     /after-sales 的候选是 `after_sale_status='open'`（**叠加在终局之上的第二层**，见 afterSale.js）。

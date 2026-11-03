@@ -143,7 +143,7 @@ test('码池清空：需 confirm + 仅 owner；清空后可改商品类型', asy
     .send({
       kind: 'physical',
       title: '清池后改实物',
-      specs: [],
+      specs: [{ name: '规格', options: ['默认'] }],
       skus: [{ key: '', priceUsdtMicro: 88_000_000, capacity: 5 }],
     })
     .expect(200);
