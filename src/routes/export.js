@@ -115,14 +115,14 @@ const auditExport = async (req, action, targetId, detail) =>
  * 另加 `accepted_partial_refund_wei` 分辨"部分退款是仲裁拆分还是买家授权"。
  */
 const ORDER_COLUMNS = [
-  'order_no', 'product_slug', 'product_title', 'sku_key', 'sku_specs', 'kind', 'nft_contract', 'nft_standard', 'erc20_contract',
-  'status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
+  'order_no', 'product_slug', 'status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
   'payment_rate_source', 'payment_rate_stale', 'payment_rate_quoted_at',
   'amount_wei', 'refunded_wei', 'amount_net_wei', 'net_usdt_micro',
   'accepted_partial_refund_wei',
   'usdt_micro', 'shipping_fee_usdt_micro', 'invoice_needed',
   'buyer', 'shipping_name', 'shipping_phone', 'shipping_address', 'shipping_edited', 'note', 'escrow_order_id',
   'paid_tx_hash', 'refund_status', 'tracking_no', 'carrier', 'created_at', 'updated_at',
+  'product_title', 'sku_key', 'sku_specs', 'kind', 'nft_contract', 'nft_standard', 'erc20_contract',
 ];
 
 /** 收款流水导出（ownerOnly；入账口径与流水页一致 = 订单 updated_at 末次迁移时刻；
@@ -163,17 +163,18 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
         店主对着一笔部分退款无法分辨是哪一种，也就无从复核"这笔结算有没有买家点头"。
   */
   const headers = [
-    'order_no', 'product_slug', 'product_title', 'sku_key', 'nft_standard', 'income_status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
+    'order_no', 'product_slug', 'income_status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
     'payment_rate_source', 'payment_rate_stale', 'payment_rate_quoted_at',
     'amount_wei', 'refunded_wei', 'net_wei', 'net_usdt_micro',
     'accepted_partial_refund_wei',
     'usdt_micro', 'income_at', 'buyer', 'escrow_order_id', 'paid_tx_hash',
+    'product_title', 'sku_key', 'nft_standard',
   ];
   const csvRows = rows.map((o) => {
     const money = moneyCellsOf(o);
     const snap = snapshotOf(o);
     return [
-      o.order_no, o.product_slug, snap.title || '', o.sku_key || '', snap.nft_standard || '', o.status, o.quantity || 1,
+      o.order_no, o.product_slug, o.status, o.quantity || 1,
       o.payment_token || '0x0000000000000000000000000000000000000000',
       o.payment_symbol || 'BTY', o.payment_decimals ?? 18,
       o.payment_rate_source || 'bty', o.payment_rate_stale ? 1 : 0, isoCell(o.payment_rate_quoted_at),
@@ -185,6 +186,7 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
       money.netUsdtMicro,
       o.accepted_partial_refund_wei ?? '',
       o.usdt_micro, isoCell(o.updated_at), o.buyer, o.escrow_order_id || '', o.paid_tx_hash || '',
+      snap.title || '', o.sku_key || '', snap.nft_standard || '',
     ];
   });
   await auditExport(req, 'export.ledger', '-', { rows: rows.length, from: req.query.from || 'all', to: req.query.to || 'all' });
@@ -235,9 +237,7 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     const money = moneyCellsOf(o);
     const snap = snapshotOf(o);
     return [
-      o.order_no, o.product_slug, snap.title || '', o.sku_key || '', jsonCell(o.sku_specs), snap.kind || '',
-      snap.nft_contract || '', snap.nft_standard || '', snap.erc20_contract || '',
-      o.status, o.quantity || 1,
+      o.order_no, o.product_slug, o.status, o.quantity || 1,
       o.payment_token || '0x0000000000000000000000000000000000000000',
       o.payment_symbol || 'BTY', o.payment_decimals ?? 18,
       o.payment_rate_source || 'bty', o.payment_rate_stale ? 1 : 0, isoCell(o.payment_rate_quoted_at),
@@ -250,6 +250,8 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
       o.buyer, o.shipping_name, o.shipping_phone, o.shipping_address, o.shipping_edit_count ? '1' : '0', o.note || '',
       o.escrow_order_id || '', o.paid_tx_hash || '', o.refund_status || 'none',
       o.tracking_no || '', o.carrier || '', isoCell(o.created_at), isoCell(o.updated_at),
+      snap.title || '', o.sku_key || '', jsonCell(o.sku_specs), snap.kind || '',
+      snap.nft_contract || '', snap.nft_standard || '', snap.erc20_contract || '',
     ];
   });
   await auditExport(req, 'export.orders', '-', {
@@ -284,7 +286,7 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     逐字保持 JSON 原文（不解析后重排键序）：这一列的价值就是"与库里那一份一致"，
     而库里那一份是 MySQL 规范化之后的文本，`JSON.stringify(读回的对象)` 给出的正是它。
   */
-  const headers = ['slug', 'title', 'kind', 'nft_contract', 'nft_standard', 'token_contract', 'claimable', 'claim_type', 'claim_window_days', 'shipping_fee_usdt_micro', 'age_restricted', 'specs', 'attributes', 'terms', 'sku_key', 'sku_specs', 'price_usdt_micro', 'sku_image_url', 'token_amount', 'capacity', 'committed', 'available', 'sku_active', 'active', 'published_at', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused'];
+  const headers = ['slug', 'title', 'kind', 'shipping_fee_usdt_micro', 'age_restricted', 'specs', 'attributes', 'terms', 'sku_key', 'sku_specs', 'price_usdt_micro', 'sku_image_url', 'capacity', 'committed', 'available', 'sku_active', 'active', 'published_at', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused', 'nft_contract', 'nft_standard', 'token_contract', 'claimable', 'claim_type', 'claim_window_days', 'token_amount'];
   const csvRows = [];
   for (const r of rows) {
     const skus = skuByProduct.get(r.id) || [];
@@ -292,17 +294,17 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     const list = skus.length ? skus : [null];
     for (const s of list) {
       csvRows.push([
-        r.slug, r.title, r.kind, r.nft_contract || '', r.nft_standard || '', r.token_contract || '',
-        r.claimable ? 1 : 0, r.claim_type || '', r.claim_window_days ?? '',
-        r.shipping_fee_usdt_micro ?? 0, r.age_restricted ? 1 : 0, jsonCell(r.specs),
+        r.slug, r.title, r.kind, r.shipping_fee_usdt_micro ?? 0, r.age_restricted ? 1 : 0, jsonCell(r.specs),
         jsonCell(r.attributes), jsonCell(r.terms),
         s ? s.sku_key : '', s ? jsonCell(s.specs_json) : '',
-        s ? s.price_usdt_micro : '', s ? (s.image_url || '') : '', s ? (s.token_amount ?? '') : '',
+        s ? s.price_usdt_micro : '', s ? (s.image_url || '') : '',
         s ? (s.capacity ?? '') : '', s ? s.committed || 0 : '',
         s ? (s.capacity === null ? '' : Math.max(0, s.capacity - (s.committed || 0))) : '',
         s ? (s.active ? 1 : 0) : '',
         r.active ? 1 : 0, isoCell(r.published_at), r.auto_deliver, r.stock_alert_at ?? '', r.snapshot_hash,
         isoCell(r.created_at), isoCell(r.updated_at), r.codes_built, r.codes_unused, r.tokens_built, r.tokens_unused,
+        r.nft_contract || '', r.nft_standard || '', r.token_contract || '',
+        r.claimable ? 1 : 0, r.claim_type || '', r.claim_window_days ?? '', s ? (s.token_amount ?? '') : '',
       ]);
     }
   }

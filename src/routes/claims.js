@@ -72,10 +72,13 @@ function claimFilterOf(req) {
   }
   const parseDay = (raw, end) => {
     if (!raw) return null;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return { error: `${end ? 'to' : 'from'} 需为 YYYY-MM-DD` };
-    const d = new Date(`${raw}T00:00:00.000Z`);
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(raw);
+    if (!dateOnly && Number.isNaN(new Date(raw).getTime())) {
+      return { error: `${end ? 'to' : 'from'} 需为 YYYY-MM-DD 或 ISO-8601 时间` };
+    }
+    const d = dateOnly ? new Date(`${raw}T00:00:00.000Z`) : new Date(raw);
     if (Number.isNaN(d.getTime())) return { error: `${end ? 'to' : 'from'} 不是有效日期` };
-    if (end) d.setUTCHours(23, 59, 59, 999);
+    if (dateOnly && end) d.setUTCHours(23, 59, 59, 999);
     return d.toISOString().slice(0, 19).replace('T', ' ');
   };
   const from = parseDay(fromRaw, false);
@@ -146,6 +149,10 @@ router.get('/nft/seller.csv', requireAuth, exportLimiter, wrap(async (req, res) 
   if (filter.error) return fail(res, filter.error);
   const scope = await sellerScopeOf(req.auth.address);
   const { where, params } = claimWhereOf(scope, filter);
+  const total = Number((await getDb().get(`SELECT COUNT(*) AS total FROM nft_claims n ${where}`, ...params))?.total || 0);
+  if (total > 20000) {
+    return fail(res, `当前筛选共 ${total} 条，超过单次导出上限 20000 条；请缩小日期或状态范围后重试`);
+  }
   const rows = await getDb().all(
     `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
        (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
