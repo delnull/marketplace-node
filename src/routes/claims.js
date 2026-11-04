@@ -29,6 +29,7 @@ import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js'
 import { verifySession, roleOf, isHost } from '../auth.js';
 import { getDb } from '../db.js';
 import { logAudit } from '../audit.js';
+import { sendCsv } from '../csv.js';
 import {
   submitClaim,
   claimDto,
@@ -42,6 +43,74 @@ const requireAuth = makeAuthMiddleware(verifySession);
 const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 // 公开状态查询是匿名可读的（买家/二级市场买家要能查），限流防脚本枚举 tokenId
 const byTokenLimiter = simpleRateLimit({ windowMs: 60_000, max: 120, message: '提货状态查询过于频繁，请稍后再试' });
+const exportLimiter = simpleRateLimit({ windowMs: 60_000, max: 10, message: '导出过于频繁（每分钟至多 10 次）：请稍后再试' });
+
+const CLAIM_STATUSES = ['requested', 'approved', 'shipped', 'fulfilled', 'rejected', 'cancelled', 'expired'];
+
+/** 卖家/店员作用域：与 POST /nft/:id/seller 同一判据（seller 本人或本店店员） */
+async function sellerScopeOf(address) {
+  const staffShops = (
+    await getDb().all('SELECT shop_code FROM shop_operators WHERE address = ?', address)
+  ).map((r) => String(r.shop_code));
+  const scope = staffShops.length
+    ? `(n.seller = ? OR n.shop_code IN (${staffShops.map(() => '?').join(',')}))`
+    : 'n.seller = ?';
+  return { scope, params: [address, ...staffShops] };
+}
+
+/**
+ * 卖家提货筛选（列表与 CSV 共用；两处口径必须逐字一致）。
+ * q 搜提货单/订单/tokenId/提货人/运单/合约；status=todo 表示三个待办态。
+ */
+function claimFilterOf(req) {
+  const q = String(req.query.q || '').trim().slice(0, 100);
+  const status = String(req.query.status || 'all').trim();
+  const fromRaw = String(req.query.from || '').trim();
+  const toRaw = String(req.query.to || '').trim();
+  if (status !== 'all' && status !== 'todo' && !CLAIM_STATUSES.includes(status)) {
+    return { error: 'status 非法' };
+  }
+  const parseDay = (raw, end) => {
+    if (!raw) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return { error: `${end ? 'to' : 'from'} 需为 YYYY-MM-DD` };
+    const d = new Date(`${raw}T00:00:00.000Z`);
+    if (Number.isNaN(d.getTime())) return { error: `${end ? 'to' : 'from'} 不是有效日期` };
+    if (end) d.setUTCHours(23, 59, 59, 999);
+    return d.toISOString().slice(0, 19).replace('T', ' ');
+  };
+  const from = parseDay(fromRaw, false);
+  const to = parseDay(toRaw, true);
+  if (from?.error) return { error: from.error };
+  if (to?.error) return { error: to.error };
+  const page = Math.max(1, Number.parseInt(String(req.query.page || '1'), 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number.parseInt(String(req.query.pageSize || '20'), 10) || 20));
+  return { q, status, from, to, page, pageSize };
+}
+
+function claimWhereOf(scope, filter) {
+  const parts = [scope.scope];
+  const params = [...scope.params];
+  if (filter.status === 'todo') {
+    parts.push(`n.status IN ('requested','approved','shipped')`);
+  } else if (filter.status !== 'all') {
+    parts.push('n.status = ?');
+    params.push(filter.status);
+  }
+  if (filter.q) {
+    parts.push(`(n.claim_no LIKE ? OR n.order_no LIKE ? OR n.token_id LIKE ? OR n.claimant LIKE ? OR n.tracking_no LIKE ? OR n.token_contract LIKE ?)`);
+    const like = `%${filter.q}%`;
+    params.push(like, like, like, like, like, like);
+  }
+  if (filter.from) {
+    parts.push('n.created_at >= ?');
+    params.push(filter.from);
+  }
+  if (filter.to) {
+    parts.push('n.created_at <= ?');
+    params.push(filter.to);
+  }
+  return { where: `WHERE ${parts.join(' AND ')}`, params };
+}
 
 /** 公开状态：这枚 token 的提货行（按时间倒序；**不含收货信息**） */
 router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
@@ -62,42 +131,92 @@ router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
 /** 我提交过的提货行（需登录；所有状态，新的在前） */
 router.get('/nft/mine', requireAuth, wrap(async (req, res) => {
   const rows = await getDb().all(
-    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+    `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
+         (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
          (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-       FROM nft_claims n WHERE n.claimant = ? ORDER BY n.id DESC LIMIT 200`,
+       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id WHERE n.claimant = ? ORDER BY n.id DESC LIMIT 200`,
     req.auth.address
   );
   ok(res, { claims: rows.map((r) => claimDto(r, { as: 'holder' })) });
 }));
 
+/** 卖家提货 CSV（当前筛选的全量，不分页；含收货信息，属卖家私域） */
+router.get('/nft/seller.csv', requireAuth, exportLimiter, wrap(async (req, res) => {
+  const filter = claimFilterOf(req);
+  if (filter.error) return fail(res, filter.error);
+  const scope = await sellerScopeOf(req.auth.address);
+  const { where, params } = claimWhereOf(scope, filter);
+  const rows = await getDb().all(
+    `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
+       (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+       (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
+       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
+       ${where}
+      ORDER BY FIELD(n.status,'requested','approved','shipped','fulfilled','rejected','cancelled','expired'), n.id DESC`,
+    ...params
+  );
+  const statusText = {
+    requested: '待处理', approved: '待发货', shipped: '已发货', fulfilled: '已交付',
+    rejected: '已驳回', cancelled: '已撤回', expired: '已过期',
+  };
+  const standardText = { erc721: 'ERC721', erc1155: 'ERC1155' };
+  const headers = [
+    '提货单号', '订单号', '商品', 'NFT标准', 'NFT合约', 'tokenId', '提货人',
+    '收货人', '电话', '地址', '运单号', 'NFT转账哈希', '状态', '链上案号', '备注', '申请时间', '更新时间',
+  ];
+  const csvRows = rows.map((r) => {
+    const d = claimDto(r, { as: 'seller' });
+    return [
+      d.id, d.orderNo, d.productTitle || '', standardText[d.nftStandard] || d.nftStandard || '',
+      d.nftContract, d.tokenId, d.claimant, d.shipping?.name || '', d.shipping?.phone || '',
+      d.shipping?.address || '', d.trackingNo || '', d.deliveryTxHash || '',
+      statusText[d.status] || d.status, d.claimId || '', d.note || '', d.createdAt, d.updatedAt,
+    ];
+  });
+  await logAudit({
+    req,
+    actor: req.auth.address,
+    actorRole: 'staff',
+    shopCode: null,
+    action: 'claim.export',
+    targetType: 'nft_claim_export',
+    targetId: 'seller.csv',
+    detail: { rows: csvRows.length, status: filter.status, from: filter.from, to: filter.to },
+  });
+  sendCsv(res, `nft-claims-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.csv`, headers, csvRows);
+}));
+
 /**
- * 我作为卖家/本店店员（本节点）的提货行（需登录；所有状态，新的在前）。
+ * 我作为卖家/本店店员（本节点）的提货行（需登录；支持搜索/日期/状态/分页）。
  *
  * 列表的授权面必须与 `POST /nft/:id/seller` 完全一致：动作允许该行的 seller **或本店店员**，
  * 而旧列表只按 `seller = ?` 过滤——店员能处理却看不到，只能靠猜 claim id。
  * 这里用 `shop_operators` 找出当前地址任店员的本店编号，再取这些店的提货行。
  */
 router.get('/nft/seller', requireAuth, wrap(async (req, res) => {
-  const address = req.auth.address;
-  const staffShops = (
-    await getDb().all('SELECT shop_code FROM shop_operators WHERE address = ?', address)
-  ).map((r) => String(r.shop_code));
-  const rows = staffShops.length
-    ? await getDb().all(
-        `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
-         (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-           FROM nft_claims n WHERE n.seller = ? OR n.shop_code IN (${staffShops.map(() => '?').join(',')})
-          ORDER BY n.id DESC LIMIT 200`,
-        address,
-        ...staffShops
-      )
-    : await getDb().all(
-        `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
-         (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-           FROM nft_claims n WHERE n.seller = ? ORDER BY n.id DESC LIMIT 200`,
-        address
-      );
-  ok(res, { claims: rows.map((r) => claimDto(r, { as: 'seller' })) });
+  const filter = claimFilterOf(req);
+  if (filter.error) return fail(res, filter.error);
+  const scope = await sellerScopeOf(req.auth.address);
+  const { where, params } = claimWhereOf(scope, filter);
+  const db = getDb();
+  const total = Number((await db.get(`SELECT COUNT(*) AS total FROM nft_claims n ${where}`, ...params))?.total || 0);
+  const offset = (filter.page - 1) * filter.pageSize;
+  const rows = await db.all(
+    `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
+       (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+       (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
+       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
+       ${where}
+      ORDER BY FIELD(n.status,'requested','approved','shipped','fulfilled','rejected','cancelled','expired'), n.id DESC
+      LIMIT ${filter.pageSize} OFFSET ${offset}`,
+    ...params
+  );
+  ok(res, {
+    claims: rows.map((r) => claimDto(r, { as: 'seller' })),
+    total,
+    page: filter.page,
+    pageSize: filter.pageSize,
+  });
 }));
 
 /** 提交提货声明（持有人；token + 收货信息） */

@@ -148,7 +148,7 @@ test('提货声明的判据链：未交付的 token 拒绝；非持有人拒绝�
   await request(app)
     .post(`/api/products/${off.body.data.slug}/tokens`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send({ tokens: ['7'] })
+    .send({ tokens: ['101'] })
     .expect(200);
   const o = await request(app)
     .post('/api/orders')
@@ -441,4 +441,41 @@ test('零赔付结案/撤销争议必须释放声明占位，不能把 token 永
   assert.equal(cancelled.status, 'cancelled');
   assert.equal(cancelled.dispute_state, 'cancelled');
   assert.equal(cancelled.claim_amount_wei, null);
+});
+
+test('卖家提货列表分页/搜索与 CSV 导出（含公式防护）', async () => {
+  const p = await createNftProduct();
+  await request(app)
+    .post(`/api/products/${p.slug}/tokens`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ tokens: ['202'] })
+    .expect(200);
+  await deliverToken(p.slug, '202');
+  currentOwner = buyer.address.toLowerCase();
+  const c = await submit(buyerToken, {
+    nftContract: NFT, tokenId: '202', shipping: { name: '=1+1', phone: '135', address: '上海' },
+  }).expect(200);
+  assertOk(c);
+  const claimNo = c.body.data.id;
+
+  const list = await request(app)
+    .get(`/api/claims/nft/seller?q=${encodeURIComponent(claimNo)}&pageSize=1`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .expect(200);
+  assertOk(list);
+  assert.equal(list.body.data.total, 1, '搜索命中数');
+  assert.equal(list.body.data.page, 1);
+  assert.equal(list.body.data.pageSize, 1);
+  assert.equal(list.body.data.claims.length, 1);
+  assert.equal(list.body.data.claims[0].id, claimNo);
+  assert.equal(list.body.data.claims[0].productTitle, '提货测试 NFT');
+
+  const csv = await request(app)
+    .get(`/api/claims/nft/seller.csv?q=${encodeURIComponent(claimNo)}`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .expect(200);
+  assert.match(csv.headers['content-type'], /text\/csv/);
+  assert.ok(csv.text.startsWith('\uFEFF'), 'UTF-8 BOM');
+  assert.ok(csv.text.includes(claimNo) && csv.text.includes('提货测试 NFT'), '含提货单号与商品字段');
+  assert.ok(csv.text.includes("'=1+1"), '收货人公式前缀已加');
 });

@@ -33,6 +33,15 @@ const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true });
 /** 时间单元格：`Date` → ISO-8601；空值 → 空串（"没有这个时刻"） */
 const isoCell = (v) => (v instanceof Date ? v.toISOString() : '');
 
+/** 订单商品快照（订单锁定值；导出商品标题/资产字段时用，解析失败不阻断导出） */
+function snapshotOf(o) {
+  try {
+    return JSON.parse(o.product_snapshot || '{}') || {};
+  } catch {
+    return {};
+  }
+}
+
 /**
  * JSON 列的单元格：驱动把 `JSON` 列解成对象（db.js 没开 jsonStrings），
  * 所以按**规范文本形**写回（`JSON.stringify`）。这一列的价值就是"与库里那一份一致"，
@@ -106,7 +115,8 @@ const auditExport = async (req, action, targetId, detail) =>
  * 另加 `accepted_partial_refund_wei` 分辨"部分退款是仲裁拆分还是买家授权"。
  */
 const ORDER_COLUMNS = [
-  'order_no', 'product_slug', 'status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
+  'order_no', 'product_slug', 'product_title', 'sku_key', 'sku_specs', 'kind', 'nft_contract', 'nft_standard', 'erc20_contract',
+  'status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
   'payment_rate_source', 'payment_rate_stale', 'payment_rate_quoted_at',
   'amount_wei', 'refunded_wei', 'amount_net_wei', 'net_usdt_micro',
   'accepted_partial_refund_wei',
@@ -153,7 +163,7 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
         店主对着一笔部分退款无法分辨是哪一种，也就无从复核"这笔结算有没有买家点头"。
   */
   const headers = [
-    'order_no', 'product_slug', 'income_status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
+    'order_no', 'product_slug', 'product_title', 'sku_key', 'nft_standard', 'income_status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
     'payment_rate_source', 'payment_rate_stale', 'payment_rate_quoted_at',
     'amount_wei', 'refunded_wei', 'net_wei', 'net_usdt_micro',
     'accepted_partial_refund_wei',
@@ -161,8 +171,9 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   ];
   const csvRows = rows.map((o) => {
     const money = moneyCellsOf(o);
+    const snap = snapshotOf(o);
     return [
-      o.order_no, o.product_slug, o.status, o.quantity || 1,
+      o.order_no, o.product_slug, snap.title || '', o.sku_key || '', snap.nft_standard || '', o.status, o.quantity || 1,
       o.payment_token || '0x0000000000000000000000000000000000000000',
       o.payment_symbol || 'BTY', o.payment_decimals ?? 18,
       o.payment_rate_source || 'bty', o.payment_rate_stale ? 1 : 0, isoCell(o.payment_rate_quoted_at),
@@ -222,8 +233,11 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const csvRows = rows.map((o) => {
     /* 与 ledger.csv 同一口径（毛额 − 已退买家 = 净额；两处必须逐字同源） */
     const money = moneyCellsOf(o);
+    const snap = snapshotOf(o);
     return [
-      o.order_no, o.product_slug, o.status, o.quantity || 1,
+      o.order_no, o.product_slug, snap.title || '', o.sku_key || '', jsonCell(o.sku_specs), snap.kind || '',
+      snap.nft_contract || '', snap.nft_standard || '', snap.erc20_contract || '',
+      o.status, o.quantity || 1,
       o.payment_token || '0x0000000000000000000000000000000000000000',
       o.payment_symbol || 'BTY', o.payment_decimals ?? 18,
       o.payment_rate_source || 'bty', o.payment_rate_stale ? 1 : 0, isoCell(o.payment_rate_quoted_at),
@@ -270,7 +284,7 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     逐字保持 JSON 原文（不解析后重排键序）：这一列的价值就是"与库里那一份一致"，
     而库里那一份是 MySQL 规范化之后的文本，`JSON.stringify(读回的对象)` 给出的正是它。
   */
-  const headers = ['slug', 'title', 'kind', 'shipping_fee_usdt_micro', 'age_restricted', 'specs', 'attributes', 'terms', 'sku_key', 'sku_specs', 'price_usdt_micro', 'sku_image_url', 'capacity', 'committed', 'available', 'sku_active', 'active', 'published_at', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused'];
+  const headers = ['slug', 'title', 'kind', 'nft_contract', 'nft_standard', 'token_contract', 'claimable', 'claim_type', 'claim_window_days', 'shipping_fee_usdt_micro', 'age_restricted', 'specs', 'attributes', 'terms', 'sku_key', 'sku_specs', 'price_usdt_micro', 'sku_image_url', 'token_amount', 'capacity', 'committed', 'available', 'sku_active', 'active', 'published_at', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused'];
   const csvRows = [];
   for (const r of rows) {
     const skus = skuByProduct.get(r.id) || [];
@@ -278,10 +292,12 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     const list = skus.length ? skus : [null];
     for (const s of list) {
       csvRows.push([
-        r.slug, r.title, r.kind, r.shipping_fee_usdt_micro ?? 0, r.age_restricted ? 1 : 0, jsonCell(r.specs),
+        r.slug, r.title, r.kind, r.nft_contract || '', r.nft_standard || '', r.token_contract || '',
+        r.claimable ? 1 : 0, r.claim_type || '', r.claim_window_days ?? '',
+        r.shipping_fee_usdt_micro ?? 0, r.age_restricted ? 1 : 0, jsonCell(r.specs),
         jsonCell(r.attributes), jsonCell(r.terms),
         s ? s.sku_key : '', s ? jsonCell(s.specs_json) : '',
-        s ? s.price_usdt_micro : '', s ? (s.image_url || '') : '',
+        s ? s.price_usdt_micro : '', s ? (s.image_url || '') : '', s ? (s.token_amount ?? '') : '',
         s ? (s.capacity ?? '') : '', s ? s.committed || 0 : '',
         s ? (s.capacity === null ? '' : Math.max(0, s.capacity - (s.committed || 0))) : '',
         s ? (s.active ? 1 : 0) : '',
@@ -319,9 +335,10 @@ router.get('/codes.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     ...params
   );
   await auditExport(req, 'export.codes', slug, { rows: rows.length, status: req.query.status || 'all' });
-  // 码为店主持有资源：关闭公式前缀（码值原样导出，值完整性优先；来源非买家可控）
+  // 码值也按公式前缀防护：CSV 会被 Excel 直接打开，卖家导入的码同样可能以 = + - @ 开头。
+  // 代价是这类码在表格里会多一个前导撇号；安全优先，避免打开文件就执行公式。
   sendCsv(res, `${slug}-codes.csv`, ['code', 'status', 'order_no', 'created_at', 'used_at'],
-    rows.map((r) => [r.code, r.status, r.order_no || '', isoCell(r.created_at), isoCell(r.used_at)]), { formulaGuard: false });
+    rows.map((r) => [r.code, r.status, r.order_no || '', isoCell(r.created_at), isoCell(r.used_at)]));
 }));
 
 export default router;

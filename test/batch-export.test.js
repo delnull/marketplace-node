@@ -152,7 +152,7 @@ test('CSV 公式注入防护：外部可控文本字段（收货姓名）以 = �
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assert.ok(csv.text.includes("'=1+1"), '公式前缀已加（外部输入不触发 Excel 执行）');
-  // 码原文以 = 开头时不加前缀（值完整性优先——店主持有资源，非买家可控）
+  // 码值同样加公式前缀：CSV 可能被 Excel 直接打开，安全优先于码值原样显示。
   const dg = await listProduct(productPayload({ kind: 'digital', title: '公式码商品' }));
   await request(app)
     .post(`/api/products/${dg.slug}/codes`)
@@ -163,7 +163,7 @@ test('CSV 公式注入防护：外部可控文本字段（收货姓名）以 = �
     .get(`/api/shop/export/codes.csv?slug=${dg.slug}&status=unused`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
-  assert.ok(codes.text.includes(',=X1,') || codes.text.includes('\n=X1,'), '码导出不加公式前缀');
+  assert.ok(codes.text.includes("'=X1"), '码导出也加公式前缀');
 });
 
 test('导出：orders.csv 列白名单与 BOM；权限（匿名 401）；codes.csv 仅 owner', async () => {
