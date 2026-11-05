@@ -89,7 +89,7 @@ test('闸 1：新买家 40 并发 → 恰好 10 张（8 轮复现，含"行还�
 });
 
 test('闸 2：同买家同商品 20 件 × 20 并发 → 恰好 4 张 / 80 件；拒因带确切读数', async () => {
-  const p = await insertProduct(db, { kind: 'physical', title: '并发草稿占位', skus: [{ key: '', priceUsdtMicro: 1_000_000, capacity: 500 }] });
+  const p = await insertProduct(db, { kind: 'physical', title: '并发草稿占位', skus: [{ key: '', priceMicro: 1_000_000, capacity: 500 }] });
   const buyer = Wallet.createRandom().address.toLowerCase();
   const { ok, errors } = await burst(20, () => attemptDraft(buyer, p.productId, 20));
   assert.deepEqual(errors, [], `不得有异常：${errors.join(' / ')}`);
@@ -184,7 +184,7 @@ test('端到端：HTTP 40 并发代客下单 → 恰好 10 个成功，且不占
 });
 
 test('闸 2 的两侧边界：80 + 19 = 99 放行；再加 1 件被拒且拒因带 99/99', async () => {
-  const p = await insertProduct(db, { kind: 'physical', title: '合计边界', skus: [{ key: '', priceUsdtMicro: 1_000_000, capacity: 200 }] });
+  const p = await insertProduct(db, { kind: 'physical', title: '合计边界', skus: [{ key: '', priceMicro: 1_000_000, capacity: 200 }] });
   const buyer = Wallet.createRandom().address.toLowerCase();
   for (let i = 0; i < 4; i++) assert.equal(await attemptDraft(buyer, p.productId, 20), 'ok'); // 合计 80
   assert.equal(await attemptDraft(buyer, p.productId, 19), 'ok', '80 + 19 = 99 必须放行（边界含等号）');

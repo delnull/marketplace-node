@@ -9,6 +9,8 @@
  *  PATCH  /api/products/admin/:slug/moderation 节点管理员：强制下架/恢复展示 {hidden, reason}
  *  POST   /api/products            店主/操作员（staff）上架（SIWE Bearer）
  *  PATCH  /api/products/:slug      店主/操作员（staff）更新/上下架
+ *  DELETE /api/products/:slug      店主/操作员（staff）软删除（?confirm=1；历史订单不受影响）
+ *  DELETE /api/products/admin/:slug 节点主（hostOnly）强制软删除（{reason} 必填）
  *  POST   /api/products/:slug/codes        店主/操作员导入兑换码池 {codes: string[]}（staff，数字商品）
  *  GET    /api/products/:slug/codes        店主/操作员查看码池 {status? cursor?}（码为敏感资源，staff 可读——处理退款/对码需要；读取入审计）
  *  DELETE /api/products/:slug/codes/:id    店主/操作员（staff）删除单个未用码
@@ -44,12 +46,12 @@
  *     由 orders.js 用同一个 `snapshotObject` 序列化 ⇒ "哈希"与"存下的那份字节"天然一致。
  *
  * **快照契约（唯一权威顺序）**：
- *   slug / title / description / description_blocks / media / kind /
- *   shipping_fee_usdt_micro / age_restricted / specs / skus / attributes / terms / sku_images
+ *   slug / title / description / description_blocks / media / kind / price_currency /
+ *   shipping_fee_micro / age_restricted / specs / skus / attributes / terms / sku_images
  *   kind='nft' 时再追加 nft_contract、nft_standard（nft_contract 在前）。
  *   追加/改动键必须在**同一位置**同时改本文件与前端 utils/snapshot.ts，
  *   否则每个买家都会看到假的「商品内容已被修改」告警。
- *   运费与年龄限制必须在快照里：否则店主可以在买家下单前事后加价运费、
+ *   标价币种、运费与年龄限制必须在快照里：否则店主可以在买家下单前换计价单位/事后加价运费、
  *   或把限制商品悄悄摘掉限制，而买家手上的哈希不变。
  *   主图区（media）同样必须在快照里：它就是买家看到的商品本身，
  *   事后换一张图/换一段视频而哈希不变，等于主图可被无声替换。
@@ -81,10 +83,11 @@ import {
   productPublicSql,
 } from '../shops.js';
 import { newProductSlug } from '../ids.js';
+import { auditChanges, boundAuditValue, sameAuditValue } from '../auditDiff.js';
 import { normalizeBlocks, deriveDescription, parseBlocks } from '../describeBlocks.js';
 import { tryAutoDeliverPendingForProduct } from '../autoDeliver.js';
-// 金额展示口径的唯一实现（usdtOf）——不要再手写 (micro/1e6).toFixed(2)
-import { usdtOf } from '../money.js';
+// 金额展示口径的唯一实现（priceOf / goodsPriceMicroOf）——不要再手写 (micro/1e6).toFixed(2)
+import { goodsPriceMicroOf, priceOf, priceUnitOf } from '../money.js';
 // 「这一单还占着库存」的唯一谓词（2026-10-14）：改名守卫与 willRestrict 的补记核算共用它，
 // 不再各自拼状态白名单——状态集每加一个终态就会漏一次，而漏的后果是超卖。
 import { stockPromiseSql, uncommittedPromiseSql } from '../stockHold.js';
@@ -103,20 +106,20 @@ import {
 } from '../mediaKinds.js';
 
 /*
-  价格与运费的闸门（**微 USDT**，1 USDT = 1e6）。
+  价格与运费的闸门（**标价币种微单位**，1 单位 = 1e6 微；单位见 products.price_currency）。
 
-  单价上限 **1e13 微 = 1e7 USDT**。这个数不是随手取的：
+  单价上限 **1e13 微 = 1e7 单位**（USDT 或 BTY 同一条上限）。这个数不是随手取的：
   订单与商品金额一律用 JS `Number` 承载，而 `Number.MAX_SAFE_INTEGER` 是 9.007e15
   （db.js 的 `ck_orders_money` / `ck_skus_price` 把这条上界写进了 schema：读不回来的值在库里根本存不下）。
   一单最多 99 件（`orders.quantity` CHECK 1..99）、运费最多 1e9 微 ⇒ 最坏合计 = 单价 × 99 + 运费；
   取 1e13 时最坏 9.9e14，离 9.007e15 还有 9 倍余量（改这个常量前先读 routes/orders.js 的同名兜底闸）。
 
-  运费上限 1e9 微 = 1000 USDT。
+  运费上限 1e9 微 = 1000 单位。BTY 定价商品的运费同样以微 BTY 计，**不换算**。
 */
-export const PRICE_MAX_MICRO = 10_000_000_000_000; // 1e7 USDT
-export const SHIPPING_FEE_MAX_MICRO = 1_000_000_000; // 1000 USDT
-/** 给店主看的单价上限（USDT 整数串；报错文案里不要直接甩 1e13 这种微整数） */
-const PRICE_MAX_USDT = '10000000';
+export const PRICE_MAX_MICRO = 10_000_000_000_000; // 1e7 单位
+export const SHIPPING_FEE_MAX_MICRO = 1_000_000_000; // 1000 单位
+/** 给店主看的单价上限（整数串；报错文案里不要直接甩 1e13 这种微整数） */
+const PRICE_MAX_UNITS = '10000000';
 
 /**
  * 插入 `products` 时 `snapshot_hash` 的占位值。
@@ -197,7 +200,7 @@ async function moderateNodeProducts({ req, slugs, hidden, reason, batch = false 
     */
     const rows = await db.all(
       `SELECT id, slug, title, shop_code, node_hidden, node_hidden_reason, node_hidden_at
-         FROM products WHERE slug IN (${marks}) FOR UPDATE`,
+         FROM products WHERE slug IN (${marks}) AND deleted_at IS NULL FOR UPDATE`,
       ...slugs
     );
     const found = new Set(rows.map((r) => String(r.slug)));
@@ -246,6 +249,8 @@ const publicProductListLimiter = simpleRateLimit({ windowMs: 60_000, max: 120, m
 const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true }); // P1-⑤：商品经营面=店主+店员
 const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true }); // 池清空/敏感资源批量作废=仅店主
 const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true }); // 节点侧强制下架/恢复（节点主∪员工）
+/** 强制删除=仅节点主（不可下放给员工：删除是终局且不可从界面恢复） */
+const hostOnly = makeAuthMiddleware(verifySession, { hostOnly: true });
 
 /**
  * 卖家面按 slug 取商品行 —— **唯一入口**（取行 + 归属校验 + 写动作的"能不能卖"闸一起做）。
@@ -271,7 +276,11 @@ const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true }); // 节
  */
 async function requireShopProduct(req, res) {
   const row = await getDb().get('SELECT * FROM products WHERE slug = ?', String(req.params.slug || ''));
-  if (!row) {
+  /*
+    已软删除的商品对店主面也是"不存在"：删除是终局（不提供恢复入口），
+    历史订单靠快照独立成立，不需要商品行继续可读。
+  */
+  if (!row || row.deleted_at != null) {
     fail(res, '商品不存在', 404, 404);
     return null;
   }
@@ -325,13 +334,13 @@ function parseMediaColumn(raw) {
 }
 
 /** 快照规范化字段（顺序固定，勿改动）：
- *  slug / title / description / description_blocks / media / kind /
- *  shipping_fee_usdt_micro / age_restricted / specs / skus / attributes / terms / sku_images；
+ *  slug / title / description / description_blocks / media / kind / price_currency /
+ *  shipping_fee_micro / age_restricted / specs / skus / attributes / terms / sku_images；
  *  kind='nft' 时追加 nft_contract、nft_standard（nft_contract 在前）。
  *
- *  价格不在商品级 —— 每个组合的单价都在 skus 里（[[sku_key, price_usdt_micro], …] 按 key 升序），
- *  买家据此核验「所选规格的价格」没有被事后改动。
- *  运费（shipping_fee_usdt_micro）与年龄限制（age_restricted）**必须**在快照里：
+ *  价格不在商品级 —— 每个组合的单价都在 skus 里（[[sku_key, price_micro], …] 按 key 升序），
+ *  单价单位由 `price_currency` 决定；买家据此核验「所选规格的价格」没有被事后改动。
+ *  运费（shipping_fee_micro，同币种微单位）与年龄限制（age_restricted）**必须**在快照里：
  *  前者是钱（事后加价运费等于改价），后者是商品属性（上架后静默增删限制，买家无从察觉）。
  *  主图区（media）**必须**在快照里：它是买家看到的那件商品本身。
  *
@@ -341,8 +350,7 @@ function parseMediaColumn(raw) {
  *   · terms        = 店主**承诺了什么**（多久发出/退换规则/退换窗口/退货运费谁承担）——
  *                   本商城的裁决不做事实调查，条款不进快照就等于没有客观判据；
  *   · sku_images   = **所选规格**的那张图（选"黑色"看到的那张）——事后换图而哈希不变即所见非所得。
- *  三者都**恒存在**（没有时是 `[]` / 空承诺对象，不是缺键）：键的存在性不再承担版本语义，
- *  唯一的例外仍是 NFT 两键（它们的键存在性 = kind='nft'，语义来自商品类型而不是契约版本）。
+ *  三者都**恒存在**（没有时是 `[]` / 空承诺对象，不是缺键）。
  *
  *  ⚠️ 入参必须是**读回的整行**（`SELECT *` 的结果，JSON 列已由驱动解析）+ 挂上的 skus
  *  （`withSkus` / `loadSkus`）。三个写入口都经 `refreshSnapshotHash` 走这条路。
@@ -361,12 +369,14 @@ export function snapshotObject(row) {
     // 校验输入，展示层的绝对化改写绝不允许回写到这里（见前端 utils/media.ts 的解析函数）。
     media: parseMediaColumn(row.media),
     kind: row.kind,
-    // 运费（微 USDT，按单收取一次；0=包邮）——买家据此核验「锁定的运费」没被事后改价
-    shipping_fee_usdt_micro: snapshotNonNegInt(row.shipping_fee_usdt_micro),
+    // 标价币种：同一件商品的全部 SKU 单价与运费只有这一种计价单位
+    price_currency: priceUnitOf(row.price_currency),
+    // 运费（标价币种微单位，按单收取一次；0=包邮）——买家据此核验「锁定的运费」没被事后改价
+    shipping_fee_micro: snapshotNonNegInt(row.shipping_fee_micro),
     // 年龄限制（0/1）——买家据此核验「下单那一刻这件商品是否声明了未成年人禁止购买」
     age_restricted: row.age_restricted ? 1 : 0,
     specs: parseSpecsColumn(row),
-    skus: sortedSkus.map((s) => [s.sku_key, s.price_usdt_micro]),
+    skus: sortedSkus.map((s) => [s.sku_key, s.price_micro]),
     // 商品参数：逐条入快照（顺序 = 店主书写顺序，与库里一致；投影只有 parseAttributesColumn 一处）
     attributes: parseAttributesColumn(row.attributes),
     // 承诺：**归一后**入快照（`parseTermsColumn` 只做形状兜底，不重新校验——判据在写入路径）
@@ -411,11 +421,12 @@ export function computeSnapshotHash(snap) {
     // 快照哈希算的是"服务端存的那一份"，任何就地改写都会让两端算出不同的哈希。
     media: snap.media,
     kind: snap.kind,
-    // 与 snapshotObject 同键同位（契约：见文件头快照契约）。手搓对象缺这两键时归一为默认值，
+    price_currency: priceUnitOf(snap.price_currency),
+    // 与 snapshotObject 同键同位（契约：见文件头快照契约）。手搓对象缺键时归一为默认值，
     // 保证「同一件商品」无论经哪条路径规范化都得到同一个哈希。
-    shipping_fee_usdt_micro: snapshotNonNegInt(snap.shipping_fee_usdt_micro),
+    shipping_fee_micro: snapshotNonNegInt(snap.shipping_fee_micro),
     age_restricted: snap.age_restricted ? 1 : 0,
-    // 价格不在商品级：每个组合的单价都在 skus 里（[[sku_key, price_usdt_micro], …]，按 key 升序）
+    // 价格不在商品级：每个组合的单价都在 skus 里（[[sku_key, price_micro], …]，按 key 升序）
     specs: snap.specs,
     skus: snap.skus,
     /*
@@ -497,7 +508,7 @@ function normalizeSpecs(input) {
     return { errors, specs: [] };
   }
   if (!Array.isArray(input)) {
-    errors.push('specs 需为数组（[{ name, options: [] }]）');
+    errors.push('商品规格必须是数组（每项含名称与选项）');
     return { errors, specs: [] };
   }
   if (input.length > 3) {
@@ -515,7 +526,7 @@ function normalizeSpecs(input) {
       continue;
     }
     if (hasSkuSeparator(name)) {
-      errors.push(`规格名不能包含 | 或 NUL：${JSON.stringify(name)}`);
+      errors.push(`规格名不能包含竖线或空字符：${JSON.stringify(name)}`);
       continue;
     }
     if (names.has(name)) {
@@ -538,7 +549,7 @@ function normalizeSpecs(input) {
       continue;
     }
     if (options.some(hasSkuSeparator)) {
-      errors.push(`规格「${name}」的选项名不能包含 | 或 NUL`);
+      errors.push(`规格「${name}」的选项名不能包含竖线或空字符`);
       continue;
     }
     specs.push({ name, options });
@@ -568,13 +579,14 @@ export function skuKeyOf(specs, combo) {
 }
 
 /** SKU 列表校验：必须**恰好覆盖**全部组合（默认规格 = 恰好 1 条 key='' 的） */
-function normalizeSkus(input, specs, kind) {
+function normalizeSkus(input, specs, kind, priceCurrency) {
   const erc20 = kind === 'erc20';
+  const unit = priceCurrency === 'BTY' ? 'BTY' : priceCurrency === 'USDT' ? 'USDT' : '标价币种';
   const errors = [];
   const combos = skuCombos(specs);
   const list = Array.isArray(input) ? input : [];
   if (list.length !== combos.length) {
-    errors.push(`SKU 需覆盖全部规格组合（当前应为 ${combos.length} 个，收到 ${list.length} 个）`);
+    errors.push(`规格组合必须覆盖全部组合（当前应为 ${combos.length} 个，收到 ${list.length} 个）`);
     return { errors, skus: [] };
   }
   const expected = new Map(combos.map((cm) => [skuKeyOf(specs, cm), cm]));
@@ -583,7 +595,7 @@ function normalizeSkus(input, specs, kind) {
   for (const rawSku of list) {
     const key = String(rawSku?.key ?? '').trim();
     if (!expected.has(key)) {
-      errors.push(`SKU「${key || '(空)'}」不属于当前规格的任一组合`);
+      errors.push(`规格组合「${key || '(空)'}」不属于当前规格的任一组合`);
       continue;
     }
     /*
@@ -591,23 +603,24 @@ function normalizeSkus(input, specs, kind) {
       的表现同样是"提交了但没生效"，所以与顶层字段一样**带字段名拒绝**。
     */
     const unknownSkuKeys = Object.keys(rawSku || {}).filter(
-      (k) => !['key', 'priceUsdtMicro', 'capacity', 'active', 'imageUrl', 'tokenAmount'].includes(k)
+      (k) => !['key', 'priceMicro', 'capacity', 'active', 'imageUrl', 'tokenAmount'].includes(k)
     );
     if (unknownSkuKeys.length) {
+      const unknownText = unknownSkuKeys.map((k) => `「${k}」`).join('、');
       errors.push(
-        `SKU「${key || '(默认)'}」不认识这些字段：${unknownSkuKeys.map((k) => `「${k}」`).join('、')}（每个组合只认 key / priceUsdtMicro / capacity / active / imageUrl / tokenAmount）`
+        `规格组合「${key || '(默认)'}」有不认识的字段：${unknownText}（每条组合只能填价格、库存、是否在售、主图、每份代币数量）`
       );
       continue;
     }
     if (seen.has(key)) {
-      errors.push(`SKU 重复：${key || '(默认)'}`);
+      errors.push(`规格组合重复：${key || '(默认)'}`);
       continue;
     }
     seen.add(key);
-    const price = Number(rawSku?.priceUsdtMicro);
+    const price = Number(rawSku?.priceMicro);
     if (!Number.isInteger(price) || price <= 0 || price > PRICE_MAX_MICRO) {
       errors.push(
-        `SKU「${key || '(默认)'}」价格需为 1..${PRICE_MAX_MICRO} 的整数（单位：微 USDT，1 USDT = 1e6，即最多 ${PRICE_MAX_USDT} USDT）`
+        `规格「${key || '(默认)'}」的价格必须是 1 到 ${PRICE_MAX_MICRO} 的整数（单位：标价币种微单位，1 单位 = 1e6，即最多 ${PRICE_MAX_UNITS} ${unit}）`
       );
       continue;
     }
@@ -615,7 +628,7 @@ function normalizeSkus(input, specs, kind) {
     if (rawSku?.capacity !== undefined && rawSku?.capacity !== null && rawSku?.capacity !== '') {
       cap = Number(rawSku.capacity);
       if (!Number.isInteger(cap) || cap < 0 || cap > 10000000) {
-        errors.push(`SKU「${key || '(默认)'}」库存需为 0..1e7 整数，留空表示不限量`);
+        errors.push(`规格「${key || '(默认)'}」的库存必须是 0 到 10000000 的整数，留空表示不限量`);
         continue;
       }
     }
@@ -630,7 +643,7 @@ function normalizeSkus(input, specs, kind) {
     */
     const imageUrl = normalizeMediaUrl(rawSku?.imageUrl);
     if (imageUrl && !mediaUrlAllowed(imageUrl)) {
-      errors.push(`SKU「${key || '(默认)'}」的图只支持 http/https 外链或本站上传路径`);
+      errors.push(`规格「${key || '(默认)'}」的图片只支持网页外链或本站上传路径`);
       continue;
     }
     /*
@@ -641,19 +654,19 @@ function normalizeSkus(input, specs, kind) {
     if (rawSku?.tokenAmount !== undefined && rawSku?.tokenAmount !== null && rawSku?.tokenAmount !== '') {
       const raw = String(rawSku.tokenAmount).trim();
       if (!/^[1-9][0-9]{0,77}$/.test(raw) || BigInt(raw) > (1n << 256n) - 1n) {
-        errors.push(`SKU「${key || '(默认)'}」tokenAmount 需为 uint256 范围内的正整数（最小单位，十进制字符串）`);
+        errors.push(`规格「${key || '(默认)'}」的每份代币数量必须是正整数（最小单位，十进制字符串）`);
         continue;
       }
       if (!erc20) {
-        errors.push('只有 ERC20 商品可以设置 tokenAmount（每份交付数量）');
+        errors.push('只有 ERC20 商品可以设置每份代币数量');
         continue;
       }
       tokenAmount = raw;
     } else if (erc20) {
-      errors.push(`SKU「${key || '(默认)'}」ERC20 商品必须填写 tokenAmount（每份交付的 token 最小单位数量）`);
+      errors.push(`规格「${key || '(默认)'}」的 ERC20 商品必须填写每份代币数量（最小单位）`);
       continue;
     }
-    skus.push({ key, specs: expected.get(key), priceUsdtMicro: price, capacity: cap, active, imageUrl, tokenAmount });
+    skus.push({ key, specs: expected.get(key), priceMicro: price, capacity: cap, active, imageUrl, tokenAmount });
   }
   return { errors, skus };
 }
@@ -723,29 +736,36 @@ async function saveSkus(productId, skus) {
     );
     await db.run('DELETE FROM product_skus WHERE product_id = ?', productId);
     const insSql =
-      'INSERT INTO product_skus (product_id, sku_key, specs_json, price_usdt_micro, image_url, capacity, committed, active, token_amount) ' +
+      'INSERT INTO product_skus (product_id, sku_key, specs_json, price_micro, image_url, capacity, committed, active, token_amount) ' +
       'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
     for (const s of skus) {
-      await db.run(insSql, productId, s.key, JSON.stringify(s.specs || {}), s.priceUsdtMicro, s.imageUrl || '', s.capacity, prev.get(s.key)?.committed || 0, s.active === false ? 0 : 1, s.tokenAmount ?? null);
+      await db.run(insSql, productId, s.key, JSON.stringify(s.specs || {}), s.priceMicro, s.imageUrl || '', s.capacity, prev.get(s.key)?.committed || 0, s.active === false ? 0 : 1, s.tokenAmount ?? null);
     }
   });
 }
 
 /** DB 行 → 对外字段（camelCase）。价格与库存**一律来自 Skus**，商品级字段只是汇总值：
- *  - priceUsdtMicro/priceUsdt = 各组合最低价（列表页「起价」展示用；成交价一律取所选 SKU）
+ *  - priceCurrency   = 本商品全部 SKU 与运费的计价币种（USDT/BTY）
+ *  - priceMicro/price = 各组合最低价（列表页「起价」展示用；成交价一律取所选 SKU）
  *  - capacity/committed    = 各组合之和；任一组合不限量则 capacity 为 null（整体视为不限量）
  *  - available             = null 或 总量 − 已占位
  *  行需先经 withSkus() 挂上 skus —— 本函数因此是 async（读 skus 要 await，见 withSkus）。 */
 async function rowToPublic(row) {
   const r = await withSkus(row);
   const snap = snapshotObject(r);
+  const priceCurrency = snap.price_currency;
+  const unit = priceUnitOf(priceCurrency);
   const skus = (r.skus || []).map((s) => ({
     key: s.sku_key,
     // `specs_json` 是 JSON 列（驱动已解析成对象）；默认规格是 {规格:'默认'}。
     // 形状兜底只为手搓行对象——快照不含该字段，所以这里归一不影响哈希。
     specs: s.specs_json && typeof s.specs_json === 'object' && !Array.isArray(s.specs_json) ? s.specs_json : {},
-    priceUsdtMicro: s.price_usdt_micro,
-    priceUsdt: usdtOf(s.price_usdt_micro),
+    /** 单价（标价币种微单位；币种见商品的 priceCurrency） */
+    priceMicro: s.price_micro,
+    /** 单价的展示串（不带单位；单位见商品的 priceCurrency） */
+    price: priceOf(s.price_micro),
+    /** 单价单位（与商品同源；购物车等脱离商品上下文的消费方靠它） */
+    priceCurrency,
     /** 该组合的主图（空串 = 没有独立图）；与商品主图同一套 URL 判据，入快照的 `sku_images` */
     imageUrl: s.image_url,
     capacity: s.capacity,
@@ -765,7 +785,7 @@ async function rowToPublic(row) {
   */
   const buyable = skus.filter((s) => s.active && (s.capacity === null || s.committed < s.capacity));
   const priceBasis = buyable.length ? buyable : skus;
-  const minMicro = priceBasis.length ? Math.min(...priceBasis.map((s) => s.priceUsdtMicro)) : 0;
+  const minMicro = priceBasis.length ? Math.min(...priceBasis.map((s) => s.priceMicro)) : 0;
   return {
     slug: r.slug,
     /**
@@ -787,14 +807,16 @@ async function rowToPublic(row) {
     /** 主图区（顺序即展示顺序）：[{type:'image',url} | {type:'video',url,poster}] */
     media: snap.media,
     kind: r.kind,
+    /** 计价币种（USDT/BTY）。**价格与运费的唯一单位来源**，消费方不得再按字段名猜 USDT。 */
+    priceCurrency,
     /**
      * 运费（实物）：**按单收取一次**（不随件数翻倍），0 = 包邮。
      * 数字 / NFT / ERC20 商品恒为 0（运费列只对 physical 生效，见 validateProduct）。
-     * 该值入快照——买家据此核验锁定的运费没被事后改价。
+     * 单位 = priceCurrency 的微单位。该值入快照——买家据此核验锁定的运费没被事后改价。
      */
-    shippingFeeUsdtMicro: r.shipping_fee_usdt_micro,
-    shippingFeeUsdt: usdtOf(r.shipping_fee_usdt_micro),
-    freeShipping: !(r.shipping_fee_usdt_micro > 0),
+    shippingFeeMicro: r.shipping_fee_micro,
+    shippingFee: priceOf(r.shipping_fee_micro),
+    freeShipping: !(r.shipping_fee_micro > 0),
     /** 未成年人禁止购买（0/1）：下单必须带买家显式确认（ageAck）；入快照，上架后不可静默增删 */
     ageRestricted: !!r.age_restricted,
     /**
@@ -845,19 +867,20 @@ async function rowToPublic(row) {
     terms: parseTermsColumn(r.terms),
     skus,
     // 汇总口径（列表页展示；逐组合的权威值在 skus 里）
-    priceUsdtMicro: minMicro,
-    priceUsdt: usdtOf(minMicro),
-    priceFromMicro: minMicro,
+    priceMicro: minMicro,
+    price: priceOf(minMicro),
+    /** 起价的展示单位（= priceCurrency；冗余一次，卡片/筛选面不必自己再查商品） */
+    priceUnit: unit,
     unlimited,
     available: capacity === null ? null : Math.max(0, capacity - committed),
     capacity,
     committed,
     outOfStock: skus.length > 0 && skus.every((s) => !s.active || (s.capacity !== null && s.available <= 0)),
     active: !!r.active,
-    /**
-     * **节点侧强制下架**（与 active 正交）：店主改不动；恢复只能由节点管理员操作。
-     * 公开面读不到被隐藏的商品，只有本店经营人员能从 `/all` 与详情页看到这一档（含原因）。
-     */
+    /*
+      **节点侧强制下架**（与 active 正交）：店主改不动；恢复只能由节点管理员操作。
+      公开面读不到被隐藏的商品，只有本店经营人员能从 `/all` 与详情页看到这一档（含原因）。
+    */
     nodeHidden: Number(r.node_hidden) === 1,
     nodeHiddenReason: Number(r.node_hidden) === 1 ? String(r.node_hidden_reason || '') : '',
     nodeHiddenAt: Number(r.node_hidden) === 1 ? (r.node_hidden_at ?? null) : null,
@@ -867,6 +890,10 @@ async function rowToPublic(row) {
      * 从未发布（草稿）与已下架（曾发布）。下架不清空（"卖过"这件事不因撤下而消失）。
      */
     publishedAt: r.published_at,
+    /** 已软删除（仅节点管理面可能看到；公开/店主管理列表恒不返回已删除行） */
+    deleted: r.deleted_at != null,
+    deletedReason: r.deleted_at != null ? String(r.deleted_reason || '') : '',
+    deletedAt: r.deleted_at ?? null,
     snapshotHash: r.snapshot_hash,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -883,7 +910,7 @@ async function rowToPublic(row) {
   本仓对这类失败的口径是"绝不静默"：认识就处理，不认识就**带字段名拒绝**并说清去哪提交。
 
   ⚠ 下面两个**不是**商品写入口的字段，它们由 `skus` 派生、只读（`rowToPublic` 的汇总口径）：
-    · `priceUsdtMicro` —— 商品级价 = 各组合最低价；只读汇总。批量改价端点 `/batch` 收它
+    · `priceMicro` —— 商品级价 = 各组合最低价；只读汇总。批量改价端点 `/batch` 收它
       （语义是"把全部组合统一改成这个价"），单个商品的上架/编辑不收；
     · `capacity` —— 商品级库存 = 各组合之和；逐组合库存在 `skus[].capacity`。
   把它们放进 `ProductInput`（前端类型）曾让"提交了但不生效"成为常态，故两份集合同批对齐。
@@ -894,6 +921,7 @@ const PRODUCT_WRITE_KEYS = new Set([
   'descriptionBlocks',
   'media',
   'kind',
+  'priceCurrency',
   'nftContract',
   'nftStandard',
   'tokenContract',
@@ -902,7 +930,7 @@ const PRODUCT_WRITE_KEYS = new Set([
   'tags',
   'attributes',
   'terms',
-  'shippingFeeUsdtMicro',
+  'shippingFeeMicro',
   'ageRestricted',
   'autoDeliver',
   'stockAlertAt',
@@ -914,7 +942,125 @@ const PRODUCT_WRITE_KEYS = new Set([
 ]);
 
 /** 批量修改的 patch 键（同一道门的第二个入口；集合不同——批量不展开规格明细） */
-const PRODUCT_BATCH_PATCH_KEYS = new Set(['priceUsdtMicro', 'active', 'autoDeliver', 'stockAlertAt']);
+const PRODUCT_BATCH_PATCH_KEYS = new Set(['priceMicro', 'active', 'autoDeliver', 'stockAlertAt']);
+
+/**
+ * 商品审计值的上限：商品描述/详情块比店名/公告大得多，默认 500 字会把一次改描述截成碎片；
+ * 每个值 2000 字 / 8000 JSON 是**有界**的（超过留 `$truncated` 标记，不假装完整）。
+ */
+const PRODUCT_AUDIT_VALUE_OPTS = {
+  maxString: 2000,
+  maxJson: 8000,
+  /*
+    商品参数的 `pair` 是只服务多值索引的派生键（DTO 与快照都刻意不带它）；
+    审计也按同一投影比较/入库，否则每次提交参数都会把 `pair` 当成"新增字段"，
+    而且界面上会冒出带 NUL 的内部键。
+  */
+  project: {
+    attributes: (v) => (Array.isArray(v) ? v.map((x) => ({ name: x?.name, value: x?.value })) : v),
+  },
+};
+
+/**
+ * 审计用的"改前值"：键是 **API 字段名**（与请求体/validateProduct 输出同名），
+ * 值必须与 `value[key]` **同形**，否则 diff 会把"表示法不同"误报成"值变了"。
+ *
+ * 只在 `PATCH /:slug` 的事务内用（`row` 是锁后重读的商品行，`skuRows` 是锁后的组合行）。
+ * 不在这里做任何校验/归一化以外的业务判断：写入路径已经判过，这里只回答"原来是什么"。
+ */
+function productAuditBefore(key, row, skuRows) {
+  switch (key) {
+    case 'title':
+      return String(row.title ?? '');
+    case 'description':
+      return String(row.description ?? '');
+    case 'descriptionBlocks':
+      return parseBlocks(row.description_blocks);
+    case 'media':
+      return parseMediaColumn(row.media);
+    case 'kind':
+      return String(row.kind ?? '');
+    case 'priceCurrency':
+      return row.price_currency;
+    case 'nftContract':
+      return row.nft_contract == null ? null : String(row.nft_contract).toLowerCase();
+    case 'nftStandard':
+      return row.nft_standard == null ? null : String(row.nft_standard).toLowerCase();
+    case 'tokenContract':
+      return row.token_contract == null ? null : String(row.token_contract).toLowerCase();
+    case 'specs':
+      return parseSpecsColumn(row);
+    case 'skus': {
+      const erc20 = String(row.kind) === 'erc20';
+      return (skuRows || []).map((s) => ({
+        key: String(s.sku_key ?? ''),
+        // `specs` 也是组合身份的一部分；漏掉它会让每个组合都被误报成"变了"
+        specs: s.specs_json && typeof s.specs_json === 'object' && !Array.isArray(s.specs_json) ? s.specs_json : {},
+        priceMicro: Number(s.price_micro),
+        capacity: s.capacity === null || s.capacity === undefined ? null : Number(s.capacity),
+        active: Number(s.active) !== 0,
+        imageUrl: String(s.image_url ?? ''),
+        tokenAmount: erc20 && s.token_amount != null ? String(s.token_amount) : null,
+      }));
+    }
+    case 'tags':
+      // 库里的 tags 是 {key, display} 对象数组；请求/validateProduct 也是同一形。
+      // 读回时先投影成展示串再走写入侧同一个 normalizeTags，避免两套形状。
+      try {
+        return normalizeTags(parseTagsColumn(row.tags));
+      } catch {
+        return [];
+      }
+    case 'attributes':
+      // 只取 {name,value}；`pair` 由 PRODUCT_AUDIT_VALUE_OPTS.project 从改后值一并去掉
+      return parseAttributesColumn(row.attributes);
+    case 'terms':
+      return parseTermsColumn(row.terms);
+    case 'shippingFeeMicro':
+      return Number(row.shipping_fee_micro);
+    case 'ageRestricted':
+      return Number(row.age_restricted) ? 1 : 0;
+    case 'autoDeliver':
+      // 三态：-1 跟随全局 / 0 关闭 / 1 开启（与 validateProduct 同形）
+      return Number(row.auto_deliver);
+    case 'stockAlertAt':
+      return row.stock_alert_at;
+    case 'active':
+      return Number(row.active) ? 1 : 0;
+    case 'claimable':
+      return Number(row.claimable) ? 1 : 0;
+    case 'claimType':
+      return row.claim_type;
+    case 'claimWindowDays':
+      return row.claim_window_days;
+    case 'claimInstructions':
+      return String(row.claim_instructions ?? '');
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * SKU 列表的审计 diff：只留**变了的组合**，按 key 配对（新增/删除各留一侧）。
+ * 不把整张价格表抄进审计——只改一个组合的库存时，另外 20 个组合不该出现在这一行里。
+ */
+function compactSkuChange(from, to, opts = {}) {
+  const a = new Map((Array.isArray(from) ? from : []).map((s) => [String(s.key), s]));
+  const b = new Map((Array.isArray(to) ? to : []).map((s) => [String(s.key), s]));
+  const fromChanged = [];
+  const toChanged = [];
+  for (const key of new Set([...a.keys(), ...b.keys()])) {
+    const x = a.get(key);
+    const y = b.get(key);
+    if (sameAuditValue(x, y)) continue;
+    if (x) fromChanged.push(x);
+    if (y) toChanged.push(y);
+  }
+  return {
+    from: boundAuditValue(fromChanged, opts),
+    to: boundAuditValue(toChanged, opts),
+  };
+}
 
 /**
  * 未知键检查（**唯一实现**；三个写入口共用）。
@@ -940,7 +1086,7 @@ function unknownKeysError(body, allowed, where) {
 function validateProduct(v) {
   const errors = [];
   const title = String(v.title ?? '').trim();
-  if (!title || title.length > 120) errors.push('title 必填且不超过 120 字符');
+  if (!title || title.length > 120) errors.push('标题必填且不超过 120 个字符');
   const description = String(v.description ?? '').slice(0, 5000);
   /*
     主图区（media）：**数组顺序即展示顺序**，元素是判别联合
@@ -957,7 +1103,7 @@ function validateProduct(v) {
   */
   let media = [];
   if (!Array.isArray(v.media)) {
-    errors.push('media 需为主图区数组（[{type:"image",url} | {type:"video",url,poster}]）');
+    errors.push('主图必须是数组（图片项或视频项）');
   } else {
     if (v.media.length > MAX_MEDIA_ITEMS) errors.push(`主图区最多 ${MAX_MEDIA_ITEMS} 项（图片 + 视频合计）`);
     let videos = 0;
@@ -967,7 +1113,7 @@ function validateProduct(v) {
       if (type === 'image') {
         if (!url) return [];
         if (!mediaUrlAllowed(url)) {
-          errors.push('图片 URL 仅支持 http/https 外链或本站上传路径');
+          errors.push('图片地址仅支持网页外链或本站上传路径');
           return [];
         }
         return [{ type: 'image', url }];
@@ -989,12 +1135,24 @@ function validateProduct(v) {
         }
         return [{ type: 'video', url, poster }];
       }
-      errors.push('主图区条目的 type 只能是 image 或 video');
+      errors.push('主图条目只能是图片或视频');
       return [];
     });
   }
   const kind = String(v.kind ?? '');
-  if (!['digital', 'physical', 'nft', 'erc20'].includes(kind)) errors.push('kind 需为 digital / physical / nft / erc20');
+  if (!['digital', 'physical', 'nft', 'erc20'].includes(kind)) errors.push('商品类型必须是数字、实物、NFT 或 ERC20');
+  /*
+    计价币种（整件商品一个）：USDT 定价需要行情换算成 BTY 支付；BTY 定价直接以原生 BTY 成交，
+    下单/改价都不读行情。写入路径必须显式给出；缺失直接拒绝（没有隐式默认）。
+  */
+  const rawPriceCurrency = String(v.priceCurrency ?? '').trim().toUpperCase();
+  if (!rawPriceCurrency) {
+    errors.push('必须选择计价币种（USDT 或 BTY）');
+  } else if (!['USDT', 'BTY'].includes(rawPriceCurrency)) {
+    errors.push('计价币种只能是 USDT 或 BTY');
+  }
+  const priceCurrency = rawPriceCurrency;
+  const priceUnit = priceCurrency === 'BTY' ? 'BTY' : priceCurrency === 'USDT' ? 'USDT' : '标价币种';
   /*
     NFT 两列的**三态形状是 NULL，不是空串**（建表 CHECK `(kind='nft') = (nft_contract IS NOT NULL)`
     让"非 NFT 却留着一个合约地址"、以及"是 NFT 却没有合约"在库里都不可表达）：
@@ -1008,7 +1166,7 @@ function validateProduct(v) {
     if (!isAddress(c) || isZeroAddress(c)) errors.push('NFT 商品需填写合法的 NFT 合约地址（0x 开头，不可为 0x0）');
     else nftContract = c;
     const s = String(v.nftStandard ?? '').trim().toLowerCase() || 'erc721';
-    if (!['erc721', 'erc1155'].includes(s)) errors.push('nftStandard 需为 erc721（兼容 ERC721A）/ erc1155');
+    if (!['erc721', 'erc1155'].includes(s)) errors.push('NFT 标准必须是 ERC721（兼容 ERC721A）或 ERC1155');
     else nftStandard = s;
   }
   /*
@@ -1019,14 +1177,14 @@ function validateProduct(v) {
   let tokenContract = null;
   if (kind === 'erc20') {
     const c = String(v.tokenContract ?? '').trim().toLowerCase();
-    if (!isAddress(c) || isZeroAddress(c)) errors.push('ERC20 商品需填写合法的 token 合约地址（0x 开头，不可为 0x0）');
+    if (!isAddress(c) || isZeroAddress(c)) errors.push('ERC20 商品需填写合法的代币合约地址（0x 开头，不可为 0x0）');
     else tokenContract = c;
   }
   // 价格与库存下沉到 SKU：specs 定义维度，skus 必须**恰好覆盖**全部组合。
   // 未提交规格 / 空规格 ⇒ 规范化为默认规格「规格：默认」，唯一组合 key 为空串。
   const { errors: specErrs, specs } = normalizeSpecs(v.specs);
   errors.push(...specErrs);
-  const { errors: skuErrs, skus } = normalizeSkus(v.skus, specs, kind);
+  const { errors: skuErrs, skus } = normalizeSkus(v.skus, specs, kind, priceCurrency);
   errors.push(...skuErrs);
   // 详情块（文字 + 图片混排）。description 由块派生 —— 搜索走 LIKE 匹配文字，
   // 不该去匹配 JSON 里的引号与 url。
@@ -1036,41 +1194,41 @@ function validateProduct(v) {
   let autoDeliver = -1;
   if (v.autoDeliver !== undefined && v.autoDeliver !== null) {
     autoDeliver = Number(v.autoDeliver);
-    if (![-1, 0, 1].includes(autoDeliver)) errors.push('autoDeliver 需为 -1（跟随全局）/ 0（关闭）/ 1（开启）');
+    if (![-1, 0, 1].includes(autoDeliver)) errors.push('自动发货设置只能是 -1（跟随全局）/ 0（关闭）/ 1（开启）');
   }
   // 低库存提醒阈值：余量 ≤ 阈值时卖家面板警示；空/0 视为不提醒（列是 NULL = 不提醒，三态不落空串）
   let stockAlertAt = null;
   if (v.stockAlertAt !== undefined && v.stockAlertAt !== null && v.stockAlertAt !== '') {
     stockAlertAt = Number(v.stockAlertAt);
     if (!Number.isInteger(stockAlertAt) || stockAlertAt < 0 || stockAlertAt > 10000000) {
-      errors.push('stockAlertAt（低库存阈值）需为 0..1e7 整数，留空表示不提醒');
+      errors.push('低库存阈值必须是 0 到 10000000 的整数，留空表示不提醒');
     }
     if (stockAlertAt === 0) stockAlertAt = null;
   }
   let active = 1;
   if (v.active !== undefined && v.active !== null) {
     // 只接受布尔/0/1：字符串 "false" 曾被默认成 1，店主以为下架、实际仍在卖。
-    if (![true, false, 0, 1].includes(v.active)) errors.push('active 需为布尔值（true/false 或 1/0）');
+    if (![true, false, 0, 1].includes(v.active)) errors.push('上架状态必须是布尔值（是/否 或 1/0）');
     else active = v.active === true || v.active === 1 ? 1 : 0;
   }
   /*
-    运费（实物，按单收取一次，微 USDT）：
-     - 非负整数，上限 1e9 微 = 1000 USDT（比价上限还高一个量级即为误填/攻击面，明确拒绝而不是截断）；
+    运费（实物，按单收取一次，**标价币种微单位**）：
+     - 非负整数，上限 1e9 微 = 1000 单位（比价上限还高一个量级即为误填/攻击面，明确拒绝而不是截断）；
      - 只有实物商品有运费语义：数字 / NFT / ERC20 商品携带非 0 值**显式拒绝**（而不是静默归零）——
        静默归零会让店主以为"我设了运费"，实际一分钱没收到；
      - 空/未提交 = 0（包邮）。
   */
-  let shippingFeeUsdtMicro = 0;
-  if (v.shippingFeeUsdtMicro !== undefined && v.shippingFeeUsdtMicro !== null && v.shippingFeeUsdtMicro !== '') {
-    const fee = Number(v.shippingFeeUsdtMicro);
+  let shippingFeeMicro = 0;
+  if (v.shippingFeeMicro !== undefined && v.shippingFeeMicro !== null && v.shippingFeeMicro !== '') {
+    const fee = Number(v.shippingFeeMicro);
     if (!Number.isInteger(fee) || fee < 0 || fee > SHIPPING_FEE_MAX_MICRO) {
       errors.push(
-        `shippingFeeUsdtMicro（运费）需为 0..${SHIPPING_FEE_MAX_MICRO} 的整数（单位：微 USDT，即 0..1000 USDT；0 = 包邮）`
+        `运费必须是 0 到 ${SHIPPING_FEE_MAX_MICRO} 的整数（单位：${priceUnit} 微单位，即 0 到 1000 ${priceUnit}；0 = 包邮）`
       );
     } else if (kind !== 'physical' && fee > 0) {
-      errors.push('仅实物商品可设置运费（数字 / NFT / ERC20 商品运费恒为 0）');
+      errors.push('仅实物商品可设置运费（数字、NFT、ERC20 商品运费恒为 0）');
     } else {
-      shippingFeeUsdtMicro = fee;
+      shippingFeeMicro = fee;
     }
   }
   /*
@@ -1081,7 +1239,7 @@ function validateProduct(v) {
   let ageRestricted = 0;
   if (v.ageRestricted !== undefined && v.ageRestricted !== null) {
     if (![true, false, 0, 1].includes(v.ageRestricted)) {
-      errors.push('ageRestricted（未成年人禁止购买）需为布尔值（true/false 或 1/0）');
+      errors.push('未成年人禁止购买必须是布尔值（是/否 或 1/0）');
     } else {
       ageRestricted = v.ageRestricted === true || v.ageRestricted === 1 ? 1 : 0;
     }
@@ -1131,22 +1289,22 @@ function validateProduct(v) {
   let claimable = 0;
   if (v.claimable !== undefined && v.claimable !== null && v.claimable !== '') {
     if (![true, false, 0, 1].includes(v.claimable)) {
-      errors.push('claimable 需为布尔值（true/false 或 1/0）');
+      errors.push('是否支持提货必须是布尔值（是/否 或 1/0）');
     } else if (v.claimable === true || v.claimable === 1) {
-      if (kind !== 'nft') errors.push('只有 NFT 商品可以开启提货兑付（claimable）');
+      if (kind !== 'nft') errors.push('只有 NFT 商品可以开启提货兑付');
       else claimable = 1;
     }
   }
   let claimType = 'physical';
   if (v.claimType !== undefined && v.claimType !== null && v.claimType !== '') {
     const ct = String(v.claimType).trim().toLowerCase();
-    if (!['physical', 'digital', 'service'].includes(ct)) errors.push('claimType 需为 physical / digital / service');
+    if (!['physical', 'digital', 'service'].includes(ct)) errors.push('提货类型必须是实物、数字或服务');
     else claimType = ct;
   }
   let claimWindowDays = null;
   if (v.claimWindowDays !== undefined && v.claimWindowDays !== null && v.claimWindowDays !== '') {
     const d = Number(v.claimWindowDays);
-    if (!Number.isInteger(d) || d <= 0 || d > 3650) errors.push('claimWindowDays 需为 1..3650 的整数（留空 = 不限期）');
+    if (!Number.isInteger(d) || d <= 0 || d > 3650) errors.push('提货窗口天数必须是 1 到 3650 的整数（留空 = 不限期）');
     else claimWindowDays = d;
   }
   const claimInstructions = String(v.claimInstructions ?? '').trim().slice(0, 500);
@@ -1159,7 +1317,8 @@ function validateProduct(v) {
       descriptionBlocks: blocks,
       media,
       kind,
-      shippingFeeUsdtMicro,
+      priceCurrency,
+      shippingFeeMicro,
       ageRestricted,
       nftContract,
       nftStandard,
@@ -1226,7 +1385,7 @@ const PRODUCT_KINDS = new Set(['digital', 'physical', 'nft', 'erc20']);
 
 router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res) => {
   const cursor = Math.max(0, parseInt(req.query.cursor, 10) || 0);
-  if (cursor > 100_000) return fail(res, 'cursor 过大：请改用筛选条件缩小范围', 1, 400);
+  if (cursor > 100_000) return fail(res, '翻页位置过大：请改用筛选条件缩小范围', 1, 400);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
   const q = String(req.query.q ?? '').trim().slice(0, 60);
   const order = String(req.query.order ?? '').toLowerCase() === 'desc' ? 'desc' : 'asc';
@@ -1309,30 +1468,19 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
   }
 
   const db = getDb();
+  if (req.query.priceMin !== undefined || req.query.priceMax !== undefined) {
+    return fail(res, '价格区间筛选已移除；请改用计价类型筛选', 400, 400);
+  }
   /*
-    价格区间按**商品起价**（各 SKU 最低价）过滤，而不是某一行的价：
-    列表卡片显示的就是起价，按这个口径筛，用户看到的“起价在区间内”才成立。
-    参数单位是微 USDT，与服务端存储/前端计算同口径，不在 query 里做浮点换算。
+    计价类型筛选：空 = 不按币种筛；给值就必须是合法币种。
+    价格区间筛选已整体去掉——不同计价单位下的数值不可比。
   */
-  const parsePriceBound = (raw, label) => {
-    const s = String(raw ?? '').trim();
-    if (!s) return { value: null, error: null };
-    if (!/^\d+$/.test(s)) return { value: null, error: `${label} 需为非负整数（微 USDT）` };
-    const n = Number(s);
-    if (!Number.isSafeInteger(n) || n > PRICE_MAX_MICRO) {
-      return { value: null, error: `${label} 超出范围（0..${PRICE_MAX_MICRO} 微 USDT）` };
-    }
-    return { value: n, error: null };
-  };
-  const rawPriceMin = parsePriceBound(req.query.priceMin, 'priceMin');
-  const rawPriceMax = parsePriceBound(req.query.priceMax, 'priceMax');
-  let priceMin = rawPriceMin.value;
-  let priceMax = rawPriceMax.value;
-  let priceError = rawPriceMin.error || rawPriceMax.error;
-  if (!priceError && priceMin !== null && priceMax !== null && priceMin > priceMax) {
-    priceError = 'priceMin 不能大于 priceMax';
-    priceMin = null;
-    priceMax = null;
+  const rawPriceCurrency = String(req.query.priceCurrency ?? '').trim().toUpperCase();
+  let priceCurrency = null;
+  let priceError = null;
+  if (rawPriceCurrency) {
+    if (!['USDT', 'BTY'].includes(rawPriceCurrency)) priceError = '计价币种只能是 USDT 或 BTY';
+    else priceCurrency = rawPriceCurrency;
   }
   const rawReviewed = String(req.query.reviewed ?? '').trim();
   let reviewed = false;
@@ -1394,7 +1542,7 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
   }
   if (tagError || attrError || kindError || priceError || reviewedError) {
     /*
-      非法/超长标签或非法 kind/价格/reviewed = **查不到**（空结果），但绝不静默：
+      非法/超长标签或非法 kind/币种/价格/reviewed = **查不到**（空结果），但绝不静默：
       结果里带对应 error 字段、message 里说明，调用方不会把"参数写错了"误读成
       "这家店没有这个类目"。空结果的实现方式是在 SQL 上加恒假条件（而不是提前 return）——
       保证响应形状与正常路径完全一致。
@@ -1404,20 +1552,9 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
   if (reviewed) {
     where.push('EXISTS (SELECT 1 FROM reviews r WHERE r.product_id = products.id)');
   }
-  if (priceMin !== null || priceMax !== null) {
-    /*
-      起价 = 该商品所有 SKU 的最低价（与 rowToPublic / 列表卡片同一个聚合口径）；
-      不按 active SKU 缩范围——停用某个规格不会让商品起价变高。
-    */
-    const minPrice = '(SELECT MIN(k.price_usdt_micro) FROM product_skus k WHERE k.product_id = products.id)';
-    if (priceMin !== null) {
-      where.push(`${minPrice} >= ?`);
-      args.push(priceMin);
-    }
-    if (priceMax !== null) {
-      where.push(`${minPrice} <= ?`);
-      args.push(priceMax);
-    }
+  if (priceCurrency) {
+    where.push('price_currency = ?');
+    args.push(priceCurrency);
   }
   if (kinds.length) {
     where.push(`kind IN (${kinds.map(() => '?').join(',')})`);
@@ -1473,9 +1610,8 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
       //  两者都不是"没有这种商品"）
       kind: kinds.length ? kinds : null,
       kindError,
-      // 价格区间按起价（SKU 最低价）过滤；回显的是实际使用的微 USDT 边界。
-      // null = 这一侧没有设边界，与"设了 0"是两件事。
-      price: priceMin !== null || priceMax !== null ? { minMicro: priceMin, maxMicro: priceMax } : null,
+      // 本次实际生效的计价类型；null = 没按币种筛；priceError = 参数写错
+      priceCurrency,
       priceError,
       // reviewed=true 表示本次只返回有评价的商品；false = 没按评价筛（不是"只要没评价"）
       reviewed,
@@ -1488,7 +1624,7 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
         : attrError
           ? `参数筛选未生效：${attrError}（本次结果为空，请改用「参数名:值」的形状）`
           : priceError
-            ? `价格筛选未生效：${priceError}（本次结果为空，请检查价格边界）`
+            ? `计价类型筛选未生效：${priceError}（本次结果为空）`
             : reviewedError
               ? `评价筛选未生效：${reviewedError}（本次结果为空）`
               : 'success'
@@ -1548,7 +1684,7 @@ router.get('/tags', listedShopScope, wrap(async (req, res) => {
   const raw = req.query.limit;
   const limit = raw === undefined || raw === '' ? TAGS_LIMIT_DEFAULT : Number(raw);
   if (!Number.isInteger(limit) || limit < 1 || limit > TAGS_LIMIT_MAX) {
-    return fail(res, `limit 需为 1..${TAGS_LIMIT_MAX} 的整数（缺省 ${TAGS_LIMIT_DEFAULT}）`);
+    return fail(res, `数量必须是 1 到 ${TAGS_LIMIT_MAX} 的整数（缺省 ${TAGS_LIMIT_DEFAULT}）`);
   }
   const db = getDb();
   // 带 X-Mk-Shop ⇒ 只统计这一家店；不带 ⇒ 全节点（目录面）。
@@ -1632,7 +1768,7 @@ router.get('/attributes', listedShopScope, wrap(async (req, res) => {
   const raw = req.query.limit;
   const limit = raw === undefined || raw === '' ? ATTRS_LIMIT_DEFAULT : Number(raw);
   if (!Number.isInteger(limit) || limit < 1 || limit > ATTRS_LIMIT_MAX) {
-    return fail(res, `limit 需为 1..${ATTRS_LIMIT_MAX} 的整数（缺省 ${ATTRS_LIMIT_DEFAULT}）`);
+    return fail(res, `数量必须是 1 到 ${ATTRS_LIMIT_MAX} 的整数（缺省 ${ATTRS_LIMIT_DEFAULT}）`);
   }
   const db = getDb();
   const shopSql = req.shop ? ' AND p.shop_code = ?' : '';
@@ -1742,7 +1878,7 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
     `GET /all` 是店主的商品管理列表，多店之下不加这一条就会把**别家店**的商品
     （含未上架的草稿与池口径读数）一并列出来。判据放第一个，参数顺序与 SQL 一致。
   */
-  const where = ['p.id > ?', 'p.shop_code = ?'];
+  const where = ['p.id > ?', 'p.shop_code = ?', 'p.deleted_at IS NULL'];
   const args = [cursor, String(req.shop.code)];
   if (incompleteOnly) where.push(`(${COMPLETENESS_MISSING_SQL}) != ''`);
   if (q) {
@@ -1846,11 +1982,17 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
   const q = String(req.query.q ?? '').trim().slice(0, 60);
   const shop = String(req.query.shop ?? '').trim().toUpperCase();
-  if (shop && !isShopCodeShape(shop)) return fail(res, 'shop 需为 9 位店铺编号', 400, 400);
+  if (shop && !isShopCodeShape(shop)) return fail(res, '店铺编号必须是 9 位', 400, 400);
   const hidden = String(req.query.hidden ?? '');
-  if (hidden !== '' && hidden !== '0' && hidden !== '1') return fail(res, 'hidden 只能是 1（只看已强制下架）或 0（只看未强制下架）', 400, 400);
+  if (hidden !== '' && hidden !== '0' && hidden !== '1') return fail(res, '筛选条件只能是「只看已强制下架」或「只看未强制下架」', 400, 400);
+  /*
+    默认不返回已软删除商品（强制删除后它退出管理面）；`deleted=1` 用于复核已删除项。
+    与公开面不同，这里允许节点管理员看到 deleted_reason 与删除时刻。
+  */
+  const deleted = String(req.query.deleted ?? '0');
+  if (deleted !== '' && deleted !== '0' && deleted !== '1') return fail(res, '删除状态筛选只能取 0 或 1', 400, 400);
   const sort = String(req.query.sort ?? '');
-  if (sort && sort !== 'recent') return fail(res, 'sort 只能是 recent（或留空）', 400, 400);
+  if (sort && sort !== 'recent') return fail(res, '排序只能按最近上架（或留空）', 400, 400);
 
   const where = [];
   const args = [];
@@ -1871,6 +2013,7 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
   }
   if (hidden === '1') where.push('p.node_hidden = 1');
   if (hidden === '0') where.push('p.node_hidden = 0');
+  where.push(deleted === '1' ? 'p.deleted_at IS NOT NULL' : 'p.deleted_at IS NULL');
   if (q) {
     // 与卖家 /all 同一套 LIKE 转义与大小写口径（库级 as_cs；搜索语义是大小写不敏感）
     const like = `%${q.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
@@ -1882,9 +2025,9 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
     args.push(like, like, like);
   }
   const rows = await getDb().all(
-    `SELECT p.id, p.slug, p.title, p.kind, p.active, p.node_hidden, p.node_hidden_reason,
-            p.node_hidden_at, p.updated_at, p.shop_code, s.name AS shop_name, s.listed AS shop_listed,
-            (SELECT MIN(k.price_usdt_micro) FROM product_skus k WHERE k.product_id = p.id) AS min_price
+    `SELECT p.id, p.slug, p.title, p.kind, p.price_currency, p.active, p.node_hidden, p.node_hidden_reason,
+            p.node_hidden_at, p.deleted_at, p.deleted_reason, p.updated_at, p.shop_code, s.name AS shop_name, s.listed AS shop_listed,
+            (SELECT MIN(k.price_micro) FROM product_skus k WHERE k.product_id = p.id) AS min_price
        FROM products p JOIN shops s ON s.code = p.shop_code
       WHERE ${where.length ? where.join(' AND ') : '1 = 1'}
       ORDER BY p.id ${sort === 'recent' ? 'DESC' : 'ASC'} LIMIT ?`,
@@ -1905,8 +2048,12 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
       nodeHidden: Number(r.node_hidden) === 1,
       nodeHiddenReason: String(r.node_hidden_reason || ''),
       nodeHiddenAt: r.node_hidden_at ?? null,
-      priceUsdtMicro: r.min_price === null ? null : Number(r.min_price),
-      priceUsdt: r.min_price === null ? null : usdtOf(r.min_price),
+      deleted: r.deleted_at != null,
+      deletedReason: String(r.deleted_reason || ''),
+      deletedAt: r.deleted_at ?? null,
+      priceCurrency: r.price_currency,
+      priceMicro: r.min_price === null ? null : Number(r.min_price),
+      price: r.min_price === null ? null : priceOf(r.min_price),
       updatedAt: r.updated_at,
     })),
     nextCursor: hasMore && page.length ? page[page.length - 1].id : null,
@@ -1916,8 +2063,9 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
 /**
  * 节点管理员：**预览任意一件商品**（含草稿、店主下架、节点强制下架）。
  *
- * 公开详情对这三类商品按 404 处理，而节点管理员在处置/复核时必须看得到内容本身
- * （标题、描述、主图、参数、价格与店铺状态）——否则只能凭商品列表的一行字判断。
+ * 公开详情对这几类商品按 404 处理，而节点管理员在处置/复核时必须看得到内容本身
+ * （标题、描述、主图、参数、价格与店铺状态）——包括已软删除商品（`deleted=1` 复核）。
+ * 否则只能凭商品列表的一行字判断。
  * 本端点只读，不改变任何状态；返回的是公开 DTO（不含码池/收货信息等卖家私域数据）。
  */
 router.get('/admin/:slug', nodeAdmin, wrap(async (req, res) => {
@@ -1945,12 +2093,12 @@ router.get('/admin/:slug', nodeAdmin, wrap(async (req, res) => {
  */
 router.patch('/admin/moderation', nodeAdmin, wrap(async (req, res) => {
   const raw = req.body?.slugs;
-  if (!Array.isArray(raw)) return fail(res, 'slugs 需为商品标识数组（1..100）', 400, 400);
+  if (!Array.isArray(raw)) return fail(res, '商品标识列表必须是 1 到 100 个', 400, 400);
   const slugs = [...new Set(raw.map((s) => String(s ?? '').trim()).filter(Boolean))];
-  if (!slugs.length) return fail(res, 'slugs 需为非空数组（1..100）', 400, 400);
+  if (!slugs.length) return fail(res, '商品标识列表不能为空（1 到 100 个）', 400, 400);
   if (slugs.length > 100) return fail(res, `批量处置单次上限 100 件（实际 ${slugs.length} 件）——请分批操作`, 400, 400);
   const hidden = req.body?.hidden;
-  if (typeof hidden !== 'boolean') return fail(res, 'hidden 需为布尔值（true=强制下架，false=恢复展示）', 400, 400);
+  if (typeof hidden !== 'boolean') return fail(res, '强制下架状态必须是布尔值（是=强制下架，否=恢复展示）', 400, 400);
   const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
   if (hidden && !reason) return fail(res, '强制下架必须填写原因（≤200 字，店主会在商品管理页看到）', 400, 400);
 
@@ -1987,7 +2135,7 @@ router.patch('/admin/moderation', nodeAdmin, wrap(async (req, res) => {
 router.patch('/admin/:slug/moderation', nodeAdmin, wrap(async (req, res) => {
   const slug = String(req.params.slug || '').trim();
   const hidden = req.body?.hidden;
-  if (typeof hidden !== 'boolean') return fail(res, 'hidden 需为布尔值（true=强制下架，false=恢复展示）', 400, 400);
+  if (typeof hidden !== 'boolean') return fail(res, '强制下架状态必须是布尔值（是=强制下架，否=恢复展示）', 400, 400);
   const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
   if (hidden && !reason) return fail(res, '强制下架必须填写原因（≤200 字，店主会在商品管理页看到）', 400, 400);
 
@@ -2033,6 +2181,8 @@ router.patch('/admin/:slug/moderation', nodeAdmin, wrap(async (req, res) => {
  * 店主必须看得见自己被下架的商品；评价列表是匿名读，没有这个豁免。
  */
 async function publicProductGate(row, { mine = false } = {}) {
+  // 软删除是终局：店主/店员也不能再从公开详情页预览（历史订单靠快照独立成立）
+  if (row.deleted_at != null) return { status: 404, code: 404, message: '商品不存在或已删除' };
   if (!row.active && !mine) return { status: 404, code: 404, message: '商品不存在或已下架' };
   if (Number(row.node_hidden) === 1 && !mine) return { status: 404, code: 404, message: '商品不存在或已下架' };
   if (mine) return null;
@@ -2051,7 +2201,7 @@ router.get('/nft-standard', staffOnly, wrap(async (req, res) => {
   const contract = String(req.query.contract || '').trim().toLowerCase();
   const rawStandard = String(req.query.standard || 'erc721').trim().toLowerCase();
   if (rawStandard !== 'erc721' && rawStandard !== 'erc1155') {
-    return fail(res, 'standard 需为 erc721 或 erc1155', 1, 400);
+    return fail(res, 'NFT 标准必须是 ERC721 或 ERC1155', 1, 400);
   }
   const r = await checkNftStandard(contract, rawStandard, { budget: 'preview' });
   if (r.standard) {
@@ -2171,12 +2321,12 @@ router.post('/', staffOnly, wrap(async (req, res) => {
   await withTransaction(async () => {
     const ins = await db.run(
       'INSERT INTO products (slug, shop_code, title, description, description_blocks, media, kind, ' +
-        'shipping_fee_usdt_micro, age_restricted, nft_contract, nft_standard, token_contract, token_decimals, token_symbol, claimable, claim_type, claim_window_days, claim_instructions, specs, attributes, terms, tags, ' +
-        `snapshot_hash, auto_deliver, stock_alert_at, active, published_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${PUBLISHED_AT_FIRST})`,
+        'price_currency, shipping_fee_micro, age_restricted, nft_contract, nft_standard, token_contract, token_decimals, token_symbol, claimable, claim_type, claim_window_days, claim_instructions, specs, attributes, terms, tags, ' +
+        `snapshot_hash, auto_deliver, stock_alert_at, active, published_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${PUBLISHED_AT_FIRST})`,
       slug,
       String(req.shop.code),
       value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.media),
-      value.kind, value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard,
+      value.kind, value.priceCurrency, value.shippingFeeMicro, value.ageRestricted, value.nftContract, value.nftStandard,
       value.tokenContract, value.tokenDecimals, value.tokenSymbol,
       value.claimable, value.claimType, value.claimWindowDays, value.claimInstructions,
       JSON.stringify(value.specs), JSON.stringify(value.attributes), JSON.stringify(value.terms),
@@ -2189,7 +2339,7 @@ router.post('/', staffOnly, wrap(async (req, res) => {
     await saveSkus(ins.insertId, value.skus);
     await refreshSnapshotHash(ins.insertId);
   });
-  await audit(req, 'product.create', 'product', slug, { kind: value.kind, skuCount: value.skus.length, specs: value.specs.map((s) => s.name), tags: value.tags.map((t) => t.display), shippingFeeUsdtMicro: value.shippingFeeUsdtMicro, ageRestricted: value.ageRestricted, active: value.active });
+  await audit(req, 'product.create', 'product', slug, { kind: value.kind, priceCurrency: value.priceCurrency, skuCount: value.skus.length, specs: value.specs.map((s) => s.name), tags: value.tags.map((t) => t.display), shippingFeeMicro: value.shippingFeeMicro, ageRestricted: value.ageRestricted, active: value.active });
   ok(
     res,
     await rowToPublic(await db.get('SELECT * FROM products WHERE slug = ?', slug)),
@@ -2208,23 +2358,40 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
   if (slugs.length > 100) {
     return fail(res, `批量修改单次上限 100 件（实际 ${slugs.length} 件）——请分批操作`);
   }
-  if (!slugs.length) return fail(res, 'slugs 需为非空数组（≤100）');
+  if (!slugs.length) return fail(res, '商品标识列表不能为空（最多 100 个）');
   const b = req.body?.patch || {};
-  if (typeof b !== 'object' || !Object.keys(b).length) return fail(res, 'patch 需为 {priceUsdtMicro?/active?/autoDeliver?/stockAlertAt?}');
+  if (typeof b !== 'object' || !Object.keys(b).length) return fail(res, '批量修改只接受这些字段：价格、上架状态、自动交付、库存提醒');
   const unknownPatch = unknownKeysError(b, PRODUCT_BATCH_PATCH_KEYS, '批量修改（PATCH /api/products/batch 的 patch）');
   if (unknownPatch) return fail(res, unknownPatch);
   // 字段合法性（整体校验）
-  if (b.priceUsdtMicro !== undefined) {
-    const micro = Number(b.priceUsdtMicro);
+  if (b.priceMicro !== undefined) {
+    const micro = Number(b.priceMicro);
     if (!Number.isInteger(micro) || micro <= 0 || micro > PRICE_MAX_MICRO) {
-      return fail(res, `priceUsdtMicro 需为 1..${PRICE_MAX_MICRO} 整数（单位：微 USDT，即最多 ${PRICE_MAX_USDT} USDT）`);
+      return fail(res, `价格需在 0.000001 到 ${PRICE_MAX_UNITS} 之间（标价币种微单位）`);
     }
   }
-  if (b.active !== undefined && ![true, false, 0, 1].includes(b.active)) return fail(res, 'active 需为布尔');
-  if (b.autoDeliver !== undefined && ![-1, 0, 1].includes(Number(b.autoDeliver))) return fail(res, 'autoDeliver 需为 -1/0/1');
+  if (b.active !== undefined && ![true, false, 0, 1].includes(b.active)) return fail(res, '上架状态必须是布尔值');
+  if (b.autoDeliver !== undefined && ![-1, 0, 1].includes(Number(b.autoDeliver))) return fail(res, '自动发货设置只能是 -1、0 或 1');
   if (b.stockAlertAt !== undefined && b.stockAlertAt !== null && b.stockAlertAt !== '') {
     const n = Number(b.stockAlertAt);
-    if (!Number.isInteger(n) || n < 0 || n > 10000000) return fail(res, 'stockAlertAt 需为 0..1e7 整数');
+    if (!Number.isInteger(n) || n < 0 || n > 10000000) return fail(res, '库存提醒值必须是 0 到 10000000 的整数');
+  }
+  /*
+    批量改价只能在同一计价币种内成立：100 USDT 与 100 BTY 的微单位数值相同但价值不同。
+    前端已按币种禁用入口，这里再在**唯一写入口**上判一次——绕过界面直接调 API 也必须被拒，
+    否则一次批量改价就会把两种币种的商品改成"看起来同名、其实不同价"的价格。
+  */
+  if (b.priceMicro !== undefined) {
+    const marks = slugs.map(() => '?').join(',');
+    const rows = await db.all(
+      `SELECT price_currency FROM products WHERE slug IN (${marks}) AND shop_code = ? AND deleted_at IS NULL`,
+      ...slugs,
+      String(req.shop.code)
+    );
+    const currencies = new Set(rows.map((r) => r.price_currency));
+    if (currencies.size > 1) {
+      return fail(res, '所选商品的计价币种不同（USDT / BTY）：同一个数字在不同币种下不是一回事，请按币种分开改价');
+    }
   }
 
   const failed = [];
@@ -2247,6 +2414,7 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
       if (String(row.shop_code) !== String(req.shop.code)) {
         return { failed: '该商品不属于本店' };
       }
+      if (row.deleted_at != null) return { failed: '商品已删除' };
       const nextActive = b.active !== undefined ? (b.active === false || b.active === 0 ? 0 : 1) : row.active;
       const nextAutoDeliver = b.autoDeliver !== undefined ? Number(b.autoDeliver) : row.auto_deliver;
       const nextStockAlertAt =
@@ -2255,18 +2423,20 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
             ? null
             : Number(b.stockAlertAt)
           : row.stock_alert_at;
-      // 批量改价：作用于该商品的**全部组合**（批量页不展开规格明细；逐组合定价走单个 PATCH /:slug）
-      if (b.priceUsdtMicro !== undefined) {
-        await db.run('UPDATE product_skus SET price_usdt_micro = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE product_id = ?', Number(b.priceUsdtMicro), row.id);
-      }
       /*
+        先更新商品行并带 `deleted_at IS NULL` 守卫：若并发删除落在上面的读与这里之间，
+        本次批量修改必须整体失败，不能把已删除商品重新写回"在售/改价"状态。
         首次上架时刻与单商品 PATCH 共用同一段 SQL（见 PUBLISHED_AT_KEEP）：已有值保留、
         无值且在售则服务器盖章、无值且未上架保持 NULL。
       */
-      await db.run(
-        `UPDATE products SET active = ?, auto_deliver = ?, stock_alert_at = ?, published_at = ${PUBLISHED_AT_KEEP}, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ?`,
+      const productUpdated = await db.run(
+        `UPDATE products SET active = ?, auto_deliver = ?, stock_alert_at = ?, published_at = ${PUBLISHED_AT_KEEP}, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND deleted_at IS NULL`,
         nextActive, nextAutoDeliver, nextStockAlertAt, nextActive, row.id
       );
+      if (productUpdated.foundRows !== 1) return { failed: '商品已删除' };
+      if (b.priceMicro !== undefined) {
+        await db.run('UPDATE product_skus SET price_micro = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE product_id = ?', Number(b.priceMicro), row.id);
+      }
       /*
         快照哈希**在这一步之后按读回值重算**：直接读整行 + SKU 行交给 snapshotObject。
         这里曾经手挑字段（只列了 slug/title/description/images/kind/… 与改价后的 sku 行），
@@ -2285,7 +2455,16 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
     `logAudit` 里少数会抛的错（shop_code 指向不存在的店、调用方漏给归属）会在 `ok()` 之后
     冒出 ERR_HTTP_HEADERS_SENT，进而变成 unhandledRejection 把整个进程带下去。
   */
-  await audit(req, 'product.batch', 'product', updated.join(',') || '-', { updated: updated.length, failed: failed.length });
+  /*
+    `targetId` 是逗号拼接的 slug，列宽 120 会静默截断（第 5~6 个起就没了）。
+    `detail.targets` 另存前 20 个 + `total`，界面才能说"共 N 件、前几个是…"。
+  */
+  await audit(req, 'product.batch', 'product', updated.join(',') || '-', {
+    updated: updated.length,
+    failed: failed.length,
+    targets: updated.slice(0, 20),
+    total: updated.length,
+  });
   ok(res, { updated, failed }, updated.length ? `已更新 ${updated.length} 个商品` : '无商品被更新');
 }));
 
@@ -2386,9 +2565,10 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
       descriptionBlocks: b.descriptionBlocks !== undefined ? b.descriptionBlocks : parseBlocks(row.description_blocks),
       media: b.media !== undefined ? b.media : parseMediaColumn(row.media),
       kind: b.kind !== undefined ? b.kind : row.kind,
+      priceCurrency: b.priceCurrency !== undefined ? b.priceCurrency : row.price_currency,
       // 运费（按单收取一次；0=包邮）与年龄限制：未提交则沿用现值——它们是快照字段，
       // 漏传等于把商品悄悄改回包邮/无限制（买家手里的哈希随即对不上）
-      shippingFeeUsdtMicro: b.shippingFeeUsdtMicro !== undefined ? b.shippingFeeUsdtMicro : row.shipping_fee_usdt_micro,
+      shippingFeeMicro: b.shippingFeeMicro !== undefined ? b.shippingFeeMicro : row.shipping_fee_micro,
       ageRestricted: b.ageRestricted !== undefined ? b.ageRestricted : row.age_restricted,
       // NFT 两列是**三态**（NULL = 非 NFT，不是空串）：未提交就沿用现值，
       // 校验层再按 kind 决定最终写什么（非 NFT 一律写回 NULL）
@@ -2403,14 +2583,14 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
       // 规格与 SKU：未提交则沿用现有（DB 行 → API 形状）
       specs: b.specs !== undefined ? b.specs : parseSpecsColumn(row),
       // SKU 支持**部分更新**：只提交要改的组合即可（按 key 覆盖到现有列表上）；
-      // 省略 priceUsdtMicro / capacity 时沿用该组合的现值。
+      // 省略 priceMicro / capacity 时沿用该组合的现值。
       // 只改某组合库存时不必重发全部组合与价格——重发既啰嗦，也容易把别的组合写错。
       skus:
         b.skus !== undefined
           ? (() => {
               const base = prevSkuRows.map((s) => ({
                 key: s.sku_key,
-                priceUsdtMicro: s.price_usdt_micro,
+                priceMicro: s.price_micro,
                 capacity: s.capacity,
                 /*
                   **必须带上 active**（源码审计 2026-09 复审，P1）：漏掉它时 `prev.active` 是
@@ -2428,10 +2608,10 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
               const byKey = new Map(base.map((s) => [s.key, s]));
               for (const s of Array.isArray(b.skus) ? b.skus : []) {
                 const key = String(s?.key ?? '').trim();
-                const prev = byKey.get(key) || { priceUsdtMicro: undefined, capacity: null, active: true, imageUrl: '', tokenAmount: null };
+                const prev = byKey.get(key) || { priceMicro: undefined, capacity: null, active: true, imageUrl: '', tokenAmount: null };
                 byKey.set(key, {
                   key,
-                  priceUsdtMicro: s?.priceUsdtMicro !== undefined ? s.priceUsdtMicro : prev.priceUsdtMicro,
+                  priceMicro: s?.priceMicro !== undefined ? s.priceMicro : prev.priceMicro,
                   capacity: s?.capacity !== undefined ? s.capacity : prev.capacity,
                   // 停售：该组合不再可下单，但不影响其它组合（与「售罄」是两回事）
                   active: s?.active !== undefined ? !!s.active : (prev.active !== false),
@@ -2445,7 +2625,7 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
           : // 整体更新（未提交 skus）同样要带上 active：否则每个组合都被当成"要上架"
             prevSkuRows.map((s) => ({
               key: s.sku_key,
-              priceUsdtMicro: s.price_usdt_micro,
+              priceMicro: s.price_micro,
               capacity: s.capacity,
               active: s.active !== 0,
               imageUrl: s.image_url,
@@ -2481,18 +2661,18 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
       }
       if (row.kind === 'digital') {
         const pool = await db.get('SELECT COUNT(*) AS c FROM product_codes WHERE product_id = ?', row.id);
-        if (Number(pool.c) > 0) return abortTx({ fail: '该数字商品已配置兑换码池，不可变更类型；请先清空码池（DELETE /api/products/:slug/codes?confirm=1）' });
+        if (Number(pool.c) > 0) return abortTx({ fail: '该数字商品已配置兑换码池，不可变更类型；请先清空码池' });
       }
       if (row.kind === 'nft') {
         const pool = await db.get('SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = ?', row.id);
-        if (Number(pool.c) > 0) return abortTx({ fail: '该 NFT 商品已配置交付池，不可变更类型；请先清空交付池（DELETE /api/products/:slug/tokens?confirm=1）' });
+        if (Number(pool.c) > 0) return abortTx({ fail: '该 NFT 商品已配置交付池，不可变更类型；请先清空交付池' });
       }
     }
     // NFT 商品已建交付池后禁止变更 NFT 标准（交付核验语义与池内库存绑定，避免 erc721/erc1155 错配）
     if (row.kind === 'nft' && merged.kind === 'nft' && merged.nftStandard !== row.nft_standard) {
       const pool = await db.get('SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = ?', row.id);
       if (Number(pool.c) > 0) {
-        return abortTx({ fail: '该 NFT 商品已配置交付池，不可变更 NFT 标准（erc721/erc1155）；请先清空交付池（DELETE /api/products/:slug/tokens?confirm=1）' });
+        return abortTx({ fail: '该 NFT 商品已配置交付池，不可变更 NFT 标准（ERC721/ERC1155）；请先清空交付池' });
       }
     }
     // NFT 商品中途更换合约地址同样禁止（与 nft_standard 同规则）：订单快照锁定旧合约、
@@ -2503,7 +2683,7 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     ) {
       const pool = await db.get('SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = ?', row.id);
       if (Number(pool.c) > 0) {
-        return abortTx({ fail: '该 NFT 商品已配置交付池，不可更换 NFT 合约地址；请先清空交付池（DELETE /api/products/:slug/tokens?confirm=1）' });
+        return abortTx({ fail: '该 NFT 商品已配置交付池，不可更换 NFT 合约地址；请先清空交付池' });
       }
     }
     const { errors, value } = validateProduct(merged);
@@ -2657,28 +2837,124 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
       `updated_at` 与 `published_at` 都由服务器盖章（不传 JS 时间，见 PUBLISHED_AT_KEEP 的说明）；
       标签与参数不再有"另一处镜像要记得同批写"——它们就在这一条 UPDATE 里。
     */
-    await db.run(
+    const updated = await db.run(
       'UPDATE products SET title = ?, description = ?, description_blocks = ?, media = ?, kind = ?, ' +
-        'shipping_fee_usdt_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, token_contract = ?, token_decimals = ?, token_symbol = ?, ' +
+        'price_currency = ?, shipping_fee_micro = ?, age_restricted = ?, nft_contract = ?, nft_standard = ?, token_contract = ?, token_decimals = ?, token_symbol = ?, ' +
         'claimable = ?, claim_type = ?, claim_window_days = ?, claim_instructions = ?, specs = ?, ' +
         `attributes = ?, terms = ?, tags = ?, auto_deliver = ?, stock_alert_at = ?, active = ?, published_at = ${PUBLISHED_AT_KEEP}, updated_at = CURRENT_TIMESTAMP(3) ` +
-        'WHERE id = ?',
+        'WHERE id = ? AND deleted_at IS NULL',
       value.title, value.description, JSON.stringify(value.descriptionBlocks), JSON.stringify(value.media), value.kind,
-      value.shippingFeeUsdtMicro, value.ageRestricted, value.nftContract, value.nftStandard,
+      value.priceCurrency, value.shippingFeeMicro, value.ageRestricted, value.nftContract, value.nftStandard,
       value.tokenContract, value.tokenDecimals, value.tokenSymbol,
       value.claimable, value.claimType, value.claimWindowDays, value.claimInstructions, JSON.stringify(value.specs),
       JSON.stringify(value.attributes), JSON.stringify(value.terms), JSON.stringify(value.tags),
       value.autoDeliver, value.stockAlertAt, value.active, value.active, row.id
     );
+    if (updated.foundRows !== 1) return abortTx({ fail: '商品已被删除，请刷新页面' });
     // 写 SKU（保留同 key 的 committed，编辑商品不该把已售数量清零）
     await saveSkus(row.id, value.skus);
     // 快照哈希最后算：它认的是上面这些列**读回来**的样子（JSON 列由 MySQL 规范化，见文件头）
     await refreshSnapshotHash(row.id);
-    return { ok: true };
+    /*
+      审计的"改了什么"：只比较**请求里出现的键**，且只留真的变了的。
+      旧实现只记 `Object.keys(b)`（提交过但值没变的也算"改了"），且没有任何值；
+      这里用同一份 `value`（校验后的最终值）与锁后重读的 `row`/`prevSkuRows` 对拍。
+    */
+    const changedKeys = Object.keys(b);
+    const before = Object.fromEntries(changedKeys.map((k) => [k, productAuditBefore(k, row, prevSkuRows)]));
+    const diff = auditChanges(before, value, changedKeys, PRODUCT_AUDIT_VALUE_OPTS);
+    if (diff.changes.skus !== undefined) {
+      const compact = compactSkuChange(before.skus, value.skus, PRODUCT_AUDIT_VALUE_OPTS);
+      const hasAny = (v) => !Array.isArray(v) || v.length > 0;
+      if (hasAny(compact.from) || hasAny(compact.to)) {
+        diff.changes.skus = compact;
+        if (!diff.fields.includes('skus')) diff.fields.push('skus');
+      } else {
+        delete diff.changes.skus;
+        diff.fields = diff.fields.filter((k) => k !== 'skus');
+      }
+    }
+    return { ok: true, fields: diff.fields, changes: diff.changes };
   });
   if (out.fail) return fail(res, out.fail);
-  await audit(req, 'product.update', 'product', row0.slug, { fields: Object.keys(b).filter((k) => ['title','description','descriptionBlocks','specs','skus','tags','attributes','terms','autoDeliver','stockAlertAt','active','kind','shippingFeeUsdtMicro','ageRestricted'].includes(k)) });
+  await audit(req, 'product.update', 'product', row0.slug, { fields: out.fields, changes: out.changes });
   ok(res, await rowToPublic(await db.get('SELECT * FROM products WHERE id = ?', row0.id)), '已更新');
+}));
+
+/**
+ * 店主删除商品（**软删除**）。
+ *
+ * 删除是终局：商品退出公开面、店主管理列表与下单闸，行继续留在库里供历史订单/审计引用。
+ * 用 `?confirm=1` 把"确认框点过"变成服务端可验证的前置（与清空码池同一口径），
+ * 避免一次误发就把商品从货架上摘掉。
+ *
+ * 仍在途的订单不受影响：它们锁的是 `product_snapshot`，不依赖商品行可售；
+ * 库存占位/交付池行也都保留，履约与退款路径照常。
+ */
+router.delete('/:slug', staffOnly, wrap(async (req, res) => {
+  if (req.query.confirm !== '1') {
+    return fail(res, '删除商品需要确认（请带 ?confirm=1）：删除后商品从店铺与公开面消失，历史订单不受影响');
+  }
+  const db = getDb();
+  const row = await requireShopProduct(req, res);
+  if (!row) return;
+  const r = await db.run(
+    'UPDATE products SET deleted_at = CURRENT_TIMESTAMP(3), deleted_reason = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND deleted_at IS NULL',
+    '',
+    row.id
+  );
+  if (r.foundRows !== 1) return fail(res, '商品不存在或已被删除', 404, 404);
+  await audit(req, 'product.delete', 'product', row.slug, { title: row.title, by: 'seller' });
+  ok(res, { slug: row.slug }, '商品已删除（历史订单仍可查看）');
+}));
+
+/**
+ * 节点主强制删除商品（**软删除**）——与店主删除同一列，但带原因、记节点级审计并通知店主。
+ *
+ * 为什么允许节点主删除而不是只做强制下架：下架仍占着商品标识与店铺管理面，
+ * 店主可以反复上架；对违法/侵权/明确不可售的商品，节点需要的是一条不可由店主撤销的终局处置。
+ * 原因写给店主看（与 node_hidden_reason 同一条纪律），删除后商品对任何人都不再公开可见。
+ */
+router.delete('/admin/:slug', hostOnly, wrap(async (req, res) => {
+  const slug = String(req.params.slug || '').trim();
+  const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
+  if (!reason) return fail(res, '强制删除必须填写原因（≤200 字，店主可在审计记录中看到）', 400, 400);
+  const db = getDb();
+  const row = await db.get('SELECT * FROM products WHERE slug = ?', slug);
+  if (!row || row.deleted_at != null) return fail(res, '商品不存在或已被删除', 404, 404);
+  const upd = await db.run(
+    'UPDATE products SET deleted_at = CURRENT_TIMESTAMP(3), deleted_reason = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND deleted_at IS NULL',
+    reason,
+    row.id
+  );
+  if (upd.foundRows !== 1) return fail(res, '商品不存在或已被删除', 404, 404);
+  await nodeAudit(req, 'product.force_delete', 'product', slug, {
+    shopCode: row.shop_code,
+    title: row.title,
+    reason,
+  });
+  /*
+    节点级审计归节点主；再写一条同店铺归属的审计，让店主在自己的审计页看得到
+    “谁、为什么删了这件商品”。同一动作两份归属是刻意的：节点治理记录不能被店主改写，
+    店主也需要可读的原因出口。
+  */
+  await logAudit({
+    req,
+    actor: req.auth?.address,
+    actorRole: 'host',
+    shopCode: row.shop_code,
+    action: 'product.force_delete_by_node',
+    targetType: 'product',
+    targetId: slug,
+    detail: { title: row.title, reason, by: 'host' },
+  });
+  void notifyRaw('product.force_delete', {
+    shopCode: row.shop_code,
+    slug,
+    title: row.title,
+    reason,
+  });
+  ok(res, { slug, reason }, `已强制删除「${row.title}」：${reason}`);
 }));
 
 // ── 兑换码池（数字商品）──
@@ -2703,7 +2979,7 @@ router.post('/:slug/codes', staffOnly, wrap(async (req, res) => {
   if (!product) return;
   if (product.kind !== 'digital') return fail(res, '仅数字商品可配置兑换码池');
   const raw = Array.isArray(req.body?.codes) ? req.body.codes : [];
-  if (!raw.length) return fail(res, 'codes 需为非空字符串数组');
+  if (!raw.length) return fail(res, '兑换码列表必须是非空数组');
   if (raw.length > 500) return fail(res, '单次导入最多 500 条');
   const dedup = [...new Set(raw.map((c) => String(c).trim()).filter(Boolean))];
   if (!dedup.length) return fail(res, '未解析到有效码（去除空白后为空）');
@@ -2731,8 +3007,10 @@ router.post('/:slug/codes', staffOnly, wrap(async (req, res) => {
       并发的 PATCH /:slug 可以在那之后把这个商品改成别的类型（那条路径的闸读的正是本池计数，
       两者靠**商品行**上的外键共享锁与排他锁串行——这就是本事务存在的意义之一）。
     */
-    const fresh = await db.get('SELECT kind FROM products WHERE id = ?', product.id);
-    if (fresh?.kind !== 'digital') return abortTx({ fail: '仅数字商品可配置兑换码池' });
+    const fresh = await db.get('SELECT kind, deleted_at FROM products WHERE id = ?', product.id);
+    if (fresh?.kind !== 'digital' || fresh.deleted_at != null) {
+      return abortTx({ fail: '商品已删除或不是数字商品' });
+    }
     let n = 0;
     const insSql =
       'INSERT INTO product_codes (product_id, code) ' +
@@ -2771,7 +3049,7 @@ router.get('/:slug/codes', staffOnly, wrap(async (req, res) => {
   const product = await requireShopProduct(req, res);
   if (!product) return;
   const status = String(req.query.status || 'unused');
-  if (!['unused', 'used', 'all'].includes(status)) return fail(res, 'status 需为 unused / used / all');
+  if (!['unused', 'used', 'all'].includes(status)) return fail(res, '状态筛选只能是未使用、已使用或全部');
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
   const where = status === 'all' ? 'pc.product_id = ?' : 'pc.product_id = ? AND pc.status = ?';
@@ -2844,7 +3122,7 @@ router.delete('/:slug/codes/:id', staffOnly, wrap(async (req, res) => {
  * 需要彻底清掉请先确认无历史订单依赖，再走库级维护（见 node/docs/OPERATIONS.md）。
  */
 router.delete('/:slug/codes', ownerOnly, wrap(async (req, res) => {
-  if (req.query.confirm !== '1') return fail(res, '清空码池为整批不可逆操作，需带 ?confirm=1 二次确认');
+  if (req.query.confirm !== '1') return fail(res, '清空码池为整批不可逆操作，需要二次确认');
   const db = getDb();
   const product = await requireShopProduct(req, res);
   if (!product) return;
@@ -2901,18 +3179,18 @@ export function parseTokenSpec(spec) {
   const parts = s.split('-');
   if (parts.length === 1) {
     const v = parseOne(parts[0]);
-    return v === null ? { ok: false, error: `「${s}」不是合法 tokenId（需十进制或 0x hex，且 < 2^256）` } : { ok: true, values: [v] };
+    return v === null ? { ok: false, error: `「${s}」不是合法的 NFT 编号（需十进制或 0x 十六进制，且小于 2^256）` } : { ok: true, values: [v] };
   }
   if (parts.length === 2) {
     const a = parseOne(parts[0]);
     const b = parseOne(parts[1]);
-    if (a === null || b === null || a > b) return { ok: false, error: `范围「${s}」非法（需 a-b 且 a <= b）` };
+    if (a === null || b === null || a > b) return { ok: false, error: `范围「${s}」非法（应为「起始-结束」且起始不大于结束）` };
     if (b - a + 1n > BigInt(NFT_MAX_IMPORT)) return { ok: false, error: `范围「${s}」展开超过单次上限 ${NFT_MAX_IMPORT} 条` };
     const values = [];
     for (let i = a; i <= b; i += 1n) values.push(i);
     return { ok: true, values };
   }
-  return { ok: false, error: `「${s}」无法解析（支持单个 tokenId 或 a-b 范围）` };
+  return { ok: false, error: `「${s}」无法解析（支持单个 NFT 编号或「起始-结束」范围）` };
 }
 
 /** 店主导入 NFT tokenId 交付库存（每行一个：十进制 / 0x hex / a-b 范围；同商品重复自动跳过） */
@@ -2920,9 +3198,9 @@ router.post('/:slug/tokens', staffOnly, wrap(async (req, res) => {
   const db = getDb();
   const product = await requireShopProduct(req, res);
   if (!product) return;
-  if (product.kind !== 'nft') return fail(res, '仅 NFT 商品可配置 tokenId 交付池');
+  if (product.kind !== 'nft') return fail(res, '仅 NFT 商品可配置编号交付池');
   const raw = Array.isArray(req.body?.tokens) ? req.body.tokens : [];
-  if (!raw.length) return fail(res, 'tokens 需为非空字符串数组');
+  if (!raw.length) return fail(res, 'NFT 编号列表必须是非空数组');
   if (raw.length > NFT_MAX_IMPORT) return fail(res, `单次导入最多 ${NFT_MAX_IMPORT} 行`);
   const seen = new Set();
   const values = [];
@@ -2941,8 +3219,8 @@ router.post('/:slug/tokens', staffOnly, wrap(async (req, res) => {
       }
     }
   }
-  if (!values.length) return fail(res, '未解析到有效 tokenId');
-  if (values.length > NFT_MAX_IMPORT) return fail(res, `tokenId 展开后超过单次上限 ${NFT_MAX_IMPORT} 条`);
+  if (!values.length) return fail(res, '未解析到有效的 NFT 编号');
+  if (values.length > NFT_MAX_IMPORT) return fail(res, `NFT 编号展开后超过单次上限 ${NFT_MAX_IMPORT} 条`);
   /*
     整批导入 + 统计读数**在同一个事务里**（防进程中断半写：tokenId 池只入一半 →
     统计与可交付量错位），并与 PATCH /:slug 的池计数闸靠**商品行**上的锁串行（同兑换码池那边）：
@@ -2957,8 +3235,10 @@ router.post('/:slug/tokens', staffOnly, wrap(async (req, res) => {
       事务内重读 kind：上面那次 `product.kind !== 'nft'` 的判定在事务**之外**，并发的
       PATCH /:slug 可以在那之后改类型/换合约（那条路径的闸读的正是本池计数，两者靠商品行上的锁串行）。
     */
-    const fresh = await db.get('SELECT kind FROM products WHERE id = ?', product.id);
-    if (fresh?.kind !== 'nft') return abortTx({ fail: '仅 NFT 商品可配置 tokenId 交付池' });
+    const fresh = await db.get('SELECT kind, deleted_at FROM products WHERE id = ?', product.id);
+    if (fresh?.kind !== 'nft' || fresh.deleted_at != null) {
+      return abortTx({ fail: '商品已删除或不是 NFT 商品' });
+    }
     let n = 0;
     const insSql =
       'INSERT INTO product_nft_tokens (product_id, token_id) ' +
@@ -2982,7 +3262,7 @@ router.get('/:slug/tokens', staffOnly, wrap(async (req, res) => {
   const product = await requireShopProduct(req, res);
   if (!product) return;
   const status = String(req.query.status || 'unused');
-  if (!['unused', 'used', 'all'].includes(status)) return fail(res, 'status 需为 unused / used / all');
+  if (!['unused', 'used', 'all'].includes(status)) return fail(res, '状态筛选只能是未使用、已使用或全部');
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
   const where = status === 'all' ? 'pt.product_id = ?' : 'pt.product_id = ? AND pt.status = ?';
@@ -3017,8 +3297,8 @@ router.delete('/:slug/tokens/:id', staffOnly, wrap(async (req, res) => {
   const product = await requireShopProduct(req, res);
   if (!product) return;
   const row = await db.get('SELECT * FROM product_nft_tokens WHERE id = ? AND product_id = ?', Number(req.params.id) || 0, product.id);
-  if (!row) return fail(res, 'tokenId 不存在', 404, 404);
-  if (row.status !== 'unused') return fail(res, '仅可删除未交付状态的 tokenId');
+  if (!row) return fail(res, 'NFT 编号不存在', 404, 404);
+  if (row.status !== 'unused') return fail(res, '仅可删除未交付状态的 NFT 编号');
   /*
     与 DELETE /:slug/codes/:id 同一条纪律：删除**必须带 status = 'unused' 条件**
     并要求恰好命中 1 行。上面那次读会被一笔并发交付（`UPDATE product_nft_tokens SET status='used' …
@@ -3026,7 +3306,7 @@ router.delete('/:slug/tokens/:id', staffOnly, wrap(async (req, res) => {
     店主把同一批 tokenId 重新导入后，同一枚 NFT 会被"交付"给第二个买家（链上那枚早已转给第一个）。
   */
   const del = await db.run("DELETE FROM product_nft_tokens WHERE id = ? AND product_id = ? AND status = 'unused'", row.id, product.id);
-  if (del.foundRows !== 1) return fail(res, '仅可删除未交付状态的 tokenId（该枚刚被分配给订单，请刷新交付池后重试）');
+  if (del.foundRows !== 1) return fail(res, '仅可删除未交付状态的 NFT 编号（该枚刚被分配给订单，请刷新交付池后重试）');
   await audit(req, 'token.delete', 'product', product.slug, { tokenId: row.id });
   ok(res, { slug: product.slug, deleted: row.id, stats: await nftStats(db, product.id) }, '已删除');
 }));
@@ -3038,11 +3318,11 @@ router.delete('/:slug/tokens/:id', staffOnly, wrap(async (req, res) => {
  * 请确认无「待交付」在途 NFT 单依赖该池（池空时新单已被售罄拦截，在途单需手动交付或退款）。
  */
 router.delete('/:slug/tokens', ownerOnly, wrap(async (req, res) => {
-  if (req.query.confirm !== '1') return fail(res, '清空交付池为整批不可逆操作，需带 ?confirm=1 二次确认');
+  if (req.query.confirm !== '1') return fail(res, '清空交付池为整批不可逆操作，需要二次确认');
   const db = getDb();
   const product = await requireShopProduct(req, res);
   if (!product) return;
-  if (product.kind !== 'nft') return fail(res, '仅 NFT 商品有 tokenId 交付池');
+  if (product.kind !== 'nft') return fail(res, '仅 NFT 商品有编号交付池');
   const stats = await nftStats(db, product.id);
   await db.run('DELETE FROM product_nft_tokens WHERE product_id = ?', product.id);
   await audit(req, 'token.clear', 'product', product.slug, { deleted: stats.total });

@@ -10,9 +10,9 @@ const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
 
 /** 期望 wei：与节点同源（rates.usdtMicroToPayWei），避免在测试里手抄一遍汇率算式 */
-async function expectWei(usdtMicro) {
+async function expectWei(priceMicro) {
   const { getRates, usdtMicroToPayWei } = await import('../src/rates.js');
-  return usdtMicroToPayWei(usdtMicro, await getRates());
+  return usdtMicroToPayWei(priceMicro, await getRates());
 }
 
 // ── 店铺与健康检查 ──
@@ -113,7 +113,7 @@ test('店主上架成功：返回快照哈希（keccak256 0x 前缀）', async (
   assertOk(res);
   const p = res.body.data;
   assert.ok(/^0x[0-9a-f]{64}$/.test(p.snapshotHash), 'snapshotHash 应为 64 位 hex');
-  assert.equal(p.priceUsdt, '88', '展示串去净尾零：88 USDT 写作 88（不是 88.00）');
+  assert.equal(p.price, '88', '展示串去净尾零：88 USDT 写作 88（不是 88.00）');
   assert.equal(p.kind, 'digital');
   productSlug = p.slug;
   productHash = p.snapshotHash;
@@ -130,7 +130,7 @@ test('上架参数校验：非法 kind / 非正价格被拒', async () => {
   const badPrice = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
-    .send(productPayload({ priceUsdtMicro: -1 }))
+    .send(productPayload({ priceMicro: -1 }))
     .expect(200);
   assert.notEqual(badPrice.body.code, 0);
 });
@@ -165,7 +165,7 @@ test('改价后快照哈希变化；下架后不出现在公开列表', async ()
   const repriced = await request(app)
     .patch(`/api/products/${productSlug}`)
     .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
-    .send({ skus: [{ key: '', priceUsdtMicro: 99_000_000, capacity: null }] })
+    .send({ skus: [{ key: '', priceMicro: 99_000_000, capacity: null }] })
     .expect(200);
   assertOk(repriced);
   assert.notEqual(repriced.body.data.snapshotHash, productHash, '改价应重算快照哈希');
@@ -182,7 +182,7 @@ test('改价后快照哈希变化；下架后不出现在公开列表', async ()
   await request(app)
     .patch(`/api/products/${productSlug}`)
     .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
-    .send({ active: true, skus: [{ key: '', priceUsdtMicro: 88_000_000, capacity: null }] })
+    .send({ active: true, skus: [{ key: '', priceMicro: 88_000_000, capacity: null }] })
     .expect(200);
 });
 
@@ -208,12 +208,12 @@ test('买家创建订单草稿：锁定快照、汇率与应付金额（BTY wei 
   assert.equal(o.snapshotHash, productHash, '订单锁定下单时刻的商品快照哈希');
   assert.equal(o.seller.toLowerCase(), owner.address.toLowerCase());
   assert.equal(o.buyer.toLowerCase(), buyer.address.toLowerCase());
-  assert.equal(o.usdtMicro, 88_000_000, '商品单价（微 USDT）× 数量');
+  assert.equal(o.priceMicro, 88_000_000, '商品单价（微 USDT）× 数量');
   /*
     应付 wei 与节点同源折算（不在这里手抄一遍汇率算式）：兜底汇率 1 BTY = 0.1 USDT
     ⇒ 88 USDT = 880 BTY。向上取整的产物由 rates.usdtMicroToPayWei 负责。
   */
-  assert.equal(o.amountWei, await expectWei(o.usdtMicro));
+  assert.equal(o.amountWei, await expectWei(o.priceMicro));
   const bty = Number(o.amountWei) / 1e18;
   assert.ok(Math.abs(bty - 880) < 1e-9, `应付 BTY 应≈880，实际 ${bty}`);
   assert.ok(o.amountDecimal.length > 0);
@@ -336,7 +336,7 @@ test('汇率接口：公网不可用时回退兜底并标记 stale', async () =>
     （源码评审 2026-10，P1）。
   */
   assert.equal(res.body.data.fallback, true, '手工兜底值必须与"缓存行情"分开报');
-  // 法币腿（USDT→CNY）已随标价单位改为 USDT 整条删除：对外快照里不该再有任何 CNY 字段
+  // 法币腿（price→CNY）已随标价单位改为 price 整条删除：对外快照里不该再有任何 CNY 字段
   assert.deepEqual(
     Object.keys(res.body.data).sort(),
     ['available', 'btyUsdt', 'error', 'fallback', 'stale', 'updatedAt', 'usdtToBty'],

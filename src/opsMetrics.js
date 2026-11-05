@@ -143,19 +143,21 @@ export function shopWhere(seller, prefix = 'o.') {
 export async function sellerTodoCounts(seller) {
   const db = getDb();
   const s = shopWhere(seller);
-  // 商品表的店铺维度读法是 `products.shop_code → shops.seller`，表别名是 `sh`——
-  // 前缀走 shopWhere 的形参，**不做字符串替换**（`s.where.replace('o.','sh.')` 只命中第一处，
-  // 谓词里出现第二个 `o.` 时会静默拼出错误别名，而 SQL 只会在运行时报"列不存在"）。
+  // 店主软删除的订单不参与**店主**待办/直方图；节点级读数（seller=null）仍看全量订单，
+  // 否则一次店主清理会把节点运营读数里的订单数悄悄改小。
+  const orderScope = `${s.where}${seller ? ' AND o.seller_deleted_at IS NULL' : ''}`;
+  const orderScopeParams = s.params;
   const shopScope = shopWhere(seller, 'sh.');
+  const shopScopeParams = s.params;
   // 状态直方图只需要 orders 一张表（不涉及链上镜像列），所以不带 JOIN——少一次无谓的连接
-  const rows = await db.all(`SELECT status, COUNT(*) AS c FROM orders o WHERE 1=1${s.where} GROUP BY status`, ...s.params);
+  const rows = await db.all(`SELECT status, COUNT(*) AS c FROM orders o WHERE 1=1${orderScope} GROUP BY status`, ...orderScopeParams);
   const byStatus = Object.fromEntries(rows.map((r) => [r.status, r.c]));
   // 下面几条谓词用到链上镜像列（refund_status / paid_tx_hash / after_sale_status）：
   // 必须 LEFT JOIN order_chain（谓词不带别名，见文件头那一段）
   const fromJoined = 'FROM orders o LEFT JOIN order_chain oc ON oc.order_id = o.id';
-  const pendingRefund = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${PENDING_REFUND_SQL}${s.where}`, ...s.params)).c;
+  const pendingRefund = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${PENDING_REFUND_SQL}${orderScope}`, ...orderScopeParams)).c;
   // 可发货：谓词见 SHIP_READY_SQL（无凭证异常行不计入、退款冻结行不可发）
-  const shipReady = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${SHIP_READY_SQL}${s.where}`, ...s.params)).c;
+  const shipReady = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${SHIP_READY_SQL}${orderScope}`, ...orderScopeParams)).c;
   const pendingDispute = byStatus.disputed || 0;
   /*
     在途**售后案件**（确认收货后开案）计数：与 disputed 并列进店主徽标。
@@ -163,13 +165,13 @@ export async function sellerTodoCounts(seller) {
     而订单状态仍是终局（settled/confirmed/expired）——只按 status 分组的徽标永远看不见它，
     店主会一直以为这单已经了结。判据与仲裁队列/退货门控同一处（afterSale.js）。
   */
-  const pendingAfterSale = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${AFTER_SALE_OPEN_SQL}${s.where}`, ...s.params)).c;
+  const pendingAfterSale = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${AFTER_SALE_OPEN_SQL}${orderScope}`, ...orderScopeParams)).c;
   // P 评审扩展（卖家待办聚合）：退货回收 / 待回复评价 / 低库存
   // 退货单与评价都挂在订单上，两处都**必须 join orders 再按店铺限定**——
   // 少了这一层，A 店店主的徽标会把 B 店待回收的退货算成自己的。
-  const pendingReturns = (await db.get(`SELECT COUNT(*) AS c FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE r.status IN ('open','shipped')${s.where}`, ...s.params)).c;
-  const returnsToConfirm = (await db.get(`SELECT COUNT(*) AS c FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE r.status = 'shipped'${s.where}`, ...s.params)).c;
-  const pendingReviewReply = (await db.get(`SELECT COUNT(*) AS c FROM reviews r JOIN orders o ON o.id = r.order_id WHERE r.reply_content = '' AND o.status IN ${INCOME_IN}${s.where}`, ...s.params)).c;
+  const pendingReturns = (await db.get(`SELECT COUNT(*) AS c FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE r.status IN ('open','shipped')${orderScope}`, ...orderScopeParams)).c;
+  const returnsToConfirm = (await db.get(`SELECT COUNT(*) AS c FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE r.status = 'shipped'${orderScope}`, ...orderScopeParams)).c;
+  const pendingReviewReply = (await db.get(`SELECT COUNT(*) AS c FROM reviews r JOIN orders o ON o.id = r.order_id WHERE r.reply_content = '' AND o.status IN ${INCOME_IN}${orderScope}`, ...orderScopeParams)).c;
   // 低库存按「商品」计数：任一组合余量 ≤ 商品级阈值即计入（卖家务必要一并看那些组合）
   /*
     商品表的店铺维度读法是 `products.shop_code`，而本模块的入参是 seller
@@ -181,6 +183,7 @@ export async function sellerTodoCounts(seller) {
          JOIN products p ON p.id = s.product_id
          JOIN shops sh ON sh.code = p.shop_code
         WHERE s.capacity IS NOT NULL AND p.stock_alert_at IS NOT NULL
+          AND p.deleted_at IS NULL
           AND (s.capacity - s.committed) <= p.stock_alert_at${shopScope.where}`, ...shopScope.params)).c;
   return {
     byStatus,
@@ -314,7 +317,7 @@ export async function escrowOverdueReading({ wantItems = false, limit = 0, now =
     items: [],
   };
   if (!config.chain.escrowAddress) {
-    return { ...base, reason: '未配置 MK_ESCROW_ADDRESS：读不到链上释放阈值（本地只能给出托管中与候选单数）' };
+    return { ...base, reason: '未配置托管合约地址：读不到链上释放阈值（本地只能给出托管中与候选单数）' };
   }
   if (!candidates.length) {
     // 没有候选就不需要任何链上读数（也就没有"读不到"可言）：0 是**确证的 0**
@@ -397,7 +400,7 @@ export async function escrowOverdueReading({ wantItems = false, limit = 0, now =
     console.warn('[opsMetrics] 托管超时读数失败:', e?.message || e);
     return {
       ...base,
-      reason: `链上读取失败（RPC 不可达，或合约未升级到含 releaseNotBeforeBlock 的版本）：${chainErrText(e)}`,
+      reason: `链上读取失败（链上节点不可达，或合约版本太旧没有释放阈值读数）：${chainErrText(e)}`,
     };
   }
 }
@@ -578,7 +581,7 @@ export async function promiseSlaReading(now = Date.now(), windowDays = 30, selle
   */
   const products = (await db.all(`SELECT p.id, p.slug, p.title, p.terms FROM products p
          JOIN shops sh ON sh.code = p.shop_code
-        WHERE p.active = 1 AND p.terms IS NOT NULL AND p.terms != '{}'${shopScope.where}`, ...shopScope.params))
+        WHERE p.active = 1 AND p.deleted_at IS NULL AND p.terms IS NOT NULL AND p.terms != '{}'${shopScope.where}`, ...shopScope.params))
     .map((p) => ({ ...p, handlingDays: parseTermsColumn(p.terms).handling_days }))
     .filter((p) => p.handlingDays !== null);
   if (!products.length) return [];

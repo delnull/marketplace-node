@@ -27,6 +27,7 @@ import config from './config.js';
 import { getDb } from './db.js';
 import { getEscrow, finalizedBlockNumber } from './chain.js';
 import { withRedisLock } from './redis.js';
+import { expireOverdueClaims } from './nftClaim.js';
 
 const INTERVAL_MS = 5 * 60_000;
 const MIN_AGE_MS = 60_000;
@@ -93,6 +94,12 @@ export async function reconcileClaims({
   blockTag = null,
 } = {}) {
   const db = getDb();
+  /* 先清过期的未处理声明：纯本地状态、不依赖链上读数；失败不阻断下面的链上对账 */
+  try {
+    await expireOverdueClaims({ now });
+  } catch (e) {
+    console.error(`[claimReconcile] 过期提货声明标记失败：${e?.message || e}`);
+  }
   const cutoff = new Date(now - minAgeMs);
   const take = Math.max(1, Math.min(200, Number(limit) || LIMIT));
   let rows = await selectBatch(db, cursor, cutoff, take);

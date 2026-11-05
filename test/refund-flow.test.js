@@ -122,7 +122,7 @@ const blocked = (res) => {
 // ── 两级售后端到端（限量实物商品：占位 → 申请 → 理由/回复 → 拒绝 → 争议 → 卖家和解退款）──
 
 test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争议陈述→卖家同意退款（占位回补）', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '两级售后实物', capacity: 5, priceUsdtMicro: 88_000_000 }));
+  const p = await listProduct(productPayload({ kind: 'physical', title: '两级售后实物', capacity: 5, priceMicro: 88_000_000 }));
   const order = await createDraft(p.slug, 2);
   assert.equal(
     (await skuInv(db, p.slug)).committed,
@@ -135,7 +135,7 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
 
   // ── 阶段门控：未链上申请前提交退款理由被拒 ──
   const early = await postEvidence(oid, { phase: 'refund_request', content: '还没申请就想退' }, buyerToken);
-  assert.match(blocked(early), /refund_status=requested/);
+  assert.match(blocked(early), /仅当退款申请待卖家处理/);
 
   // 买家链上 requestRefund（watcher 回写）
   assert.equal(await applyEvent('RefundRequested', { orderId: eid }), 1);
@@ -163,11 +163,11 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   assert.match(blocked(ownerAsk), /仅买家可提交/);
   // content 边界
   const emptyC = await postEvidence(oid, { phase: 'refund_reply', content: '   ' }, ownerToken);
-  assert.match(blocked(emptyC), /content/);
+  assert.match(blocked(emptyC), /内容必须/);
   const overC = await postEvidence(oid, { phase: 'refund_reply', content: 'x'.repeat(2001) }, ownerToken);
-  assert.match(blocked(overC), /content/);
+  assert.match(blocked(overC), /内容必须/);
   const badPhase = await postEvidence(oid, { phase: 'refund_chargeback', content: 'x' }, ownerToken);
-  assert.match(blocked(badPhase), /phase/);
+  assert.match(blocked(badPhase), /阶段参数/);
 
   // 匿名详情不带 evidence（私人陈述不随公开字段泄露）
   const anonDetail = await getDetail(oid);
@@ -319,7 +319,7 @@ test('applyRefundFlags：sync 反查按链上 getOrder 标记回填/清除 refun
     buyer: buyer.address.toLowerCase(),
     seller: owner.address.toLowerCase(),
     amountWei: '1000000000000000000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     escrowOrderId: eid,
     paidTxHash: payHash(),

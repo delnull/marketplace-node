@@ -23,7 +23,7 @@ async function makeClaim({ snapshot = '0', chainPaid = '0', closed = true } = {}
     buyer: buyer.address.toLowerCase(),
     seller: owner.address.toLowerCase(),
     amountWei: '1000000000000000000',
-    usdtMicro: 1_000_000,
+    priceMicro: 1_000_000,
     escrowOrderId: claimId(),
     paidTxHash: '0x' + String(n).padStart(64, '0'),
   });

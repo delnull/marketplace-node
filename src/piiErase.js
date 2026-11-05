@@ -119,9 +119,8 @@ function notTerminal(status) {
     code: 'not_terminal',
     error: 'not_terminal',
     message:
-      `当前状态(${status})不可擦除个人信息：资金流未终结——在途单必须保留收货信息，` +
-      '卖家才能按地址发货（draft/escrowed/shipped/disputed 一律拒绝）。请等订单终局' +
-      '（confirmed/settled/refunded/expired/cancelled）后再执行删除请求',
+      '当前状态不可擦除个人信息：资金流尚未终结——在途单必须保留收货信息，' +
+      '卖家才能按地址发货。请等订单终局后再执行删除请求',
   };
 }
 
@@ -135,7 +134,7 @@ function claimOpen() {
   return {
     code: 'claim_open',
     error: 'claim_open',
-    message: '该订单还有在途的 NFT 提货声明：claim 里的收货信息正在用于履约，需先完成/驳回/取消声明后再擦除',
+    message: '该订单还有在途的 NFT 提货声明：声明里的收货信息正在用于履约，需先完成、驳回或撤回声明后再擦除',
   };
 }
 
@@ -687,7 +686,7 @@ export function startPiiRetentionSweep() {
       }
       if (retentionStatus.lastError) console.error(`[pii] ${retentionStatus.lastError}`);
     } catch (e) {
-      retentionStatus.lastError = String(e?.message || e);
+      retentionStatus.lastError = '本轮保留期擦除失败（详情见节点日志）';
       console.error('[pii] 本轮保留期擦除异常（下轮重试）:', e?.message || e);
     }
   };

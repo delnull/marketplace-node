@@ -117,7 +117,7 @@ test('分面 limit：非法值明确拒绝（不静默钳制），截断时给 t
   // 本仓的失败形状是 HTTP 200 + 非 0 code（与 /tags 的 limit 拒绝同一口径）
   const zero = await request(app).get('/api/products/attributes?limit=0').expect(200);
   assert.notEqual(zero.body.code, 0, '非法 limit 明确拒绝而不是静默钳制');
-  assert.match(zero.body.message, /limit 需为 1\.\.500 的整数/);
+  assert.match(zero.body.message, /数量必须是 1 到 500 的整数/);
   const abc = await request(app).get('/api/products/attributes?limit=abc').expect(200);
   assert.notEqual(abc.body.code, 0);
   const one = await facets('?limit=1');

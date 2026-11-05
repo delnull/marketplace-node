@@ -122,7 +122,7 @@ test('放行：{allow:true} 建单成功，payload 只含交易要素（收货�
   responder = async () => ({ status: 200, json: async () => ({ allow: true }) });
 
   const p = await listProduct(
-    productPayload({ kind: 'physical', title: '风控放行商品', priceUsdtMicro: 88_000_000, capacity: 5, shippingFeeUsdtMicro: 9_000_000 })
+    productPayload({ kind: 'physical', title: '风控放行商品', priceMicro: 88_000_000, capacity: 5, shippingFeeMicro: 9_000_000 })
   );
   const res = await draftAttempt(p.slug, {
     quantity: 2,
@@ -157,12 +157,13 @@ test('放行：{allow:true} 建单成功，payload 只含交易要素（收货�
     'at',
     'buyer',
     'event',
+    'priceCurrency',
+    'priceMicro',
     'productSlug',
     'quantity',
     'seller',
-    'shippingFeeUsdtMicro',
+    'shippingFeeMicro',
     'skuKey',
-    'usdtMicro',
   ]);
   assert.equal(body.event, 'order.gate');
   assert.equal(body.productSlug, p.slug);
@@ -171,9 +172,9 @@ test('放行：{allow:true} 建单成功，payload 只含交易要素（收货�
   assert.equal(body.buyer, buyer.address.toLowerCase());
   assert.equal(body.seller, owner.address.toLowerCase());
   assert.equal(body.quantity, 2);
-  assert.equal(body.usdtMicro, draft.usdtMicro, '锁定金额口径与订单一致（88 USDT×2 + 9 USDT 运费）');
-  assert.equal(body.usdtMicro, 88_000_000 * 2 + 9_000_000);
-  assert.equal(body.shippingFeeUsdtMicro, 9_000_000);
+  assert.equal(body.priceMicro, draft.priceMicro, '锁定金额口径与订单一致（88 USDT×2 + 9 price 运费）');
+  assert.equal(body.priceMicro, 88_000_000 * 2 + 9_000_000);
+  assert.equal(body.shippingFeeMicro, 9_000_000);
   assert.equal(body.amountWei, draft.amountWei, '链上应付 wei 与订单一致');
   assert.ok(Number.isFinite(body.at));
 

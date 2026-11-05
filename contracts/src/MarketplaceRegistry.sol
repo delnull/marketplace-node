@@ -64,6 +64,9 @@ contract MarketplaceRegistry is Ownable2Step {
     /// @notice 被永久关闭的 operator 墓碑（不可再注册）
     mapping(address => bool) private forceClosedOperator;
 
+    /// @notice 停用原因（suspendNode 写入、unsuspend/deregister/forceClose 清空）
+    mapping(address => string) private _suspendedReason;
+
     /// @notice 被永久关闭行钉住的资金合约墓碑：同一个 Escrow/Staking 换 owner 也不能再回目录
     mapping(address => bool) private forceClosedEscrow;
     mapping(address => bool) private forceClosedStaking;
@@ -71,6 +74,13 @@ contract MarketplaceRegistry is Ownable2Step {
     /// @notice 可发现 operator 的紧凑数组（getActiveNodes 直接切片）
     address[] private _activeOperators;
     mapping(address => uint256) private _activeIndex;
+
+    /// @notice 当前仍有登记行的 operator 全集（注销/停用保留；永久关闭/转出时移除）
+    address[] private _operators;
+    mapping(address => uint256) private _operatorIndex; // 0 = 未记录，i+1 = 下标
+
+    /// @notice 单页 operator 上限（避免一次返回无界数组）
+    uint256 private constant MAX_OPERATORS_PAGE = 200;
 
     /// @notice escrow => operator（一个 Escrow 只能属于一个节点；注销/永久关闭时清空）
     mapping(address => address) private _escrowOperator;
@@ -176,6 +186,8 @@ contract MarketplaceRegistry is Ownable2Step {
             n.registeredAtBlock = isNew ? uint64(block.number) : n.registeredAtBlock;
             n.updatedAtBlock = uint64(block.number);
             n.active = true;
+            delete _suspendedReason[operator];
+            _rememberOperator(operator);
             _addActive(operator);
             emit NodeRegistered(operator, endpoint, escrow, staking, n.registeredAtBlock);
         } else {
@@ -214,6 +226,7 @@ contract MarketplaceRegistry is Ownable2Step {
           是为了让"active=false + suspended=true"这个不可表达态在代码里没有第二个来源。
         */
         n.suspended = false;
+        delete _suspendedReason[msg.sender];
         n.updatedAtBlock = uint64(block.number);
         _removeActive(msg.sender);
         emit NodeDeregistered(msg.sender, n.endpoint);
@@ -257,6 +270,10 @@ contract MarketplaceRegistry is Ownable2Step {
         moved.updatedAtBlock = uint64(block.number);
         delete nodes[previousOperator];
         nodes[newOperator] = moved;
+        delete _suspendedReason[previousOperator];
+        delete _suspendedReason[newOperator];
+        _forgetOperator(previousOperator);
+        _rememberOperator(newOperator);
 
         _escrowOperator[moved.escrow] = newOperator;
         _stakingOperator[moved.staking] = newOperator;
@@ -273,6 +290,7 @@ contract MarketplaceRegistry is Ownable2Step {
         if (n.registeredAtBlock == 0 || !n.active || n.suspended) revert NodeNotRegistered();
         n.suspended = true;
         n.updatedAtBlock = uint64(block.number);
+        _suspendedReason[operator] = reason;
         _removeActive(operator);
         emit NodeSuspended(operator, n.endpoint, reason);
     }
@@ -282,6 +300,7 @@ contract MarketplaceRegistry is Ownable2Step {
         if (n.registeredAtBlock == 0 || !n.suspended) revert NodeNotRegistered();
         n.suspended = false;
         n.updatedAtBlock = uint64(block.number);
+        delete _suspendedReason[operator];
         if (n.active) _addActive(operator);
         emit NodeRestored(operator, n.endpoint);
     }
@@ -310,6 +329,8 @@ contract MarketplaceRegistry is Ownable2Step {
         if (staking != address(0) && _stakingOperator[staking] == operator) delete _stakingOperator[staking];
         _removeActive(operator);
         delete nodes[operator];
+        delete _suspendedReason[operator];
+        _forgetOperator(operator);
         forceClosedOperator[operator] = true;
         /*
           只有**仍归本 operator 绑定**的资金合约才进墓碑。已注销的 operator 可能已经
@@ -353,6 +374,32 @@ contract MarketplaceRegistry is Ownable2Step {
         NodeInfo memory n = nodes[operator];
         if (n.active && !_nodeActiveNow(n)) n.active = false;
         return n;
+    }
+
+    /// @notice 当前仍有登记行的 operator 总数（注销/停用保留；永久关闭/转出已移除）
+    function operatorCount() external view returns (uint256) {
+        return _operators.length;
+    }
+
+    /**
+     * @notice operator 全集的一页（只返回地址，不拷贝 NodeInfo 结构体/字符串）
+     * @dev 这是给治理台枚举历史行用的；当前 active 状态仍以 `getNode` 为准。
+     */
+    function operators(uint256 from, uint256 count) external view returns (address[] memory result) {
+        if (count > MAX_OPERATORS_PAGE) revert PageTooLarge();
+        uint256 len = _operators.length;
+        if (from >= len || count == 0) return new address[](0);
+        uint256 take = len - from;
+        if (take > count) take = count;
+        result = new address[](take);
+        for (uint256 i = 0; i < take; ++i) {
+            result[i] = _operators[from + i];
+        }
+    }
+
+    /// @notice 最近一次治理停用的原因（未停用/已恢复为空串）
+    function suspendedReasonOf(address operator) external view returns (string memory) {
+        return _suspendedReason[operator];
     }
 
     /// @notice 活跃节点列表的一页（offset 是在可发现集合里的下标；单页最多 100 条）
@@ -580,6 +627,25 @@ contract MarketplaceRegistry is Ownable2Step {
         if (_activeIndex[operator] != 0) return;
         _activeIndex[operator] = _activeOperators.length + 1;
         _activeOperators.push(operator);
+    }
+
+    /// @dev 追加进 operator 枚举；重复登记/转移回旧地址不产生重复项
+    function _rememberOperator(address operator) private {
+        if (_operatorIndex[operator] != 0) return;
+        _operators.push(operator);
+        _operatorIndex[operator] = _operators.length;
+    }
+
+    /// @dev 从枚举移除（swap-pop）；只用于永久关闭/转出后已删除登记行的地址
+    function _forgetOperator(address operator) private {
+        uint256 idx = _operatorIndex[operator];
+        if (idx == 0) return;
+        uint256 last = _operators.length - 1;
+        address lastOp = _operators[last];
+        _operators[idx - 1] = lastOp;
+        _operatorIndex[lastOp] = idx;
+        _operators.pop();
+        delete _operatorIndex[operator];
     }
 
     function _removeActive(address operator) private {

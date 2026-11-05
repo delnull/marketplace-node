@@ -87,14 +87,14 @@ test('操作员可经营（商品/码池/发货/订单列表/状态计数），�
   const p = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
-    .send(productPayload({ kind: 'physical', title: '操作员商品', priceUsdtMicro: 99_000_000 }))
+    .send(productPayload({ kind: 'physical', title: '操作员商品', priceMicro: 99_000_000 }))
     .expect(200);
   assertOk(p);
   const patch = await request(app)
     .patch(`/api/products/${p.body.data.slug}`)
     .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
-    // 价格/库存逐组合给出（`specs + skus` 是写接口的唯一形状；商品级的 priceUsdtMicro/capacity 是只读汇总）
-    .send({ skus: [{ key: '', priceUsdtMicro: 88_000_000 }] })
+    // 价格/库存逐组合给出（`specs + skus` 是写接口的唯一形状；商品级的 priceMicro/capacity 是只读汇总）
+    .send({ skus: [{ key: '', priceMicro: 88_000_000 }] })
     .expect(200);
   assertOk(patch);
   const all = await request(app).get('/api/products/all').set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
@@ -177,7 +177,7 @@ test('审计：staff 动作入账（detail 无码原文）；买家动作不入�
   await request(app)
     .patch(`/api/products/${slug}`)
     .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
-    .send({ skus: [{ key: '', priceUsdtMicro: 50_000_000 }] })
+    .send({ skus: [{ key: '', priceMicro: 50_000_000 }] })
     .expect(200);
 
   const audit = await request(app).get('/api/shop/audit?pageSize=100').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
@@ -190,6 +190,70 @@ test('审计：staff 动作入账（detail 无码原文）；买家动作不入�
   assert.ok(!JSON.stringify(imp.detail).includes('AUDIT-SECRET-CODE'), '审计 detail 不含码原文');
   const opUpdate = items.find((i) => i.action === 'product.update' && i.targetId === slug && i.actorRole === 'staff');
   assert.ok(opUpdate, '店员动作入审计（actor_role=staff）');
+  // 改价要记**改前/改后**：管理员事后不能只看到"改了价格"这四个字
+  assert.deepEqual(opUpdate.detail.fields, ['skus']);
+  const skuChange = opUpdate.detail.changes?.skus;
+  assert.ok(skuChange && Array.isArray(skuChange.from) && Array.isArray(skuChange.to), 'skus 变更对必须存在');
+  assert.equal(Number(skuChange.from[0].priceMicro), 88_000_000);
+  assert.equal(Number(skuChange.to[0].priceMicro), 50_000_000);
+
+  // 标量字段同样是"改前 → 改后"（不是只有 SKU 有值）
+  await request(app)
+    .patch(`/api/products/${slug}`)
+    .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ title: '审计商品（改名）', active: false })
+    .expect(200);
+  const upd2 = await db.get("SELECT * FROM audit_logs WHERE action = 'product.update' ORDER BY id DESC LIMIT 1");
+  assert.deepEqual(upd2.detail.fields, ['title', 'active']);
+  assert.equal(upd2.detail.changes.title.to, '审计商品（改名）');
+  assert.equal(upd2.detail.changes.title.from, '审计商品');
+  assert.equal(upd2.detail.changes.active.to, 0);
+
+  // "提交了但值没变"不算变更：审计不能把一次无变化的重发说成"改了"
+  await request(app)
+    .patch(`/api/products/${slug}`)
+    .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ title: '审计商品（改名）' })
+    .expect(200);
+  const upd3 = await db.get("SELECT * FROM audit_logs WHERE action = 'product.update' ORDER BY id DESC LIMIT 1");
+  assert.deepEqual(upd3.detail.fields, []);
+  assert.deepEqual(upd3.detail.changes, {});
+
+  // 标签/媒体这类结构化字段也要有值（不是只对数字字段生效）；同时验证改前形状取自库行
+  await request(app)
+    .patch(`/api/products/${slug}`)
+    .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({
+      tags: ['审计标签'],
+      media: [{ type: 'image', url: 'https://example.com/audit-b.jpg' }],
+    })
+    .expect(200);
+  const upd4 = await db.get("SELECT * FROM audit_logs WHERE action = 'product.update' ORDER BY id DESC LIMIT 1");
+  assert.deepEqual(upd4.detail.fields, ['tags', 'media']);
+  assert.equal(upd4.detail.changes.tags.to[0].display, '审计标签');
+  assert.equal(upd4.detail.changes.media.from[0].url, 'https://example.com/a.jpg');
+  assert.equal(upd4.detail.changes.media.to[0].url, 'https://example.com/audit-b.jpg');
+
+  /*
+    商品参数：`value.attributes` 含派生键 `pair`（多值索引用），而库读回/DTO/快照都刻意不带它。
+    审计必须按同一投影比较，否则"原样再提交一次"也会被记成 attributes 变更，且 changes 里
+    会冒出带 NUL 的内部键。这里先改一次、再原样提交一次，两次都钉住。
+  */
+  await request(app)
+    .patch(`/api/products/${slug}`)
+    .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ attributes: [{ name: '成色', value: '全新' }] })
+    .expect(200);
+  const attr1 = await db.get("SELECT * FROM audit_logs WHERE action = 'product.update' ORDER BY id DESC LIMIT 1");
+  assert.deepEqual(attr1.detail.changes.attributes.to, [{ name: '成色', value: '全新' }]);
+  assert.equal(JSON.stringify(attr1.detail).includes('pair'), false, '派生键 pair 不进入审计');
+  await request(app)
+    .patch(`/api/products/${slug}`)
+    .set('Authorization', `Bearer ${operatorToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ attributes: [{ name: '成色', value: '全新' }] })
+    .expect(200);
+  const attr2 = await db.get("SELECT * FROM audit_logs WHERE action = 'product.update' ORDER BY id DESC LIMIT 1");
+  assert.deepEqual(attr2.detail.fields, [], '原样重发不算变更');
   const cancels = items.filter((i) => i.action === 'order.cancel');
   assert.equal(cancels.length, 0, '买家取消不入审计（user 动作过滤）');
   assert.ok(items.every((i) => i.actorRole === 'owner' || i.actorRole === 'staff'));

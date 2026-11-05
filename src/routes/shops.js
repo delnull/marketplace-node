@@ -283,14 +283,14 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
  */
 router.patch('/admin/listing', nodeAdmin, wrap(async (req, res) => {
   const raw = req.body?.codes;
-  if (!Array.isArray(raw)) return fail(res, 'codes 需为店铺编号数组（1..100）', 400, 400);
+  if (!Array.isArray(raw)) return fail(res, '店铺编号列表必须是 1 到 100 个', 400, 400);
   const codes = [...new Set(raw.map((s) => String(s ?? '').trim().toUpperCase()).filter(Boolean))];
-  if (!codes.length) return fail(res, 'codes 需为非空数组（1..100）', 400, 400);
+  if (!codes.length) return fail(res, '店铺编号列表不能为空（1 到 100 个）', 400, 400);
   if (codes.length > 100) return fail(res, `批量处置单次上限 100 家（实际 ${codes.length} 家）——请分批操作`, 400, 400);
   const bad = codes.filter((c) => !isShopCodeShape(c));
   if (bad.length) return fail(res, `店铺编号形状非法：${bad.slice(0, 10).join('、')}`, 400, 400);
   const listed = req.body?.listed;
-  if (typeof listed !== 'boolean') return fail(res, 'listed 需为布尔值（true=恢复接单，false=暂停接单）', 400, 400);
+  if (typeof listed !== 'boolean') return fail(res, '接单状态必须是布尔值（是=恢复接单，否=暂停接单）', 400, 400);
   const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
   if (!listed && !reason) return fail(res, '暂停接单必须填写原因（≤200 字，店主会在店铺设置页看到）', 400, 400);
 
@@ -323,7 +323,7 @@ router.patch('/admin/listing', nodeAdmin, wrap(async (req, res) => {
 router.patch('/admin/:code/listing', nodeAdmin, wrap(async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   const listed = req.body?.listed;
-  if (typeof listed !== 'boolean') return fail(res, 'listed 需为布尔值（true=恢复接单，false=暂停接单）', 400, 400);
+  if (typeof listed !== 'boolean') return fail(res, '接单状态必须是布尔值（是=恢复接单，否=暂停接单）', 400, 400);
   const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
   if (!listed && !reason) return fail(res, '暂停接单必须填写原因（≤200 字，店主会在店铺设置页看到）', 400, 400);
 
@@ -372,7 +372,7 @@ router.get('/:code', wrap(async (req, res) => {
  */
 router.post('/applications', requireAuth, applicationLimiter, wrap(async (req, res) => {
   const hostAddr = await nodeOwner();
-  if (!hostAddr) return fail(res, '本节点未配置节点主地址（MK_SHOP_OWNER），无法受理开店申请');
+  if (!hostAddr) return fail(res, '本节点未配置节点主地址，无法受理开店申请（需节点运维设置后重启）');
   const seller = String(req.auth?.address || '').toLowerCase();
   if (!isAddress(seller) || isZeroAddress(seller)) return fail(res, '登录地址非法');
   const { name, notice } = req.body || {};
@@ -666,9 +666,9 @@ async function reviewApplications({ req, ids, action, reason, batch = false }) {
  */
 router.post('/applications/:id/review', nodeAdmin, wrap(async (req, res) => {
   const id = Number(String(req.params.id ?? '').trim());
-  if (!Number.isInteger(id) || id <= 0) return fail(res, 'id 需为申请的正整数编号');
+  if (!Number.isInteger(id) || id <= 0) return fail(res, '申请编号必须是正整数');
   const action = String(req.body?.action || '');
-  if (action !== 'approve' && action !== 'reject') return fail(res, 'action 需为 approve / reject');
+  if (action !== 'approve' && action !== 'reject') return fail(res, '动作只能是批准或驳回');
   const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
   if (action === 'reject' && !reason) {
     return fail(res, '驳回开店申请必须填写原因（≤200 字，申请人会看到）', 400, 400);
@@ -710,7 +710,7 @@ router.post('/applications/:id/review', nodeAdmin, wrap(async (req, res) => {
  */
 router.post('/applications/batch-review', nodeAdmin, wrap(async (req, res) => {
   const raw = req.body?.ids;
-  if (!Array.isArray(raw)) return fail(res, 'ids 需为申请编号数组（1..100）', 400, 400);
+  if (!Array.isArray(raw)) return fail(res, '申请编号列表必须是 1 到 100 个', 400, 400);
   if (raw.length > 100) return fail(res, `批量审批单次上限 100 条（实际 ${raw.length} 条）——请分批操作`, 400, 400);
   const ids = [];
   const seen = new Set();
@@ -721,9 +721,9 @@ router.post('/applications/batch-review', nodeAdmin, wrap(async (req, res) => {
     seen.add(n);
     ids.push(n);
   }
-  if (!ids.length) return fail(res, 'ids 需为非空的申请编号数组（1..100）', 400, 400);
+  if (!ids.length) return fail(res, '申请编号列表不能为空（1 到 100 个）', 400, 400);
   const action = String(req.body?.action || '');
-  if (action !== 'approve' && action !== 'reject') return fail(res, 'action 需为 approve / reject', 400, 400);
+  if (action !== 'approve' && action !== 'reject') return fail(res, '动作只能是批准或驳回', 400, 400);
   const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
   if (action === 'reject' && !reason) {
     return fail(res, '驳回开店申请必须填写原因（≤200 字，申请人会看到）', 400, 400);

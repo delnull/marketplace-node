@@ -3,7 +3,7 @@
  *
  * 旧实现 `optionalShop` 在 `listed !== 1` 时把 `req.shop = null`，而 null 的语义是
  * "没有 X-Mk-Shop 头 ⇒ 该节点全部在售店铺"。于是挂起店页面上的
- * `/api/shop/reputation`、`/api/shop/reviews/stats`、`/api/shop/claims` 拿到的是
+ * `/api/shop/reputation`、`/api/shop/reviews/stats` 拿到的是
  * **别人家/全节点**的数字，HTTP 200 + code:0，前端无从分辨。
  *
  * 现在三态显式：没有头（全节点）/ 可售店 / 不可售店。聚合端点用 `listedShopScope`，
@@ -36,13 +36,13 @@ after(async () => {
 });
 
 test('挂起店铺的聚合端点被拒（409 + 唯一拒因）；无头仍可拿全节点合计', async () => {
-  // 前置：在售时三个聚合端点都正常，且它们本来就允许（这里是"全节点合计"）
+  // 前置：在售时两个聚合端点都正常，且它们本来就允许（这里是"全节点合计"）
   const beforePause = await request(app).get('/api/shop/reputation').expect(200);
   assertOk(beforePause);
 
   await db.run("UPDATE shops SET listed = 0, listed_reason = '测试暂停' WHERE code = ?", shopRef.value);
 
-  for (const path of ['/api/shop/reputation', '/api/shop/reviews/stats', '/api/shop/claims']) {
+  for (const path of ['/api/shop/reputation', '/api/shop/reviews/stats']) {
     const res = await request(app).get(path).set('X-Mk-Shop', shopRef.value);
     assert.equal(res.status, 409, `${path}：指到暂停接单的店必须拒绝（不能返回 200 + 全节点合计）`);
     assert.notEqual(res.body.code, 0, `${path}：拒绝必须是业务失败，不是 code:0`);
@@ -50,7 +50,7 @@ test('挂起店铺的聚合端点被拒（409 + 唯一拒因）；无头仍可�
   }
 
   // "全节点合计"只由没有头进入：同一条路径不带 X-Mk-Shop 仍然 200/code:0
-  for (const path of ['/api/shop/reputation', '/api/shop/reviews/stats', '/api/shop/claims']) {
+  for (const path of ['/api/shop/reputation', '/api/shop/reviews/stats']) {
     const res = await request(app).get(path).expect(200);
     assertOk(res);
   }

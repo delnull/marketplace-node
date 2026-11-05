@@ -109,7 +109,7 @@ test('编辑 NFT：PATCH 检测 RPC 读不到 ⇒ 503 fail-closed', async () => 
   setNftStandardCheck(async () => ({
     ok: false,
     retryable: true,
-    reason: '读取 NFT 合约标准失败：RPC timeout',
+    reason: '读取 NFT 合约标准失败（链上节点暂时不可用）',
   }));
   const res = await request(app)
     .patch(`/api/products/${created.body.data.slug}`)
@@ -117,7 +117,7 @@ test('编辑 NFT：PATCH 检测 RPC 读不到 ⇒ 503 fail-closed', async () => 
     .set('X-Mk-Shop', shopRef.value)
     .send({ nftStandard: 'erc1155' })
     .expect(503);
-  assert.match(res.body.message, /RPC/);
+  assert.match(res.body.message, /链上节点/);
 });
 
 test('发布前的标准预检接口：返回实际标准，不替卖家做发布决定', async () => {
@@ -161,7 +161,7 @@ test('发布 NFT：RPC 读不到 ⇒ 503 fail-closed，不把未知当通过', a
   setNftStandardCheck(async () => ({
     ok: false,
     retryable: true,
-    reason: '读取 NFT 合约标准失败：RPC timeout',
+    reason: '读取 NFT 合约标准失败（链上节点暂时不可用）',
   }));
   const res = await request(app)
     .post('/api/products')
@@ -170,5 +170,5 @@ test('发布 NFT：RPC 读不到 ⇒ 503 fail-closed，不把未知当通过', a
     .send(nftPayload())
     .expect(503);
   assert.notEqual(res.body.code, 0);
-  assert.match(res.body.message, /RPC/);
+  assert.match(res.body.message, /链上节点/);
 });

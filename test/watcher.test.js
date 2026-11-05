@@ -34,7 +34,7 @@ async function insertOrder(status = 'draft') {
     buyer: '0x00000000000000000000000000000000000000aa',
     seller: '0x00000000000000000000000000000000000000bb',
     amountWei: '1000000000000000000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     escrowOrderId: `0x${String(seq).padStart(64, '0')}`,
   });
@@ -662,7 +662,7 @@ test('order.hold_missing：投递失败不写标记（事件重放会重试）�
   const { productId, slug } = await insertProduct(db, {
     title: '占位恢复失败商品',
     kind: 'physical',
-    skus: [{ key: '', priceUsdtMicro: 88_000_000, capacity: 1, committed: 1 }],
+    skus: [{ key: '', priceMicro: 88_000_000, capacity: 1, committed: 1 }],
   });
   const held = await insertOrderRow(db, {
     status: 'cancelled',
@@ -671,7 +671,7 @@ test('order.hold_missing：投递失败不写标记（事件重放会重试）�
     buyer: GOOD_BUYER,
     seller: GOOD_SELLER,
     amountWei: '1000000000000000000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     holdQty: 1,
     releasedAt: new Date(),

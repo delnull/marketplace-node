@@ -57,16 +57,17 @@ const payHash = () => '0x' + String(++seq).padStart(64, '0');
 const NFT_CONTRACT = '0x' + '9'.repeat(40);
 
 function nftPayload(overrides = {}) {
-  const { priceUsdtMicro = 66_000_000, capacity = null, specs, skus, ...rest } = overrides;
+  const { priceMicro = 66_000_000, capacity = null, specs, skus, ...rest } = overrides;
   return {
     title: '占位测试 NFT',
     description: 'capacity 占位单测 NFT 商品。',
     media: [{ type: 'image', url: 'https://example.com/n.jpg' }],
     kind: 'nft',
+    priceCurrency: 'USDT',
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出；单一默认规格就是 key='' 的唯一组合
     specs: specs ?? [{ name: '规格', options: ['默认'] }],
-    skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
+    skus: skus ?? [{ key: '', priceMicro, capacity }],
     ...rest,
   };
 }
@@ -626,8 +627,8 @@ test('规格改名守卫：已交付后退款（货未回收）的占位不得�
       title: '改名守卫商品',
       specs: [{ name: '颜色', options: ['红', '蓝'] }],
       skus: [
-        { key: '红', priceUsdtMicro: 10_000_000, capacity: 1 },
-        { key: '蓝', priceUsdtMicro: 10_000_000, capacity: 1 },
+        { key: '红', priceMicro: 10_000_000, capacity: 1 },
+        { key: '蓝', priceMicro: 10_000_000, capacity: 1 },
       ],
     })
   );
@@ -671,8 +672,8 @@ test('规格改名守卫：已交付后退款（货未回收）的占位不得�
     .send({
       specs: [{ name: '颜色', options: ['深红', '蓝'] }],
       skus: [
-        { key: '深红', priceUsdtMicro: 10_000_000, capacity: 1 },
-        { key: '蓝', priceUsdtMicro: 10_000_000, capacity: 1 },
+        { key: '深红', priceMicro: 10_000_000, capacity: 1 },
+        { key: '蓝', priceMicro: 10_000_000, capacity: 1 },
       ],
     })
     .expect(200);
@@ -701,8 +702,8 @@ test('规格改名守卫：已交付后退款（货未回收）的占位不得�
     .send({
       specs: [{ name: '颜色', options: ['深红', '蓝'] }],
       skus: [
-        { key: '深红', priceUsdtMicro: 10_000_000, capacity: 1 },
-        { key: '蓝', priceUsdtMicro: 10_000_000, capacity: 1 },
+        { key: '深红', priceMicro: 10_000_000, capacity: 1 },
+        { key: '蓝', priceMicro: 10_000_000, capacity: 1 },
       ],
     })
     .expect(200);

@@ -53,13 +53,13 @@ export function parseReviewImages(value) {
  */
 function normalizeReviewImages(input) {
   if (input === undefined || input === null) return { images: [] };
-  if (!Array.isArray(input)) return { error: 'images 需为数组' };
+  if (!Array.isArray(input)) return { error: '评价图需为图片列表' };
   const images = [];
   for (const raw of input) {
     const url = String(raw ?? '').trim();
     if (!url) continue;
     const m = REVIEW_IMAGE_URL_RE.exec(url);
-    if (!m) return { error: '评价图必须是本节点上传的 /api/uploads/… 图片 URL' };
+    if (!m) return { error: '评价图必须是本节点上传的图片地址' };
     if (images.includes(url)) continue;
     if (images.length >= REVIEW_MAX_IMAGES) {
       return { error: `评价图最多 ${REVIEW_MAX_IMAGES} 张` };
@@ -131,7 +131,7 @@ export function reviewWriteRefusal(order) {
  */
 export async function submitReview({ order, buyer, rating, content, images }) {
   const r = Number(rating);
-  if (!Number.isInteger(r) || r < 1 || r > 5) return { error: 'rating 需为 1..5 的整数' };
+  if (!Number.isInteger(r) || r < 1 || r > 5) return { error: '评分必须是 1 到 5 的整数' };
   const text = String(content ?? '').trim();
   if (text.length > 1000) return { error: '评价内容不能超过 1000 字' };
   const imgs = normalizeReviewImages(images);
@@ -144,7 +144,7 @@ export async function submitReview({ order, buyer, rating, content, images }) {
   if (!REVIEWABLE_STATUS.includes(order.status)) {
     return { error: `当前状态(${order.status})不可评价——仅成交终局（确认收货/仲裁判付/超时释放）订单可评` };
   }
-  if (!reviewableAt(order)) return { error: '已超过可评价期限（成交后 TTL 内有效）' };
+  if (!reviewableAt(order)) return { error: '已超过可评价期限（成交后有效期内）' };
   const db = getDb();
   try {
     // created_at / updated_at 不传：由列的 DEFAULT CURRENT_TIMESTAMP(3) 盖章
@@ -266,7 +266,7 @@ export async function clearReviewImages(orderId) {
  */
 export async function removeReviewImage({ orderId, kind, url }) {
   const col = kind === 'followup' ? 'followup_images' : kind === 'review' ? 'images' : null;
-  if (!col) return { error: 'kind 需为 review / followup' };
+  if (!col) return { error: '评价类型必须是评价或追评' };
   const db = getDb();
   const row = await db.get(`SELECT id, ${col} AS raw FROM reviews WHERE order_id = ?`, orderId);
   if (!row) return { error: '该订单还没有评价' };
@@ -309,7 +309,7 @@ export async function productReviewSummary(productId) {
  */
 export async function productReviews(slug, page, pageSize, filter = 'all', sort = 'new') {
   const db = getDb();
-  const product = await db.get('SELECT id FROM products WHERE slug = ?', String(slug || ''));
+  const product = await db.get('SELECT id FROM products WHERE slug = ? AND deleted_at IS NULL', String(slug || ''));
   if (!product) return null;
 
   // 白名单拼 SQL（不把用户输入带进语句；只有这三个片段可能出现在 WHERE 里）

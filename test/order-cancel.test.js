@@ -74,7 +74,7 @@ test('托管单号唯一：重复 escrow_order_id 在写入时即被拒绝', asy
       buyer: buyer.address.toLowerCase(),
       seller: owner.address.toLowerCase(),
       amountWei: '1000000000000000000',
-      usdtMicro: 100,
+      priceMicro: 100,
       escrowOrderId,
     });
   await draft(orderIdHex);

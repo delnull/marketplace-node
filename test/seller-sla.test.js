@@ -61,7 +61,7 @@ async function insertOrder({
     seller: SELLER,
     status,
     amountWei: '1000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     // 没有链上镜像行时**整块不传**链上字段（夹具拒绝 escrowOrderId:null 与链上字段同时出现）
     ...(escrow

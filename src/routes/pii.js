@@ -189,7 +189,7 @@ router.post('/retention/run', hostOnly, retentionLimiter, wrap(async (req, res) 
   const raw = req.body?.days;
   if (raw !== undefined && raw !== null && raw !== '') {
     days = Number(raw);
-    if (!Number.isInteger(days) || days < 0) return fail(res, 'days 需为 ≥ 0 的整数（保留天数；0 = 关闭自动擦除）');
+    if (!Number.isInteger(days) || days < 0) return fail(res, '保留天数必须是 0 或正整数（0 = 关闭自动擦除）');
   }
   if (retentionLast && retentionLast.days === days && Date.now() - retentionLast.at < RETENTION_REUSE_WINDOW_MS) {
     return ok(

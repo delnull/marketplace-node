@@ -198,8 +198,8 @@ test('规格图：逐组合可选；进快照只收有图的组合；批量改�
       title: '多规格带图',
       specs: [{ name: '颜色', options: ['黑', '白'] }],
       skus: [
-        { key: '黑', priceUsdtMicro: 10_000_000, imageUrl: 'https://example.com/black.png' },
-        { key: '白', priceUsdtMicro: 12_000_000 }, // 没有独立图
+        { key: '黑', priceMicro: 10_000_000, imageUrl: 'https://example.com/black.png' },
+        { key: '白', priceMicro: 12_000_000 }, // 没有独立图
       ],
     })
   );
@@ -218,7 +218,7 @@ test('规格图：逐组合可选；进快照只收有图的组合；批量改�
   const batch = await request(app)
     .patch('/api/products/batch')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send({ slugs: [p.slug], patch: { priceUsdtMicro: 9_000_000 } })
+    .send({ slugs: [p.slug], patch: { priceMicro: 9_000_000 } })
     .expect(200);
   assertOk(batch);
   const after = await request(app)
@@ -241,15 +241,15 @@ test('规格图：非法 URL 被拒（与主图同一套判据）；非法 SKU �
   const bad = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send(productPayload({ title: '坏图', skus: [{ key: '', priceUsdtMicro: 1_000_000, imageUrl: 'javascript:alert(1)' }] }))
+    .send(productPayload({ title: '坏图', skus: [{ key: '', priceMicro: 1_000_000, imageUrl: 'javascript:alert(1)' }] }))
     .expect(200);
   assert.equal(bad.body.code, 1);
-  assert.match(String(bad.body.message), /http\/https/);
+  assert.match(String(bad.body.message), /网页外链/);
 
   const extra = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send(productPayload({ title: '多键 sku', skus: [{ key: '', priceUsdtMicro: 1_000_000, img: 'x' }] }))
+    .send(productPayload({ title: '多键 sku', skus: [{ key: '', priceMicro: 1_000_000, img: 'x' }] }))
     .expect(200);
   assert.equal(extra.body.code, 1, '组合条目多一个键 = 提交了不生效，同样要点名');
   assert.match(String(extra.body.message), /img/);
@@ -264,7 +264,7 @@ test('订单快照锁定承诺/参数/规格图（下单时冻结，事后改商
       title: '快照冻结',
       attributes: [{ name: '产地', value: '武夷山' }],
       terms: { handling_days: 2 },
-      skus: [{ key: '', priceUsdtMicro: 8_000_000, imageUrl: 'https://example.com/only.png' }],
+      skus: [{ key: '', priceMicro: 8_000_000, imageUrl: 'https://example.com/only.png' }],
     })
   );
   const created = await request(app)
@@ -305,7 +305,7 @@ test('开票声明：三态（true / false / 未声明），且只认布尔', as
   const unset = await create(productPayload({ kind: 'physical', terms: { handling_days: 1 }, capacity: 5 }));
   assert.equal(unset.terms.invoice_supported, null, '没填 = 未声明，不许折成 false');
 
-  // 只认布尔：'true' / 1 / 'yes' 一律拒绝（否则"店主声明了什么"变成拼写问题）
+  // 只认布尔：'true' / 1 / 'yes' 一律拒绝（否则"商品声明了什么"变成拼写问题）
   for (const bad of ['true', 1, 'yes']) {
     const res = await request(app)
       .post('/api/products')

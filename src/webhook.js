@@ -73,6 +73,8 @@ async function buildPayload(type, ref) {
     加法在这里是刻意的遗漏（发票抬头/税号属个人信息，需要开票信息的店主应到面板/订单详情查看，
     而不是让它进 webhook 日志）。
     金额口径：amountWei = 商品 + 运费（运费按单收取一次，见 routes/orders.js）。
+    priceCurrency/priceMicro/shippingFeeMicro 给出**标价币种**口径；BTY 定价单的 amountWei
+    与 priceMicro 不同刻度，接收端不能只看 amountWei 判断标价。
     时间口径：`at` 是 ISO-8601 字符串——接收端拿到的是一个**没有歧义的时刻**（旧形状给毫秒整数，
     而"这个数到底是秒还是毫秒"要靠约定去猜）。
   */
@@ -90,6 +92,9 @@ async function buildPayload(type, ref) {
     escrowOrderId: row.escrow_order_id || null,
     productSlug: row.product_slug,
     quantity: row.quantity || 1,
+    priceCurrency: row.price_currency,
+    priceMicro: row.price_micro ?? null,
+    shippingFeeMicro: row.shipping_fee_micro ?? 0,
     amountWei: row.amount_wei,
     paymentToken: row.payment_token || null,
     paymentSymbol: row.payment_symbol || null,

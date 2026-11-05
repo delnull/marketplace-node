@@ -211,11 +211,11 @@ export async function listShopRows() {
  */
 export async function listShopRowsWithCounts() {
   return await getDb().all(`SELECT s.*,
-         (SELECT COUNT(*) FROM products p WHERE p.shop_code = s.code) AS product_count,
+         (SELECT COUNT(*) FROM products p WHERE p.shop_code = s.code AND p.deleted_at IS NULL) AS product_count,
          (SELECT COUNT(*) FROM products p
-           WHERE p.shop_code = s.code AND p.active = 1 AND p.node_hidden = 0) AS listed_product_count,
+           WHERE p.shop_code = s.code AND p.deleted_at IS NULL AND p.active = 1 AND p.node_hidden = 0) AS listed_product_count,
          (SELECT COUNT(*) FROM products p
-           WHERE p.shop_code = s.code AND p.node_hidden = 1) AS hidden_product_count
+           WHERE p.shop_code = s.code AND p.deleted_at IS NULL AND p.node_hidden = 1) AS hidden_product_count
        FROM shops s ORDER BY s.created_at ASC, s.code ASC`);
 }
 
@@ -314,14 +314,14 @@ export function sellableError(row) {
 /**
  * **商品自身可售**的 SQL 判据（唯一实现；`alias` 为空时用裸列名）。
  *
- * 两个条件缺一不可：店主侧 `active`（愿意卖）与节点侧 `node_hidden=0`（允许卖）。
- * 它回答的是"这件商品能不能成交"，不回答"这家店能不能接单"——后者由
- * `productPublicSql` 里的店铺子查询、以及建单闸的 `sellableError` 分别回答。
- * 新增一个"公开可见"查询却漏掉 node_hidden，就是给节点处置留了一个后门（商品被下架了还能搜到/下单）。
+ * 三个条件缺一不可：未软删除（`deleted_at IS NULL`）、店主侧 `active`（愿意卖）、
+ * 节点侧 `node_hidden=0`（允许卖）。它回答的是"这件商品能不能成交"，不回答"这家店能不能接单"
+ * ——后者由 `productPublicSql` 里的店铺子查询、以及建单闸的 `sellableError` 分别回答。
+ * 新增一个"公开可见"查询却漏掉任何一条，就是给删除/下架留了一个后门（商品被删了还能搜到/下单）。
  */
 export function productSellableSql(alias = '') {
   const col = (name) => (alias ? `${alias}.${name}` : name);
-  return `${col('active')} = 1 AND ${col('node_hidden')} = 0`;
+  return `${col('deleted_at')} IS NULL AND ${col('active')} = 1 AND ${col('node_hidden')} = 0`;
 }
 
 /** **公开可见商品**的完整 SQL 判据：商品可售 + 所属店铺当前接单（两个正交判据的唯一拼法）。 */

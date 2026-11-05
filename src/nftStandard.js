@@ -107,7 +107,8 @@ export async function detectNftStandard(contract, { reader = null, provider = nu
     try {
       p = provider || getProvider();
     } catch (e) {
-      return { ok: false, retryable: true, reason: `读取 NFT 合约标准失败：${messageOf(e) || 'RPC 未配置'}` };
+      console.error('[nftStandard] 读取链上节点失败：', messageOf(e) || e);
+      return { ok: false, retryable: true, reason: '读取 NFT 合约标准失败（链上节点暂时不可用，请稍后重试）' };
     }
     try {
       const code = await withTimeout(p.getCode(c), RPC_TIMEOUT_MS);
@@ -115,7 +116,8 @@ export async function detectNftStandard(contract, { reader = null, provider = nu
         return { ok: false, retryable: false, reason: `NFT 合约地址 ${c} 在当前链上没有代码——请核对地址与网络` };
       }
     } catch (e) {
-      return { ok: false, retryable: true, reason: `读取 NFT 合约代码失败：${messageOf(e) || 'RPC 不可达'}` };
+      console.error('[nftStandard] 读取合约代码失败：', messageOf(e) || e);
+      return { ok: false, retryable: true, reason: '读取 NFT 合约代码失败（链上节点暂时不可用，请稍后重试）' };
     }
     const contractReader = new ethers.Contract(c, SUPPORTS_ABI, p);
     supports = (interfaceId) => withTimeout(contractReader.supportsInterface(interfaceId), RPC_TIMEOUT_MS);
@@ -150,19 +152,20 @@ export async function detectNftStandard(contract, { reader = null, provider = nu
   if (is721) return { ok: true, standard: 'erc721' };
   if (is1155) return { ok: true, standard: 'erc1155' };
   if (supportError && !isRevertError(supportError)) {
-    return { ok: false, retryable: true, reason: `读取 NFT 合约标准失败：${messageOf(supportError)}` };
+    console.error('[nftStandard] 读取合约标准失败：', messageOf(supportError) || supportError);
+    return { ok: false, retryable: true, reason: '读取 NFT 合约标准失败（链上节点暂时不可用，请稍后重试）' };
   }
   if (is165 === false) {
     return {
       ok: false,
       retryable: false,
-      reason: '该合约未实现 ERC165（supportsInterface），无法确认是 ERC721 还是 ERC1155',
+      reason: '该合约不支持标准接口检测，无法确认是 ERC721 还是 ERC1155',
     };
   }
   return {
     ok: false,
     retryable: false,
-    reason: '该合约未声明 ERC721（0x80ac58cd）或 ERC1155（0xd9b67a26）接口——请核对合约地址与标准',
+    reason: '该合约未声明 ERC721 或 ERC1155 接口——请核对合约地址与标准',
   };
 }
 
@@ -174,7 +177,7 @@ export async function checkNftStandard(contract, declared, opts = {}) {
   if (_check) return await _check({ contract, declared });
   const d = String(declared || '').trim().toLowerCase();
   if (d !== 'erc721' && d !== 'erc1155') {
-    return { ok: false, retryable: false, reason: 'NFT 标准必须选择 erc721 或 erc1155' };
+    return { ok: false, retryable: false, reason: 'NFT 标准必须选择 ERC721 或 ERC1155' };
   }
   const key = String(contract || '').trim().toLowerCase();
   if (!opts.reader && !opts.provider) {

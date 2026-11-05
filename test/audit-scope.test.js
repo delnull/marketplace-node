@@ -43,8 +43,9 @@ async function renameShop(wallet, shopCode, notice) {
     .send({ notice });
   assert.equal(res.body.code, 0, JSON.stringify(res.body));
   return await db.get(
-    "SELECT * FROM audit_logs WHERE action = 'shop.update' AND target_id = ? AND detail->>'$.noticeChanged' = 'true' ORDER BY id DESC LIMIT 1",
-    shopCode
+    "SELECT * FROM audit_logs WHERE action = 'shop.update' AND target_id = ? AND detail->>'$.changes.notice.to' = ? ORDER BY id DESC LIMIT 1",
+    shopCode,
+    notice
   );
 }
 
@@ -62,12 +63,20 @@ async function renameNode(notice) {
 const itemOf = (body) => body.data.items;
 
 test('真接口：A 店店主读不到 B 店的审计行，也读不到节点级行（加过滤器同样读不到）', async () => {
-  const a = await renameShop(owner, TEST_SHOP_CODE, `A 店公告 ${Date.now()}`);
-  const b = await renameShop(otherOwner, OTHER_SHOP_CODE, `B 店公告 ${Date.now()}`);
-  const n = await renameNode(`节点公告 ${Date.now()}`);
+  const noticeA = `A 店公告 ${Date.now()}`;
+  const noticeB = `B 店公告 ${Date.now()}`;
+  const noticeN = `节点公告 ${Date.now()}`;
+  const a = await renameShop(owner, TEST_SHOP_CODE, noticeA);
+  const b = await renameShop(otherOwner, OTHER_SHOP_CODE, noticeB);
+  const n = await renameNode(noticeN);
   assert.equal(a.shop_code, TEST_SHOP_CODE, 'A 店的行必须写着 A 店编号');
   assert.equal(b.shop_code, OTHER_SHOP_CODE, 'B 店的行必须写着 B 店编号');
   assert.equal(n.shop_code, null, '节点级动作不属于任何一家店（NULL，不是空串）');
+  // 改前 → 改后：店主/节点主事后能看出改成了什么（不再只有 nameChanged: true）
+  assert.deepEqual(a.detail.fields, ['notice']);
+  assert.equal(a.detail.changes.notice.to, noticeA);
+  assert.equal(b.detail.changes.notice.to, noticeB);
+  assert.equal(n.detail.changes.notice.to, noticeN);
 
   const { token } = await login(ctx, owner);
   const list = await request(app)
@@ -133,6 +142,34 @@ test('节点级审计只有节点主能读（GET /api/shop/audit/node），且�
   // 匿名：401（两条路由都不放行）
   await request(app).get('/api/shop/audit/node').expect(401);
   await request(app).get('/api/shop/audit').expect(401);
+});
+
+test('shop/node 的 name 与 tanxinAddress 也记改前/改后', async () => {
+  const { token } = await login(ctx, owner);
+  const shopBefore = await db.get('SELECT name, tanxin_address FROM shops WHERE code = ?', TEST_SHOP_CODE);
+  await request(app)
+    .put('/api/shop')
+    .set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', TEST_SHOP_CODE)
+    .send({ name: '审计改名店', tanxinAddress: owner.address })
+    .expect(200);
+  const s = await db.get(
+    "SELECT * FROM audit_logs WHERE action = 'shop.update' AND target_id = ? ORDER BY id DESC LIMIT 1",
+    TEST_SHOP_CODE
+  );
+  assert.equal(s.detail.changes.name.from, String(shopBefore.name || ''));
+  assert.equal(s.detail.changes.name.to, '审计改名店');
+  assert.equal(s.detail.changes.tanxinAddress.from, shopBefore.tanxin_address ?? null);
+  assert.equal(s.detail.changes.tanxinAddress.to, owner.address);
+
+  const nodeBefore = await db.get('SELECT name FROM node WHERE id = 1');
+  await request(app)
+    .put('/api/shop/node')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ name: '审计改名节点' })
+    .expect(200);
+  const n = await db.get("SELECT * FROM audit_logs WHERE action = 'node.update' ORDER BY id DESC LIMIT 1");
+  assert.equal(n.detail.changes.name.from, String(nodeBefore.name || ''));
+  assert.equal(n.detail.changes.name.to, '审计改名节点');
 });
 
 test('shopCode 必填：undefined（忘了给）抛错，null（节点级）与编号是两种明确的表态', async () => {

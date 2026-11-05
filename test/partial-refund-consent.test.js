@@ -187,7 +187,7 @@ async function insertOrder({ status = 'escrowed', accepted = null, events = null
     buyer: BUYER,
     seller: SELLER,
     amountWei: AMOUNT,
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     status,
     escrowOrderId: `0x${String(seq).padStart(64, '0')}`,

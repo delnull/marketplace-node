@@ -44,7 +44,7 @@ async function insertOrder({ slug, kind = 'digital', status = 'escrowed', refund
     quantity: qty,
     status,
     amountWei: '1000000000000000000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     escrowOrderId: escrowId(),
     paidTxHash: payHash(),
     refundStatus,

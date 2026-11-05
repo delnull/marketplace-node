@@ -29,7 +29,7 @@ async function setupDigital({ quantity = 1 } = {}) {
     buyer: BUYER,
     seller: SELLER,
     amountWei: '0',
-    usdtMicro: 0,
+    priceMicro: 0,
   });
   return { product: p, order: o };
 }

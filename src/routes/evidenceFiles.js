@@ -103,7 +103,7 @@ router.post(
   const { order, evidence } = req.evidenceCtx;
 
   const raw = Array.isArray(req.body?.files) ? req.body.files : [];
-  if (!raw.length) return fail(res, 'files 需为非空数组 [{name, mime, dataB64}]');
+  if (!raw.length) return fail(res, '文件需为非空数组，每项包含名称、类型与内容');
   /*
     **条数闸必须在 I/O 之前**：20MB body 上限只约束字节，不约束 JSON entry 数量。
     一个最小 PNG entry 约 56 字节，单个 20MB 请求可带约 30 万条；全部同步写盘后

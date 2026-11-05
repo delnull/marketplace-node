@@ -189,8 +189,8 @@ export async function createReturn({ order, address, note, quantity }) {
   if (!['escrowed', 'shipped', 'disputed', 'refunded'].includes(order.status) && !afterSaleOpen) {
     return {
       error:
-        `当前状态(${order.status})不可创建退货单：仅退款协商中（escrowed / shipped / disputed / refunded）` +
-        '或**有在途售后案件**（确认收货后由买家在链上 openAfterSale 开案）的订单可建单——' +
+        `当前状态不可创建退货单：仅退款协商中（托管中、已发货、争议中、已退款）` +
+        '或有在途售后案件（确认收货后由买家在链上申请售后开案）的订单可建单——' +
         '已终局且无售后案件的订单钱货两清，无需退货单（如需追回请线下协商或先开售后案件）',
     };
   }

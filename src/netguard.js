@@ -166,13 +166,13 @@ export async function assertPublicHttpTarget(url) {
   try {
     u = new URL(url);
   } catch {
-    return { ok: false, message: 'URL 格式非法' };
+    return { ok: false, message: '网址格式非法' };
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
     return { ok: false, message: '仅支持 http/https 协议' };
   }
   if (u.username || u.password) {
-    return { ok: false, message: 'URL 不允许携带用户信息（user:pass@）' };
+    return { ok: false, message: '网址不允许携带用户名和密码（用户名:密码@）' };
   }
   // 方括号只是 URL 语法（http://[::1]/）：判定与钉住地址都用裸地址
   const host = u.hostname.replace(/^\[|\]$/g, '');
@@ -196,6 +196,7 @@ export async function assertPublicHttpTarget(url) {
     // 全部为公网：把这批地址交给调用方钉死（本次解析结果即连接目标，不再给 DNS 第二次机会）
     return { ok: true, ...base, addresses: addrs };
   } catch (e) {
-    return { ok: false, message: `目标域名解析失败：${e?.message || e}` };
+    console.error('[netguard] 目标域名解析失败：', e?.message || e);
+    return { ok: false, message: `目标域名解析失败（域名服务暂时不可用）` };
   }
 }

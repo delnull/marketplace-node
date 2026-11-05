@@ -106,13 +106,14 @@ export async function readAuditChain() {
     };
   } catch (e) {
     // 读不到 ≠ 没问题（本仓对"读不到"的一贯口径）：ok 留 null，不让它看起来通过
+    console.error('[healthz] 审计链校验失败（详情只进日志）：', e?.stack || e?.message || e);
     value = {
       window: AUDIT_CHAIN_WINDOW,
       checked: 0,
       ok: null,
       firstBrokenId: null,
       code: 2,
-      detail: `本次没校验成（不是"链没问题"）：${e?.message || e}`,
+      detail: `本次没校验成（不是"链没问题"）：审计链读取失败，详情见节点日志`,
       at: now,
     };
   }
@@ -350,42 +351,36 @@ export function createApp() {
     const ownerBinding = ownerBindingStatus();
     const ownerBindingBad = ownerBinding.ok === false;
     const healthy = !watcherStalled && !watcherLockBlocked && !ownerBindingBad && quarantinedOk && redisOk;
-    if (!healthy) {
-      const why = [
-        ownerBindingBad
-          ? `资金方身份漂移：${ownerBinding.reason}`
-          : null,
-        watcherLockBlocked
-          ? `链上事件轮询器 ${Math.round((Date.now() - lockSkippedSince) / 1000)} 秒拿不到分布式锁` +
-            `（锁空闲但本进程抢不到；当前进程未处理任何链上事件）`
-          : watcherStalled
-          ? `链上事件轮询器已停滞 ${Math.round((Date.now() - watcherBaseline) / 1000)} 秒` +
-            `（集群最后一次成功轮询 ${clusterLastOk ? new Date(clusterLastOk).toISOString() : '从未成功'}；` +
-            `lagBlocks=${watcher.lagBlocks ?? null}，游标不再推进 ⇒ 订单会停在旧状态）`
-          : null,
-        !quarantinedOk ? `${watcher.quarantined} 条链上事件已隔离、需人工介入（见 node.quarantined_events）` : null,
-        !redisOk ? 'Redis 不可用：限流/共享缓存无法工作（检查 MK_REDIS_URL 与 Redis 进程）' : null,
-      ].filter(Boolean);
-      res.status(503);
-      return fail(res, `节点不健康：${why.join('；')}`, 1, 503, {
-        healthy: false,
-        reason: why.join('；'),
-        watcher,
-        redis,
-        // 503 也要给隔离条数：否则运维只能从 watcher 里猜，node 读数在故障时反而消失。
-        node: node
-          ? {
-              quarantinedEvents: node.quarantined_events && typeof node.quarantined_events === 'object'
-                ? Array.isArray(node.quarantined_events)
-                  ? node.quarantined_events.length
-                  : Object.keys(node.quarantined_events).length
-                : null,
-            }
-          : null,
-      });
-    }
-    ok(res, {
-      healthy: true,
+    const reason = healthy
+      ? null
+      : [
+          ownerBindingBad
+            ? `资金方身份漂移：${ownerBinding.reason}`
+            : null,
+          watcherLockBlocked
+            ? `链上事件轮询器 ${Math.round((Date.now() - lockSkippedSince) / 1000)} 秒拿不到分布式锁` +
+              `（锁空闲但本进程抢不到；当前进程未处理任何链上事件）`
+            : watcherStalled
+            ? `链上事件轮询器已停滞 ${Math.round((Date.now() - watcherBaseline) / 1000)} 秒` +
+              `（集群最后一次成功轮询 ${clusterLastOk ? new Date(clusterLastOk).toISOString() : '从未成功'}；` +
+              `lagBlocks=${watcher.lagBlocks ?? null}，游标不再推进 ⇒ 订单会停在旧状态）`
+            : null,
+          !quarantinedOk ? `${watcher.quarantined} 条链上事件已隔离、需人工介入（见 node.quarantined_events）` : null,
+          !redisOk ? 'Redis 不可用：限流/共享缓存无法工作（检查 MK_REDIS_URL 与 Redis 进程）' : null,
+        ].filter(Boolean).join('；');
+    /*
+      **200 与 503 的正文必须是同一份读数**（2026-11-04）。
+
+      为什么：界面把"响应里没有这个字段"渲染成"读不到"。此前 503 只回
+      `{healthy, reason, watcher, redis, node}`——于是节点因为 watcher 停摆而 503 时，
+      健康页会把审计链 / 委员会 / 合约锚点 / 保留期全印成"读不到"，把 Redis 印成"不可用"
+      （它其实在 top-level、页面读的是 capabilities.redis）。恰恰在出事、最需要读的时候，
+      给出的是一屏假话。所以先算同一份读数，再用 HTTP 码表达结论。
+      代价：不健康时也要多读一次审计链（30s 缓存）与媒体用量（60s 缓存）。
+    */
+    const readings = {
+      healthy,
+      ...(reason ? { reason } : {}),
       name: await nodeNameOf(),
       host: owner || null,
       shops: { total: shopRows.length, listed: shopRows.filter((r) => Number(r.listed) === 1).length },
@@ -434,9 +429,9 @@ export function createApp() {
       piiRetention: piiRetentionStatus(),
       /*
         托管合约地址锚点（源码评审 2026-09）：启动时"这次用的地址与上次记录的是否一致、
-        本地还有多少在途链上单"——不一致且还有在途单时进程根本不会起来（见 chainAnchor.js），
-        所以这里能看到的状态是 ok/record/warn/ack 四种；把它暴露出来是为了让运维不用翻日志
-        就知道"这个节点现在锚在哪个合约上"。
+        本地还有多少在途链上单"——不一致且还有在途单时进程根本不会起来（见 chainAnchor.js）。
+        这里能看到的状态是 record（首次记录）/ ok / warn / ack；skip = 没配置托管合约，
+        refuse = 拒绝启动（走到这里说明进程根本没起来）。
       */
       escrowAnchor: escrowAnchorStatus(),
       /*
@@ -445,8 +440,8 @@ export function createApp() {
         见 chain.js 的说明），但它的代价是「RPC 抖动期间合法的仲裁人也进不来」，
         而在此之前这个状态**只能靠翻日志**看：`/healthz` 一切正常、仲裁人只看到自己被拒，
         运维无从知道是"你不是仲裁人"还是"节点读不到"。
-        `known:false` = 本次没确证（此时 `committee` 为 null），`lastOk` 只是排障线索、不参与判定。
-        三态口径——"读不到"必须能作为一个独立结论被看见。
+        `state` 是唯一判据（ok / failed / none / disabled，见 committeeStatus）：`none` 是
+        "还没读过"（不是故障），`failed` 才是"读了没读到"；`lastOk` 只是排障线索、不参与判定。
       */
       committee: committeeStatus(),
       // 资金方身份漂移（Ownable2Step 之后 owner 不再相等/双向接线断开）：启动只查一次，
@@ -485,7 +480,12 @@ export function createApp() {
         // Redis 是限流/共享缓存的依赖；未配置/掉线会让 /healthz 503（见上方 healthy）
         redis,
       },
-    });
+    };
+    if (!healthy) {
+      res.status(503);
+      return fail(res, `节点不健康：${reason}`, 1, 503, readings);
+    }
+    return ok(res, readings);
     } catch (e) {
       /*
         健康端点必须**响亮地**失败：通用 wrap 的约定是“业务失败=HTTP 200 + code!=0”，
@@ -494,10 +494,12 @@ export function createApp() {
       */
       console.error(`[healthz] 健康读数读取失败：${e?.stack || e?.message || e}`);
       res.status(503);
-      return fail(res, '节点不健康：健康读数读取失败（数据库或依赖不可用）', 1, 503, {
-        healthy: false,
-        reason: '健康读数读取失败（数据库或依赖不可用）',
-      });
+      /*
+        **不带 data**：读数本身就没算出来，回一个只有 `{healthy:false, reason}` 的 data 会让
+        前端把它当成完整读数、把每一行都渲染成"读不到"。没有读数就说"读数读取失败"——
+        前端（fetchNodeHealth）在没有 data 时走错误档，而不是逐行编。
+      */
+      return fail(res, '节点不健康：健康读数读取失败（数据库或依赖不可用）', 1, 503);
     }
   }));
 

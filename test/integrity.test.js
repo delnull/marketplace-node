@@ -33,8 +33,8 @@ const PRODUCT_ID = 990001;
    */
   async function seed({ status = 'shipped', productId = PRODUCT_ID } = {}) {
     const slug = `P${String(productId).padStart(10, '0').slice(-10)}`; // P + 10 位数字（Crockford 合法字符）
-    await db.run(`INSERT INTO products (id, slug, shop_code, title, description, kind, snapshot_hash)
-       VALUES (?, ?, ?, ?, '', 'digital', '0x00')
+    await db.run(`INSERT INTO products (id, slug, shop_code, title, description, kind, price_currency, snapshot_hash)
+       VALUES (?, ?, ?, ?, '', 'digital', 'USDT', '0x00')
        ON DUPLICATE KEY UPDATE id = id`, productId, slug, TEST_SHOP_CODE, `体检商品 ${productId}`);
     const row = await insertOrderRow(db, {
       status,
@@ -43,7 +43,7 @@ const PRODUCT_ID = 990001;
       buyer: buyer.address.toLowerCase(),
       seller: owner.address.toLowerCase(),
       amountWei: '1',
-      usdtMicro: 1,
+      priceMicro: 1,
     });
     /*
       夹具直接插一行 shipped 订单**绕过下单路径**，所以池占位计数器没有被加过；而

@@ -33,7 +33,7 @@ async function insertOrder(status = 'draft', paidTxHash = null) {
     buyer: '0x00000000000000000000000000000000000000aa',
     seller: '0x00000000000000000000000000000000000000bb',
     amountWei: '1000000000000000000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     escrowOrderId: `0x${String(seq).padStart(64, '0')}`,
     paidTxHash,

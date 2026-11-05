@@ -151,7 +151,7 @@ test('erase-pii：在途单拒绝；终局擦除（含附件行与磁盘文件�
   // ── 在途（escrowed）：拒绝擦除——卖家还得靠收货信息发货 ──
   const inflight = await eraseViaApi(order.id);
   assert.notEqual(inflight.body.code, 0);
-  assert.match(inflight.body.message, /资金流未终结/);
+  assert.match(inflight.body.message, /资金流尚未终结/);
   assert.equal((await rowOf(order.id)).shipping_name, '张三', '在途单的收货信息必须原样保留');
 
   // 匿名 / 店员均不可擦（ownerOnly）
@@ -888,7 +888,7 @@ test('擦除只动 PII：保留清单里的每一类都逐项验一遍（不是�
   const before = await rowOf(o.id);
   // 逐项铺上"保留清单"里的数据（都走真实写入路径能写到的列/表）
   const keepId = await orderIdOfNo(o.id);
-  await db.run(`UPDATE orders SET tracking_no = ?, carrier = ?, shipping_fee_usdt_micro = 0, shipped_at = ?
+  await db.run(`UPDATE orders SET tracking_no = ?, carrier = ?, shipping_fee_micro = 0, shipped_at = ?
       WHERE order_no = ?`, 'SF1234567890', '顺丰', new Date(), o.id);
   await db.run('UPDATE order_chain SET after_sale_note = ? WHERE order_id = ?', '结案说明：双方已协商一致（链上公开文本）', keepId);
   await db.run(`INSERT INTO order_returns (order_id, status, quantity, address, note, tracking_no, carrier)

@@ -145,7 +145,7 @@ test('media：形状、上限、URL 白名单、视频只收本站、封面必�
   // 形状不对
   const badShape = await post({ media: ['https://example.com/a.jpg'] }).expect(200);
   assert.notEqual(badShape.body.code, 0);
-  assert.match(badShape.body.message, /type 只能是 image 或 video/);
+  assert.match(badShape.body.message, /主图条目只能是图片或视频/);
 
   // javascript: 之外还要求 http(s)/本站路径
   const badScheme = await post({ media: [{ type: 'image', url: 'javascript:alert(1)' }] }).expect(200);
@@ -389,7 +389,7 @@ test('批量改价：快照重算必须带上描述块与主图区（漏一个�
   const res = await request(app)
     .patch('/api/products/batch')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send({ slugs: [p.slug], patch: { priceUsdtMicro: 99_000_000 } })
+    .send({ slugs: [p.slug], patch: { priceMicro: 99_000_000 } })
     .expect(200);
   assertOk(res);
 
@@ -397,7 +397,7 @@ test('批量改价：快照重算必须带上描述块与主图区（漏一个�
   const { rowLikeOf } = await import('./setup.mjs');
   const detail = await request(app).get(`/api/products/${p.slug}`).expect(200);
   const d = detail.body.data;
-  assert.equal(d.priceUsdtMicro, 99_000_000, '批量改价生效');
+  assert.equal(d.priceMicro, 99_000_000, '批量改价生效');
   assert.equal(
     computeSnapshotHash(snapshotObject(rowLikeOf(d))),
     d.snapshotHash,

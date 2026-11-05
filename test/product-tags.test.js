@@ -443,7 +443,7 @@ test('标签清单：limit 截断时 truncated=true、total 仍是全量（不�
 
   const bad = await request(app).get('/api/products/tags?limit=0').expect(200);
   assert.notEqual(bad.body.code, 0, '非法 limit 明确拒绝而不是静默钳制');
-  assert.match(bad.body.message, /limit 需为 1\.\.200 的整数/);
+  assert.match(bad.body.message, /数量必须是 1 到 200 的整数/);
 
   const tooBig = await request(app).get('/api/products/tags?limit=999').expect(200);
   assert.notEqual(tooBig.body.code, 0);

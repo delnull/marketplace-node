@@ -64,7 +64,7 @@ const draftCount = async () => (await db.get("SELECT COUNT(*) AS c FROM v_orders
 
 test('年龄限制商品：下单必须带买家显式确认；确认后留痕并写入快照', async () => {
   const p = await listProduct(
-    productPayload({ kind: 'physical', title: '年龄限制商品', priceUsdtMicro: 50_000_000, capacity: 3, ageRestricted: true })
+    productPayload({ kind: 'physical', title: '年龄限制商品', priceMicro: 50_000_000, capacity: 3, ageRestricted: true })
   );
   assert.equal(p.ageRestricted, true, '公开投影回传年龄限制标记');
 
@@ -77,7 +77,7 @@ test('年龄限制商品：下单必须带买家显式确认；确认后留痕�
   assert.match(blocked(denied), /未成年人禁止购买/);
   // ③ 非法断言类型：拒（不给字符串留漂移空间）
   const badType = await postOrder({ productSlug: p.slug, ageAck: 'yes' });
-  assert.match(blocked(badType), /ageAck 需为布尔值/);
+  assert.match(blocked(badType), /买家确认年龄的字段必须是布尔值/);
   assert.equal(await draftCount(), before, '被拒的下单不产生草稿（也不占库存额度）');
 
   // ④ 带断言：建单成功，留痕 + 快照锁定
@@ -87,7 +87,7 @@ test('年龄限制商品：下单必须带买家显式确认；确认后留痕�
   assert.equal(o.ageAck, true, '订单记录买家确认');
   assert.equal((await rowOf(o.id)).age_ack, 1);
   assert.equal(o.productSnapshot.age_restricted, 1, '年龄限制写入订单锁定的商品快照');
-  assert.equal(o.productSnapshot.shipping_fee_usdt_micro, 0, '未设运费时为 0（包邮）');
+  assert.equal(o.productSnapshot.shipping_fee_micro, 0, '未设运费时为 0（包邮）');
   // 店主代下单同样受门槛约束（门槛在商品上，不在调用方身份上）
   const ownerRes = await postOrder({ productSlug: p.slug, buyer: buyer.address }, ownerToken);
   assert.match(blocked(ownerRes), /未成年人禁止购买/);
@@ -97,7 +97,7 @@ test('年龄限制商品：下单必须带买家显式确认；确认后留痕�
 });
 
 test('非年龄限制商品：ageAck 断言被忽略（恒 0，不留误导性痕迹）', async () => {
-  const p = await listProduct(productPayload({ kind: 'digital', title: '普通商品，无年龄限制', priceUsdtMicro: 10_000_000 }));
+  const p = await listProduct(productPayload({ kind: 'digital', title: '普通商品，无年龄限制', priceMicro: 10_000_000 }));
 
   const noAck = (await postOrder({ productSlug: p.slug })).body.data;
   assert.equal(noAck.ageAck, false);
@@ -113,7 +113,7 @@ test('非年龄限制商品：ageAck 断言被忽略（恒 0，不留误导性�
 test('年龄限制标记入快照：加/去限制必变哈希，同值保存哈希不变；校验拒绝非布尔', async () => {
   const { computeSnapshotHash, snapshotObject } = await import('../src/routes/products.js');
   const p = await listProduct(
-    productPayload({ kind: 'physical', title: '年龄限制快照商品', priceUsdtMicro: 20_000_000, capacity: 5, shippingFeeUsdtMicro: 5_000_000 })
+    productPayload({ kind: 'physical', title: '年龄限制快照商品', priceMicro: 20_000_000, capacity: 5, shippingFeeMicro: 5_000_000 })
   );
   const base = p.snapshotHash;
   assert.equal(p.ageRestricted, false);
@@ -142,13 +142,13 @@ test('年龄限制标记入快照：加/去限制必变哈希，同值保存哈�
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send(productPayload({ kind: 'physical', title: '非法限制值', ageRestricted: 'yes' }))
     .expect(200);
-  assert.match(blocked(bad), /ageRestricted/);
+  assert.match(blocked(bad), /未成年人禁止购买/);
 });
 
 // ══ C：开票信息 ══
 
 test('开票信息：往返存读 + trim + 长度上限 + 类型校验；不影响金额', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '开票商品', priceUsdtMicro: 33_000_000, capacity: 10, shippingFeeUsdtMicro: 6_000_000 }));
+  const p = await listProduct(productPayload({ kind: 'physical', title: '开票商品', priceMicro: 33_000_000, capacity: 10, shippingFeeMicro: 6_000_000 }));
 
   const withInvoice = await postOrder({
     productSlug: p.slug,
@@ -161,10 +161,10 @@ test('开票信息：往返存读 + trim + 长度上限 + 类型校验；不影�
   assert.equal(row.invoice_needed, 1);
   assert.equal(row.invoice_title, '某某科技有限公司');
   assert.equal(row.invoice_tax_no, '91310000MA1K35XXXX');
-  // 开票信息不是钱：金额仍 = 商品 33 + 运费 6 = 39 USDT
-  assert.equal(o.usdtMicro, 39_000_000);
-  assert.equal(o.goodsUsdtMicro, 33_000_000);
-  assert.equal(o.shippingFeeUsdtMicro, 6_000_000);
+  // 开票信息不是钱：金额仍 = 商品 33 + 运费 6 = 39 price
+  assert.equal(o.priceMicro, 39_000_000);
+  assert.equal(o.goodsPriceMicro, 33_000_000);
+  assert.equal(o.shippingFeeMicro, 6_000_000);
 
   // 未提交 invoice：默认空对象，不误标 needed
   const none = (await postOrder({ productSlug: p.slug })).body.data;
@@ -197,15 +197,15 @@ test('开票信息：往返存读 + trim + 长度上限 + 类型校验；不影�
 
   // 类型校验：needed 非布尔 / invoice 非对象 / 勾了要票却什么都没填
   const badNeeded = await postOrder({ productSlug: p.slug, invoice: { needed: 'yes', title: '甲' } });
-  assert.match(blocked(badNeeded), /invoice\.needed 需为布尔值/);
+  assert.match(blocked(badNeeded), /发票的「是否需要」必须是布尔值/);
   const badShape = await postOrder({ productSlug: p.slug, invoice: ['x'] });
-  assert.match(blocked(badShape), /invoice 需为对象/);
+  assert.match(blocked(badShape), /发票信息必须是对象/);
   const emptyButNeeded = await postOrder({ productSlug: p.slug, invoice: { needed: true } });
   assert.match(blocked(emptyButNeeded), /至少填写发票抬头或纳税人识别号/);
 });
 
 test('开票信息可见性：仅买家本人/店主可见（同收货信息矩阵），匿名与第三人恒 null', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '开票可见性商品', priceUsdtMicro: 10_000_000, capacity: 5 }));
+  const p = await listProduct(productPayload({ kind: 'physical', title: '开票可见性商品', priceMicro: 10_000_000, capacity: 5 }));
   const o = (
     await postOrder({ productSlug: p.slug, invoice: { needed: true, title: '某某商贸行', taxNo: '91440300MA5FXXXXXX' } })
   ).body.data;

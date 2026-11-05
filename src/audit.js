@@ -188,7 +188,9 @@ function auditRowDto(r) {
  * （这些行 `shop_code` 为 NULL，留给节点主看），而在 target/detail：
  *   · 店铺暂停/恢复：`target_type='shop' AND target_id=code`；
  *   · 商品强制下架/恢复：`target_type='product' AND detail.shopCode=code`；
- *   · 开店审批通过：`target_type='shop_application' AND detail.code=code`。
+ *   · 开店审批通过：`target_type='shop_application' AND detail.code=code`；
+ *   · 提货争议参数：`target_type='nft_claim' AND detail.shopCode=code`；
+ *   · 评价图下架：`target_type='order' AND detail.shopCode=code`。
  * 只对 `shopCode: null` 有意义；与本店查询组合没有语义，直接抛错。
  */
 function auditWhere({ action, actor, shopCode, targetShop }) {
@@ -216,8 +218,10 @@ function auditWhere({ action, actor, shopCode, targetShop }) {
       (target_type = 'shop' AND target_id = ?)
       OR (target_type = 'shop_application' AND detail->>'$.code' = ?)
       OR (target_type = 'product' AND detail->>'$.shopCode' = ?)
+      OR (target_type = 'nft_claim' AND detail->>'$.shopCode' = ?)
+      OR (target_type = 'order' AND detail->>'$.shopCode' = ?)
     )`);
-    params.push(String(targetShop), String(targetShop), String(targetShop));
+    params.push(String(targetShop), String(targetShop), String(targetShop), String(targetShop), String(targetShop));
   }
   return { whereSql: 'WHERE ' + where.join(' AND '), params };
 }

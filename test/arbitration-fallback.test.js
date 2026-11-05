@@ -149,9 +149,9 @@ test('读到过一次之后 RPC 故障：不得把上一届成员当成当前仲
   const afterFail = await detailAs(arbiterToken, order.id);
   assert.deepEqual(afterFail.deliveries, [], '旧成员密钥在 RPC 故障期间不得再读到交付码');
 
-  // ③ 诊断读数：known=false；lastOk 只作"最后读到过谁"的排障线索，不参与判定
+  // ③ 诊断读数：state=failed；lastOk 只作"最后读到过谁"的排障线索，不参与判定
   const st = committeeStatus();
-  assert.equal(st.known, false, '读不到必须能作为一个独立结论被看见');
+  assert.equal(st.state, 'failed', '读失败必须能作为一个独立结论被看见（不是 none / 旧名单）');
   assert.equal(st.committee, null, '判定值不得显示成某个具体名单');
   assert.deepEqual(st.lastOk?.arbiters, [arbiterOnchain], '最后一次成功读数留作排障线索');
 });

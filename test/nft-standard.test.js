@@ -72,7 +72,7 @@ test('标准检测：地址没有代码/RPC 读不到分别明确拒绝，后者
   });
   assert.equal(rpcDown.ok, false);
   assert.equal(rpcDown.retryable, true);
-  assert.match(rpcDown.reason, /RPC|rpc down/);
+  assert.match(rpcDown.reason, /链上节点/);
 });
 
 test('声明与实际标准不一致必须给出可执行拒绝', async () => {
@@ -93,7 +93,7 @@ test('supportsInterface 调用遇到超时/网络错误 ⇒ retryable，而不�
   });
   assert.equal(r.ok, false);
   assert.equal(r.retryable, true);
-  assert.match(r.reason, /RPC timeout/);
+  assert.match(r.reason, /链上节点/);
 });
 
 test('声明本身非法时直接拒绝', async () => {
@@ -101,5 +101,5 @@ test('声明本身非法时直接拒绝', async () => {
     reader: readerFor([ERC721_INTERFACE_ID]),
   });
   assert.equal(r.ok, false);
-  assert.match(r.reason, /erc721 或 erc1155/);
+  assert.match(r.reason, /ERC721 或 ERC1155/);
 });

@@ -114,7 +114,7 @@ async function insertOrder({
     buyer: buyer.address.toLowerCase(),
     seller: SELLER,
     amountWei: '1000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     status,
     /*
@@ -320,7 +320,7 @@ test('SLA limit 参数：0/负数/超上限/非整数一律明确拒绝（不静
   for (const bad of ['0', '-1', '101', 'abc', '1.5']) {
     const r = await request(app).get(`/api/shop/sla?limit=${bad}`).set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value);
     assert.notEqual(r.body.code, 0, `limit=${bad} 必须被拒`);
-    assert.match(r.body.message, /limit 需为 1\.\.100/);
+    assert.match(r.body.message, /数量必须是 1 到 100 的整数/);
   }
   await request(app).get('/api/shop/sla').expect(401);
   const asBuyer = await request(app).get('/api/shop/sla').set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value);
@@ -399,7 +399,7 @@ test('店铺维度读数：走 shopWhere(seller, "sh.") 的前缀参数（低库
     title: '低库存 + 承诺对账商品',
     shopCode: shopRef.value,
     // 余量 1 ≤ 阈值 2 ⇒ 计入低库存
-    skus: [{ key: '', priceUsdtMicro: 5_000_000, capacity: 1, committed: 0 }],
+    skus: [{ key: '', priceMicro: 5_000_000, capacity: 1, committed: 0 }],
     stockAlertAt: 2,
     terms: { handling_days: 2 },
   });

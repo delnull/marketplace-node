@@ -57,7 +57,7 @@ export async function findIntegrityIssues(db = getDb()) {
   //    `pc.product_id = o.product_id` 在 `o.product_id IS NULL` 时恒为 NULL ⇒ 永不匹配 ⇒
   //    `pc.id IS NULL` 成立 ⇒ 一条**完全自洽**的交付被报成"该商品的码池里没有这个码"，
   //    而本工具的处置建议是"优先重建库"（见 ④ 的长注释：一个会导致**误删正常数据**的
-  //    假阳性比不报更糟）。`orders.product_id` 被设计成可空（商品删除后置 NULL，
+  //    假阳性比不报更糟）。`orders.product_id` 被设计成可空（商品硬删除后置 NULL，
   //    快照仍在，见 db.js 的列注释），所以这条路径是正常数据会走到的。
   const codeDeliveredNotUsed = await db.all(`SELECT di.order_id AS orderId, o.order_no AS orderNo, di.value AS code, o.product_id AS orderProductId,
               pc.id AS codeId, pc.status AS codeStatus, pc.order_id AS codeOrderId, pc.product_id AS codeProductId

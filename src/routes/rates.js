@@ -2,8 +2,8 @@
  * 汇率路由：GET /api/rates
  * 返回当前 BTY-USDT 行情与 USDT → BTY 换算系数（1 USDT = x BTY）；
  * 唯一数据源（官方 BTY ticker）不可用时自动降级（stale=true / 手工兜底值 fallback=true），
- * 完全不可用时 available=false，前端只展示 USDT 标价（不显示 BTY 估算）。
- * 标价单位已是 USDT，因此不再有任何法币（CNY）汇率腿。
+ * 完全不可用时 available=false，USDT 定价单不显示 BTY 估算；BTY 定价单本就不读行情。
+ * USDT 定价单的标价单位是 USDT，因此不再有任何法币（CNY）汇率腿。
  *
  * 降级分支**也返回同一组键**（值置 null / true）：形状不一致时，任何读 `rates.error`/`rates.stale`
  * 的消费方拿到的是 `undefined`，而 `frontend/src/types.ts` 把这几项声明为非可选——

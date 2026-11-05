@@ -37,7 +37,8 @@ export async function checkErc20Contract(address) {
   try {
     code = await Promise.race([provider.getCode(contract), timeout(8_000, '读取合约代码超时')]);
   } catch (e) {
-    return { ok: false, retryable: true, reason: `读不到合约代码（RPC 失败）：${String(e?.message || e).slice(0, 120)}` };
+    console.error('[erc20Sale] 读取合约代码失败：', e?.message || e);
+    return { ok: false, retryable: true, reason: `读不到合约代码（链上节点读取失败），请核对合约地址与节点配置` };
   }
   if (!code || code === '0x') return { ok: false, retryable: false, reason: '该地址没有合约代码，不是 ERC20 合约' };
   const token = new Contract(contract, ERC20_ABI, provider);
@@ -49,25 +50,26 @@ export async function checkErc20Contract(address) {
       timeout(8_000, '读取 ERC20 元数据超时'),
     ]);
   } catch (e) {
+    console.error('[erc20Sale] 读取代币元数据失败：', e?.message || e);
     return {
       ok: false,
       retryable: true,
-      reason: `该合约没有返回标准 ERC20 的 decimals()/symbol()：${String(e?.message || e).slice(0, 120)}`,
+      reason: `该合约没有返回标准代币的小数位与符号，请核对合约地址`,
     };
   }
   const d = Number(decimals);
   if (!Number.isInteger(d) || d < 0 || d > 36) {
-    return { ok: false, retryable: false, reason: `ERC20 decimals 非法（${String(decimals)}，需 0..36）` };
+    return { ok: false, retryable: false, reason: `代币小数位非法（${String(decimals)}，需 0 到 36）` };
   }
   const s = String(symbol || '').trim();
-  if (!s || s.length > 32) return { ok: false, retryable: false, reason: 'ERC20 symbol 为空或超过 32 字符' };
+  if (!s || s.length > 32) return { ok: false, retryable: false, reason: '代币符号为空或超过 32 个字符' };
   return { ok: true, contract, decimals: d, symbol: s };
 }
 
 /** 把一个 BTY/Chain33 或 EVM 交易哈希解析成回执 + canonical 哈希。 */
 export async function resolveTxReceipt(txHash) {
   const input = String(txHash || '').trim().toLowerCase();
-  if (!TX_HASH_RE.test(input)) return { ok: false, notFound: true, reason: '交易哈希格式非法（需 0x + 64 位 hex）' };
+  if (!TX_HASH_RE.test(input)) return { ok: false, notFound: true, reason: '交易哈希格式非法（需 0x 开头的 64 位十六进制）' };
   let receipt;
   try {
     receipt = await rpcRequest('eth_getTransactionReceipt', [input], { timeoutMs: 15_000 });
@@ -110,7 +112,7 @@ export async function verifyErc20Transfer(txHash, { token, from, to }) {
   if (!got.ok) return got;
   const status = got.receipt.status;
   const success = status === true || Number(status) === 1 || String(status).toLowerCase() === '0x1';
-  if (!success) return { ok: false, retryable: false, reason: '该交易执行失败（receipt.status != 1）' };
+  if (!success) return { ok: false, retryable: false, reason: '该交易执行失败（未成功）' };
 
   const fromTopic = `0x${String(from).toLowerCase().replace(/^0x/, '').padStart(64, '0')}`;
   const toTopic = `0x${String(to).toLowerCase().replace(/^0x/, '').padStart(64, '0')}`;
@@ -128,7 +130,7 @@ export async function verifyErc20Transfer(txHash, { token, from, to }) {
     return {
       ok: false,
       retryable: false,
-      reason: `收据里没有该 ERC20 从卖家 ${String(from).slice(0, 10)}… 转给买家 ${String(to).slice(0, 10)}… 的 Transfer`,
+      reason: `收据里没有该 ERC20 从卖家转到买家的转账记录`,
     };
   }
   return {

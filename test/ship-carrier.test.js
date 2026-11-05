@@ -211,7 +211,7 @@ test('CSV 导出带上同一列（店主对账时不必回页面抄承运方）'
     .expect(200);
   const text = String(res.text || '');
   const header = text.split('\n')[0];
-  assert.match(header, /(^|,)carrier(,|$)/, '表头含 carrier');
+  assert.match(header, /(^|,)承运商(,|$)/, '表头含「承运商」');
   const line = text.split('\n').find((l) => l.startsWith(o.id));
   assert.ok(line, '能找到本单那一行');
   assert.match(line, /EMS123456789CN/, '运单号在同一行');

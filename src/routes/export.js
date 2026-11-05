@@ -9,8 +9,8 @@
  *
  *  - 过滤参数 `from`/`to` 收 **ISO-8601 字符串**（如 `2026-10-01T00:00:00Z`），非法即拒绝——
  *    旧形状收毫秒整数，而"这个数到底是秒还是毫秒"猜错的症状是一次**静默的全量导出**；
- *  - 单元格里的时刻写成 ISO-8601（`Date.toISOString()`）：Excel 里是文本时间，
- *    但它是**没有歧义**的那一种（旧形状给毫秒整数，任何人拿去手算都要先猜单位）；
+ *  - 单元格里的时刻写成 `YYYY-MM-DD HH:mm`（服务器本地时区）：这份文件是给店主在 Excel 里
+ *    对账用的，ISO/UTC 串对人不友好；机器读的那份走 JSON API；
  *  - 列的来源是**读模型视图 `v_orders`**（订单事实 + 收货信息 + 链上镜像三表各一份）：
  *    导出是"把一张订单读全"的典型场景，"写哪张表"在这里不存在。
  *    视图里内部主键叫 `order_id`、对外标识叫 `order_no`——CSV 下发**对外单号**
@@ -20,18 +20,17 @@ import { Router } from 'express';
 import { getDb } from '../db.js';
 import { verifySession, roleOf } from '../auth.js';
 import { fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
-import { refundUsdtMicroOfRow } from '../stats.js';
+import { refundPriceMicroOfRow } from '../stats.js';
 import { sendCsv } from '../csv.js';
 import { logAudit } from '../audit.js';
 // 入账口径与订单状态集合的唯一出处（与流水页/看板/可评价同源，见 src/orderStatus.js）
 import { INCOME_STATUS as ORDER_INCOME_STATUS } from '../orderStatus.js';
 import { sellerOrderFilters } from '../sellerOrderFilters.js';
+// 用户词表：表头与枚举值都从唯一来源取（与前端同一份数据，见 src/userText.js）
+import { enumText, yesNo, fmtTime } from '../userText.js';
 
 const router = Router();
 const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true });
-
-/** 时间单元格：`Date` → ISO-8601；空值 → 空串（"没有这个时刻"） */
-const isoCell = (v) => (v instanceof Date ? v.toISOString() : '');
 
 /** 订单商品快照（订单锁定值；导出商品标题/资产字段时用，解析失败不阻断导出） */
 function snapshotOf(o) {
@@ -57,7 +56,7 @@ function timeParamOf(raw, name) {
   if (raw === undefined || raw === '') return { value: null };
   const d = new Date(String(raw));
   if (Number.isNaN(d.getTime())) {
-    return { error: `${name} 需为 ISO-8601 时间字符串（如 2026-10-01T00:00:00Z；本接口不再接受毫秒整数）` };
+    return { error: `${name} 请填写完整日期时间（如 2026-10-01T00:00:00Z；本接口不再接受毫秒整数）` };
   }
   return { value: d };
 }
@@ -73,10 +72,17 @@ function moneyCellsOf(o) {
   const refunded = o.refunded_amount_wei === null || o.refunded_amount_wei === undefined ? null : BigInt(o.refunded_amount_wei);
   const amount = o.amount_wei === null || o.amount_wei === undefined ? null : BigInt(o.amount_wei);
   const net = refunded === null || amount === null ? null : amount - refunded;
+  const currency = o.price_currency;
+  // 标价币种净额：USDT 定价按行情/代币报价折；BTY 定价直接 wei/1e12（无行情）
+  const refundPrice = refunded === null ? null : refundPriceMicroOfRow(o);
+  const netPrice = refunded === null ? '' : (BigInt(o.price_micro || '0') - refundPrice).toString();
   return {
     refundedWei: refunded === null ? '' : refunded.toString(),
     netWei: net === null ? '' : net.toString(),
-    netUsdtMicro: refunded === null ? '' : (BigInt(o.usdt_micro || '0') - refundUsdtMicroOfRow(o)).toString(),
+    currency,
+    priceMicro: String(o.price_micro ?? ''),
+    netUsdtMicro: currency === 'USDT' ? netPrice : '',
+    netBtyMicro: currency === 'BTY' ? netPrice : '',
   };
 }
 
@@ -115,14 +121,78 @@ const auditExport = async (req, action, targetId, detail) =>
  * 另加 `accepted_partial_refund_wei` 分辨"部分退款是仲裁拆分还是买家授权"。
  */
 const ORDER_COLUMNS = [
-  'order_no', 'product_slug', 'status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
-  'payment_rate_source', 'payment_rate_stale', 'payment_rate_quoted_at',
-  'amount_wei', 'refunded_wei', 'amount_net_wei', 'net_usdt_micro',
-  'accepted_partial_refund_wei',
-  'usdt_micro', 'shipping_fee_usdt_micro', 'invoice_needed',
-  'buyer', 'shipping_name', 'shipping_phone', 'shipping_address', 'shipping_edited', 'note', 'escrow_order_id',
-  'paid_tx_hash', 'refund_status', 'tracking_no', 'carrier', 'created_at', 'updated_at',
-  'product_title', 'sku_key', 'sku_specs', 'kind', 'nft_contract', 'nft_standard', 'erc20_contract',
+  ['order_no', '订单号'],
+  ['product_slug', '商品标识'],
+  ['status', '订单状态'],
+  ['quantity', '数量'],
+  ['payment_token', '支付资产合约'],
+  ['payment_symbol', '支付币种'],
+  ['payment_decimals', '支付币种小数位'],
+  ['payment_rate_source', '报价来源'],
+  ['payment_rate_stale', '报价已过期'],
+  ['payment_rate_quoted_at', '报价时间'],
+  ['price_currency', '标价币种'],
+  ['amount_wei', '托管金额（最小单位）'],
+  ['refunded_wei', '已退金额（最小单位）'],
+  ['amount_net_wei', '托管净额（最小单位）'],
+  ['net_usdt_micro', '净额（微 USDT；USDT 定价单）'],
+  ['net_bty_micro', '净额（微 BTY；BTY 定价单）'],
+  ['accepted_partial_refund_wei', '买家授权部分退款额（最小单位）'],
+  ['price_micro', '应付总额（标价币种微单位）'],
+  ['shipping_fee_micro', '运费（标价币种微单位）'],
+  ['invoice_needed', '需要发票'],
+  ['buyer', '买家地址'],
+  ['shipping_name', '收货人'],
+  ['shipping_phone', '电话'],
+  ['shipping_address', '收货地址'],
+  ['shipping_edited', '收货信息改过'],
+  ['note', '备注'],
+  ['escrow_order_id', '链上订单号'],
+  ['paid_tx_hash', '支付交易哈希'],
+  ['refund_status', '退款状态'],
+  ['tracking_no', '运单号'],
+  ['carrier', '承运商'],
+  ['created_at', '创建时间'],
+  ['updated_at', '更新时间'],
+  ['product_title', '商品标题'],
+  ['sku_key', '规格组合'],
+  ['sku_specs', '规格明细'],
+  ['kind', '商品类型'],
+  ['nft_contract', 'NFT 合约'],
+  ['nft_standard', 'NFT 标准'],
+  ['erc20_contract', '代币合约'],
+];
+
+/** 列定义 → 表头（键与中文标签成对写，行宽由 `sendCsv` 再守一道） */
+const headersOf = (cols) => cols.map(([, label]) => label);
+
+/** 收款流水列（与订单导出口径一致：键在左、中文表头在右） */
+const LEDGER_COLUMNS = [
+  ['order_no', '订单号'],
+  ['product_slug', '商品标识'],
+  ['income_status', '订单状态'],
+  ['quantity', '数量'],
+  ['payment_token', '支付资产合约'],
+  ['payment_symbol', '支付币种'],
+  ['payment_decimals', '支付币种小数位'],
+  ['payment_rate_source', '报价来源'],
+  ['payment_rate_stale', '报价已过期'],
+  ['payment_rate_quoted_at', '报价时间'],
+  ['price_currency', '标价币种'],
+  ['amount_wei', '托管金额（最小单位）'],
+  ['refunded_wei', '已退金额（最小单位）'],
+  ['net_wei', '净额（最小单位）'],
+  ['net_usdt_micro', '净额（微 USDT；USDT 定价单）'],
+  ['net_bty_micro', '净额（微 BTY；BTY 定价单）'],
+  ['accepted_partial_refund_wei', '买家授权部分退款额（最小单位）'],
+  ['price_micro', '应付总额（标价币种微单位）'],
+  ['income_at', '入账时间'],
+  ['buyer', '买家地址'],
+  ['escrow_order_id', '链上订单号'],
+  ['paid_tx_hash', '支付交易哈希'],
+  ['product_title', '商品标题'],
+  ['sku_key', '规格组合'],
+  ['nft_standard', 'NFT 标准'],
 ];
 
 /** 收款流水导出（ownerOnly；入账口径与流水页一致 = 订单 updated_at 末次迁移时刻；
@@ -143,7 +213,7 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   if (fromP.error) return fail(res, fromP.error);
   const toP = timeParamOf(req.query.to, 'to');
   if (toP.error) return fail(res, toP.error);
-  if (fromP.value && toP.value && fromP.value.getTime() > toP.value.getTime()) return fail(res, 'from 不得晚于 to');
+  if (fromP.value && toP.value && fromP.value.getTime() > toP.value.getTime()) return fail(res, '开始时间不得晚于结束时间');
   if (fromP.value) {
     range.push('updated_at >= ?');
     params.push(fromP.value);
@@ -162,35 +232,29 @@ router.get('/ledger.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
         在链上有两个来源——仲裁拆分（无需同意）与双方谈拢（买家授权）。只导 refunded_wei 时，
         店主对着一笔部分退款无法分辨是哪一种，也就无从复核"这笔结算有没有买家点头"。
   */
-  const headers = [
-    'order_no', 'product_slug', 'income_status', 'quantity', 'payment_token', 'payment_symbol', 'payment_decimals',
-    'payment_rate_source', 'payment_rate_stale', 'payment_rate_quoted_at',
-    'amount_wei', 'refunded_wei', 'net_wei', 'net_usdt_micro',
-    'accepted_partial_refund_wei',
-    'usdt_micro', 'income_at', 'buyer', 'escrow_order_id', 'paid_tx_hash',
-    'product_title', 'sku_key', 'nft_standard',
-  ];
   const csvRows = rows.map((o) => {
     const money = moneyCellsOf(o);
     const snap = snapshotOf(o);
     return [
-      o.order_no, o.product_slug, o.status, o.quantity || 1,
+      o.order_no, o.product_slug, enumText('orderStatus', o.status), o.quantity || 1,
       o.payment_token || '0x0000000000000000000000000000000000000000',
       o.payment_symbol || 'BTY', o.payment_decimals ?? 18,
-      o.payment_rate_source || 'bty', o.payment_rate_stale ? 1 : 0, isoCell(o.payment_rate_quoted_at),
+      enumText('rateSource', o.payment_rate_source || 'bty'), yesNo(o.payment_rate_stale), fmtTime(o.payment_rate_quoted_at),
+      money.currency,
       o.amount_wei,
       // 链上镜像列来自 LEFT JOIN：NULL = **这一单还没有链上镜像行**（尚未托管），
       // 而 '0' = 确证没退过款。两者在月结里必须长得不一样，所以 NULL 留空、不折成 0。
       money.refundedWei,
       money.netWei,
       money.netUsdtMicro,
+      money.netBtyMicro,
       o.accepted_partial_refund_wei ?? '',
-      o.usdt_micro, isoCell(o.updated_at), o.buyer, o.escrow_order_id || '', o.paid_tx_hash || '',
-      snap.title || '', o.sku_key || '', snap.nft_standard || '',
+      money.priceMicro, fmtTime(o.updated_at), o.buyer, o.escrow_order_id || '', o.paid_tx_hash || '',
+      snap.title || '', o.sku_key || '', snap.nft_standard ? enumText('nftStandard', snap.nft_standard) : '',
     ];
   });
   await auditExport(req, 'export.ledger', '-', { rows: rows.length, from: req.query.from || 'all', to: req.query.to || 'all' });
-  sendCsv(res, 'ledger.csv', headers, csvRows);
+  sendCsv(res, 'ledger.csv', headersOf(LEDGER_COLUMNS), csvRows);
 }));
 
 router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
@@ -212,13 +276,15 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const filters = sellerOrderFilters(req.query);
   if ('error' in filters) return fail(res, filters.error);
   const { where, params } = filters;
+  // 店主软删除的单不再出现在导出里（与 /seller 列表同一个可见性判据）
+  const visibleWhere = `seller_deleted_at IS NULL AND ${where}`;
   // from/to 校验同 ledger.csv（防静默忽略/from>to 空集误导）
   const fromP = timeParamOf(req.query.from, 'from');
   if (fromP.error) return fail(res, fromP.error);
   const toP = timeParamOf(req.query.to, 'to');
   if (toP.error) return fail(res, toP.error);
-  if (fromP.value && toP.value && fromP.value.getTime() > toP.value.getTime()) return fail(res, 'from 不得晚于 to');
-  let rangeWhere = where;
+  if (fromP.value && toP.value && fromP.value.getTime() > toP.value.getTime()) return fail(res, '开始时间不得晚于结束时间');
+  let rangeWhere = visibleWhere;
   const rangeParams = [String(req.shop.code), ...params];
   if (fromP.value) {
     rangeWhere += ' AND created_at >= ?';
@@ -237,21 +303,23 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     const money = moneyCellsOf(o);
     const snap = snapshotOf(o);
     return [
-      o.order_no, o.product_slug, o.status, o.quantity || 1,
+      o.order_no, o.product_slug, enumText('orderStatus', o.status), o.quantity || 1,
       o.payment_token || '0x0000000000000000000000000000000000000000',
       o.payment_symbol || 'BTY', o.payment_decimals ?? 18,
-      o.payment_rate_source || 'bty', o.payment_rate_stale ? 1 : 0, isoCell(o.payment_rate_quoted_at),
+      enumText('rateSource', o.payment_rate_source || 'bty'), yesNo(o.payment_rate_stale), fmtTime(o.payment_rate_quoted_at),
+      money.currency,
       o.amount_wei,
       money.refundedWei,
       money.netWei,
       money.netUsdtMicro,
+      money.netBtyMicro,
       o.accepted_partial_refund_wei ?? '',
-      o.usdt_micro, o.shipping_fee_usdt_micro ?? 0, o.invoice_needed ? 1 : 0,
-      o.buyer, o.shipping_name, o.shipping_phone, o.shipping_address, o.shipping_edit_count ? '1' : '0', o.note || '',
-      o.escrow_order_id || '', o.paid_tx_hash || '', o.refund_status || 'none',
-      o.tracking_no || '', o.carrier || '', isoCell(o.created_at), isoCell(o.updated_at),
-      snap.title || '', o.sku_key || '', jsonCell(o.sku_specs), snap.kind || '',
-      snap.nft_contract || '', snap.nft_standard || '', snap.erc20_contract || '',
+      money.priceMicro, o.shipping_fee_micro ?? 0, yesNo(o.invoice_needed),
+      o.buyer, o.shipping_name, o.shipping_phone, o.shipping_address, o.shipping_edit_count ? '是' : '否', o.note || '',
+      o.escrow_order_id || '', o.paid_tx_hash || '', enumText('refundStatus', o.refund_status || 'none'),
+      o.tracking_no || '', o.carrier || '', fmtTime(o.created_at), fmtTime(o.updated_at),
+      snap.title || '', o.sku_key || '', jsonCell(o.sku_specs), snap.kind ? enumText('productKind', snap.kind) : '',
+      snap.nft_contract || '', snap.nft_standard ? enumText('nftStandard', snap.nft_standard) : '', snap.erc20_contract || '',
     ];
   });
   await auditExport(req, 'export.orders', '-', {
@@ -261,8 +329,50 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     afterSale: req.query.afterSale || 'all',
     q: req.query.q ? 'filtered' : 'all',
   });
-  sendCsv(res, 'orders.csv', ORDER_COLUMNS, csvRows);
+  sendCsv(res, 'orders.csv', headersOf(ORDER_COLUMNS), csvRows);
 }));
+
+/** 商品列（一行 = 商品 × 规格组合；键在左、中文表头在右） */
+const PRODUCT_COLUMNS = [
+  ['slug', '商品标识'],
+  ['title', '商品标题'],
+  ['kind', '商品类型'],
+  ['price_currency', '标价币种'],
+  ['shipping_fee_micro', '运费（标价币种微单位）'],
+  ['age_restricted', '年龄限制'],
+  ['specs', '规格'],
+  ['attributes', '参数'],
+  ['terms', '承诺'],
+  ['sku_key', '规格组合'],
+  ['sku_specs', '规格明细'],
+  ['price_micro', '价格（标价币种微单位）'],
+  ['sku_image_url', '规格图地址'],
+  ['capacity', '库存'],
+  ['committed', '已占'],
+  ['available', '可售'],
+  ['sku_active', '规格上架'],
+  ['active', '商品上架'],
+  ['published_at', '发布时间'],
+  ['auto_deliver', '自动交付'],
+  ['stock_alert_at', '库存提醒值'],
+  ['snapshot_hash', '快照哈希'],
+  ['created_at', '创建时间'],
+  ['updated_at', '更新时间'],
+  ['codes_built', '已建兑换码数'],
+  ['codes_unused', '未用兑换码数'],
+  ['tokens_built', '已建 NFT 数'],
+  ['tokens_unused', '未用 NFT 数'],
+  ['nft_contract', 'NFT 合约'],
+  ['nft_standard', 'NFT 标准'],
+  ['token_contract', '代币合约'],
+  ['claimable', '可提货'],
+  ['claim_type', '提货类型'],
+  ['claim_window_days', '提货窗口天数'],
+  ['token_amount', '每份代币数量'],
+];
+
+/** `auto_deliver` 的三态：-1 跟随全局 / 0 关 / 1 开 */
+const autoDeliverText = (v) => (Number(v) === -1 ? '跟随全局' : yesNo(v));
 
 router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const db = getDb();
@@ -271,10 +381,10 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
          (SELECT COUNT(*) FROM product_codes c WHERE c.product_id = p.id AND c.status = 'unused') AS codes_unused,
          (SELECT COUNT(*) FROM product_nft_tokens t WHERE t.product_id = p.id) AS tokens_built,
          (SELECT COUNT(*) FROM product_nft_tokens t WHERE t.product_id = p.id AND t.status = 'unused') AS tokens_unused
-       FROM products p WHERE p.shop_code = ? ORDER BY p.id ASC`, String(req.shop.code));
+       FROM products p WHERE p.shop_code = ? AND p.deleted_at IS NULL ORDER BY p.id ASC`, String(req.shop.code));
   // 商品 CSV 按「商品 × SKU」展开：一行一个规格组合 —— 价格与库存本来就逐组合不同，
   // 压成一行会让「哪个组合还剩几件」在导出里彻底丢失。默认规格就是 sku_key 为空的那一行。
-  const skuRows = await getDb().all('SELECT s.* FROM product_skus s JOIN products p ON p.id = s.product_id WHERE p.shop_code = ? ORDER BY s.product_id, s.sku_key', String(req.shop.code));
+  const skuRows = await getDb().all('SELECT s.* FROM product_skus s JOIN products p ON p.id = s.product_id WHERE p.shop_code = ? AND p.deleted_at IS NULL ORDER BY s.product_id, s.sku_key', String(req.shop.code));
   const skuByProduct = new Map();
   for (const s of skuRows) {
     if (!skuByProduct.has(s.product_id)) skuByProduct.set(s.product_id, []);
@@ -286,7 +396,7 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     逐字保持 JSON 原文（不解析后重排键序）：这一列的价值就是"与库里那一份一致"，
     而库里那一份是 MySQL 规范化之后的文本，`JSON.stringify(读回的对象)` 给出的正是它。
   */
-  const headers = ['slug', 'title', 'kind', 'shipping_fee_usdt_micro', 'age_restricted', 'specs', 'attributes', 'terms', 'sku_key', 'sku_specs', 'price_usdt_micro', 'sku_image_url', 'capacity', 'committed', 'available', 'sku_active', 'active', 'published_at', 'auto_deliver', 'stock_alert_at', 'snapshot_hash', 'created_at', 'updated_at', 'codes_built', 'codes_unused', 'tokens_built', 'tokens_unused', 'nft_contract', 'nft_standard', 'token_contract', 'claimable', 'claim_type', 'claim_window_days', 'token_amount'];
+  const headers = headersOf(PRODUCT_COLUMNS);
   const csvRows = [];
   for (const r of rows) {
     const skus = skuByProduct.get(r.id) || [];
@@ -294,17 +404,17 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     const list = skus.length ? skus : [null];
     for (const s of list) {
       csvRows.push([
-        r.slug, r.title, r.kind, r.shipping_fee_usdt_micro ?? 0, r.age_restricted ? 1 : 0, jsonCell(r.specs),
+        r.slug, r.title, enumText('productKind', r.kind), r.price_currency, r.shipping_fee_micro ?? 0, yesNo(r.age_restricted), jsonCell(r.specs),
         jsonCell(r.attributes), jsonCell(r.terms),
         s ? s.sku_key : '', s ? jsonCell(s.specs_json) : '',
-        s ? s.price_usdt_micro : '', s ? (s.image_url || '') : '',
+        s ? s.price_micro : '', s ? (s.image_url || '') : '',
         s ? (s.capacity ?? '') : '', s ? s.committed || 0 : '',
         s ? (s.capacity === null ? '' : Math.max(0, s.capacity - (s.committed || 0))) : '',
-        s ? (s.active ? 1 : 0) : '',
-        r.active ? 1 : 0, isoCell(r.published_at), r.auto_deliver, r.stock_alert_at ?? '', r.snapshot_hash,
-        isoCell(r.created_at), isoCell(r.updated_at), r.codes_built, r.codes_unused, r.tokens_built, r.tokens_unused,
-        r.nft_contract || '', r.nft_standard || '', r.token_contract || '',
-        r.claimable ? 1 : 0, r.claim_type || '', r.claim_window_days ?? '', s ? (s.token_amount ?? '') : '',
+        s ? yesNo(s.active) : '',
+        yesNo(r.active), fmtTime(r.published_at), autoDeliverText(r.auto_deliver), r.stock_alert_at ?? '', r.snapshot_hash,
+        fmtTime(r.created_at), fmtTime(r.updated_at), r.codes_built, r.codes_unused, r.tokens_built, r.tokens_unused,
+        r.nft_contract || '', r.nft_standard ? enumText('nftStandard', r.nft_standard) : '', r.token_contract || '',
+        yesNo(r.claimable), r.claim_type ? enumText('claimType', r.claim_type) : '', r.claim_window_days ?? '', s ? (s.token_amount ?? '') : '',
       ]);
     }
   }
@@ -320,7 +430,7 @@ router.get('/codes.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const where = ['c.product_id = ?'];
   const params = [product.id];
   if (req.query.status) {
-    if (!['unused', 'used', 'all'].includes(String(req.query.status))) return fail(res, 'status 需为 unused/used/all');
+    if (!['unused', 'used', 'all'].includes(String(req.query.status))) return fail(res, '状态筛选值不合法（可选：未使用、已使用、全部）');
     if (req.query.status !== 'all') {
       where.push('c.status = ?');
       params.push(String(req.query.status));
@@ -339,8 +449,8 @@ router.get('/codes.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   await auditExport(req, 'export.codes', slug, { rows: rows.length, status: req.query.status || 'all' });
   // 码值也按公式前缀防护：CSV 会被 Excel 直接打开，卖家导入的码同样可能以 = + - @ 开头。
   // 代价是这类码在表格里会多一个前导撇号；安全优先，避免打开文件就执行公式。
-  sendCsv(res, `${slug}-codes.csv`, ['code', 'status', 'order_no', 'created_at', 'used_at'],
-    rows.map((r) => [r.code, r.status, r.order_no || '', isoCell(r.created_at), isoCell(r.used_at)]));
+  sendCsv(res, `${slug}-codes.csv`, ['兑换码', '状态', '订单号', '创建时间', '使用时间'],
+    rows.map((r) => [r.code, enumText('codeStatus', r.status), r.order_no || '', fmtTime(r.created_at), fmtTime(r.used_at)]));
 }));
 
 export default router;

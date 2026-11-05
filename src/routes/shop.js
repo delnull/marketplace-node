@@ -15,11 +15,9 @@
  *  PUT  /webhook         通知配置 {url, secret}（ownerOnly；secret 不回显，仅布尔状态）
  *  GET  /reputation      履约画像聚合统计（公开只读；带 X-Mk-Shop 时按该店限定）
  *  GET  /staking         本节点保证金状况（治理只读；口径见 src/stakingRisk.js）
+ *  GET  /staking/requests 待审批的撤资申请（hostOnly；见 src/stakingRequests.js）
  *  GET  /reviews/stats   店铺买家评价聚合（公开只读）
  *  GET  /buyer-signal    买家履约信号（ownerOnly；**本店视角**，口径见 src/buyerSignal.js）
- *  POST /claims          提交一条身份声明 {kind,value,issued,signature}（ownerOnly；签名核验见 src/claims.js）
- *  GET  /claims          公开列出**有效**声明（原样带 message/signature，供第三方核验；不标"认证"）
- *  POST /claims/:id/revoke  撤销一条声明（ownerOnly；已撤销的不再出现在公开列表；入审计）
  *  GET  /metrics         运营指标（ownerOnly；待办/超时/挂账/对账读数，口径见 src/opsMetrics.js）
  *  GET  /sla             卖家 SLA 读数（ownerOnly；三份待办清单 + 发货时长分布，同上）
  *
@@ -42,6 +40,7 @@ import {
 } from '../auth.js';
 import { getDb, withTransaction, abortTx } from '../db.js';
 import { logAudit } from '../audit.js';
+import { auditChanges } from '../auditDiff.js';
 import { isAddress, isZeroAddress } from '../chain.js';
 import { assertPublicHttpTarget } from '../netguard.js';
 import { sweepOrphanUploads } from '../mediaSweep.js';
@@ -53,7 +52,7 @@ import {
   UploadUnavailableError,
   storeRequestMedia,
 } from '../uploadFlow.js';
-import { getRates, usdtMicroToPayWei, isPayableAmount } from '../rates.js';
+import { getRates, usdtMicroToPayWei, btyMicroToWei, isPayableAmount } from '../rates.js';
 import {
   listPaymentMethods,
   tokenSupportedOnChain,
@@ -83,10 +82,6 @@ import {
 // 节点级运营读数（nodeAdmin）：只出"这台机器有没有在干活"，不出任何店铺经营明细
 import { escrowWatcherStatus } from '../escrowWatcher.js';
 import { chainReconcileStatus } from '../chainReconcile.js';
-// 店铺身份声明的唯一判据层：规范消息构造（**逐字**使用请求字段）/ 声明值校验（**拒绝**而非变换）/
-// 签名核验（见 src/claims.js 文件头——那里写清了铁律"签名的字节就是提交的字节"，
-// 以及"它证明什么、不证明什么"：对外口径必须是"店主签过这句话"，不是"官方认证"）
-import { checkClaimValue, buildClaimMessage, verifyClaim } from '../claims.js';
 import { reputationSummary } from '../reputation.js';
 import { shopReviewStats } from '../reviews.js';
 // 谈信地址的唯一形状入口：两种写法（0x / 1 开头）与“清空”的语义都只在这里
@@ -95,6 +90,8 @@ import { webhookStatus, sendTestEvent, webhookConfig, setWebhookConfig } from '.
 import { overviewStats, trendStats, productStats, normalizeStatsDays } from '../stats.js';
 // 本节点保证金状况的读数（治理只读；事实源与取舍见 src/stakingRisk.js）
 import { stakingShortfall } from '../stakingRisk.js';
+// 待审批撤资申请（节点主待办；不依赖事件索引，见 src/stakingRequests.js）
+import { pendingUnstakeRequests } from '../stakingRequests.js';
 // 买家履约信号（本店视角；口径、隐私边界与文案纪律见 src/buyerSignal.js 文件头）
 import { buyerSignal } from '../buyerSignal.js';
 // 运营读数与 SLA（待办谓词、托管超时、挂账、对账、发货时长的**唯一实现**）
@@ -312,11 +309,33 @@ router.get('/node-identity', wrap(async (req, res) => {
  * 那些只有该店店主能通过店铺级端点读到。
  */
 router.get('/payment-methods', paymentMethodsLimiter, wrap(async (req, res) => {
-  const raw = String(req.query.usdtMicro ?? '').trim();
+  const raw = String(req.query.priceMicro ?? '').trim();
+  const currency = String(req.query.priceCurrency ?? '').trim().toUpperCase();
+  if (!currency) return fail(res, '必须指定计价币种（USDT 或 BTY）');
+  if (!['USDT', 'BTY'].includes(currency)) return fail(res, '计价币种只能是 USDT 或 BTY');
   let total = null;
   if (raw) {
-    if (!/^\d+$/.test(raw) || BigInt(raw) <= 0n) return fail(res, 'usdtMicro 需为正整数（微 USDT）');
+    if (!/^\d+$/.test(raw) || BigInt(raw) <= 0n) return fail(res, `金额必须是正整数（${currency} 微单位）`);
     total = raw;
+  }
+  /*
+    BTY 定价：金额本身就是 BTY，只列原生 BTY，**不读行情**、不列 ERC20
+    （列出别的币种就意味着要做 BTY→代币换算，与"BTY 定价不需要行情转换"直接矛盾）。
+    USDT 定价：原生金额走 USDT→BTY 行情，ERC20 走节点自己的报价。
+  */
+  if (currency === 'BTY') {
+    const nativeAmount = total ? btyMicroToWei(total) : null;
+    return ok(res, {
+      native: {
+        token: 'native',
+        symbol: 'BTY',
+        decimals: 18,
+        usdtMicroPerToken: null,
+        amountWei: nativeAmount,
+        payable: nativeAmount === null ? null : isPayableAmount(nativeAmount),
+      },
+      tokens: [],
+    });
   }
   const rates = await getRates();
   const nativeAmount = total ? usdtMicroToPayWei(total, rates) : null;
@@ -396,7 +415,7 @@ router.post('/payment-tokens', hostOnly, wrap(async (req, res) => {
     return fail(res, e.message);
   }
   if (!config.chain.escrowAddress) {
-    return fail(res, '本节点未接入托管合约（MK_ESCROW_ADDRESS 为空）：先接 Escrow，否则配了也收不了 ERC20');
+    return fail(res, '本节点未接入托管合约（托管合约地址未配置）：先完成托管接线，否则配了也收不了代币');
   }
   if (token.mode === 'oracle') {
     const target = await assertPublicHttpTarget(token.priceUrl);
@@ -407,14 +426,40 @@ router.post('/payment-tokens', hostOnly, wrap(async (req, res) => {
   } catch (e) {
     return fail(res, e.message, 1, 503);
   }
+  const prev = (await listPaymentTokenConfigs()).find((c) => c.address === token.address) ?? null;
   await upsertPaymentToken(token);
-  await audit(req, 'payment_token.save', 'node', token.address, {
+  /*
+    支付资产配置也是"改前 → 改后"：改固定价/行情源会直接影响买家实付，只有新值不够。
+    新增（prev=null）没有旧值；更新时把配置字段逐一对比。字符串/数字先归一成同一形
+    （`prev.fixed` 是 DB 读回的字符串、`token.fixed` 可能是数字），否则 5000000 与 "5000000"
+    会被 diff 当成"变了"。
+    **行情源 URL 不写原文**：URL 常带 `?apikey=`/token，审计是 append-only 且会进 CSV——
+    只记录"有没有设置"，与 webhook 不记 URL/secret 同一口径。
+  */
+  const norm = (v) => (v == null || v === '' ? null : String(v));
+  const before = prev
+    ? {
+        symbol: prev.symbol,
+        decimals: prev.decimals,
+        mode: prev.mode,
+        fixedUsdtMicroPerToken: norm(prev.fixed),
+        priceUrlSet: !!prev.priceUrl,
+      }
+    : null;
+  const after = {
     symbol: token.symbol,
     decimals: token.decimals,
     mode: token.mode,
-    fixedUsdtMicroPerToken: token.fixed,
-    priceUrl: token.priceUrl || null,
-  }, null);
+    fixedUsdtMicroPerToken: norm(token.fixed),
+    priceUrlSet: !!token.priceUrl,
+  };
+  const diff = before ? auditChanges(before, after, Object.keys(after)) : { fields: [], changes: {} };
+  /*
+    新增没有"改前"：不写空的 fields/changes（否则界面会把一次新增说成"未发生变更"）。
+    更新时 current 字段 + 变更对一起下发，摘要既能显示现值，也能显示旧值。
+  */
+  const detail = before ? { ...after, fields: diff.fields, changes: diff.changes } : { ...after };
+  await audit(req, 'payment_token.save', 'node', token.address, detail, null);
   ok(res, { token }, '已保存；还需节点主钱包在链上启用 supportedToken，买家才能用它付款');
 }));
 
@@ -429,7 +474,8 @@ router.delete('/payment-tokens/:address', hostOnly, wrap(async (req, res) => {
     decimals: deleted.decimals,
     mode: deleted.mode,
     fixedUsdtMicroPerToken: deleted.fixed,
-    priceUrl: deleted.priceUrl || null,
+    /* 与 save 同口径：不把可能带凭据的 URL 写进 append-only 审计 */
+    priceUrlSet: !!deleted.priceUrl,
   }, null);
   ok(res, { address }, '已删除配置（链上 supportedToken 仍由节点主自行关停）');
 }));
@@ -484,8 +530,8 @@ router.get('/node-staff', nodeAdmin, wrap(async (req, res) => {
 router.put('/node-staff', hostOnly, wrap(async (req, res) => {
   const action = String(req.body?.action || '');
   const address = String(req.body?.address || '').trim().toLowerCase();
-  if (!['add', 'remove'].includes(action)) return fail(res, 'action 需为 add / remove');
-  if (!isAddress(address) || isZeroAddress(address)) return fail(res, 'address 需为 0x 开头的以太坊地址（零地址不可加入）');
+  if (!['add', 'remove'].includes(action)) return fail(res, '动作只能是添加或移除');
+  if (!isAddress(address) || isZeroAddress(address)) return fail(res, '地址必须是 0x 开头的以太坊地址（零地址不可加入）');
   const owner = await nodeOwner();
   if (owner && address === owner) return fail(res, '节点主无需加入员工名单（节点主权限恒高于员工）');
   if (action === 'add') {
@@ -523,13 +569,20 @@ router.put('/node', hostOnly, wrap(async (req, res) => {
     nextTanxin = parsed.value;
   }
   await setNodeProfile({ name: nextName, notice: nextNotice, tanxinAddress: nextTanxin });
-  // 节点级动作：**不属于任何一家店**（节点主可以一家店都没有；带上 X-Mk-Shop 也只是范围提示），
-  // 所以显式传 null，而不是从 req.shop 猜一个归属
-  await audit(req, 'node.update', 'node', 'node', {
-    nameChanged: nextName !== curName,
-    noticeChanged: nextNotice !== curNotice,
-    tanxinChanged: nextTanxin !== curTanxin,
-  }, null);
+  /*
+    节点级动作：**不属于任何一家店**（节点主可以一家店都没有；带上 X-Mk-Shop 也只是范围提示），
+    所以显式传 null，而不是从 req.shop 猜一个归属。
+
+    `changes` 是**改前 → 改后**：`nameChanged/noticeChanged/tanxinChanged` 只说"变没变"，
+    店主/节点主事后看不出改成了什么（改名与改公告都可能是争议点）。旧的三个布尔不再写；
+    历史行仍带它们，界面按旧形状回显（append-only 的显示兜底，不是写入兼容）。
+  */
+  const diff = auditChanges(
+    { name: curName, notice: curNotice, tanxinAddress: curTanxin },
+    { name: nextName, notice: nextNotice, tanxinAddress: nextTanxin },
+    ['name', 'notice', 'tanxinAddress']
+  );
+  await audit(req, 'node.update', 'node', 'node', { fields: diff.fields, changes: diff.changes }, null);
   ok(
     res,
     { name: shopDisplayName({ name: nextName }), notice: nextNotice, tanxinAddress: nextTanxin },
@@ -562,12 +615,18 @@ router.put('/', staffOnly, wrap(async (req, res) => {
     nextTanxin = parsed.value;
   }
   await setShopProfile(shop, { name: nextName, notice: nextNotice, tanxinAddress: nextTanxin });
+  // 店铺资料同样记**改前 → 改后**；布尔标志只保留在历史行里（见 auditScope 的旧形状回显）
+  const diff = auditChanges(
+    { name: curName, notice: curNotice, tanxinAddress: curTanxin },
+    { name: nextName, notice: nextNotice, tanxinAddress: nextTanxin },
+    ['name', 'notice', 'tanxinAddress']
+  );
   await audit(
     req,
     'shop.update',
     'shop',
     shop.code,
-    { nameChanged: nextName !== curName, noticeChanged: nextNotice !== curNotice, tanxinChanged: nextTanxin !== curTanxin },
+    { fields: diff.fields, changes: diff.changes },
     shop.code
   );
   ok(
@@ -668,7 +727,7 @@ router.delete('/node/avatar', hostOnly, wrap(async (req, res) => {
 router.patch('/listing', ownerOnly, wrap(async (req, res) => {
   const shop = req.shop;
   const listed = req.body?.listed;
-  if (typeof listed !== 'boolean') return fail(res, 'listed 需为布尔值（true=复业，false=歇业）', 400, 400);
+  if (typeof listed !== 'boolean') return fail(res, '接单状态必须是布尔值（是=复业，否=歇业）', 400, 400);
   const reason = String(req.body?.reason ?? '').trim().slice(0, 120);
   const currentlyListed = Number(shop.listed) === 1;
   if (listed === currentlyListed) {
@@ -705,7 +764,7 @@ router.patch('/listing', ownerOnly, wrap(async (req, res) => {
 router.post('/media/sweep-orphans', hostOnly, wrap(async (req, res) => {
   const days = req.body?.olderThanDays === undefined ? 7 : Number(req.body.olderThanDays);
   if (!Number.isFinite(days) || days < 1 || days > 365) {
-    return fail(res, 'olderThanDays 需为 1..365 的整数', 400, 400);
+    return fail(res, '天数必须是 1 到 365 的整数', 400, 400);
   }
   const run = await withRedisLock(
     'media-orphans',
@@ -758,8 +817,8 @@ router.put('/staff', ownerOnly, wrap(async (req, res) => {
   const shop = req.shop;
   const action = String(req.body?.action || '');
   const address = String(req.body?.address || '').trim().toLowerCase();
-  if (!['add', 'remove'].includes(action)) return fail(res, 'action 需为 add / remove');
-  if (!isAddress(address) || isZeroAddress(address)) return fail(res, 'address 需为 0x 开头的以太坊地址（零地址不可加入）');
+  if (!['add', 'remove'].includes(action)) return fail(res, '动作只能是添加或移除');
+  if (!isAddress(address) || isZeroAddress(address)) return fail(res, '地址必须是 0x 开头的以太坊地址（零地址不可加入）');
   if (address === String(shop.seller || '').toLowerCase()) return fail(res, '店主无需加入店员名单（店主权限恒高于店员）');
   let removed = false;
   if (action === 'add') {
@@ -794,12 +853,12 @@ router.put('/staff', ownerOnly, wrap(async (req, res) => {
 router.put('/webhook', ownerOnly, wrap(async (req, res) => {
   const shop = req.shop;
   const { url, secret } = req.body || {};
-  if (url === undefined && secret === undefined) return fail(res, '需提供 url 或 secret');
+  if (url === undefined && secret === undefined) return fail(res, '需要提供通知地址或签名密钥');
   const saved = await withTransaction(async () => {
     const cur = await webhookConfig(shop.code);
     const nextUrl = url !== undefined ? String(url).trim().slice(0, 500) : cur.url;
     const nextSecret = secret !== undefined ? String(secret).trim().slice(0, 200) : cur.secret;
-    if (nextUrl && !/^https:\/\//i.test(nextUrl)) return abortTx({ error: 'webhook url 需为 https:// 开头（投递端只接受加密目标）' });
+    if (nextUrl && !/^https:\/\//i.test(nextUrl)) return abortTx({ error: '通知地址必须以 https:// 开头（只接受加密目标）' });
     await setWebhookConfig(shop.code, { url: nextUrl, secret: nextSecret });
     return { url: nextUrl, secret: nextSecret };
   });
@@ -819,254 +878,6 @@ router.post('/webhook-test', ownerOnly, wrap(async (req, res) => {
   await audit(req, 'webhook.test', 'shop', req.shop.code, { ok: r.ok }, req.shop.code);
   if (!r.ok) return ok(res, r, `测试事件投递失败：${r.error}`);
   ok(res, r, '测试事件投递成功（接收方应已收到 type=webhook.test 的 POST）');
-}));
-
-// ── 店铺身份声明（shop claim：店主钱包签名、可核验的外部身份声明）──
-/*
-  为什么要它：`code`（店铺编号）解决"唯一"，不解决"哪个才是官方那家"——编号本身不带外部身份。
-  本组端点让店主用钱包**对一段规范消息签名**，把 domain / github / x / telegram 绑定到店铺地址上；
-  EOA 可离线 `ethers.verifyMessage`；合约账户（Safe/多签）走标准 1271 或 Safe legacy 链上核验。
-  节点提交时已验过，第三方不依赖节点也能按账户类型自行核验。⚠️ 它证明"某个地址签过这句话"，
-  **不证明**那个域名/账号真的属于他——
-  归属核验（DNS TXT / gist / OAuth）不在本机制内，故对外**不得**标成"已认证/官方"。
-*/
-
-/** 声明行的对外形状（公开列表与写回执共用一份，避免两处各拼一遍字段） */
-function claimDto(row) {
-  return {
-    // id 是自增 BIGINT（MySQL AUTO_INCREMENT），但对外**下发字符串**：前端类型 `ShopClaim.id` 是 string
-    // （撤销走 URL 路径段，字符串与数字都能拼，但类型不一致会让 TS 端在其它用法上出错）。
-    id: String(row.id),
-    kind: row.kind,
-    value: row.value,
-    address: row.address,
-    // message 与 signature **原样**下发：第三方核验用的就是这两个字节，
-    // 任何"顺手规整一下"（去尾换行、重排字段）都会让重算出的地址/1271 摘要与 address 不一致。
-    message: row.message,
-    signature: row.signature,
-    // `created_at` 是 DATETIME(3) → `Date`，对外 JSON 是 ISO-8601（前端按 ISO 解析）
-    createdAt: row.created_at,
-  };
-}
-
-/**
- * 解析"本店是谁"：店主地址 + 店铺编号 —— **用请求的店铺上下文，不另起第二个真相源**。
- *
- * 多店之前它是"读全局常量 + 读链上 codeOf(常量)"；现在它直接回答"这次请求指的是哪家店"：
- * `seller` 来自该行（链上 `ShopInfo.seller` 的镜像）、`code` 是该行的店铺编号。
- * 编号的意义不变：声明消息里要写 `code:` 行，**签名因此覆盖了"这条声明属于哪家店"**——
- * 换一家店的 code 就是另一段消息，签名对不上。
- *
- * 三态纪律：**没有编号就如实报"暂无法核验"并拒绝落库**，绝不"先存着"——
- * 未经核验的声明一旦进了公开列表，第三方会把它当成"店主签过"（它并没有）。
- * @returns {{operator: string|null, code: string|null, reason: string|null}}
- */
-function resolveShopIdentity(req) {
-  const shop = req.shop;
-  /*
-    `ownerOnly` 中间件保证这里必有店铺上下文（请求头指的那家，或这个地址唯一经营的那家），
-    所以这一支正常不可达；真走到这里说明鉴权链被绕过——如实拒绝，**绝不"先存着"**。
-  */
-  if (!shop) {
-    return { operator: null, code: null, reason: '本次请求没有解析出店铺上下文' };
-  }
-  const operator = String(shop.seller || '').trim().toLowerCase();
-  if (!isAddress(operator) || isZeroAddress(operator)) {
-    return { operator: null, code: null, reason: '该店铺行没有合法的店主地址' };
-  }
-  // 编号恒非空（一行店铺只在链上登记之后才存在，见 src/shops.js），所以这里没有"还没有编号"那一档
-  return { operator, code: shop.code, reason: null };
-}
-
-/**
- * 公开列表的限流：与其他公开只读端点同款（联邦前端的店主主页会扇出到每个可达节点，
- * 60 次/分足够"一屏几十家店 × 几次页面切换"）。同样是 **Redis 固定窗口**，
- * 多实例部署需网关层兜底。
- */
-const claimsLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '店铺身份声明查询过于频繁，请稍后再试' });
-
-/**
- * 提交一条身份声明（ownerOnly）：`{kind, value, issued, signature}`。
- *
- * ⚠️ **签名的字节就是提交的字节**（铁律，见 src/claims.js 文件头）：`kind` / `value` / `issued`
- * **逐字**进消息——不 trim、不折大小写、不补当天。归一**只发生在拒绝这一侧**：
- * 值不是规范形就直接拒绝并告诉店主该写成什么、该对哪条消息重签；
- * 绝不允许"先替店主归一、再用归一后的值去验签"（那样客户端签原文永远验不过，
- * 而错误看起来只是"签名不对"，排查成本极高）。
- *
- * `issued` **必须由请求体给出**（`YYYY-MM-DD`）：它是被签名覆盖的文本的一部分，
- * 节点**不替客户端补当天**——日期是跨时区最容易漂移的一环（同一时刻两端可能不是同一天），
- * 节点自己生成会让"店主签的那天"与"节点算的那天"不同，表现是验签失败且极难定位。
- * 缺失/形状非法 ⇒ 报可读中文错（要求客户端显式给出）。
- *
- * 声明值长度上限：**逐字 ≤ 320 字符**（各类 kind 另有更紧的形状规则，见 src/claims.js），
- * 超限直接拒绝而不是截断——截断后的域名/仓库名会变成一个
- * "看起来合法但完全不是他声明的东西"。
- *
- * 幂等：同 (kind, value, shop_code) 在库里只有一行（唯一索引）；完全相同的重发**不改行、不新增**，
- * 已撤销后重新声明则恢复生效（按新签名覆盖 message/signature 并刷新 created_at）。
- * 每一种情况都写审计，detail 里带 duplicate/revived 以便区分"真的新声明"与"重复提交"。
- */
-router.post('/claims', ownerOnly, wrap(async (req, res) => {
-  const { kind, value, issued, signature } = req.body || {};
-  const me = resolveShopIdentity(req);
-  if (me.reason) {
-    return fail(res, `暂无法核验店主身份：${me.reason}——请稍后重试（未通过核验的声明一律不落库）`);
-  }
-  // ① 校验（**拒绝**而不是变换）：请求里的值必须**逐字**就是规范形，否则不进入验签
-  const check = checkClaimValue(kind, value);
-  if (!check.ok) {
-    /*
-      归一**只出现在这条错误信息里**：告诉店主该改成什么，并给出"改成规范形后应当签的那条消息"。
-      这一段**不参与**验签，也绝不会被写进库——它只是让店主一次就能改对。
-      （`canonical` 为 null 时连规范形都得不出来，例如非字符串/超长/空值，就只能给原因。）
-    */
-    const suggested =
-      check.canonical === null
-        ? null
-        : (() => {
-            try {
-              return buildClaimMessage({ code: me.code, operator: me.operator, kind, value: check.canonical, issued });
-            } catch {
-              return null; // issued 也就缺/非法：先让店主把它补齐，下一步再报
-            }
-          })();
-    return fail(
-      res,
-      suggested
-        ? `${check.reason}。\n请改成规范形后，用店主钱包对下面这条消息原文重新签名：\n${suggested}`
-        : check.reason
-    );
-  }
-  // ② 用请求体**原样**字段构造消息（不归一、不生成日期）：kind/value/issued 逐字进消息
-  let message;
-  try {
-    message = buildClaimMessage({ code: me.code, operator: me.operator, kind, value, issued });
-  } catch (e) {
-    return fail(res, e.message);
-  }
-  // ③ 验签：验的就是上面那条逐字拼出来的消息
-  const v = await verifyClaim({ message, signature, expectedOperator: me.operator });
-  if (!v.ok) {
-    /*
-      验签失败时把**这条消息**回给店主：前端一旦按别的字节（例如自己先做了归一）去签，
-      两边算出的消息就不是同一串。给出确切字节，店主重签一次即可，不必去猜"哪里不一样"。
-      消息本身是公开信息（它最终要原样下发），不构成泄露。
-    */
-    return fail(
-      res,
-      `签名核验不通过：${v.reason}。\n签名覆盖的就是提交的字节（节点不做任何归一）。请用店主钱包对下面这条消息原文签名后重试：\n${message}`
-    );
-  }
-  const db = getDb();
-  /*
-    落库口径：`value` 存**签名覆盖的那个原文**（校验通过时它就是规范形，二者相等——不存在
-    "归一值"与"原文"两份真相）；`kind` 同理（校验已保证它是逐字的规范 kind）。
-    `created_at` 由服务器盖章（列默认 CURRENT_TIMESTAMP(3)）；恢复生效那一支要显式刷新它，
-    因为"这一行代表的是现在这次声明"。
-  */
-  const signedValue = value;
-  const signedKind = kind;
-  const shopCode = String(req.shop.code || '');
-  const existing = await db.get('SELECT * FROM shop_claims WHERE kind = ? AND value = ? AND shop_code = ?', signedKind, signedValue, shopCode);
-  let id;
-  let duplicate = false;
-  let revived = false;
-  if (!existing) {
-    id = Number(
-      (await db.run('INSERT INTO shop_claims (shop_code, kind, value, address, message, signature) VALUES (?, ?, ?, ?, ?, ?)', shopCode, signedKind, signedValue, me.operator, message, String(signature))).insertId
-    );
-  } else if (existing.revoked_at === null && existing.message === message && existing.signature === String(signature)) {
-    // 完全相同的重发：**幂等**——不改行、不新增、不动 created_at（否则每次重发都像"重新声明了一次"）
-    id = existing.id;
-    duplicate = true;
-  } else {
-    // 已撤销后重新声明（恢复生效）或换了一份新签名（issued 不同）：同一行按最新签名覆盖。
-    // created_at 也随之刷新：它表示"现在这一行的声明时刻"，而不是历史上第一次声明的时刻
-    // （那一次的时间与撤销都留在审计里，见 action=shop.claim / shop.claim.revoke）。
-    revived = existing.revoked_at !== null;
-    id = existing.id;
-    await db.run('UPDATE shop_claims SET message = ?, signature = ?, created_at = CURRENT_TIMESTAMP(3), revoked_at = NULL WHERE id = ?', message,
-      String(signature),
-      id);
-  }
-  await audit(req, 'shop.claim', 'shop_claim', String(id), { kind: signedKind, value: signedValue, duplicate, revived }, shopCode);
-  const row = await db.get('SELECT * FROM shop_claims WHERE id = ?', id);
-  ok(
-    res,
-    claimDto(row),
-    duplicate
-      ? '该声明此前已提交过（幂等：未产生新记录）'
-      : revived
-        ? '该声明此前已撤销，现按新签名恢复生效'
-        : '声明已记录：EOA 可用 verifyMessage(message, signature) 离线核验；合约账户用标准 1271 或 Safe legacy 链上核验'
-  );
-}));
-
-/**
- * 公开列出**有效**声明（已撤销的不出现）。
- *
- * 只呈现**原始事实**：message / signature / address / kind / value / createdAt——
- * 刻意**不加**任何"已认证 / 官方 / verified"字段：节点能证明的只有"这个地址签过这句话"，
- * 证明不了"这个域名真是他的"（见文件头）。把它标成认证，就是在替第三方做一个做不了的判断。
- * 核验方式（响应 message 里也写了一遍，界面/脚本照做即可）：EOA 重算
- * `ethers.verifyMessage(message, signature)` 与 address 比对；合约账户对 address 调
- * 标准 1271 digest 或 Safe legacy `isValidSignature(bytes,bytes)`。
- *
- * 形状 `{ claims: [...] }` 而不是裸数组：与其它列表端点一样留出扩展位（将来要加 total/截断标记
- * 时不至于为了一个字段改整个响应形状）。
- */
-router.get('/claims', listedShopScope, claimsLimiter, wrap(async (req, res) => {
-  /*
-    按店铺限定：不带 X-Mk-Shop 时汇总**全部在售店铺**的声明（公开目录页要的就是这个），
-    带了就只出那一家。声明本身是公开事实，所以"汇总"不构成越权；而"哪条属于哪家店"
-    必须随行下发（`shopCode` 字段）——否则第三方无法把声明与它要核验的那家店对上。
-    ⚠️ 这里的"全部"只能由**没有请求头**进入：指到一家暂停接单的店铺时请求被
-    `listedShopScope` 以 409 拒绝（否则挂起店页面会显示全节点合计，还带着 code:0）。
-  */
-  const scoped = req.shop ? String(req.shop.code || '') : null;
-  const rows = (
-    scoped === null
-      ? await getDb().all(
-          `SELECT sc.* FROM shop_claims sc
-             JOIN shops s ON s.code = sc.shop_code AND s.listed = 1
-            WHERE sc.revoked_at IS NULL ORDER BY sc.id ASC`
-        )
-      : await getDb().all(
-          `SELECT sc.* FROM shop_claims sc
-             JOIN shops s ON s.code = sc.shop_code AND s.listed = 1
-            WHERE sc.revoked_at IS NULL AND sc.shop_code = ? ORDER BY sc.id ASC`,
-          scoped
-        )
-  );
-  ok(
-    res,
-    { claims: rows.map((r) => ({ ...claimDto(r), shopCode: r.shop_code || '' })) },
-    '声明由店主钱包签名：EOA 可离线 verifyMessage；合约账户用标准 1271 或 Safe legacy 链上核验（无需信任本节点）；节点不判定域名/账号归属'
-  );
-}));
-
-/**
- * 撤销一条声明（ownerOnly）：置 `revoked_at`（`Date`），此后不再出现在公开列表。写审计。
- * 幂等：已撤销的再撤一次只回执"此前已撤销"，不改行、不写第二条审计（没有发生变化）。
- * `id` 非法/不存在都如实报（404），不静默成功——店主以为撤了、实际没撤是最坏的形态。
- * **只能撤本店的声明**：否则 A 店店主可以拿一个自增 id 把 B 店的声明撤掉（那些 id 是连号的）。
- */
-router.post('/claims/:id/revoke', ownerOnly, wrap(async (req, res) => {
-  const id = Number(String(req.params.id ?? '').trim());
-  if (!Number.isInteger(id) || id <= 0) return fail(res, 'id 需为声明的正整数编号');
-  const db = getDb();
-  const row = await db.get('SELECT * FROM shop_claims WHERE id = ?', id);
-  if (!row) return fail(res, '声明不存在', 404, 404);
-  if (String(row.shop_code || '') !== String(req.shop.code || '')) {
-    return fail(res, '该声明不属于本店', 403, 403);
-  }
-  if (row.revoked_at !== null) {
-    return ok(res, claimDto(row), '该声明此前已撤销（幂等：未产生新记录，也不重复写审计）');
-  }
-  await db.run('UPDATE shop_claims SET revoked_at = CURRENT_TIMESTAMP(3) WHERE id = ?', id);
-  await audit(req, 'shop.claim.revoke', 'shop_claim', String(id), { kind: row.kind, value: row.value }, row.shop_code);
-  ok(res, claimDto(await db.get('SELECT * FROM shop_claims WHERE id = ?', id)), '声明已撤销（不再出现在公开列表）');
 }));
 
 /** 履约画像（公开只读聚合统计，口径见 reputation.js 头注释——不下发单笔订单）
@@ -1094,6 +905,17 @@ router.get('/staking/refresh', nodeAdmin, wrap(async (req, res) => {
   ok(res, await stakingShortfall({ force: true }));
 }));
 
+/**
+ * 待审批的撤资申请（仅节点主）。
+ *
+ * 只读、且是 Staking owner 做审批前的唯一待办视图：合约没有枚举 pending 的读法，
+ * 节点按"自己名下店铺的 seller"逐个读 `unstakeState`（见 src/stakingRequests.js 的口径与代价）。
+ * 单个地址读不到时 `partial=true`，界面必须如实提示列表可能不完整。
+ */
+router.get('/staking/requests', hostOnly, stakingLimiter, wrap(async (req, res) => {
+  ok(res, await pendingUnstakeRequests());
+}));
+
 /** 店铺买家评价聚合（公开只读：count/avg——与履约画像互补的主观质量信号）
  *  **按店铺限定**：不带 X-Mk-Shop 时是"该节点全部在售店铺"的合计，带了就只算那一家。
  *  暂停接单的店铺由 `listedShopScope` 拒绝——同 `/reputation`。 */
@@ -1110,7 +932,7 @@ router.get('/reviews/stats', listedShopScope, reviewsStatsLimiter, wrap(async (r
 */
 const buyerSignalLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '买家履约信号查询过于频繁，请稍后再试' });
 const metricsLimiter = simpleRateLimit({ windowMs: 60_000, max: 30, message: '运营指标查询过于频繁，请稍后再试' });
-const slaLimiter = simpleRateLimit({ windowMs: 60_000, max: 30, message: 'SLA 读数查询过于频繁，请稍后再试' });
+const slaLimiter = simpleRateLimit({ windowMs: 60_000, max: 30, message: '履约时效读数查询过于频繁，请稍后再试' });
 
 /**
  * 买家履约信号（ownerOnly 只读）：**该买家在本店**的争议/退款/确认收货/超时释放分布。
@@ -1124,7 +946,7 @@ const slaLimiter = simpleRateLimit({ windowMs: 60_000, max: 30, message: 'SLA �
 router.get('/buyer-signal', ownerOnly, buyerSignalLimiter, wrap(async (req, res) => {
   const address = String(req.query.address || '').trim().toLowerCase();
   if (!isAddress(address) || isZeroAddress(address)) {
-    return fail(res, 'address 需为 0x 开头的以太坊地址（零地址没有履约历史可谈）');
+    return fail(res, '地址必须是 0x 开头的以太坊地址（零地址没有履约历史）');
   }
   ok(res, await buyerSignal(address, req.shop.seller));
 }));
@@ -1148,7 +970,7 @@ router.get('/sla', ownerOnly, slaLimiter, wrap(async (req, res) => {
   const raw = req.query.limit;
   const limit = raw === undefined || raw === '' ? SLA_LIMIT_DEFAULT : Number(raw);
   if (!Number.isInteger(limit) || limit < 1 || limit > SLA_LIMIT_MAX) {
-    return fail(res, `limit 需为 1..${SLA_LIMIT_MAX} 的整数（缺省 ${SLA_LIMIT_DEFAULT}）`);
+    return fail(res, `数量必须是 1 到 ${SLA_LIMIT_MAX} 的整数（缺省 ${SLA_LIMIT_DEFAULT}）`);
   }
   ok(res, await slaReading({ limit, seller: req.shop.seller }));
 }));
@@ -1158,22 +980,22 @@ router.get('/sla', ownerOnly, slaLimiter, wrap(async (req, res) => {
 /** 汇总卡（缺省 30；days=0 全量；D7 钳制与归一见 stats.normalizeStatsDays） */
 router.get('/stats/overview', ownerOnly, wrap(async (req, res) => {
   const days = normalizeStatsDays(req.query.days, 30);
-  if (days === null) return fail(res, 'days 无效（需非负整数；0=全量；上限 366 天）');
+  if (days === null) return fail(res, '天数无效（需 0 或正整数；0=全量；上限 366 天）');
   ok(res, await overviewStats(days, req.shop.seller));
 }));
 
 /** 最近 N 天趋势（缺省 14，补零；D6 自然日对齐见 stats.trendStats） */
 router.get('/stats/trend', ownerOnly, wrap(async (req, res) => {
   const days = normalizeStatsDays(req.query.days, 14);
-  if (days === null) return fail(res, 'days 无效（需正整数；上限 366 天）');
-  if (days === 0) return fail(res, 'trend 需正整数天数（不支持全量）');
+  if (days === null) return fail(res, '天数无效（需正整数；上限 366 天）');
+  if (days === 0) return fail(res, '趋势天数必须是正整数（不支持全量）');
   ok(res, { days, items: await trendStats(days, req.shop.seller) });
 }));
 
 /** 商品排行（sort=gmv|orders|refund；缺省 30 天；days=0 全量） */
 router.get('/stats/products', ownerOnly, wrap(async (req, res) => {
   const days = normalizeStatsDays(req.query.days, 30);
-  if (days === null) return fail(res, 'days 无效（需非负整数；0=全量；上限 366 天）');
+  if (days === null) return fail(res, '天数无效（需 0 或正整数；0=全量；上限 366 天）');
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
   ok(res, await productStats(days, String(req.query.sort || 'gmv'), page, pageSize, req.shop.seller));

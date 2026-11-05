@@ -161,10 +161,11 @@ export async function deliveryGate(order) {
   try {
     chain = await fetchOrderFor(orderIdHex);
   } catch (e) {
+    console.error('[chainOrder] 读不到链上托管状态：', e?.message || e);
     return {
       ok: false,
       code: 'unreadable',
-      message: `读不到链上托管状态（${e?.message || e}）：交付前必须确认这笔钱仍在托管且未被申请退款，本次已中止，请稍后重试`,
+      message: `读不到链上托管状态（链上节点暂时不可用）：交付前必须确认这笔钱仍在托管且未被申请退款，本次已中止，请稍后重试`,
     };
   }
   if (!chainParamsMatch(order, chain)) {
@@ -186,7 +187,7 @@ export async function deliveryGate(order) {
     return {
       ok: false,
       code: 'refund_pending',
-      message: '链上显示买家已申请退款（资金冻结中）：请先在链上拒绝该退款申请（rejectRefund）后再交付，或同意退款（approveRefund）',
+      message: '链上显示买家已申请退款（资金冻结中）：请先在链上拒绝该退款申请后再交付，或同意退款',
     };
   }
   return { ok: true, chain };

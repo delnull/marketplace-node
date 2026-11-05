@@ -22,10 +22,10 @@ const SPECS = [
   { name: '尺寸', options: ['65', '80'] },
 ];
 const SKUS = [
-  { key: '黑|65', priceUsdtMicro: 100_000_000, capacity: 2 },
-  { key: '黑|80', priceUsdtMicro: 110_000_000, capacity: 3 },
-  { key: '白|65', priceUsdtMicro: 120_000_000, capacity: null },
-  { key: '白|80', priceUsdtMicro: 130_000_000, capacity: 1 },
+  { key: '黑|65', priceMicro: 100_000_000, capacity: 2 },
+  { key: '黑|80', priceMicro: 110_000_000, capacity: 3 },
+  { key: '白|65', priceMicro: 120_000_000, capacity: null },
+  { key: '白|80', priceMicro: 130_000_000, capacity: 1 },
 ];
 
 const skuRow = async (slug, key) =>
@@ -41,9 +41,9 @@ async function draftAs(who, slug, skuKey) {
 const newBuyer = () => Wallet.createRandom();
 
 /** 期望 wei：与节点同源（rates.usdtMicroToPayWei），避免在测试里手抄一遍汇率算式 */
-async function expectWei(usdtMicro) {
+async function expectWei(priceMicro) {
   const { getRates, usdtMicroToPayWei } = await import('../src/rates.js');
-  return usdtMicroToPayWei(usdtMicro, await getRates());
+  return usdtMicroToPayWei(priceMicro, await getRates());
 }
 
 // ── 组合键与校验 ──
@@ -54,17 +54,17 @@ test('规格组合：笛卡尔积落库，key 按 specs 声明顺序拼接', asy
   const p = res.body.data;
   assert.deepEqual([...p.skus.map((s) => s.key)].sort(), ['白|65', '白|80', '黑|65', '黑|80'].sort(), '2×2 = 4 个组合，按 key 升序');
   assert.deepEqual(p.specs, SPECS);
-  assert.equal((await skuRow(p.slug, '黑|65')).price_usdt_micro, 100_000_000, '逐组合定价落库（微 USDT）');
+  assert.equal((await skuRow(p.slug, '黑|65')).price_micro, 100_000_000, '逐组合定价落库（微 USDT）');
   assert.deepEqual((await skuRow(p.slug, '黑|65')).specs_json, { 颜色: '黑', 尺寸: '65' });
 });
 
 test('SKU 必须恰好覆盖全部组合：少一个 / 多一个 / 键不属于规格 都拒绝', async () => {
   const missing = await post(productPayload({ specs: SPECS, skus: SKUS.slice(0, 3) }));
   assert.notEqual(missing.body.code, 0);
-  assert.match(missing.body.message, /覆盖全部规格组合/);
+  assert.match(missing.body.message, /覆盖全部组合/);
 
   const extra = await post(
-    productPayload({ specs: SPECS, skus: [...SKUS, { key: '红|65', priceUsdtMicro: 90_000_000, capacity: 1 }] })
+    productPayload({ specs: SPECS, skus: [...SKUS, { key: '红|65', priceMicro: 90_000_000, capacity: 1 }] })
   );
   assert.notEqual(extra.body.code, 0);
 
@@ -77,7 +77,7 @@ test('SKU 必须恰好覆盖全部组合：少一个 / 多一个 / 键不属于�
 
 test('规格定义边界：单维 1 个选项可上架（单规格）/ 超过 3 维 → 拒绝', async () => {
   const one = await post(
-    productPayload({ specs: [{ name: '颜色', options: ['黑'] }], skus: [{ key: '黑', priceUsdtMicro: 1_000_000 }] })
+    productPayload({ specs: [{ name: '颜色', options: ['黑'] }], skus: [{ key: '黑', priceMicro: 1_000_000 }] })
   );
   assertOk(one);
   assert.deepEqual(one.body.data.specs, [{ name: '颜色', options: ['黑'] }]);
@@ -105,7 +105,7 @@ test("显式默认规格（规格：默认）= 唯一组合 sku_key=''", async (
     productPayload({
       title: '默认规格商品',
       specs: [{ name: '规格', options: ['默认'] }],
-      skus: [{ key: '', priceUsdtMicro: 1_000_000 }],
+      skus: [{ key: '', priceMicro: 1_000_000 }],
     })
   );
   assertOk(res);
@@ -118,26 +118,26 @@ test("显式默认规格（规格：默认）= 唯一组合 sku_key=''", async (
 
 // ── 定价 ──
 
-test('价格汇总：商品级 priceUsdtMicro 取各组合最低价（列表页「起价」）', async () => {
+test('价格汇总：商品级 priceMicro 取各组合最低价（列表页「起价」）', async () => {
   const res = await post(productPayload({ title: '起价商品', specs: SPECS, skus: SKUS }));
   assertOk(res);
-  assert.equal(res.body.data.priceUsdtMicro, 100_000_000, 'min(100,110,120,130 USDT)');
-  assert.equal(res.body.data.priceUsdt, '100', '展示串去净尾零：100 USDT 写作 100（不是 100.00）');
+  assert.equal(res.body.data.priceMicro, 100_000_000, 'min(100,110,120,130 price)');
+  assert.equal(res.body.data.price, '100', '展示串去净尾零：100 price 写作 100（不是 100.00）');
 });
 
 test('按所选 SKU 定价：不同组合不同价，与商品级「起价」无关', async () => {
   const p = (await post(productPayload({ title: '按 SKU 定价', specs: SPECS, skus: SKUS }))).body.data;
 
   const a = (await draftAs(newBuyer(), p.slug, '黑|65')).body.data;
-  assert.equal(a.usdtMicro, 100_000_000, '黑|65 单价 100 USDT');
+  assert.equal(a.priceMicro, 100_000_000, '黑|65 单价 100 price');
   // 期望 wei 取自节点自己的折算函数（兜底汇率 1 BTY = 0.1 USDT，向上取整）
-  assert.equal(a.amountWei, await expectWei(a.usdtMicro), '按 SKU 单价折算 wei');
+  assert.equal(a.amountWei, await expectWei(a.priceMicro), '按 SKU 单价折算 wei');
   const frozen = await db.get('SELECT sku_key, sku_specs FROM v_orders WHERE order_no = ?', a.id);
   assert.equal(frozen.sku_key, '黑|65', '订单记录所选组合');
   assert.deepEqual(frozen.sku_specs, { 颜色: '黑', 尺寸: '65' }, '订单冻结所选规格');
 
   const b = (await draftAs(newBuyer(), p.slug, '白|80')).body.data;
-  assert.equal(b.usdtMicro, 130_000_000, '白|80 单价 130 USDT');
+  assert.equal(b.priceMicro, 130_000_000, '白|80 单价 130 price');
   assert.notEqual(a.amountWei, b.amountWei, '不同组合应付金额不同');
 });
 
@@ -148,14 +148,14 @@ test('多规格商品必须指定 skuKey；单组合商品可省略', async () =
       productPayload({
         title: '单组合',
         specs: [{ name: '规格', options: ['默认'] }],
-        skus: [{ key: '', priceUsdtMicro: 66_000_000 }],
+        skus: [{ key: '', priceMicro: 66_000_000 }],
       })
     )
   ).body.data;
 
   const noKey = await draftAs(newBuyer(), multi.slug);
   assert.equal(noKey.status, 400);
-  assert.match(noKey.body.message, /需指定 skuKey/);
+  assert.match(noKey.body.message, /需指定所选规格/);
 
   const badKey = await draftAs(newBuyer(), multi.slug, '不存在');
   assert.equal(badKey.status, 400);
@@ -221,11 +221,11 @@ test('编辑商品：同 key 组合的销量保留；改价不影响占位', asy
   const edited = await request(app)
     .patch(`/api/products/${p.slug}`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send({ specs: SPECS, skus: SKUS.map((s) => (s.key === '黑|65' ? { ...s, priceUsdtMicro: 99_000_000 } : s)) })
+    .send({ specs: SPECS, skus: SKUS.map((s) => (s.key === '黑|65' ? { ...s, priceMicro: 99_000_000 } : s)) })
     .expect(200);
   assertOk(edited);
   const row = await skuRow(p.slug, '黑|65');
-  assert.equal(row.price_usdt_micro, 99_000_000, '改价生效');
+  assert.equal(row.price_micro, 99_000_000, '改价生效');
   assert.equal(row.committed, 1, '改价不触碰占位');
 });
 
@@ -250,7 +250,7 @@ test('编辑：总量不得小于该组合已占位（校验先于写入）；SK
   assertOk(onlyCap);
   const row = await skuRow(p.slug, '黑|65');
   assert.equal(row.capacity, 7);
-  assert.equal(row.price_usdt_micro, 100_000_000, '未提交价格时沿用原价');
+  assert.equal(row.price_micro, 100_000_000, '未提交价格时沿用原价');
 });
 
 /**
@@ -345,11 +345,11 @@ test('编辑商品：整体上下架不得把已停售的单个组合重新上�
     await request(app)
       .patch(`/api/products/${p.slug}`)
       .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-      .send({ skus: [{ key: '黑|65', priceUsdtMicro: 123_450_000 }] })
+      .send({ skus: [{ key: '黑|65', priceMicro: 123_450_000 }] })
       .expect(200)
   );
   assert.equal((await skuRow(p.slug, '黑|65')).active, 0, '改价同样不得改回上架');
-  assert.equal((await skuRow(p.slug, '黑|65')).price_usdt_micro, 123_450_000);
+  assert.equal((await skuRow(p.slug, '黑|65')).price_micro, 123_450_000);
 });
 
 // ── 快照 ──
@@ -369,13 +369,14 @@ test('快照覆盖规格与逐组合单价，且可复算；改任一组合价�
     description: p.description,
     media: p.media,
     kind: p.kind,
+    price_currency: 'USDT',
     specs: p.specs,
-    skus: p.skus.map((s) => ({ sku_key: s.key, price_usdt_micro: s.priceUsdtMicro })),
+    skus: p.skus.map((s) => ({ sku_key: s.key, price_micro: s.priceMicro })),
   });
   assert.deepEqual(snap.specs, SPECS, '快照含规格定义');
   assert.deepEqual(
     snap.skus,
-    [...SKUS].sort((a, b) => (a.key < b.key ? -1 : 1)).map((s) => [s.key, s.priceUsdtMicro]),
+    [...SKUS].sort((a, b) => (a.key < b.key ? -1 : 1)).map((s) => [s.key, s.priceMicro]),
     '快照含逐组合单价（按 key 升序，保证哈希确定）'
   );
   assert.equal(computeSnapshotHash(snap), p.snapshotHash, '哈希可复算');
@@ -383,7 +384,7 @@ test('快照覆盖规格与逐组合单价，且可复算；改任一组合价�
   await request(app)
     .patch(`/api/products/${p.slug}`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send({ skus: SKUS.map((s) => (s.key === '白|80' ? { ...s, priceUsdtMicro: 1 } : s)) })
+    .send({ skus: SKUS.map((s) => (s.key === '白|80' ? { ...s, priceMicro: 1 } : s)) })
     .expect(200);
   const after = (await request(app).get(`/api/products/${p.slug}`).expect(200)).body.data;
   assert.notEqual(after.snapshotHash, p.snapshotHash, '组合改价应重算快照哈希');

@@ -36,7 +36,7 @@ export function normalizeBlocks(input) {
   const errors = [];
   if (input === undefined || input === null) return { errors, blocks: [] };
   if (!Array.isArray(input)) {
-    errors.push('descriptionBlocks 需为数组（[{type:"text"|"image", ...}]）');
+    errors.push('商品描述必须是数组（文字或图片项）');
     return { errors, blocks: [] };
   }
   if (input.length > MAX_BLOCKS) {

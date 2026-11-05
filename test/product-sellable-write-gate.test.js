@@ -73,7 +73,7 @@ test('暂停接单：PATCH /:slug、POST /:slug/codes、POST /:slug/tokens 全�
     },
     {
       label: 'PATCH /batch（批量改价）',
-      run: () => asOwner(request(app).patch('/api/products/batch')).send({ slugs: [physical.slug], patch: { priceUsdtMicro: 1 } }),
+      run: () => asOwner(request(app).patch('/api/products/batch')).send({ slugs: [physical.slug], patch: { priceMicro: 1 } }),
     },
   ];
 

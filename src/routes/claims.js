@@ -30,6 +30,8 @@ import { verifySession, roleOf, isHost } from '../auth.js';
 import { getDb } from '../db.js';
 import { logAudit } from '../audit.js';
 import { sendCsv } from '../csv.js';
+// 用户词表：表头与枚举值都从唯一来源取（与前端同一份数据）
+import { enumText, fmtTime } from '../userText.js';
 import {
   submitClaim,
   claimDto,
@@ -68,13 +70,13 @@ function claimFilterOf(req) {
   const fromRaw = String(req.query.from || '').trim();
   const toRaw = String(req.query.to || '').trim();
   if (status !== 'all' && status !== 'todo' && !CLAIM_STATUSES.includes(status)) {
-    return { error: 'status 非法' };
+    return { error: '状态筛选值非法' };
   }
   const parseDay = (raw, end) => {
     if (!raw) return null;
     const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(raw);
     if (!dateOnly && Number.isNaN(new Date(raw).getTime())) {
-      return { error: `${end ? 'to' : 'from'} 需为 YYYY-MM-DD 或 ISO-8601 时间` };
+      return { error: `${end ? '结束时间' : '开始时间'}请填写日期（如 2026-10-01）或完整时间` };
     }
     const d = dateOnly ? new Date(`${raw}T00:00:00.000Z`) : new Date(raw);
     if (Number.isNaN(d.getTime())) return { error: `${end ? 'to' : 'from'} 不是有效日期` };
@@ -119,11 +121,14 @@ function claimWhereOf(scope, filter) {
 router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
   const contract = String(req.query.contract || '').trim();
   const tokenId = String(req.query.tokenId ?? '').trim();
-  if (!contract || !tokenId) return fail(res, '需要 contract 与 tokenId 两个参数');
+  if (!contract || !tokenId) return fail(res, '需要合约地址与 NFT 编号两个参数');
   const rows = await getDb().all(
-    `SELECT n.*, (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+    `SELECT n.*, p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
+         (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
          (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
        FROM nft_claims n
+       LEFT JOIN products p ON p.id = n.product_id
+       LEFT JOIN orders o ON o.id = n.order_id
       WHERE n.token_contract = ? AND n.token_id = ? ORDER BY n.id DESC LIMIT 20`,
     contract.toLowerCase(),
     tokenId
@@ -135,9 +140,12 @@ router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
 router.get('/nft/mine', requireAuth, wrap(async (req, res) => {
   const rows = await getDb().all(
     `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
+         p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
          (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
          (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id WHERE n.claimant = ? ORDER BY n.id DESC LIMIT 200`,
+       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
+            LEFT JOIN orders o ON o.id = n.order_id
+      WHERE n.claimant = ? ORDER BY n.id DESC LIMIT 200`,
     req.auth.address
   );
   ok(res, { claims: rows.map((r) => claimDto(r, { as: 'holder' })) });
@@ -155,41 +163,65 @@ router.get('/nft/seller.csv', requireAuth, exportLimiter, wrap(async (req, res) 
   }
   const rows = await getDb().all(
     `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
+       p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
        (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
        (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
        FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
+            LEFT JOIN orders o ON o.id = n.order_id
        ${where}
       ORDER BY FIELD(n.status,'requested','approved','shipped','fulfilled','rejected','cancelled','expired'), n.id DESC`,
     ...params
   );
-  const statusText = {
-    requested: '待处理', approved: '待发货', shipped: '已发货', fulfilled: '已交付',
-    rejected: '已驳回', cancelled: '已撤回', expired: '已过期',
-  };
-  const standardText = { erc721: 'ERC721', erc1155: 'ERC1155' };
   const headers = [
-    '提货单号', '订单号', '商品', 'NFT标准', 'NFT合约', 'tokenId', '提货人',
-    '收货人', '电话', '地址', '运单号', 'NFT转账哈希', '状态', '链上案号', '备注', '申请时间', '更新时间',
+    '提货单号', '订单号', '商品', 'NFT 标准', 'NFT 合约', 'NFT 编号', '提货人',
+    '收货人', '电话', '地址', '运单号', 'NFT 转账哈希', '状态', '链上案号', '备注', '申请时间', '更新时间',
   ];
   const csvRows = rows.map((r) => {
     const d = claimDto(r, { as: 'seller' });
     return [
-      d.id, d.orderNo, d.productTitle || '', standardText[d.nftStandard] || d.nftStandard || '',
+      d.id, d.orderNo, d.productTitle || '', d.nftStandard ? enumText('nftStandard', d.nftStandard) : '',
       d.nftContract, d.tokenId, d.claimant, d.shipping?.name || '', d.shipping?.phone || '',
       d.shipping?.address || '', d.trackingNo || '', d.deliveryTxHash || '',
-      statusText[d.status] || d.status, d.claimId || '', d.note || '', d.createdAt, d.updatedAt,
+      enumText('claimStatus', d.status), d.claimId || '', d.note || '', fmtTime(d.createdAt), fmtTime(d.updatedAt),
     ];
   });
-  await logAudit({
-    req,
-    actor: req.auth.address,
-    actorRole: 'staff',
-    shopCode: null,
-    action: 'claim.export',
-    targetType: 'nft_claim_export',
-    targetId: 'seller.csv',
-    detail: { rows: csvRows.length, status: filter.status, from: filter.from, to: filter.to },
-  });
+  /*
+    导出审计**逐店落行**，一行一家店（`shop_code` 由被导出的行自己回答）。
+
+    为什么不是一行节点级（旧形状 `shopCode: null` + `actorRole: 'staff'`）：
+      · 角色是假的——卖家本人导出自己的提货单，旧实现恒写 staff；
+      · 归属是假的——一份 CSV 可能横跨同一位卖家/店员可经营的几家店，而它读的是店铺私域数据
+        （含收货信息）。写成节点级之后**只有节点主看得见**，真正该监督这次导出的店主反而看不到；
+        而且节点主看到的是租户的动作，方向反了。
+    逐店落行之后，每家店主在自己的审计列表里都能看到"谁在什么时候导出了我这家店的提货单"，
+    角色也按该行自己的 seller 判定（seller == 操作者 ⇒ owner，否则 staff：他是因为店员身份进来的）。
+
+    零行导出不落行：没有数据离开节点，就不存在"哪家店的提货单被带走"这个事实；
+    给它编一个店铺归属反而是一句假话（见 audit.js 的 logAudit 对 shopCode 的纪律）。
+  */
+  const byShop = new Map();
+  const actorAddress = String(req.auth.address || '').toLowerCase();
+  for (const r of rows) {
+    const code = String(r.shop_code || '');
+    if (!code) continue;
+    const g = byShop.get(code) || { rows: 0, mine: false };
+    g.rows += 1;
+    if (String(r.seller || '').toLowerCase() === actorAddress) g.mine = true;
+    byShop.set(code, g);
+  }
+  for (const [code, g] of byShop) {
+    await logAudit({
+      req,
+      actor: req.auth.address,
+      // 他导出的是**自己作为 seller 的那批行** ⇒ 店主；否则他是该店店员（staff）
+      actorRole: g.mine ? 'owner' : 'staff',
+      shopCode: code,
+      action: 'claim.export',
+      targetType: 'nft_claim_export',
+      targetId: 'seller.csv',
+      detail: { rows: g.rows, status: filter.status, from: filter.from, to: filter.to },
+    });
+  }
   sendCsv(res, `nft-claims-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.csv`, headers, csvRows);
 }));
 
@@ -210,9 +242,11 @@ router.get('/nft/seller', requireAuth, wrap(async (req, res) => {
   const offset = (filter.page - 1) * filter.pageSize;
   const rows = await db.all(
     `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
+       p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
        (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
        (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
        FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
+            LEFT JOIN orders o ON o.id = n.order_id
        ${where}
       ORDER BY FIELD(n.status,'requested','approved','shipped','fulfilled','rejected','cancelled','expired'), n.id DESC
       LIMIT ${filter.pageSize} OFFSET ${offset}`,
@@ -298,8 +332,9 @@ router.post('/nft/:id/seller', requireAuth, wrap(async (req, res) => {
  */
 router.post('/nft/:id/dispute', nodeAdmin, wrap(async (req, res) => {
   const { amountWei, deadline } = req.body || {};
-  const r = await buildClaimDisputeCall({ claimNo: req.params.id, amountWei, deadlineSeconds: deadline });
+  const r = await buildClaimDisputeCall({ claimNo: String(req.params.id), amountWei, deadlineSeconds: deadline });
   if (!r.ok) return fail(res, r.message, r.status, r.status);
+  const claimRow = await getDb().get('SELECT shop_code FROM nft_claims WHERE claim_no = ?', String(req.params.id || ''));
   const host = await isHost(req.auth.address, { force: true });
   await logAudit({
     req,
@@ -309,7 +344,11 @@ router.post('/nft/:id/dispute', nodeAdmin, wrap(async (req, res) => {
     action: 'claim.dispute.prepare',
     targetType: 'nft_claim',
     targetId: String(req.params.id),
-    detail: { claimId: r.call.claimId, amountWei: r.call.args[5] },
+    /*
+      `shopCode` 是**这家店的治理记录**赖以找到这一行的归属（节点级行的 shop_code 恒为 NULL，
+      见 audit.js 的 auditWhere）。没有它，节点主在店铺详情里看不到"这家店的提货争议参数是谁生成的"。
+    */
+    detail: { claimId: r.call.claimId, amountWei: r.call.args[5], shopCode: claimRow?.shop_code ?? null },
   });
   ok(
     res,

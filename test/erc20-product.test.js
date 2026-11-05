@@ -64,8 +64,8 @@ test('ERC20 商品：地址必须是合约；SKU 必须带每份 raw 数量；�
       tokenContract: TOKEN,
       specs: [{ name: '面额', options: ['100', '500'] }],
       skus: [
-        { key: '100', priceUsdtMicro: 10_000_000, capacity: 2, tokenAmount: '100000000000000000000' },
-        { key: '500', priceUsdtMicro: 50_000_000, capacity: 1, tokenAmount: '500000000000000000000' },
+        { key: '100', priceMicro: 10_000_000, capacity: 2, tokenAmount: '100000000000000000000' },
+        { key: '500', priceMicro: 50_000_000, capacity: 1, tokenAmount: '500000000000000000000' },
       ],
     }))
     .expect(200);
@@ -95,15 +95,15 @@ test('ERC20 元数据预检：返回合约精度/符号，供前端把人类单�
 test('ERC20 商品缺少 tokenAmount / 地址不是合约都拒绝', async () => {  const noAmount = await ctx.request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send(productPayload({ kind: 'erc20', title: '缺数量', tokenContract: TOKEN, skus: [{ key: '', priceUsdtMicro: 1 }] }))
+    .send(productPayload({ kind: 'erc20', title: '缺数量', tokenContract: TOKEN, skus: [{ key: '', priceMicro: 1 }] }))
     .expect(200);
   assert.notEqual(noAmount.body.code, 0);
-  assert.match(noAmount.body.message, /tokenAmount/);
+  assert.match(noAmount.body.message, /每份代币数量/);
 
   const zero = await ctx.request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send(productPayload({ kind: 'erc20', title: '零地址', tokenContract: '0x0000000000000000000000000000000000000000', skus: [{ key: '', priceUsdtMicro: 1, tokenAmount: '1' }] }))
+    .send(productPayload({ kind: 'erc20', title: '零地址', tokenContract: '0x0000000000000000000000000000000000000000', skus: [{ key: '', priceMicro: 1, tokenAmount: '1' }] }))
     .expect(200);
   assert.notEqual(zero.body.code, 0);
 });

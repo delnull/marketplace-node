@@ -69,9 +69,10 @@ const nftPayload = (overrides = {}) => ({
   description: 'NFT 池缺货告警单测商品。',
   media: [{ type: 'image', url: 'https://example.com/n.jpg' }],
   kind: 'nft',
+  priceCurrency: 'USDT',
   nftContract: NFT_CONTRACT,
   specs: [{ name: '规格', options: ['默认'] }],
-  skus: [{ key: '', priceUsdtMicro: 66_000_000, capacity: null }],
+  skus: [{ key: '', priceMicro: 66_000_000, capacity: null }],
   ...overrides,
 });
 

@@ -60,7 +60,7 @@ async function insertOrder({
     status,
     productSlug: 'p-bs',
     amountWei: '1000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     // 草稿期就已生成链上单号（所以它不能当"成交"判据）
     escrowOrderId: `0x${String(seq).padStart(64, '0')}`,

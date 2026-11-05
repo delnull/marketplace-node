@@ -52,7 +52,7 @@ async function insertOrder({ productId, slug, status, createdAgoMs, shippedAgoMs
     buyer: buyer.address.toLowerCase(),
     seller: owner.address.toLowerCase(),
     amountWei: '1000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     status,
     escrowOrderId: `0x${String(seq).padStart(64, '0')}`,

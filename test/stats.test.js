@@ -16,6 +16,38 @@ let buyerToken;
 let seq = 0;
 const payHash = () => '0x' + String(++seq).padStart(64, '0');
 
+test('商品排行可比口径：原生按实际 wei，ERC20 按锁定 token/USDT 与 bty 汇率折成微 BTY', async () => {
+  const { btyComparableMicroOfRow, refundBtyComparableMicroOfRow } = await import('../src/stats.js');
+  const native = {
+    amount_wei: '250000000000000000000',
+    refunded_amount_wei: '0',
+    payment_token: '0x0000000000000000000000000000000000000000',
+    payment_decimals: 18,
+    bty_usdt_rate: '0.1',
+    token_usdt_micro_per_token: '0',
+  };
+  // 250 BTY 实收 = 250_000_000 微 BTY
+  assert.equal(btyComparableMicroOfRow(native), 250_000_000n);
+
+  const erc20 = {
+    amount_wei: '25000000', // 25 USDT（6 位）
+    refunded_amount_wei: '5000000', // 退 5 USDT
+    payment_token: '0x1111111111111111111111111111111111111111',
+    payment_decimals: 6,
+    token_usdt_micro_per_token: '1000000', // 1 token = 1 USDT
+    bty_usdt_rate: '0.1', // 1 BTY = 0.1 USDT
+  };
+  // 20 USDT / 0.1 = 200 BTY = 200_000_000 微 BTY；退款 5 USDT = 50 BTY
+  assert.equal(btyComparableMicroOfRow(erc20), 200_000_000n);
+  assert.equal(refundBtyComparableMicroOfRow(erc20), 50_000_000n);
+
+  assert.equal(
+    btyComparableMicroOfRow({ ...erc20, bty_usdt_rate: '0' }),
+    null,
+    '折算率缺失不能当 0'
+  );
+});
+
 before(async () => {
   ownerToken = (await login(ctx, owner)).token;
   buyerToken = (await login(ctx, buyer)).token;
@@ -81,8 +113,8 @@ test('跨资产退款折算：原生按 BTY 锁定汇率、ERC20 按 token 精�
 });
 
 test('overview：入账净额与退款并列、件数/买家/复购去重、确认率', async () => {
-  const p1 = await listProduct(productPayload({ kind: 'physical', title: '看板A', capacity: 99, priceUsdtMicro: 100_000_000 }));
-  const p2 = await listProduct(productPayload({ kind: 'digital', title: '看板B', priceUsdtMicro: 200_000_000 }));
+  const p1 = await listProduct(productPayload({ kind: 'physical', title: '看板A', capacity: 99, priceMicro: 100_000_000 }));
+  const p2 = await listProduct(productPayload({ kind: 'digital', title: '看板B', priceMicro: 200_000_000 }));
   // p1 两单（qty 2 + 1）→ confirmed + expired；p2 一单 confirmed
   const a1 = await createDraft(p1.slug, 2);
   const a2 = await createDraft(p1.slug);
@@ -162,7 +194,7 @@ test('trend：按天补零、退款额并入对应日', async () => {
 });
 
 test('products 排行：排序与分页；越权拒绝', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '排行商品', capacity: 99, priceUsdtMicro: 50_000_000 }));
+  const p = await listProduct(productPayload({ kind: 'physical', title: '排行商品', capacity: 99, priceMicro: 50_000_000 }));
   for (let i = 0; i < 3; i++) {
     const o = await createDraft(p.slug);
     await settle(o.id, 'confirmed');
@@ -264,7 +296,7 @@ test('overview：ERC20 单进入微 USDT 汇总，不把 token 单位混进 BTY 
     fixedUsdtMicroPerToken: '1000000',
   });
   try {
-    const p = await listProduct(productPayload({ kind: 'digital', title: 'ERC20 看板', priceUsdtMicro: 12_500_000 }));
+    const p = await listProduct(productPayload({ kind: 'digital', title: 'ERC20 看板', priceMicro: 12_500_000 }));
     const before = (await request(app).get('/api/shop/stats/overview?days=0')
       .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200)).body.data;
     const o = await createDraft(p.slug, 1, token);
@@ -275,7 +307,7 @@ test('overview：ERC20 单进入微 USDT 汇总，不把 token 单位混进 BTY 
     assert.equal(
       BigInt(after.gmvNetUsdtMicro) - BigInt(before.gmvNetUsdtMicro),
       12_500_000n,
-      'ERC20 单的净额按锁定 USDT 金额进入跨资产口径'
+      'ERC20 单的净额按锁定 price 金额进入跨资产口径'
     );
 
     await settle(o.id, 'settled', Date.now(), o.amountWei);

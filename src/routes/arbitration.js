@@ -3,6 +3,7 @@
  *
  *  GET /api/arbitration/pending       待仲裁争议单列表（公开只读，分页倒序）
  *  GET /api/arbitration/after-sales   待处理**售后案件**列表（确认收货后开的案；公开只读，分页倒序）
+ *  GET /api/arbitration/claims        未结的**提货争议**（claimId 队列；公开只读，不含本地订单号）
  *
  * 裁决闭环：买家在订单页发起争议（链上 requestDispute）→ 节点 escrowWatcher 回写本单
  * 为 disputed（事件史追加 DisputeRequested）→ 仲裁人在前端「仲裁台」从各可达
@@ -40,11 +41,11 @@
  */
 import { Router } from 'express';
 import { getDb } from '../db.js';
-import { ok, wrap, simpleRateLimit, bearerToken } from '../http.js';
+import { ok, fail, wrap, simpleRateLimit, bearerToken } from '../http.js';
 import { verifySession } from '../auth.js';
 import { weiToDecimal, isArbiterForOrder } from '../chain.js';
-// 金额展示口径的唯一实现（usdtOf / goodsMicroOf）——不要手写 (micro/1e6).toFixed(2)
-import { goodsMicroOf, usdtOf } from '../money.js';
+// 金额展示口径的唯一实现（priceOf / goodsPriceMicroOf）——不要手写 (micro/1e6).toFixed(2)
+import { goodsPriceMicroOf, priceOf, priceUnitOf } from '../money.js';
 // 「已交付事实」的唯一实现（shipped_at / tracking_no / 交付行三要素）——不要在本文件重写判据
 import { hasDelivered, hasDeliveredMany } from '../returns.js';
 // 事件史对外的唯一折算点（库里的 at 是毫秒，出口一律 ISO；见 src/reputation.js）
@@ -165,19 +166,21 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null, delivered, e
     quantity: o.quantity || 1,
     /*
       金额拆分（与 orders.js 的 orderToPublic 同口径，缺一不可）：
-        usdtMicro            = 本单应付总额（商品 + 运费），也是链上锁定 amountWei 的 USDT 口径
-        shippingFeeUsdtMicro = 本单实际锁定的运费（按单收取一次；数字 / NFT / ERC20 单恒 0）
-        goodsUsdtMicro       = usdtMicro − 运费 = 商品金额（单价 × 数量）
+        priceCurrency        = 本单标价币种（USDT/BTY）
+        priceMicro           = 本单应付总额（商品 + 运费），标价币种微单位
+        shippingFeeMicro     = 本单实际锁定的运费（按单收取一次；数字 / NFT / ERC20 单恒 0）
+        goodsPriceMicro      = priceMicro − 运费 = 商品金额（单价 × 数量）
       仲裁人要判的是"退多少"，而商品金额与运费是两笔不同的钱：只给总额，
-      前端任何「本单单价 = 总额 ÷ 数量」的换算都会把运费摊成商品价
-      （2 件 10 USDT + 运费 5 USDT → 12.5 USDT/件），裁决依据里就多出一个不存在的单价。
+      前端任何「本单单价 = 总额 ÷ 数量」的换算都会把运费摊成商品价。
     */
-    usdtMicro: o.usdt_micro,
-    usdt: usdtOf(o.usdt_micro),
-    shippingFeeUsdtMicro: o.shipping_fee_usdt_micro || 0,
-    shippingFeeUsdt: usdtOf(o.shipping_fee_usdt_micro),
-    goodsUsdtMicro: goodsMicroOf(o.usdt_micro, o.shipping_fee_usdt_micro),
-    goodsUsdt: usdtOf(goodsMicroOf(o.usdt_micro, o.shipping_fee_usdt_micro)),
+    priceCurrency: o.price_currency,
+    priceMicro: o.price_micro,
+    price: priceOf(o.price_micro),
+    priceUnit: priceUnitOf(o.price_currency),
+    shippingFeeMicro: o.shipping_fee_micro || 0,
+    shippingFee: priceOf(o.shipping_fee_micro),
+    goodsPriceMicro: goodsPriceMicroOf(o.price_micro, o.shipping_fee_micro),
+    goodsPrice: priceOf(goodsPriceMicroOf(o.price_micro, o.shipping_fee_micro)),
     // 金额列是 `DECIMAL(38,0)` → 驱动给**字符串**（见 db.js：38 位 wei 过不了 JS number）；
     // 展示用的十进制同样由 chain.weiToDecimal 从字符串算，不经过 number
     amountWei: o.amount_wei,
@@ -312,6 +315,49 @@ router.get('/after-sales', pendingLimiter, wrap(async (req, res) => {
     page,
     pageSize,
     waiting: await queueWait({ where: AFTER_SALE_OPEN_SQL, timeCol: 'after_sale_opened_at', seller: null }),
+  });
+}));
+
+/**
+ * 未结的**提货争议**（claimId 队列）。
+ *
+ * 为什么需要：`/pending` 与 `/after-sales` 覆盖的是订单争议与收货后售后；
+ * 提货争议的案号只存在节点本地（`nft_claims.dispute_claim_id`），此前仲裁台只能手输。
+ * 这里把节点上 `dispute_state='opened'` 的案号列出来，委员会才有"发现"的入口。
+ *
+ * 只下发链上本来就公开的字段（案号、NFT 合约/tokenId、双方地址、开案时间）；
+ * `order_no` 是本地可继续探测的句柄，刻意**不下发**（与 `/pending` 的匿名口径一致）。
+ */
+router.get('/claims', pendingLimiter, wrap(async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
+  const offset = (page - 1) * pageSize;
+  if (offset > 10_000) return fail(res, '分页过深：请缩小范围或使用更精确的筛选', 1, 400);
+  const db = getDb();
+  const total = Number(
+    (await db.get("SELECT COUNT(*) AS c FROM nft_claims WHERE dispute_state = 'opened' AND dispute_claim_id IS NOT NULL")).c
+  );
+  const rows = await db.all(
+    `SELECT dispute_claim_id, token_contract, token_id, seller, claimant, dispute_opened_at
+       FROM nft_claims
+      WHERE dispute_state = 'opened' AND dispute_claim_id IS NOT NULL
+      ORDER BY dispute_opened_at DESC, id DESC
+      LIMIT ? OFFSET ?`,
+    pageSize,
+    offset
+  );
+  ok(res, {
+    claims: rows.map((r) => ({
+      claimId: String(r.dispute_claim_id).toLowerCase(),
+      nftContract: String(r.token_contract).toLowerCase(),
+      tokenId: String(r.token_id),
+      seller: String(r.seller).toLowerCase(),
+      claimant: String(r.claimant).toLowerCase(),
+      openedAt: r.dispute_opened_at ?? null,
+    })),
+    total,
+    page,
+    pageSize,
   });
 }));
 

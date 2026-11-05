@@ -74,7 +74,8 @@ test('重导出限流：四路 CSV 共用一把窗口，达到阈值后 429（�
     首列是**对外单号**（`order_no`），不是内部自增键：内部键在换库/重建之后会变，而 CSV 是拿去对账的
     （判据见 routes/export.js 的文件头）。旧列名 `id` 随"内部键不出本节点"这条口径一起作废。
   */
-  assert.match(first.text, /^\uFEFForder_no,product_slug/);
+  assert.match(first.text, /^\uFEFF订单号,商品标识/);
+  assert.ok(!first.text.includes('order_no'), '表头不得再出现机器列名');
   const ledger = await request(app).get('/api/shop/export/ledger.csv').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value);
   assert.equal(ledger.status, 200);
 

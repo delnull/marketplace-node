@@ -50,7 +50,7 @@ test('图片 URL 仅 http/https：javascript:/data: 拒绝入库，正常 https 
     .send(productPayload({ title: '坏图商品', media: [{ type: 'image', url: 'javascript:alert(1)' }, { type: 'image', url: 'data:image/png;base64,AAAA' }] }))
     .expect(200);
   assert.notEqual(bad.body.code, 0, '非 http(s) 图片应整体拒绝');
-  assert.match(bad.body.message, /http\/https/);
+  assert.match(bad.body.message, /网页外链/);
 
   const okP = await createProduct(productPayload({ title: '好图商品', media: [{ type: 'image', url: 'https://example.com/ok.jpg' }] }));
   assert.equal(okP.media.length, 1);
@@ -64,13 +64,13 @@ test('规格选项含 | 时拒绝创建（两个组合不得拼成同一把 key�
       title: '分隔符碰撞商品',
       specs: [{ name: '颜色', options: ['黑|白', '白'] }],
       skus: [
-        { key: '黑|白', priceUsdtMicro: 100, capacity: 1 },
-        { key: '白', priceUsdtMicro: 100, capacity: 1 },
+        { key: '黑|白', priceMicro: 100, capacity: 1 },
+        { key: '白', priceMicro: 100, capacity: 1 },
       ],
     }))
     .expect(200);
   assert.notEqual(res.body.code, 0);
-  assert.match(String(res.body.message), /不能包含 \| 或 NUL/);
+  assert.match(String(res.body.message), /不能包含竖线或空字符/);
 });
 
 test('下架商品详情：匿名/第三人 404，店主令牌可预览', async () => {
@@ -137,14 +137,14 @@ test('码池清空：需 confirm + 仅 owner；清空后可改商品类型', asy
     /*
       写接口只认 `specs + skus`（商品级的 `capacity` 是各组合之和的只读汇总，提交它会被
       **带字段名拒绝**——见 products.js 的 PRODUCT_WRITE_KEYS）。本用例只想验"清池后可改型"，
-      所以库存按真实形状写在组合上；同时把 skus 完整给出（含 priceUsdtMicro）：
+      所以库存按真实形状写在组合上；同时把 skus 完整给出（含 priceMicro）：
       改了 kind 就落在一件无规格商品上，唯一组合 key='' 给全字段最不易误读。
     */
     .send({
       kind: 'physical',
       title: '清池后改实物',
       specs: [{ name: '规格', options: ['默认'] }],
-      skus: [{ key: '', priceUsdtMicro: 88_000_000, capacity: 5 }],
+      skus: [{ key: '', priceMicro: 88_000_000, capacity: 5 }],
     })
     .expect(200);
   assertOk(changed);
@@ -152,15 +152,15 @@ test('码池清空：需 confirm + 仅 owner；清空后可改商品类型', asy
 });
 
 test('汇率换算：纯整数向上取整（防少付），无死代码修正分支', () => {
-  // 唯一一条腿：1 BTY = x USDT（标价即 USDT，换算里不再乘任何法币汇率）
+  // 唯一一条腿：1 BTY = x price（标价即 price，换算里不再乘任何法币汇率）
   const rates = { btyUsdt: 0.1 };
-  // 10 USDT（10_000_000 微）→ 恰 100 BTY
+  // 10 price（10_000_000 微）→ 恰 100 BTY
   assert.equal(usdtMicroToPayWei(10_000_000, rates), (100n * 10n ** 18n).toString());
 
   /*
     除不尽的汇率：结果必须是**不小于精确值的最小整数**（整除余数无条件进位）。
     汇率在实现里被放大成整数 scaled = round(rate × 1e8)，于是 1 微 USDT 的精确应付
-    = 1e-6 USDT ÷ rate BTY/USDT × 1e18 wei = 1e20 / scaled wei。
+    = 1e-6 price ÷ rate BTY/price × 1e18 wei = 1e20 / scaled wei。
   */
   const scaled = BigInt(Math.round(0.022778 * 1e8));
   const num = 1n * 10n ** 20n;

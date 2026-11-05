@@ -76,6 +76,7 @@
  *    配置 MK_ESCROW_START_BLOCK = Escrow 合约部署块高度；
  *  - 同一轮询内事件按 (blockNumber, logIndex) 排序后逐个应用，状态迁移顺序与链一致。
  */
+import { ethers } from 'ethers';
 import config from './config.js';
 import { withRedisLock } from './redis.js';
 import { getDb, withTransaction, withDbLock } from './db.js';
@@ -100,6 +101,31 @@ import { alertPoolEmptyForOrder } from './poolAlert.js';
 import { alertOnceDelivered } from './alertAck.js';
 // 确认收货后的售后案件：本地镜像的**唯一写入口/判据**（事件路径、/sync、后台对账三者同源）
 import { applyAfterSaleOpened, applyAfterSaleClosed } from './afterSale.js';
+
+/** Staking 的“本单全部保证金赔付”累计（普通罚没 + 提货赔付）。 */
+const STAKING_PAID_ABI = ['function penalizedByOrderTotal(bytes32 orderId) view returns (uint256)'];
+
+/**
+ * 读本单的保证金赔付累计（绝对读数）。读不到**必须抛**：事件会按失败重试，
+ * 不能把未知写成 0（那会让买家退款/卖家净额多算）。
+ */
+async function readStakePaidFromChain(orderId) {
+  if (!config.chain.stakingAddress) throw new Error('未配置 Staking 地址，无法读保证金赔付累计');
+  const provider = await getPinnedProvider();
+  const c = new ethers.Contract(config.chain.stakingAddress, STAKING_PAID_ABI, provider);
+  return String(await c.penalizedByOrderTotal(orderId));
+}
+
+let stakePaidReader = readStakePaidFromChain;
+
+/** 测试桩：链上读取在单测里不可用，由 setup 注入固定值；生产不调用。 */
+export function setStakePaidReaderForTest(fn) {
+  stakePaidReader = fn || readStakePaidFromChain;
+}
+
+async function stakePaidOf(orderId) {
+  return await stakePaidReader(orderId);
+}
 
 /* ─────────────────── node 单例行的写口（读只有 nodeRow 一处）─────────────────── */
 
@@ -416,7 +442,7 @@ async function localRowOf(db, escrowOrderId) {
   */
   return await db.get(
     `SELECT o.id AS order_id, o.order_no, o.status, o.buyer, o.seller, o.shop_code, o.amount_wei, o.timeout_blocks,
-            o.payment_token, c.paid_tx_hash, c.refund_status, c.refunded_amount_wei, c.claim_paid_wei, c.accepted_partial_refund_wei
+            o.payment_token, c.paid_tx_hash, c.refund_status, c.refunded_amount_wei, c.claim_paid_wei, c.stake_paid_wei, c.accepted_partial_refund_wei
        FROM order_chain c JOIN orders o ON o.id = c.order_id
       WHERE c.escrow_order_id = ?`,
     String(escrowOrderId).toLowerCase()
@@ -1223,11 +1249,13 @@ async function applyEventCore(name, args, meta = {}) {
       if (local.claim_paid_wei != null && claimBig < BigInt(local.claim_paid_wei)) {
         throw new Error(`ClaimPaid claimPaidTotal=${claimTotal} 小于本地 ${local.claim_paid_wei}（不应回退）`);
       }
+      const stakePaid = await stakePaidOf(orderId);
       changed = (await db.run(
-        `UPDATE order_chain SET refunded_amount_wei = ?, claim_paid_wei = ?
+        `UPDATE order_chain SET refunded_amount_wei = ?, claim_paid_wei = ?, stake_paid_wei = ?
           WHERE order_id = ? AND (refunded_amount_wei <> ? OR claim_paid_wei <> ?)`,
         total,
         claimTotal,
+        stakePaid,
         local.order_id,
         total,
         claimTotal
@@ -1269,9 +1297,12 @@ async function applyEventCore(name, args, meta = {}) {
           `SellerRefunded 的 refundedTotal=${total} 小于本地已记账 ${local.refunded_amount_wei}（链上退款额不应回退）`
         );
       }
+      const stakePaid = await stakePaidOf(orderId);
       changed = (await db.run(
-        'UPDATE order_chain SET refunded_amount_wei = ? WHERE order_id = ? AND refunded_amount_wei <> ?',
+        `UPDATE order_chain SET refunded_amount_wei = ?, stake_paid_wei = ?
+          WHERE order_id = ? AND refunded_amount_wei <> ?`,
         total,
+        stakePaid,
         local.order_id,
         total
       )).foundRows;
@@ -1829,7 +1860,7 @@ export function startWatcher() {
       watcherStatus.standbySince = 0;
       watcherStatus.lastLockAcquiredAt = Date.now();
     } catch (e) {
-      watcherStatus.lastError = String(e?.shortMessage || e?.message || e);
+      watcherStatus.lastError = '本轮监听失败（详情见节点日志）';
       watcherStatus.lastPollAt = Date.now();
       console.error('[escrowWatcher] 轮询失败:', e.shortMessage || e.message);
     } finally {

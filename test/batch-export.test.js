@@ -107,25 +107,25 @@ test('batch-ship：实物多单同单号发货；拒绝数字/无凭证/退款�
 });
 
 test('PATCH /products/batch：非法字段整体拒；不存在 slug 跳过；价格变更重算快照', async () => {
-  const p1 = await listProduct(productPayload({ title: '批量商品1', priceUsdtMicro: 10_000_000 }));
-  const p2 = await listProduct(productPayload({ title: '批量商品2', priceUsdtMicro: 20_000_000 }));
+  const p1 = await listProduct(productPayload({ title: '批量商品1', priceMicro: 10_000_000 }));
+  const p2 = await listProduct(productPayload({ title: '批量商品2', priceMicro: 20_000_000 }));
   const hash1 = p1.snapshotHash;
 
   // 非法字段 → 整体拒绝（无半写）
   const bad = await request(app)
     .patch('/api/products/batch')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send({ slugs: [p1.slug, p2.slug], patch: { priceUsdtMicro: -5 } })
+    .send({ slugs: [p1.slug, p2.slug], patch: { priceMicro: -5 } })
     .expect(200);
   assert.notEqual(bad.body.code, 0);
   const unchanged = await request(app).get(`/api/products/${p1.slug}`).expect(200);
-  assert.equal(unchanged.body.data.priceUsdtMicro, 10_000_000);
+  assert.equal(unchanged.body.data.priceMicro, 10_000_000);
 
   // 个别 slug 不存在 → failed 跳过，其余更新 + 价格快照重算 + 上下架
   const res = await request(app)
     .patch('/api/products/batch')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send({ slugs: [p1.slug, p2.slug, 'p-not-exist'], patch: { priceUsdtMicro: 30_000_000, active: false } })
+    .send({ slugs: [p1.slug, p2.slug, 'p-not-exist'], patch: { priceMicro: 30_000_000, active: false } })
     .expect(200);
   assertOk(res);
   assert.deepEqual(res.body.data.updated, [p1.slug, p2.slug]);
@@ -136,7 +136,7 @@ test('PATCH /products/batch：非法字段整体拒；不存在 slug 跳过；�
     .get(`/api/products/${p1.slug}`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
-  assert.equal(preview.body.data.priceUsdtMicro, 30_000_000);
+  assert.equal(preview.body.data.priceMicro, 30_000_000);
   assert.equal(preview.body.data.active, false);
   assert.notEqual(preview.body.data.snapshotHash, hash1, '价格变更重算快照哈希');
 });
@@ -181,7 +181,8 @@ test('导出：orders.csv 列白名单与 BOM；权限（匿名 401）；codes.c
   const text = csvRes.text;
   assert.ok(text.startsWith('\uFEFF'), 'UTF-8 BOM');
   assert.ok(text.includes(o.id) && text.includes('张三'), '含订单与收货信息（店主私域）');
-  assert.ok(text.includes('amount_net_wei'));
+  assert.ok(text.includes('订单号') && text.includes('托管净额（最小单位）'), '表头必须是中文（店主在 Excel 里读）');
+  assert.ok(!text.includes('amount_net_wei'), '机器列名不得再出现在表头');
   // 匿名拒绝
   await request(app).get('/api/shop/export/orders.csv').expect(401);
 

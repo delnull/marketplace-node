@@ -32,7 +32,7 @@ const snapshot = JSON.stringify({
   description: 'order-status-matrix',
   media: [],
   specs: [{ name: '规格', options: ['默认'] }],
-  skus: [{ key: '', priceUsdtMicro: 1_000_000, capacity: null }],
+  skus: [{ key: '', priceMicro: 1_000_000, capacity: null }],
 });
 
 before(async () => {
@@ -57,7 +57,7 @@ async function makeOrder(status) {
     productSnapshot: snapshot,
     snapshotHash: hex(1),
     amountWei: '1000000000000000000',
-    usdtMicro: 1_000_000,
+    priceMicro: 1_000_000,
     timeoutBlocks: 120_960,
     escrowOrderId: escrowId(),
     paidTxHash: status === 'draft' ? undefined : paidHash(),

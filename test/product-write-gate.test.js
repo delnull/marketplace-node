@@ -8,7 +8,7 @@
  *
  *  2. **未知字段拒绝**（`PRODUCT_WRITE_KEYS` / `PRODUCT_BATCH_PATCH_KEYS`）：
  *     三个写入口（上架 / 编辑 / 批量）都必须**带字段名**拒绝不认识的键。
- *     判据的历史：`capacity` 与 `priceUsdtMicro` 曾是"提交了但被静默忽略"的两个真实字段
+ *     判据的历史：`capacity` 与 `priceMicro` 曾是"提交了但被静默忽略"的两个真实字段
  *     （商品级价与库存都是各组合的只读汇总），本仓对这种失败的口径是"绝不静默"。
  *     这里同时验**反例不会扩大**：认识的键照常通过（否则这道门会变成"什么都存不进去"）。
  *
@@ -82,7 +82,7 @@ test('active/claimable 非法值明确拒绝（不得静默转成"开启"）', a
     .send(productPayload({ active: 'false' }))
     .expect(200);
   assert.notEqual(badActive.body.code, 0);
-  assert.match(String(badActive.body.message), /active/);
+  assert.match(String(badActive.body.message), /上架状态/);
 
   const badClaimable = await request(app)
     .post('/api/products')
@@ -90,7 +90,7 @@ test('active/claimable 非法值明确拒绝（不得静默转成"开启"）', a
     .send({ ...productPayload({ kind: 'nft', nftContract: '0x' + '8'.repeat(40) }), claimable: 'false' })
     .expect(200);
   assert.notEqual(badClaimable.body.code, 0);
-  assert.match(String(badClaimable.body.message), /claimable/);
+  assert.match(String(badClaimable.body.message), /是否支持提货/);
 });
 
 test('草稿：POST 采纳 active=false；买家看不到、店主看得到；上架后立即公开', async () => {
@@ -186,14 +186,14 @@ test('未知字段被拒绝：上架 / 编辑 / 批量三个入口，错误里�
   const okCreate = await create(productPayload({ title: '认识的字段照常通过' }));
   assert.equal(okCreate.title, '认识的字段照常通过');
 
-  // ② 编辑：商品级 priceUsdtMicro 是只读汇总（各组合最低价），不是可写字段
+  // ② 编辑：商品级 priceMicro 是只读汇总（各组合最低价），不是可写字段
   const badPatch = await request(app)
     .patch(`/api/products/${okCreate.slug}`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
-    .send({ priceUsdtMicro: 1_000_000 })
+    .send({ priceMicro: 1_000_000 })
     .expect(200);
   assert.equal(badPatch.body.code, 1);
-  assert.match(String(badPatch.body.message), /priceUsdtMicro/);
+  assert.match(String(badPatch.body.message), /priceMicro/);
 
   // ③ 批量：patch 的键集更小（批量不展开规格）
   const badBatch = await request(app)

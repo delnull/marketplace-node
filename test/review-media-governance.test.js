@@ -57,6 +57,23 @@ test('逐图下架：节点管理员删一张，JSON 与磁盘同时消失', asy
   assert.equal(r.body.data.remaining, 0);
   assert.equal(fs.existsSync(disk), false, '下架必须删盘，不能只改 JSON');
 
+  /*
+    节点治理动作必须落在**节点级审计**里（2026-11-04 修）。
+    旧实现走店铺级 `audit` + `roleOf(addr, order.shop_code)`：租户店上节点主/员工算 'user'，
+    `logAudit` 直接 return——删了图，一条审计都没有。这里钉住三件事：
+    行是节点级、角色是 host/staff、目标店写在 detail 里（店铺详情靠它回看治理记录）。
+  */
+  const audit = await db.get("SELECT * FROM audit_logs WHERE action = 'review.image.remove' ORDER BY id DESC LIMIT 1");
+  assert.ok(audit, '评价图下架必须留审计（不能因为操作者不是该店店主就静默丢掉）');
+  assert.equal(audit.shop_code, null, '这是节点治理动作，不属于那家店');
+  assert.equal(audit.actor_role, 'host');
+  assert.equal(audit.detail.shopCode, shopRef.value, '目标店写在 detail 里，auditWhere 的 targetShop 用它归属');
+  const byShop = await request(app)
+    .get(`/api/shop/audit/node?targetShop=${shopRef.value}&pageSize=100`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .expect(200);
+  assert.ok(byShop.body.data.items.some((i) => i.id === audit.id), '店铺详情的治理记录要能按 targetShop 找到这一行');
+
   const o = await request(app).get(`/api/orders/${orderNo}`).set('Authorization', `Bearer ${buyerToken}`).expect(200);
   assert.deepEqual(o.body.data.review.images, []);
 });

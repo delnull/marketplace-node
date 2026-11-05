@@ -414,8 +414,8 @@ const config = {
   rates: {
     /*
       只有一条腿（2026-10 标价单位由 CNY 改为 USDT 之后）：
-      USDT 标价 → 原生 BTY 应付，唯一的换算是「USDT → BTY」，数据源是官方
-      mainnet.bityuan.com/tapi/ticker（BTY-USDT）。它直接决定"买家要付多少 BTY"，要跟得紧，
+      USDT 定价单 → 原生 BTY 应付，唯一的换算是「USDT → BTY」，数据源是官方
+      mainnet.bityuan.com/tapi/ticker（BTY-USDT）；BTY 定价单不读行情。它直接决定"买家要付多少 BTY"，要跟得紧，
       所以 TTL 默认 60 秒（MK_BTY_TTL_MS）。
       解析器用 intEnvAllowZero 而不是 intEnv：后者把 0 当成"没给"并回退默认值，
       于是 `MK_BTY_TTL_MS=0` 会**静默变成默认值**（历史真事，test/setup.mjs 里记过一笔）。

@@ -25,14 +25,14 @@ export function sellerOrderFilters(query) {
 
   if (query.status) {
     const st = String(query.status);
-    if (!ORDER_STATUS.includes(st)) return { error: `status 无效（可选：${ORDER_STATUS.join('/')}）` };
+    if (!ORDER_STATUS.includes(st)) return { error: '状态筛选值无效' };
     where += ' AND status = ?';
     params.push(st);
   }
 
   if (query.refund) {
     const r = String(query.refund);
-    if (!['requested', 'rejected'].includes(r)) return { error: 'refund 需为 requested / rejected' };
+    if (!['requested', 'rejected'].includes(r)) return { error: '退款筛选只能是待处理或已拒绝' };
     where += ' AND refund_status = ?';
     params.push(r);
     /*
@@ -44,7 +44,7 @@ export function sellerOrderFilters(query) {
 
   if (query.afterSale) {
     const a = String(query.afterSale);
-    if (!['open', 'closed'].includes(a)) return { error: 'afterSale 需为 open / closed' };
+    if (!['open', 'closed'].includes(a)) return { error: '售后筛选值必须是「未结案」或「已结案」' };
     where += a === 'open' ? ` AND ${AFTER_SALE_OPEN_SQL}` : " AND after_sale_status = 'closed'";
   }
 

@@ -429,13 +429,13 @@ export async function initDb() {
     serverCaps = await probeServerCapabilities();
     await assertDatabaseCollation();
     /*
-      **结构门禁在 migrate 之前跑**（老库）：migrate 只在新库执行，老库不会自动改表，
+      **结构门禁在建库之前跑**（已有表）：建库只在新库执行，老库不会自动改表，
       也不重建触发器——否则多后端滚动重启时会出现触发器短暂缺失的窗口。
       新库（一张声明过的表都还没有）例外：由 inspectSchemaStructure 先建出来再对拍。
     */
     const structure = await inspectSchemaStructure();
     if (!structure.ok) {
-      reportSchemaStructureFailure(structure.diffs, structure.repairs);
+      reportSchemaStructureFailure(structure.diffs);
       process.exit(1);
     }
     /*
@@ -443,8 +443,8 @@ export async function initDb() {
       旧实现在每次启动都 `DROP + CREATE TRIGGER`：单进程时那只是一次短暂的空窗，
       多后端滚动重启时旧进程仍在服务，触发器被摘掉的那几毫秒里写订单的请求会绕过
       配额计数器的减量半边 ⇒ 静默漂移。结构指纹已经把触发器语句纳入对拍：
-      语句不一致会在这里 exit 并打印修复 SQL，不需要"先拆再建"。
-      新库由 `inspectSchemaStructure` 的 fresh 分支调用 `migrate()` 一次建全。
+      语句不一致会在这里 exit（删库重建），不需要"先拆再建"。
+      新库由 `inspectSchemaStructure` 的 fresh 分支调用 `createFreshSchema()` 一次建全。
     */
     await ensureNodeRow();
     await assertFoundRowsSemantics();
@@ -506,7 +506,7 @@ async function withInitLock(fn) {
     if (Number(rows[0]?.ok) !== 1) {
       throw new Error(
         `数据库 \`${config.db.name}\` 的初始化锁 ${name} 在 ${INIT_LOCK_TIMEOUT_SECONDS}s 内没有拿到：` +
-          '另一个后端正在做结构自检/迁移且耗时异常。请检查那个进程的日志；它的连接断开后锁会自动释放，' +
+          '另一个后端正在做结构自检且耗时异常。请检查那个进程的日志；它的连接断开后锁会自动释放，' +
           '再重启本进程即可（这不是"一库只能一个进程"的限制）。'
       );
     }
@@ -846,7 +846,7 @@ async function exec(sql, params, wantMeta = false) {
  *
  * ## 为什么不是"必备列清单"
  *
- * `migrate()` 执行的全是 `CREATE TABLE IF NOT EXISTS`，对**已存在**的表是 no-op：列在不在
+ * `createFreshSchema()` 执行的全是 `CREATE TABLE IF NOT EXISTS`，对**已存在**的表是 no-op：列在不在
  * 看得见，而 CHECK / 索引 / 生成列表达式 / 列宽 / 外键删除规则都不在任何清单里。实测（测试机
  * 旧库）：缺 `ck_skus_committed`（`committed <= capacity`）⇒ `committed > capacity` 可表达
  * ⇒ **静默超卖**，而启动过程一切正常。列清单本身还是第二份真相：新增一列忘了登记，门禁就
@@ -866,14 +866,13 @@ async function exec(sql, params, wantMeta = false) {
  * 对拍范围**只包含 SCHEMA_DDL 声明过的对象**：运维自己的表、视图、触发器不在断言范围内
  * （真实库比建表语句多是正常状态）。触发器只断言"声明过的那些在不在、语句一不一致"。
  *
- * 有差异 ⇒ 打印"表.对象：缺/多/不同"与一份**幂等**修复清单（每条都先判存在，可重复运行），
- * 然后拒绝启动（exit 1）。修复清单由期望形状生成（`SHOW CREATE TABLE` 里的原始行），
- * 不是让人照着建表语句手抄。
+ * 有差异 ⇒ 打印"表.对象：缺/多/不同"，然后拒绝启动（exit 1）。本仓不做结构迁移：
+ * 全新项目没有历史数据，处置就是删除并重建目标库（见 reportSchemaStructureFailure）。
  *
  * ## 顺序
  *
- * 老库在 `migrate()` **之前**对拍：migrate 只在新库执行，不会重建触发器；新库（一张声明过的表都没有）
- * 由 `inspectSchemaStructure` 先建再对拍。
+ * 已有表的库在 `createFreshSchema()` **之前**对拍：建库只在新库执行，不会重建触发器；新库
+ * （一张声明过的表都没有）由 `inspectSchemaStructure` 先建再对拍。
  */
 
 const SCHEMA_PROBE_PREFIX = 'mk_schema_probe_';
@@ -928,47 +927,9 @@ function changedFields(expected, actual, keys) {
 }
 
 /**
- * 把 `SHOW CREATE TABLE` 的结果拆成"列定义 / 键与约束定义"，用于生成修复语句。
- * 只取行首形态（MySQL 的输出格式稳定：列行以反引号开头，键/约束行以 PRIMARY/KEY/CONSTRAINT 开头）。
- */
-function parseCreateTable(createSql) {
-  const columns = new Map();
-  const keys = new Map();
-  let tableOptions = '';
-  for (const raw of String(createSql || '').split('\n')) {
-    const line = raw.trim().replace(/,$/, '');
-    if (!line) continue;
-    if (line.startsWith('`')) {
-      const m = /^`([^`]+)`/.exec(line);
-      if (m) columns.set(m[1], line);
-      continue;
-    }
-    if (/^PRIMARY KEY\b/.test(line)) {
-      keys.set('PRIMARY', line);
-      continue;
-    }
-    const key = /^(?:UNIQUE )?KEY `([^`]+)`/.exec(line);
-    if (key) {
-      keys.set(key[1], line);
-      continue;
-    }
-    const constraint = /^CONSTRAINT `([^`]+)`/.exec(line);
-    if (constraint) {
-      keys.set(constraint[1], line);
-      continue;
-    }
-    if (line.startsWith(')')) tableOptions = line;
-  }
-  return { columns, keys, tableOptions };
-}
-
-/**
  * 读一个库的完整结构指纹（**对拍两侧共用同一份读法**：临时库与真实库没有第二套判断）。
- *
- * `includeDefinitions` 只在期望侧开启：修复语句要用 `SHOW CREATE TABLE` 的原始定义行，
- * 而真实库不需要（它的定义就是"待修"的那一份）。
  */
-async function collectSchemaFingerprint(conn, schema, { includeDefinitions = false } = {}) {
+async function collectSchemaFingerprint(conn, schema) {
   const query = async (sql, params) => (await conn.query(sql, params))[0];
   const fingerprint = { tables: {}, triggers: {} };
 
@@ -988,7 +949,6 @@ async function collectSchemaFingerprint(conn, schema, { includeDefinitions = fal
       checks: {},
       fks: {},
       view: null,
-      definitions: null,
     };
   }
 
@@ -1107,28 +1067,13 @@ async function collectSchemaFingerprint(conn, schema, { includeDefinitions = fal
     };
   }
 
-  if (includeDefinitions) {
-    for (const table of Object.values(fingerprint.tables)) {
-      if (!SAFE_IDENT.test(table.name)) {
-        throw new Error(`结构自检取建表语句时遇到不安全的表名：${JSON.stringify(table.name)}`);
-      }
-      const rows = await query(`SHOW CREATE TABLE \`${schema}\`.\`${table.name}\``);
-      const createSql = Object.values(rows[0] || {})[1];
-      table.definitions = {
-        createSql: String(createSql || ''),
-        ...(table.type === 'VIEW' ? { columns: new Map(), keys: new Map(), tableOptions: '' } : parseCreateTable(createSql)),
-      };
-    }
-  }
-
   return fingerprint;
 }
 
 /**
  * 对拍两个指纹，只断言**期望侧声明过的对象**。
  *
- * 差异的形状固定为 `{ kind, table?, object?, fields?, expected?, actual? }`——打印与修复清单
- * 都只读这几个字段，不再各自解析文本。
+ * 差异的形状固定为 `{ kind, table?, object?, fields?, expected?, actual? }`——打印只读这几个字段，不再各自解析文本。
  */
 function diffSchemaFingerprints(expected, actual) {
   const diffs = [];
@@ -1224,231 +1169,7 @@ function diffSchemaFingerprints(expected, actual) {
   return diffs;
 }
 
-/** 把一段 SQL 变成 MySQL 字符串字面量（用于 PREPARE 的动态语句） */
-function sqlStringLiteral(text) {
-  return `'${String(text).replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
-}
-
-/**
- * 生成一条**幂等**修复：先判断"还差这一步吗"，再执行。
- *
- * MySQL 8 没有 `ADD COLUMN IF NOT EXISTS` / `DROP INDEX IF EXISTS`，所以用
- * `PREPARE` + `IF(条件, 语句, 'SELECT 1')`：重复执行时条件是"已经是期望状态"，
- * 实际只跑一句空转。条件里用 `DATABASE()`，操作符在目标库上执行即可。
- */
-function guardedFix(neededCondition, ddl) {
-  return (
-    `SET @mk_fix := IF((${neededCondition}), ${sqlStringLiteral(ddl)}, 'SELECT 1');\n` +
-    'PREPARE mk_schema_fix FROM @mk_fix;\n' +
-    'EXECUTE mk_schema_fix;\n' +
-    'DEALLOCATE PREPARE mk_schema_fix;'
-  );
-}
-
-/**
- * information_schema 里的"某个对象存在吗"（**带括号的子查询**，条件里再拼 `= 0/1`）。
- * 括号不能省：`… WHERE CONSTRAINT_TYPE = 'CHECK' = 0` 会被解析成 `(… = 'CHECK') = 0`，
- * 即把 `= 0` 吃进 WHERE 里，计数恒为 0 ⇒ 修复要么永远不执行，要么每次执行。
- */
-const objectExists = {
-  column: (t, c) =>
-    `(SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ${sqlStringLiteral(t)} AND COLUMN_NAME = ${sqlStringLiteral(c)})`,
-  index: (t, c) =>
-    `(SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ${sqlStringLiteral(t)} AND INDEX_NAME = ${sqlStringLiteral(c)})`,
-  check: (t, c) =>
-    `(SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ${sqlStringLiteral(t)} AND CONSTRAINT_NAME = ${sqlStringLiteral(c)} AND CONSTRAINT_TYPE = 'CHECK')`,
-  fk: (t, c) =>
-    `(SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = ${sqlStringLiteral(t)} AND CONSTRAINT_NAME = ${sqlStringLiteral(c)})`,
-};
-
-/** 差异 → 一条可照做的修复（缺/多/不同各自能表达成什么，就生成什么） */
-function repairSqlFor(diff, expected) {
-  const table = diff.table ? expected.tables[diff.table] : null;
-  const defs = table?.definitions;
-  const header = `-- ${diff.table ? `${diff.table}.${diff.object ?? ''}` : diff.object}：${diffLabel(diff)}`;
-  const line = (key, fallback) => {
-    const found = defs?.keys?.get(key) || defs?.columns?.get(key);
-    if (!found) return `${fallback}（取不到期望定义，见 SCHEMA_DDL）`;
-    return found;
-  };
-
-  switch (diff.kind) {
-    case 'table-missing': {
-      if (!defs?.createSql) return `${header}\n-- 取不到期望建表语句，见 SCHEMA_DDL`;
-      const create = defs.createSql.replace(/^CREATE TABLE /, 'CREATE TABLE IF NOT EXISTS ').replace(/ AUTO_INCREMENT=\d+/, '');
-      return `${header}\n${create};`;
-    }
-    case 'view-missing':
-    case 'view-diff':
-      return `${header}\nCREATE OR REPLACE VIEW \`${diff.table}\` AS ${table.view};`;
-    case 'table-kind':
-      return `${header}\n-- 表/视图的类型变了，无法用 ALTER 表达；按 SCHEMA_DDL 重建该对象（先备份数据）`;
-    case 'table-option':
-      return `${header}\nALTER TABLE \`${diff.table}\` ENGINE=InnoDB COLLATE ${DB_COLLATION};`;
-    case 'column-missing':
-      return `${header}\n${guardedFix(`${objectExists.column(diff.table, diff.object)} = 0`, `ALTER TABLE \`${diff.table}\` ADD COLUMN ${line(diff.object, '`' + diff.object + '`')}`)}`;
-    case 'column-diff':
-      return `${header}\nALTER TABLE \`${diff.table}\` MODIFY COLUMN ${line(diff.object, '`' + diff.object + '`')};`;
-    case 'column-extra':
-      return `${header}\n${guardedFix(`${objectExists.column(diff.table, diff.object)} = 1`, `ALTER TABLE \`${diff.table}\` DROP COLUMN \`${diff.object}\``)}`;
-    case 'index-missing':
-      return `${header}\n${guardedFix(`${objectExists.index(diff.table, diff.object)} = 0`, `ALTER TABLE \`${diff.table}\` ADD ${line(diff.object, `KEY \`${diff.object}\``)}`)}`;
-    case 'index-diff':
-      // 由 buildRepairPlan 拆成"先删、后建"两条（见 repairDropSql/repairAddSql 的说明）
-      return `${repairDropSql(diff, expected)}\n${repairAddSql(diff, expected)}`;
-    case 'index-extra':
-      if (diff.object === 'PRIMARY') return `${header}\n-- 主键不可能"多出来"；请人工核对`;
-      return `${header}\n${guardedFix(`${objectExists.index(diff.table, diff.object)} = 1`, `ALTER TABLE \`${diff.table}\` DROP INDEX \`${diff.object}\``)}`;
-    case 'check-missing':
-      return `${header}\n${guardedFix(`${objectExists.check(diff.table, diff.object)} = 0`, `ALTER TABLE \`${diff.table}\` ADD ${line(diff.object, `CONSTRAINT \`${diff.object}\` CHECK`)}`)}`;
-    case 'check-diff':
-      return `${repairDropSql(diff, expected)}\n${repairAddSql(diff, expected)}`;
-    case 'check-extra':
-      return `${header}\n${guardedFix(`${objectExists.check(diff.table, diff.object)} = 1`, `ALTER TABLE \`${diff.table}\` DROP CHECK \`${diff.object}\``)}`;
-    case 'fk-missing':
-      return `${header}\n${guardedFix(`${objectExists.fk(diff.table, diff.object)} = 0`, `ALTER TABLE \`${diff.table}\` ADD ${line(diff.object, `CONSTRAINT \`${diff.object}\` FOREIGN KEY`)}`)}`;
-    case 'fk-diff':
-      return `${repairDropSql(diff, expected)}\n${repairAddSql(diff, expected)}`;
-    case 'fk-extra':
-      return `${header}\n${guardedFix(`${objectExists.fk(diff.table, diff.object)} = 1`, `ALTER TABLE \`${diff.table}\` DROP FOREIGN KEY \`${diff.object}\``)}`;
-    case 'trigger-missing':
-    case 'trigger-diff': {
-      const t = expected.triggers[diff.object];
-      if (!t) return `${header}\n-- 取不到期望触发器定义，见 TRIGGER_DDL`;
-      /*
-        复合触发器体（BEGIN/END）含内部分号：`mysql` 客户端会按分号切语句，粘进交互式
-        session 时 CREATE 会被切成几段。所以这一类必须整条发送（mysql 客户端用 DELIMITER，
-        编程客户端用单条 query）——修复清单把这句话写在语句前面，免得人照着执行却得到
-        "语法错误"而以为修复本身是错的。
-      */
-      const compound = /^BEGIN\b/i.test(String(t.statement || ''))
-        ? '\n-- 复合触发器体（BEGIN/END）：请把下面这条 CREATE 作为**单条语句**发送（mysql 客户端需先 DELIMITER）'
-        : '';
-      return `${header}${compound}\nDROP TRIGGER IF EXISTS \`${t.name}\`;\nCREATE TRIGGER \`${t.name}\` ${t.timing} ${t.event} ON \`${t.tableName}\` FOR EACH ROW ${t.statement};`;
-    }
-    default:
-      return `${header}\n-- 没有可自动生成的修复；按 SCHEMA_DDL 重建该对象`;
-  }
-}
-
-/**
- * 修复语句的**执行阶段**（数字小的先执行；同阶段保持指纹/差异顺序）。
- *
- * 为什么必须排序（真实可踩的顺序错误）：MySQL 8 在 DROP COLUMN 时如果该列被 CHECK 约束
- * 引用，会以 `Check constraint 'x' uses column 'y', hence column cannot be dropped` 拒绝；
- * 被索引/外键引用同样会失败。而指纹差异的顺序是"先列后索引、再 CHECK、最后外键"
- * （`diffSchemaFingerprints` 的分组顺序），直接 map 成修复清单就会先给出 DROP COLUMN。
- * 运维照着执行会在第一条就失败，而"修复清单不能直接执行"等于把最后一道自救手段废掉。
- *
- * 分档（每一档内部不互相依赖）：
- *   0 表/视图级（缺表、表选项、视图替换）
- *   1 **DROP** 约束/索引/外键 —— 必须在删列之前
- *   2 多出的列（DROP COLUMN）
- *   3 列定义变更（MODIFY COLUMN；依赖列已存在）
- *   4 缺列（ADD COLUMN；后续约束依赖它）
- *   5 ADD 约束/索引/外键
- *   6 触发器（可能引用新列/新表，最后建）
- * `index-diff`/`check-diff`/`fk-diff` 含 DROP + ADD：`buildRepairPlan` 把它们**拆成两条**
- * （DROP 在阶段 1、ADD 在阶段 5），否则"删列前要删旧约束"与"建新约束要等新列"无法同时成立。
- */
-const REPAIR_PHASE = {
-  'table-missing': 0,
-  'table-kind': 0,
-  'table-option': 0,
-  'view-missing': 0,
-  'view-diff': 0,
-  'index-extra': 1,
-  'index-diff': 1,
-  'check-extra': 1,
-  'check-diff': 1,
-  'fk-extra': 1,
-  'fk-diff': 1,
-  'column-extra': 2,
-  'column-diff': 3,
-  'column-missing': 4,
-  'index-missing': 5,
-  'check-missing': 5,
-  'fk-missing': 5,
-  'trigger-missing': 6,
-  'trigger-diff': 6,
-};
-
-/**
- * `*‑diff` 类差异的**删除半边**（DROP INDEX / DROP CHECK / DROP FOREIGN KEY）。
- *
- * 为什么把 diff 拆成两条：它本来是一条 `DROP … , ADD …`。指纹差异里"列多出来/缺列"与
- * "约束定义不同"可以同时出现，而 MySQL 对被引用列拒绝 DROP COLUMN——DROP 那半边必须在
- * 所有列删除之前，ADD 那半边必须在新列加好之后。合成一条时无论排在哪个阶段都会有一类旧库失败。
- */
-function repairDropSql(diff, expected) {
-  const table = diff.table ? expected.tables[diff.table] : null;
-  const header = `-- ${diff.table}.${diff.object}：${diffLabel(diff)}（先删旧定义）`;
-  if (diff.kind === 'index-diff') {
-    if (diff.object === 'PRIMARY') return `${header}\nALTER TABLE \`${diff.table}\` DROP PRIMARY KEY;`;
-    return `${header}\n${guardedFix(
-      `${objectExists.index(diff.table, diff.object)} = 1`,
-      `ALTER TABLE \`${diff.table}\` DROP INDEX \`${diff.object}\``
-    )}`;
-  }
-  if (diff.kind === 'check-diff') {
-    return `${header}\n${guardedFix(
-      `${objectExists.check(diff.table, diff.object)} = 1`,
-      `ALTER TABLE \`${diff.table}\` DROP CHECK \`${diff.object}\``
-    )}`;
-  }
-  if (diff.kind === 'fk-diff') {
-    return `${header}\n${guardedFix(
-      `${objectExists.fk(diff.table, diff.object)} = 1`,
-      `ALTER TABLE \`${diff.table}\` DROP FOREIGN KEY \`${diff.object}\``
-    )}`;
-  }
-  return null;
-}
-
-/** `*‑diff` 类差异的**新增半边**（ADD INDEX / ADD CONSTRAINT …），必须在列增删之后执行 */
-function repairAddSql(diff, expected) {
-  const table = diff.table ? expected.tables[diff.table] : null;
-  const defs = table?.definitions;
-  const header = `-- ${diff.table}.${diff.object}：${diffLabel(diff)}（再建新定义）`;
-  const line = (key, fallback) => {
-    const found = defs?.keys?.get(key) || defs?.columns?.get(key);
-    if (!found) return `${fallback}（取不到期望定义，见 SCHEMA_DDL）`;
-    return found;
-  };
-  if (diff.kind === 'index-diff') {
-    return `${header}\nALTER TABLE \`${diff.table}\` ADD ${line(diff.object, diff.object === 'PRIMARY' ? 'PRIMARY KEY' : `KEY \`${diff.object}\``)};`;
-  }
-  if (diff.kind === 'check-diff') {
-    return `${header}\nALTER TABLE \`${diff.table}\` ADD ${line(diff.object, `CONSTRAINT \`${diff.object}\` CHECK`)};`;
-  }
-  if (diff.kind === 'fk-diff') {
-    return `${header}\nALTER TABLE \`${diff.table}\` ADD ${line(diff.object, `CONSTRAINT \`${diff.object}\` FOREIGN KEY`)};`;
-  }
-  return null;
-}
-
-/**
- * 差异 → **可照着执行**的修复清单（顺序见 `REPAIR_PHASE`）。
- * 纯函数（不读库）；顺序由 `test/schema-fingerprint.test.js` 用真实旧 schema 钉住。
- */
-function buildRepairPlan(diffs, expected) {
-  /** @type {{phase:number, sql:string}[]} */
-  const steps = [];
-  for (const d of diffs) {
-    if (d.kind === 'index-diff' || d.kind === 'check-diff' || d.kind === 'fk-diff') {
-      const drop = repairDropSql(d, expected);
-      const add = repairAddSql(d, expected);
-      if (drop) steps.push({ phase: 1, sql: drop });
-      if (add) steps.push({ phase: 5, sql: add });
-      continue;
-    }
-    steps.push({ phase: REPAIR_PHASE[d.kind] ?? 9, sql: repairSqlFor(d, expected) });
-  }
-  // Array.prototype.sort 是稳定排序：同阶段保持指纹差异顺序（输出可预期、可对拍）
-  return steps.sort((a, b) => a.phase - b.phase).map((s) => s.sql);
-}
-
-/** 差异的一句话形态（打印与修复注释共用，保证两处不会各说一套） */
+/** 差异的一句话形态（打印用） */
 function diffLabel(diff) {
   switch (diff.kind) {
     case 'table-missing': return '缺（整张表）';
@@ -1539,30 +1260,27 @@ async function readRealSchemaFingerprint() {
  *
  * 新库（一张声明过的表都没有）在这里先建出来再对拍；老库直接对拍（见 initDb 的顺序说明）。
  *
- * @returns {Promise<{ok:boolean, diffs:Array<object>, repairs:string[], fresh:boolean}>}
+ * @returns {Promise<{ok:boolean, diffs:Array<object>, fresh:boolean}>}
  */
 export async function inspectSchemaStructure() {
-  const expected = await withProbeSchema((conn, probe) => collectSchemaFingerprint(conn, probe, { includeDefinitions: true }));
+  const expected = await withProbeSchema((conn, probe) => collectSchemaFingerprint(conn, probe));
   let actual = await readRealSchemaFingerprint();
   const fresh = !Object.keys(expected.tables).some((name) => actual.tables[name]);
   if (fresh) {
-    await migrate();
+    await createFreshSchema();
     actual = await readRealSchemaFingerprint();
   }
   const diffs = diffSchemaFingerprints(expected, actual);
-  const repairs = buildRepairPlan(diffs, expected);
-  return { ok: diffs.length === 0, diffs, repairs, fresh };
+  return { ok: diffs.length === 0, diffs, fresh };
 }
 
-/** 打印结构差异 + 修复清单（**只由 diff 的固定形状生成**，不在这里另做判断） */
-function reportSchemaStructureFailure(diffs, repairs) {
+/** 打印结构差异；库结构不一致时没有"修复脚本"，只有删库重建（全新项目、无历史数据）。 */
+function reportSchemaStructureFailure(diffs) {
   console.error(`[db] 数据库结构自检未通过：真实库与 SCHEMA_DDL 的形状不一致（${diffs.length} 处），已拒绝启动。`);
   for (const d of diffs) console.error(`[db]   ${describeSchemaDiff(d)}`);
   console.error('[db] 期望形状的唯一真相是 src/db.js 的 SCHEMA_DDL / TRIGGER_DDL（在临时库里全量执行一遍得到），不存在第二份清单。');
   console.error('[db] 运维自己的表/视图/触发器不在对拍范围内（不会因此报错）。');
-  console.error('[db] 处置：在目标库上依次执行下面的修复（每条都先判存在，可重复运行；执行前先备份）：');
-  for (const sql of repairs) console.error(sql);
-  console.error('[db] 修复后重新启动。若差异来自误删/手工改表，也可以按 node/docs/OPERATIONS.md 重建库（会丢数据）。');
+  console.error('[db] 本仓不做结构迁移：请删除并重建目标库（全新项目，无历史数据需要保留），然后重新启动。');
 }
 
 /* ─────────────────────────── 建表 ─────────────────────────── */
@@ -1572,9 +1290,9 @@ function reportSchemaStructureFailure(diffs, repairs) {
  *
  * ⚠️ 它只对**新库**与**已通过结构门禁的库**执行：`CREATE TABLE IF NOT EXISTS` 对已存在的表
  * 是 no-op，老库缺的 CHECK/索引/列宽它一个都补不上——那些缺口由 `inspectSchemaStructure`
- * 在启动时拒绝（并给出修复清单），不是靠这里"再执行一遍建表语句"蒙混过去。
+ * 在启动时拒绝（删库重建），不是靠这里"再执行一遍建表语句"蒙混过去。
  */
-async function migrate() {
+async function createFreshSchema() {
   /*
     建表走**一条临时连接**，且只在这一条上开 `multipleStatements`：
     业务池一律关着它（SQL 注入的第二道网，见 baseConnectionOptions），
@@ -1591,7 +1309,7 @@ async function migrate() {
       触发器与建表同一批下发（同样只有这一条连接允许多语句）：它们是 schema 的一部分，
       不是可选的加固——缺了它们，配额计数器的减量半边就不存在（见 TRIGGER_DDL 的说明）。
       只在**新库**由 inspectSchemaStructure 的 fresh 分支调用一次；已存在的库由结构门禁
-      对拍触发器语句，不一致就拒绝启动并给修复 SQL（不在运行期 DROP + CREATE）。
+      对拍触发器语句，不一致就拒绝启动（删库重建；不在运行期 DROP + CREATE）。
     */
     await conn.query(TRIGGER_DDL.join(';\n'));
   } finally {
@@ -1614,7 +1332,7 @@ const SCHEMA_DDL = `
        唯一例外是 shops.code CHAR(9)——它 9 字节、**由本节点铸造**、不可变，再套一层代理键只会多一次 JOIN。
        （旧形状是 orders.id VARCHAR(40) 当主键，5 张子表各背 40 字节外键。）
     R2 类型按语义精确：地址 CHAR(42)、交易哈希/托管单号 CHAR(66)、店铺编号 CHAR(9)、
-       订单号 CHAR(21)、商品标识 CHAR(11)；wei 金额 DECIMAL(38,0)、微 USDT BIGINT UNSIGNED、
+       订单号 CHAR(21)、商品标识 CHAR(11)；wei 金额 DECIMAL(38,0)、标价币种微单位 BIGINT UNSIGNED（USDT/BTY）、
        汇率 DECIMAL(20,10)。
        （旧形状把 9 位编号放进 VARCHAR(64)、把地址与金额放进 TEXT。）
 
@@ -1818,25 +1536,6 @@ const SCHEMA_DDL = `
     CONSTRAINT fk_operators_shop FOREIGN KEY (shop_code) REFERENCES shops (code) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
-  /* 店主对外身份声明（EOA 可离线 verifyMessage；合约账户走 1271）。证明"某地址签过这句话"，**不证明**域名/GitHub 归他。 */
-  CREATE TABLE IF NOT EXISTS shop_claims (
-    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    shop_code  CHAR(9) NOT NULL,
-    kind       ENUM('domain','github','x','telegram') NOT NULL,
-    value      VARCHAR(320) NOT NULL,                   -- 规范形（归一与上限的唯一实现在 src/claims.js）
-    address    CHAR(42) NOT NULL,
-    message    TEXT NOT NULL,                           -- 逐字节原样（核验的唯一输入）
-    signature  VARCHAR(200) NOT NULL,
-    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    revoked_at DATETIME(3) NULL,                        -- NULL = 有效
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_claims_identity (kind, value, shop_code),
-    KEY idx_claims_active (revoked_at, id),
-    CONSTRAINT ck_shop_claims_shop_code_upper CHECK (shop_code = UPPER(shop_code)),
-    CONSTRAINT ck_shop_claims_address_lower CHECK (address = LOWER(address)),
-    CONSTRAINT fk_claims_shop FOREIGN KEY (shop_code) REFERENCES shops (code) ON DELETE CASCADE
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
-
   /* 通知 webhook 配置：**一行一店**。secret 单独成表，便于只对它收紧读权限与审计。 */
   CREATE TABLE IF NOT EXISTS shop_webhook (
     shop_code CHAR(9) NOT NULL,
@@ -1869,7 +1568,14 @@ const SCHEMA_DDL = `
     description_blocks JSON NOT NULL DEFAULT ('[]'),                   -- [{type:'text',text}|{type:'image',url}]，入快照
     media         JSON NOT NULL DEFAULT ('[]'),                        -- 主图区（**数组顺序即展示顺序**），入快照
     kind          ENUM('digital','physical','nft','erc20') NOT NULL,
-    shipping_fee_usdt_micro BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    /*
+      计价币种：整件商品（每个 SKU 的单价与运费）只有一个标价币种。
+      两种币种的金额一律存「该币种的微单位」（1 单位 = 1e6 微）：USDT 微 = 1e-6 USDT，
+      BTY 微 = 1e12 wei = 1e-6 BTY。两者都是 6 位小数，换算与展示只有一条代码路径。
+      BTY 定价的商品直接以 BTY 成交（原生 BTY，不经行情换算）；USDT 定价才需要行情。
+    */
+    price_currency ENUM('USDT','BTY') NOT NULL,
+    shipping_fee_micro BIGINT UNSIGNED NOT NULL DEFAULT 0,
     age_restricted TINYINT(1) NOT NULL DEFAULT 0,
     nft_contract  CHAR(42) NULL,                        -- kind='nft' 必填（小写）
     nft_standard  ENUM('erc721','erc1155') NULL,
@@ -1906,7 +1612,16 @@ const SCHEMA_DDL = `
     reserved_tokens INT UNSIGNED NOT NULL DEFAULT 0,
     active        TINYINT(1) NOT NULL DEFAULT 1,        -- 店主侧的可见性：1=在售，0=草稿/已下架
     /*
-      **节点侧强制下架**：与 active 正交——店主可以改 active，但改不动这一列。
+      **软删除**（商品软删除，行保留供历史订单/审计引用）：
+       · deleted_at IS NULL = 未删除；非空 = 已删除，退出一切公开可见性、店主管理列表与下单闸；
+       · deleted_reason：节点主强制删除时的原因（店主自己删除时为空串）。
+      “已删除”与 active/node_hidden 正交：删除是终局，不再由店主改回在售。
+      可见性的唯一判据在 src/shops.js 的 productSellableSql（所有公开列表/详情/下单共用）。
+    */
+    deleted_at    DATETIME(3) NULL,
+    deleted_reason VARCHAR(200) NOT NULL DEFAULT '',
+    /*
+      节点侧强制下架：与 active 正交——店主可以改 active，但改不动这一列。
       两个判据各自回答不同的问题：active 是"店主愿不愿意卖"，node_hidden 是"本节点允不允许卖"。
       公开列表/详情/下单必须同时满足，任一为 0 都不可售；恢复只能由节点管理员操作。
       reason 给店主看（他要知道为什么被下架、该改什么），at 给管理面排序。
@@ -1921,6 +1636,7 @@ const SCHEMA_DDL = `
     UNIQUE KEY uq_products_slug (slug),
     KEY idx_products_shop (shop_code, active),
     KEY idx_products_public (active, node_hidden, id),
+    KEY idx_products_deleted (deleted_at, id),
     KEY idx_products_tags ((CAST(tags->'$[*].key' AS CHAR(64) ARRAY))),
     KEY idx_products_attrs ((CAST(attributes->'$[*].pair' AS CHAR(128) ARRAY))),
     CONSTRAINT fk_products_shop FOREIGN KEY (shop_code) REFERENCES shops (code),
@@ -1939,7 +1655,7 @@ const SCHEMA_DDL = `
     product_id    BIGINT UNSIGNED NOT NULL,
     sku_key       VARCHAR(62) NOT NULL,                 -- 按 specs 声明顺序用 '|' 拼接；默认规格为空串（唯一组合）
     specs_json    JSON NOT NULL DEFAULT ('{}'),
-    price_usdt_micro BIGINT UNSIGNED NOT NULL,
+    price_micro   BIGINT UNSIGNED NOT NULL,            -- 单价（微单位，币种见 products.price_currency）
     image_url     VARCHAR(500) NOT NULL DEFAULT '',
     capacity      INT UNSIGNED NULL,                    -- NULL = 不限量
     committed     INT UNSIGNED NOT NULL DEFAULT 0,      -- 已占位件数（占位/释放的权威值）
@@ -1950,7 +1666,7 @@ const SCHEMA_DDL = `
     PRIMARY KEY (id),
     UNIQUE KEY uq_skus_product_key (product_id, sku_key),
     CONSTRAINT fk_skus_product FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE CASCADE,
-    CONSTRAINT ck_skus_price CHECK (price_usdt_micro <= 9007199254740991),
+    CONSTRAINT ck_skus_price CHECK (price_micro <= 9007199254740991),
     CONSTRAINT ck_skus_token_amount CHECK (token_amount IS NULL OR (token_amount REGEXP '^[1-9][0-9]*$' AND CHAR_LENGTH(token_amount) <= 78)),
     -- 防超卖的**唯一权威**在库里，不在调用点（2026-10-16 补）：判据此前只活在
     -- src/stockHold.js 的两条条件 UPDATE 里（committed + ? <= capacity），于是任何第三个写者
@@ -1985,7 +1701,7 @@ const SCHEMA_DDL = `
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     order_no      CHAR(21) NOT NULL,                    -- B + 10 位时间 + 10 位随机；对外标识
     shop_code     CHAR(9) NOT NULL,
-    product_id    BIGINT UNSIGNED NULL,                 -- 商品删除后置 NULL（快照仍在）
+    product_id    BIGINT UNSIGNED NULL,                 -- 商品硬删除时置 NULL（软删除保留）
     product_slug  CHAR(11) NOT NULL,                    -- 下单时的商品标识（历史事实）
     product_snapshot MEDIUMTEXT NOT NULL,               -- 冻结快照（**字节精确**，哈希的输入）
     snapshot_hash CHAR(66) NOT NULL,
@@ -2004,13 +1720,32 @@ const SCHEMA_DDL = `
     payment_symbol VARCHAR(20) NOT NULL DEFAULT 'BTY',
     payment_decimals TINYINT UNSIGNED NOT NULL DEFAULT 18,
     token_usdt_micro_per_token DECIMAL(38,0) NOT NULL DEFAULT 0,
-    payment_rate_source ENUM('bty','fixed','oracle') NOT NULL DEFAULT 'bty',
+    payment_rate_source ENUM('bty','fixed','oracle','none') NOT NULL DEFAULT 'bty',
     -- 行情源失败后按 fixed 兜底时必须如实标记；否则订单会声称"这是 oracle 报价"
     payment_rate_stale TINYINT(1) NOT NULL DEFAULT 0,
     payment_rate_quoted_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    usdt_micro    BIGINT UNSIGNED NOT NULL,             -- 成交时微 USDT（1 USDT = 1e6）
-    shipping_fee_usdt_micro BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    /*
+      本单的标价币种（= 下单时商品的 price_currency）。
+      price_micro 是该币种的微单位总额（商品 + 运费），**不是**支付资产的金额：
+      支付资产金额在 amount_wei。USDT 定价单的 price_micro 经行情折算成 BTY/代币；
+      BTY 定价单的 amount_wei = price_micro × 1e12（1 微 BTY = 1e12 wei），不经任何行情。
+    */
+    price_currency ENUM('USDT','BTY') NOT NULL,
+    price_micro   BIGINT UNSIGNED NOT NULL,             -- 标价币种微单位总额（商品 + 运费）
+    shipping_fee_micro BIGINT UNSIGNED NOT NULL DEFAULT 0,
     bty_usdt_rate DECIMAL(20,10) NOT NULL DEFAULT 0,
+    /*
+      **店主侧软删除**（只影响店主管理列表）。已取消/已超时订单可以从店主后台隐藏，
+      但买家仍能按订单号查看自己的记录，流水/统计也不会因此少一笔。
+      NULL = 未删除；非空 = 店主已从管理列表移除。
+    */
+    seller_deleted_at DATETIME(3) NULL,
+    /*
+      **买家侧软删除**（只影响买家自己的订单列表）：与 seller_deleted_at 互不影响——
+      店主清理管理列表不该让买家"我的订单"少一单，买家隐藏自己的历史也不影响店主对账。
+      同样只允许 cancelled/expired；买家侧列表与详情都隐藏，店主/仲裁人仍可访问。
+    */
+    buyer_deleted_at DATETIME(3) NULL,
     -- 履约
     hold_qty      TINYINT UNSIGNED NOT NULL DEFAULT 0,
     /*
@@ -2071,6 +1806,8 @@ const SCHEMA_DDL = `
     UNIQUE KEY uq_orders_no (order_no),
     KEY idx_orders_shop (shop_code, created_at),
     KEY idx_orders_buyer (buyer, created_at),
+    KEY idx_orders_seller_deleted (shop_code, seller_deleted_at, id),
+    KEY idx_orders_buyer_deleted (buyer, buyer_deleted_at, id),
     KEY idx_orders_product (product_id, status),
     /*
       保留期扫描的候选/排序判据是
@@ -2112,7 +1849,36 @@ const SCHEMA_DDL = `
     CONSTRAINT ck_orders_payment_decimals CHECK (payment_decimals <= 36),
     CONSTRAINT ck_orders_qty CHECK (quantity BETWEEN 1 AND 99),
     CONSTRAINT ck_orders_released_qty CHECK (released_qty <= hold_qty),
-    CONSTRAINT ck_orders_money CHECK (usdt_micro <= 9007199254740991 AND shipping_fee_usdt_micro <= 9007199254740991),
+    CONSTRAINT ck_orders_money CHECK (price_micro <= 9007199254740991 AND shipping_fee_micro <= 9007199254740991),
+    /* 软删除只可能出现在终局状态；离开终局时由 trg_orders_revive_clear_deleted 清标记。 */
+    CONSTRAINT ck_orders_seller_deleted_terminal CHECK (
+      seller_deleted_at IS NULL OR status IN ('cancelled','expired')
+    ),
+    CONSTRAINT ck_orders_buyer_deleted_terminal CHECK (
+      buyer_deleted_at IS NULL OR status IN ('cancelled','expired')
+    ),
+    /*
+      BTY 定价单的支付资产形状：只能原生 BTY、没有行情腿。
+      把"BTY 定价却用 ERC20 支付/带着汇率"变成库层不可表达——应用层校验会漏，
+      而这两列一旦互相矛盾，账就永远对不上（price_micro 是 BTY，amount_wei 是代币）。
+    */
+    CONSTRAINT ck_orders_bty_pricing CHECK (
+      price_currency <> 'BTY' OR (
+        payment_token = '0x0000000000000000000000000000000000000000'
+        AND payment_decimals = 18
+        AND payment_rate_source = 'none'
+        AND payment_rate_stale = 0
+        AND bty_usdt_rate = 0
+        AND token_usdt_micro_per_token = 0
+      )
+    ),
+    /* BTY 直接定价的唯一金额等式：微 BTY × 1e12 = amount_wei；不靠应用层记得乘。
+       乘数必须显式转 DECIMAL：BIGINT 乘法在 9.22e18 以上会溢出（20.5 BTY 就会踩到），
+       而 amount_wei 本身是 DECIMAL(38,0)。 */
+    CONSTRAINT ck_orders_bty_amount CHECK (
+      price_currency <> 'BTY' OR amount_wei = CAST(price_micro AS DECIMAL(38,0)) * 1000000000000
+    ),
+    CONSTRAINT ck_orders_usdt_pricing CHECK (price_currency <> 'USDT' OR payment_rate_source <> 'none'),
     -- 第二道网：计数器被绕过时（直连 SQL / 未来的新写入点）也存不下越界的账
     CONSTRAINT ck_orders_evidence_bytes CHECK (evidence_bytes <= 20971520)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
@@ -2135,7 +1901,7 @@ const SCHEMA_DDL = `
       宽度是业务规则的一部分，改校验上限时这一列要同批改。
 
       ⚠️ 列宽是**结构指纹**的一部分：启动自检对拍 COLUMN_TYPE，老库这一列仍是 20 宽
-      （症状与上面那条一样，但只在长税号上出现）就**拒绝启动**并给出 MODIFY COLUMN 的修复语句。
+      （症状与上面那条一样，但只在长税号上出现）就**拒绝启动**（删库重建）。
     */
     invoice_tax_no VARCHAR(40) NOT NULL DEFAULT '',
     edit_count    TINYINT UNSIGNED NOT NULL DEFAULT 0,   -- 发货前最多改 1 次
@@ -2155,6 +1921,12 @@ const SCHEMA_DDL = `
     refund_rejected_at  DATETIME(3) NULL,
     refunded_amount_wei DECIMAL(38,0) NOT NULL DEFAULT 0,
     claim_paid_wei DECIMAL(38,0) NOT NULL DEFAULT 0, -- 提货争议赔给 claimant（与买家退款分开）
+    /*
+      Staking.penalizedByOrderTotal 的镜像（同一订单全部保证金赔付：普通罚没 + 提货赔付）。
+      原生单的 refunded_amount_wei 含这笔（Escrow._accountBuyerCredit），但它从卖家保证金出、
+      不减 sellerPending；用它把“买家退款”与“保证金赔付”拆开。
+    */
+    stake_paid_wei DECIMAL(38,0) NOT NULL DEFAULT 0,
     accepted_partial_refund_wei DECIMAL(38,0) NOT NULL DEFAULT 0, -- 买家链上精确授权过的那个数
     after_sale_status ENUM('none','open','closed') NOT NULL DEFAULT 'none',
     after_sale_opened_at DATETIME(3) NULL,
@@ -2187,7 +1959,7 @@ const SCHEMA_DDL = `
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     claim_no      CHAR(21) NOT NULL,                    -- C + 10 位时间 + 10 位随机（与订单号同一套格式）
     shop_code     CHAR(9) NOT NULL,
-    product_id    BIGINT UNSIGNED NULL,                 -- 商品删除后置 NULL（slug/快照仍在）
+    product_id    BIGINT UNSIGNED NULL,                 -- 商品硬删除时置 NULL（软删除保留；slug/快照仍在）
     product_slug  CHAR(11) NOT NULL,
     order_id      BIGINT UNSIGNED NOT NULL,             -- 交付这枚 token 的订单（必须是终局成交态）
     order_no      CHAR(21) NOT NULL,
@@ -2212,6 +1984,13 @@ const SCHEMA_DDL = `
     -- 链上提货争议（节点侧发起，Escrow 裁决）
     claim_amount_wei DECIMAL(38,0) NULL,                -- 争议金额上限（NULL = 未申请）
     claim_paid_at_open DECIMAL(38,0) NULL,              -- 开案时订单累计提货赔付快照（对账零赔付用）
+    /*
+      提交时的提货截止快照：卖家事后改商品 claim_window_days 不得追溯改变已提交声明的生死。
+      NULL = 旧行（提交时还没有这一列）；过期任务跳过它们，不用当前商品配置重算。
+    */
+    claim_deadline_at DATETIME(3) NULL,
+    /* 提交时的提货类型快照：卖家事后改商品 claim_type 不得追溯改变已提交声明的交付规则 */
+    claim_type ENUM('physical','digital','service') NOT NULL DEFAULT 'physical',
     dispute_claim_id CHAR(66) NULL,
     dispute_state ENUM('none','opened','closed','cancelled') NOT NULL DEFAULT 'none',
     dispute_opened_at DATETIME(3) NULL,
@@ -2651,7 +2430,8 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     o.buyer, o.seller, o.quantity, o.status,
     o.amount_wei, o.payment_token, o.payment_symbol, o.payment_decimals, o.token_usdt_micro_per_token,
     o.payment_rate_source, o.payment_rate_stale, o.payment_rate_quoted_at,
-    o.usdt_micro, o.shipping_fee_usdt_micro, o.bty_usdt_rate,
+    o.price_currency, o.price_micro, o.shipping_fee_micro, o.bty_usdt_rate,
+    o.seller_deleted_at, o.buyer_deleted_at,
     /*
       **净额 = amount_wei − refunded_amount_wei**（零费模型：没有平台费、没有节点抽成，
       结算只有退款 + 卖家两条腿）。退款额住在 order_chain（链上镜像表，LEFT JOIN 可能为 NULL），
@@ -2670,7 +2450,7 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     s.edit_count      AS shipping_edit_count,
     c.escrow_order_id, c.paid_tx_hash,
     c.refund_status, c.refund_requested_at, c.refund_rejected_at,
-    c.refunded_amount_wei, c.claim_paid_wei, c.accepted_partial_refund_wei,
+    c.refunded_amount_wei, c.claim_paid_wei, c.stake_paid_wei, c.accepted_partial_refund_wei,
     c.after_sale_status, c.after_sale_opened_at, c.after_sale_opened_block,
     c.after_sale_closed_at, c.after_sale_note, c.events AS onchain_events
   FROM orders o
@@ -2720,8 +2500,8 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
  *
  * ## 语句形式
  *
- * 配额触发器绝大多数是**单语句体**：读的人一眼能看全，也便于从启动失败时的修复清单里
- * 原样复制。唯一的复合体是"整单删除"那一支（四本额度账 + 删除代客 marker 必须按序完成；
+ * 配额触发器绝大多数是**单语句体**：读的人一眼能看全，也便于和启动时的结构对拍逐字比较。
+ * 唯一的复合体是"整单删除"那一支（四本额度账 + 删除代客 marker 必须按序完成；
  * 拆成多个同事件触发器时，第一个删掉 marker 之后后面的就只能误减买家账）。
  * 审计守卫必须表达"不满足条件就拒绝"，那在 MySQL 里只有 `IF … THEN SIGNAL`
  * 一条路（复合体）。实测（8.0.46）：复合体与其它 DDL 一起用 `multipleStatements` 下发
@@ -2749,6 +2529,18 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
  * 从未加过量，却同样会走到这里的减量（所以"从没加过量"必须被当作**可能**，而不是不可能）。
  */
 const TRIGGER_DDL = [
+  /*
+    订单从 cancelled/expired 被链上对账、/sync 或 watcher 恢复时，两个软删除标记必须一起消失。
+    这些写者分布在多个模块、直接 UPDATE status；判据放触发器里，新增恢复入口也不会再漏。
+  */
+  `DROP TRIGGER IF EXISTS trg_orders_revive_clear_deleted`,
+  `CREATE TRIGGER trg_orders_revive_clear_deleted BEFORE UPDATE ON orders FOR EACH ROW
+   BEGIN
+     IF NEW.status NOT IN ('cancelled','expired') THEN
+       SET NEW.seller_deleted_at = NULL,
+           NEW.buyer_deleted_at = NULL;
+     END IF;
+   END`,
   // ①② 订单离开 draft ⇒ 两道免费草稿闸各还一份额度（不变量见 orders 的建表注释）
   `DROP TRIGGER IF EXISTS trg_orders_draft_quota_release`,
   `CREATE TRIGGER trg_orders_draft_quota_release AFTER UPDATE ON orders FOR EACH ROW

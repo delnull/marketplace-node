@@ -1,0 +1,287 @@
+{
+  "terms": {
+    "escrow": {
+      "label": "托管合约",
+      "hint": "买家付的钱先由合约保管，确认收货后才给店主"
+    },
+    "staking": {
+      "label": "保证金",
+      "hint": "店主押在链上的钱，用来赔付买家"
+    },
+    "registry": {
+      "label": "节点目录",
+      "hint": "链上记录有哪些节点、各自地址的目录"
+    },
+    "operator": {
+      "label": "节点运营方",
+      "hint": "这家节点在链上登记的控制地址"
+    },
+    "endpoint": {
+      "label": "节点接口地址",
+      "hint": "浏览器访问这家节点数据的地址"
+    },
+    "arbiter": {
+      "label": "仲裁委员",
+      "hint": "由节点任命、按委员会投票裁决争议的人"
+    },
+    "committee": {
+      "label": "仲裁委员会",
+      "hint": "负责投票裁决争议的一组仲裁委员"
+    },
+    "governor": {
+      "label": "治理合约",
+      "hint": "节点参数变更按提案和时间锁执行的合约"
+    },
+    "vault": {
+      "label": "代币托管",
+      "hint": "ERC20 代币赔付暂存的地方"
+    },
+    "owner": {
+      "label": "合约管理员",
+      "hint": "有权修改合约参数的钱包地址"
+    },
+    "wei": {
+      "label": "最小单位",
+      "hint": "BTY 的最小计量单位，1 BTY = 10^18 最小单位"
+    },
+    "bps": {
+      "label": "万分比",
+      "hint": "合约里的比例单位，10000 = 100%"
+    },
+    "gas": {
+      "label": "矿工费",
+      "hint": "链上交易手续费"
+    },
+    "rpc": {
+      "label": "链上节点",
+      "hint": "浏览器读取区块链数据的服务"
+    },
+    "abi": {
+      "label": "合约接口",
+      "hint": "程序调用合约的函数清单"
+    },
+    "tokenId": {
+      "label": "NFT 编号",
+      "hint": "一枚 NFT 在合约里的编号"
+    },
+    "tokenRef": {
+      "label": "提货凭证编号",
+      "hint": "查询提货资格用的编号"
+    },
+    "decimals": {
+      "label": "小数位",
+      "hint": "代币最多能拆到几位小数"
+    },
+    "nonce": {
+      "label": "交易序号",
+      "hint": "同一钱包发交易的顺序号"
+    },
+    "txHash": {
+      "label": "交易哈希",
+      "hint": "每笔链上交易的唯一编号"
+    },
+    "block": {
+      "label": "区块",
+      "hint": "链上按块记录交易，BTY 约 5 秒一块"
+    },
+    "chainId": {
+      "label": "链编号",
+      "hint": "区分不同区块链网络的数字"
+    },
+    "seller": {
+      "label": "店主",
+      "hint": "在平台上开店的人"
+    },
+    "buyer": {
+      "label": "买家",
+      "hint": "下单付款的人"
+    },
+    "host": {
+      "label": "节点主",
+      "hint": "部署并运营这家节点的人"
+    },
+    "nodeStaff": {
+      "label": "节点员工",
+      "hint": "节点主授权的运营人员"
+    },
+    "shopStaff": {
+      "label": "店员",
+      "hint": "店主授权的店铺运营人员"
+    },
+    "claimant": {
+      "label": "提货人",
+      "hint": "来提货的人"
+    },
+    "escrowOrderId": {
+      "label": "链上订单号",
+      "hint": "这笔订单在托管合约里的编号"
+    },
+    "claim": {
+      "label": "提货单",
+      "hint": "买家用兑换凭证申请提货的记录"
+    },
+    "claimDispute": {
+      "label": "提货争议",
+      "hint": "提货出问题时开的链上争议"
+    },
+    "afterSale": {
+      "label": "售后",
+      "hint": "确认收货后才发现问题的处理流程"
+    },
+    "dispute": {
+      "label": "争议",
+      "hint": "买卖双方谈不拢，交给仲裁委员会裁决"
+    },
+    "refund": {
+      "label": "退款",
+      "hint": "把钱退给买家"
+    },
+    "retention": {
+      "label": "留存期",
+      "hint": "确认收货后货款暂缓释放的等待期"
+    },
+    "exposure": {
+      "label": "未了结金额",
+      "hint": "还没处理完的退款和争议金额"
+    },
+    "penalty": {
+      "label": "罚没",
+      "hint": "从店主保证金里扣钱赔给买家"
+    },
+    "settlement": {
+      "label": "结算",
+      "hint": "把托管里的钱分给买卖双方"
+    },
+    "stake": {
+      "label": "质押",
+      "hint": "店主把保证金存进合约"
+    },
+    "unstake": {
+      "label": "取回保证金",
+      "hint": "店主申请把保证金取回"
+    },
+    "codePool": {
+      "label": "码池",
+      "hint": "自动发货用的兑换码库存"
+    },
+    "code": {
+      "label": "兑换码",
+      "hint": "数字商品发给买家的兑换凭证"
+    },
+    "sku": {
+      "label": "规格组合",
+      "hint": "同一商品下不同规格与价格的组合"
+    },
+    "gmv": {
+      "label": "成交额",
+      "hint": "已成交订单的金额合计"
+    },
+    "quorum": {
+      "label": "通过票数",
+      "hint": "委员会通过一项决议所需的最少票数"
+    },
+    "epoch": {
+      "label": "届",
+      "hint": "委员会换届的编号"
+    },
+    "timelock": {
+      "label": "时间锁",
+      "hint": "提案通过后必须等待的时间"
+    },
+    "ledger": {
+      "label": "收款流水",
+      "hint": "卖家收到的钱按时间列出的明细"
+    },
+    "auditLog": {
+      "label": "操作记录",
+      "hint": "谁在什么时候做了什么"
+    },
+    "webhook": {
+      "label": "事件通知",
+      "hint": "订单变化时自动推送给店主服务器的消息"
+    },
+    "pii": {
+      "label": "个人信息",
+      "hint": "买家姓名、电话、地址等"
+    }
+  },
+  "enums": {
+    "orderStatus": {
+      "draft": "待支付托管",
+      "escrowed": "已托管 · 待发货",
+      "shipped": "已发货 · 待确认",
+      "confirmed": "已完成",
+      "disputed": "争议中",
+      "settled": "已结算（货款结算给店主）",
+      "refunded": "已退款（全额退回）",
+      "expired": "超时已释放给店主",
+      "cancelled": "已取消"
+    },
+    "productKind": {
+      "physical": "实物",
+      "digital": "数字",
+      "nft": "NFT",
+      "erc20": "ERC20"
+    },
+    "claimStatus": {
+      "requested": "待处理",
+      "approved": "待发货",
+      "shipped": "已发货",
+      "fulfilled": "已交付",
+      "rejected": "已驳回",
+      "cancelled": "已撤回",
+      "expired": "已过期"
+    },
+    "claimAction": {
+      "approve": "同意提货",
+      "ship": "提货发货",
+      "fulfill": "确认提货完成",
+      "reject": "拒绝提货",
+      "cancel": "取消提货"
+    },
+    "returnStatus": {
+      "open": "待寄回",
+      "shipped": "已寄回",
+      "received": "已收到"
+    },
+    "codeStatus": {
+      "unused": "未使用",
+      "used": "已使用",
+      "all": "全部"
+    },
+    "evidencePhase": {
+      "refund_request": "退款理由",
+      "refund_reply": "退款回复",
+      "arbitration": "仲裁陈述",
+      "after_sale": "售后陈述"
+    },
+    "rateSource": {
+      "none": "BTY 直接定价",
+      "bty": "BTY 行情",
+      "fixed": "固定价",
+      "oracle": "行情源报价"
+    },
+    "chainStatus": {
+      "0": "链上无此单",
+      "1": "托管中",
+      "2": "争议冻结",
+      "3": "已结算",
+      "4": "已退款"
+    },
+    "refundStatus": {
+      "none": "无退款",
+      "requested": "退款待处理",
+      "approved": "退款已同意",
+      "rejected": "退款已驳回"
+    },
+    "claimType": {
+      "physical": "实物",
+      "digital": "数字",
+      "service": "服务"
+    },
+    "nftStandard": {
+      "erc721": "ERC721",
+      "erc1155": "ERC1155"
+    }
+  }
+}

@@ -37,8 +37,8 @@ test('卖家筛选：检索词转义 LIKE 通配符，并带 COLLATE', () => {
 });
 
 test('卖家筛选：非法参数返回错误而不是静默忽略', () => {
-  assert.match(sellerOrderFilters({ status: 'nope' }).error, /status 无效/);
-  assert.match(sellerOrderFilters({ refund: 'nope' }).error, /refund/);
+  assert.match(sellerOrderFilters({ status: 'nope' }).error, /状态筛选值无效/);
+  assert.match(sellerOrderFilters({ refund: 'nope' }).error, /退款筛选/);
   assert.match(sellerOrderFilters({ q: '   ' }).error, /q 不能为空/);
-  assert.match(sellerOrderFilters({ afterSale: 'nope' }).error, /afterSale/);
+  assert.match(sellerOrderFilters({ afterSale: 'nope' }).error, /售后筛选值/);
 });

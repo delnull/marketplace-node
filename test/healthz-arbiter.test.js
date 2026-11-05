@@ -6,8 +6,13 @@
  * 但那个方向的代价是「合法的仲裁人在抖动期间也进不来」，而在此之前这个状态**只能靠翻日志**看：
  * `/healthz` 一切正常、仲裁人只看到自己被拒，运维无从区分"你不是仲裁人"与"节点读不到"。
  *
- * 判据（两半）：① 读不到时 `known=false` 且 `committee=null`（不得显示成某几个人）；
- *              ② 确证读到时 `known=true` 且给出当前届名单与阈值。
+ * 判据（三半）：① 本次启动后还没读过 ⇒ `state='none'`（**不是**"读不到"：下一次鉴权请求会实时读）；
+ *              ② 读失败时 `state='failed'` 且 `committee=null`（不得显示成某几个人）；
+ *              ③ 确证读到时 `state='ok'` 且给出当前届名单与阈值。
+ *
+ * 为什么"还没读过"要单列一档（2026-11-04 实测）：节点健康页把 `committee=null` 一律写成
+ * "本次读不到（此时合法委员也会被拒）"，而线上那个进程启动后**根本没有人访问过仲裁台**——
+ * 链上明明读得到 3 名委员，页面却说读不到。把"还没问"说成"问坏了"，运维会去查一个不存在的故障。
  *
  * 装配注记：用 `chain.setCommitteeReader` 注入点替换**取值**（与 `setBlocklistReader` 同款），
  * 判据与控制流仍是被测的真实代码；不需要假 JSON-RPC，也就不存在"provider 单例指向旧地址"那一类问题。
@@ -50,7 +55,20 @@ const health = async () => {
   return r.body.data;
 };
 
-test('/healthz：委员会读不到时必须显式说"读不到"（known=false, committee=null）', async () => {
+test('/healthz：本次启动后还没读过委员会 ⇒ state=none（不得说成"读不到"）', async () => {
+  readFails = true;
+  __resetCommitteeCacheForTest();
+
+  const h = await health();
+  assert.ok(h.committee, 'healthz 必须有 committee 这一块（否则运维只能翻日志）');
+  assert.equal(h.committee.state, 'none', '还没读过 ≠ 读不到：下一次鉴权请求会实时读');
+  assert.equal(h.committee.committee, null, '没有读数时不得显示成某个具体名单');
+  assert.equal(h.committee.lastOk, null, '从未成功读到过 ⇒ 没有"最后一次成功读数"');
+  assert.equal(h.committee.lastAttemptAt, null, '一次都没试过 ⇒ 没有"最后一次尝试"');
+  assert.equal(h.committee.lastError, null, '没试过就没有失败原因');
+});
+
+test('/healthz：委员会读失败时必须显式说"读失败"（state=failed, committee=null）', async () => {
   readFails = true;
   __resetCommitteeCacheForTest();
 
@@ -59,22 +77,26 @@ test('/healthz：委员会读不到时必须显式说"读不到"（known=false, 
 
   const h = await health();
   assert.ok(h.committee, 'healthz 必须有 committee 这一块（否则运维只能翻日志）');
-  assert.equal(h.committee.known, false, '读不到 ⇒ known=false（这是一个独立结论，不是某个地址）');
+  assert.equal(h.committee.state, 'failed', '读失败 ⇒ state=failed（这是一个独立结论，不是某个地址）');
   assert.equal(h.committee.committee, null, '读不到时不得显示成某个具体名单');
   assert.equal(h.committee.lastOk, null, '从未成功读到过 ⇒ 没有"最后一次成功读数"');
+  assert.equal(typeof h.committee.lastAttemptAt, 'number', '失败时刻要能看见');
+  assert.match(String(h.committee.lastError), /读不到委员会/, '失败原因要能看见');
 });
 
-test('/healthz：确证读到委员会时给出名单/阈值与 known=true', async () => {
+test('/healthz：确证读到委员会时给出名单/阈值与 state=ok', async () => {
   readFails = false;
   __resetCommitteeCacheForTest();
   const c = await getCommittee();
   assert.deepEqual(c, { arbiters: [arbiterOnchain, arbiter2], threshold: 2, epoch: 3 }, '确证读到');
 
   const h = await health();
-  assert.equal(h.committee.known, true, '确证 ⇒ known=true');
+  assert.equal(h.committee.state, 'ok', '确证 ⇒ state=ok');
   assert.deepEqual(h.committee.committee.arbiters, [arbiterOnchain, arbiter2]);
   assert.equal(h.committee.committee.threshold, 2);
   assert.equal(h.committee.committee.epoch, 3);
+  assert.equal(h.committee.lastError, null, '成功之后不得再挂着上一次的失败原因');
+  assert.equal(typeof h.committee.lastOk?.at, 'number', '最后一次成功读数带时刻（排障线索）');
   assert.equal(h.committee.lastOk?.threshold, 2, '最后一次成功读数可查（排障线索）');
   assert.deepEqual(committeeStatus().committee.arbiters, [arbiterOnchain, arbiter2]);
 });

@@ -14,7 +14,7 @@ import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js'
 import { verifySession } from '../auth.js';
 import { getDb, withTransaction } from '../db.js';
 import { isShopCodeShape, shopDisplayName } from '../shops.js';
-import { usdtOf } from '../money.js';
+import { priceOf } from '../money.js';
 
 const router = Router();
 const requireAuth = makeAuthMiddleware(verifySession);
@@ -33,13 +33,13 @@ function shapeOf(body) {
   const kind = body?.kind === 'shop' ? 'shop' : body?.kind === 'product' ? 'product' : '';
   const code = String(body?.code ?? '').trim().toUpperCase();
   const slug = String(body?.slug ?? '').trim();
-  if (!kind) return { error: 'kind 只能是 shop 或 product' };
+  if (!kind) return { error: '收藏类型只能是店铺或商品' };
   if (!isShopCodeShape(code)) return { error: '店铺编号形状不对' };
   if (kind === 'shop') {
-    if (slug) return { error: '店铺收藏不带 slug' };
+    if (slug) return { error: '店铺收藏不能带商品标识' };
     return { kind, code, slug: '' };
   }
-  if (!SLUG_RE.test(slug)) return { error: '商品 slug 形状不对' };
+  if (!SLUG_RE.test(slug)) return { error: '商品标识格式不对' };
   return { kind, code, slug };
 }
 
@@ -48,7 +48,7 @@ async function assertTarget({ kind, code, slug }) {
   const shop = await db.get('SELECT code FROM shops WHERE code = ?', code);
   if (!shop) return { error: '店铺不存在', notFound: true };
   if (kind === 'product') {
-    const product = await db.get('SELECT slug FROM products WHERE shop_code = ? AND slug = ?', code, slug);
+    const product = await db.get('SELECT slug FROM products WHERE shop_code = ? AND slug = ? AND deleted_at IS NULL', code, slug);
     if (!product) return { error: '这家店没有这个商品', notFound: true };
   }
   return { ok: true };
@@ -69,11 +69,11 @@ router.get('/', wrap(async (req, res) => {
   // 按钱包地址的偏好：即使接口公开，也不能进共享缓存。
   res.setHeader('Cache-Control', 'private, no-store');
   const address = normAddress(req.query.address);
-  if (!address) return fail(res, 'address 需为 0x 开头的 40 位地址', 400, 400);
+  if (!address) return fail(res, '地址必须是 0x 开头的 40 位地址', 400, 400);
   const rows = await getDb().all(
     `SELECT f.kind, f.shop_code, s.name AS shop_name, s.listed AS shop_listed,
-            p.slug AS product_slug, p.title, p.media, p.active, p.node_hidden,
-            (SELECT MIN(k.price_usdt_micro) FROM product_skus k WHERE k.product_id = p.id) AS min_price
+            p.slug AS product_slug, p.title, p.media, p.active, p.node_hidden, p.deleted_at, p.price_currency,
+            (SELECT MIN(k.price_micro) FROM product_skus k WHERE k.product_id = p.id) AS min_price
        FROM buyer_favorites f
        JOIN shops s ON s.code = f.shop_code
        LEFT JOIN products p ON p.shop_code = f.shop_code AND p.slug = f.product_slug
@@ -95,10 +95,12 @@ router.get('/', wrap(async (req, res) => {
         code: String(r.shop_code),
         slug: String(r.product_slug),
         title: String(r.title || ''),
-        priceUsdt: r.min_price == null ? null : usdtOf(r.min_price),
+        priceCurrency: r.price_currency,
+        price: r.min_price == null ? null : priceOf(r.min_price),
         media: mediaOf(r.media),
         // 收藏是买家自己的记录，商品/店铺下架后仍返回，只是标记为不可购买。
         active:
+          r.deleted_at == null &&
           Number(r.active) === 1 &&
           Number(r.node_hidden) !== 1 &&
           Number(r.shop_listed) === 1,

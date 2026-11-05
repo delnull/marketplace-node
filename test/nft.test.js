@@ -22,16 +22,17 @@ const NFT_CONTRACT = '0x' + '9'.repeat(40);
 const OTHER_CONTRACT = '0x' + '8'.repeat(40);
 
 function nftPayload(overrides = {}) {
-  const { priceUsdtMicro = 66_000_000, capacity = null, specs, skus, ...rest } = overrides;
+  const { priceMicro = 66_000_000, priceCurrency = 'USDT', capacity = null, specs, skus, ...rest } = overrides;
   return {
     title: '测试 NFT 藏品',
     description: '单测 NFT 商品：链上藏品交付。',
     media: [{ type: 'image', url: 'https://example.com/nft.jpg' }],
     kind: 'nft',
+    priceCurrency,
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出；单一默认规格就是 key='' 的唯一组合
     specs: specs ?? [{ name: '规格', options: ['默认'] }],
-    skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
+    skus: skus ?? [{ key: '', priceMicro, capacity }],
     ...rest,
   };
 }
@@ -104,9 +105,10 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
     */
     media: [],
     kind: 'digital',
+    price_currency: 'USDT',
     description_blocks: [],
     specs: [{ name: '规格', options: ['默认'] }],
-    skus: [{ sku_key: '', price_usdt_micro: 100 }],
+    skus: [{ sku_key: '', price_micro: 100 }],
     nft_contract: null, // 非 NFT 商品的该列是 **NULL**（三态：'没有'不等于空串）
   };
   const snap = snapshotObject(rowLike);
@@ -114,7 +116,7 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
   assert.ok(!('nft_standard' in snap), '数字商品快照不得含 nft_standard 键');
   /*
     契约：无商品级价格（在 skus 里）；详情块 description_blocks 是权威内容，也入快照。
-    2026-09 契约版本 +1：**运费（shipping_fee_usdt_micro）与年龄限制（age_restricted）**插入
+    2026-09 契约版本 +1：**运费（shipping_fee_micro）与年龄限制（age_restricted）**插入
     kind 之后、specs 之前（实物运费要能被买家核验"没被事后加价"；年龄限制要被锁定，
     防上架后静默增删）。键序同时改在 node 端 snapshotObject/computeSnapshotHash 与
     前端 utils/snapshot.ts —— 两端不同位就会让每个买家看到假的「商品内容已被修改」。
@@ -126,7 +128,8 @@ test('快照契约回归：数字商品快照不含 nft_contract 键，键序为
   */
   const canonical = JSON.stringify({
     slug: 'p-abc', title: '旧商品', description: 'd', description_blocks: [], media: [], kind: 'digital',
-    shipping_fee_usdt_micro: 0, age_restricted: 0,
+    price_currency: 'USDT',
+    shipping_fee_micro: 0, age_restricted: 0,
     specs: [{ name: '规格', options: ['默认'] }], skus: [['', 100]],
     attributes: [],
     terms: {
@@ -148,7 +151,7 @@ test('nftStandard 校验：非法值被拒；erc1155 上架成功且快照锁定
     .send(nftPayload({ nftStandard: 'erc20' }))
     .expect(200);
   assert.notEqual(bad.body.code, 0);
-  assert.match(bad.body.message, /nftStandard/);
+  assert.match(bad.body.message, /NFT 标准必须是/);
 
   const res = await request(app)
     .post('/api/products')
@@ -585,7 +588,7 @@ test('matchNftTransfers：标准错配（erc721 合约日志按 erc1155 申报�
   });
   assert.equal(r.ok, false);
   assert.match(r.reason, /未找到/);
-  assert.match(r.reason, /erc1155/, '错误信息应指引核对 NFT 标准');
+  assert.match(r.reason, /ERC1155/, '错误信息应指引核对 NFT 标准');
 });
 
 test('matchNftTransfers：无关事件（Foo 等）与申报集合为空被拒', async () => {

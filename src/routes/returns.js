@@ -69,16 +69,12 @@ router.post('/:orderNo/return/request', requireAuth, wrap(async (req, res) => {
     quantity: req.body?.quantity,
   });
   if (r.error) return fail(res, r.error, r.forbidden ? 403 : r.notFound ? 404 : 1, r.forbidden ? 403 : r.notFound ? 404 : 200);
-  await logAudit({
-    req,
-    actor: req.auth.address,
-    actorRole: 'buyer',
-    shopCode: order.shop_code,
-    action: 'return.request',
-    targetType: 'order',
-    targetId: order.order_no,
-    detail: { status: r.data.status },
-  });
+  /*
+    买家的动作**不入审计**（本表只记 staff 的管理写操作，见 audit.js 文件头）：这里此前有一条
+    `action: 'return.request'`、`actorRole: 'buyer'` 的 logAudit——它被 logAudit 的 buyer
+    过滤直接 return，**永远不会落库**，而 ACTION_LABEL 里也没有这个动作。留着它等于让下一个人
+    以为"买家退货申请有审计可查"。买家的申请事实由 `order_returns` 行本身承担。
+  */
   ok(res, returnToPublic(r.data), '退货申请已提交，等待卖家填写退货地址');
 }));
 

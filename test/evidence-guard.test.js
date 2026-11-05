@@ -69,7 +69,7 @@ async function insertOrder({ status = 'escrowed', refundStatus = 'none', paid = 
     status,
     productSlug: 'p-ev',
     amountWei: '1000',
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     escrowOrderId: `0x${String(seq).padStart(64, '0')}`,
     paidTxHash: paid ? `0x${String(seq).padStart(64, 'f')}` : null,

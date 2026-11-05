@@ -86,7 +86,7 @@ export function matchNftTransfers(logs, nftContract, expected) {
       // ethers Result 的 values 为内置属性（与事件参数同名冲突），须按位置索引（4）取批量数量数组
       const vals = a[4];
       if (!Array.isArray(ids) || !Array.isArray(vals) || ids.length !== vals.length) {
-        return { ok: false, reason: 'ERC1155 批量转账日志异常（ids/values 长度不一致）' };
+        return { ok: false, reason: 'ERC1155 批量转账日志异常（编号与数量长度不一致）' };
       }
       for (let i = 0; i < ids.length; i++) {
         const id = dec(ids[i]);
@@ -99,7 +99,7 @@ export function matchNftTransfers(logs, nftContract, expected) {
       standard === 'erc1155' ? 'ERC1155 TransferSingle/TransferBatch' : 'ERC721 Transfer';
     return {
       ok: false,
-      reason: `该交易中未找到该 NFT 合约（${evt}）且转出方=店主、接收方=买家的转账事件——请核对合约地址、商品 NFT 标准（erc721/erc1155）与转账交易`,
+      reason: `该交易中未找到该 NFT 合约（${evt}）且转出方=店主、接收方=买家的转账事件——请核对合约地址、商品 NFT 标准（ERC721/ERC1155）与转账交易`,
     };
   }
   // 每件恰一份：**累计份数必须恰为 1**（>1 = 多份、=0 = 空转账）即拒绝
@@ -134,7 +134,7 @@ export function matchNftTransfers(logs, nftContract, expected) {
   if (missing.length) {
     return {
       ok: false,
-      reason: `交易中缺少申报 tokenId ${sortedIds(missing)} 的转移记录（已找到：${sortedIds([...collected.keys()]) || '无'}）——请核对转账内容与本单申报一致（可分批多哈希，或同哈希一次批量转多枚）`,
+      reason: `交易中缺少申报的 NFT 编号 ${sortedIds(missing)} 的转移记录（已找到：${sortedIds([...collected.keys()]) || '无'}）——请核对转账内容与本单申报一致（可分批多哈希，或同哈希一次批量转多枚）`,
     };
   }
   return { ok: true };

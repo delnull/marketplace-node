@@ -67,11 +67,11 @@ export function anchorVerdict({ envAddress = '', storedAddress = '', inflightCou
       ok: false,
       action: 'none',
       reason:
-        `MK_ESCROW_ADDRESS 从 ${stored} 改成了 ${env}，而本地还有 ${n} 笔**已上链的在途订单**（escrowed/shipped/disputed）。\n` +
+        `MK_ESCROW_ADDRESS 从 ${stored} 改成了 ${env}，而本地还有 ${n} 笔**已上链的在途订单**（托管中 / 已发货 / 争议中）。\n` +
         '  这些单的托管资金在**旧合约实例**上：换个地址后它们查不到、也对不了账，店主会一直看到"待发货"。\n' +
         '  处置（任选其一）：\n' +
         '   ① 先把旧实例上的这些单了结（确认收货 / 退款 / 争议裁决 / 超时释放），再改地址；\n' +
-        '   ② 本项目为 greenfield：确认这批数据可弃 ⇒ **重建节点库**（DROP DATABASE 后重启，节点会重新记录新地址）；\n' +
+        '   ② 本项目为 greenfield：确认这批数据可弃 ⇒ **重建节点库**（清空后重启，节点会重新记录新地址）；\n' +
         '   ③ 确实知道后果仍要继续 ⇒ 显式设 MK_ESCROW_CHANGE_ACK=1 再启动（本次会记下新地址）。',
     };
   }

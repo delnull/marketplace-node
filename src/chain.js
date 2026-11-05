@@ -863,6 +863,12 @@ let _committee = null;
 let _committeeAt = 0; // 最后一次**成功**读数的时刻
 let _committeeFailedAt = 0; // 最后一次失败的时刻（负缓存 5s）
 let _committeeLastOk = null;
+/*
+  最后一次**尝试**（成功或失败）的结果：`{ at, ok, error }`，从未读过时为 null。
+  为什么它必须独立存在：`_committee === null` 同时覆盖"从来没读过"（启动后还没有仲裁人访问）
+  与"读失败"两种完全不同的局面，而界面此前只能把两者都写成"读不到"——把"还没问"说成"问了没答"。
+*/
+let _committeeLastAttempt = null;
 let _committeeInflight = null;
 const COMMITTEE_TTL_MS = 60_000;
 const COMMITTEE_ERROR_TTL_MS = 5_000;
@@ -875,7 +881,8 @@ const COMMITTEE_RPC_TIMEOUT_MS = 2_000;
 
 /**
  * 委员会缓存立即失效（`escrowWatcher` 收到 `CommitteeUpdated` / `ArbiterRevoked` 时调用）。
- * 不清 `_committeeLastOk`：它是"最后一次确证读到过谁"的排障线索，不是判定值。
+ * 不清 `_committeeLastOk` / `_committeeLastAttempt`：它们是"最后一次确证读到过谁 / 最后一次尝试"
+ * 的排障线索，不是判定值。清掉 attempt 会让 state 从 failed 退回 none——把"刚失败"说成"没试过"。
  */
 export function invalidateCommitteeCache() {
   _committee = null;
@@ -977,10 +984,14 @@ export async function getCommittee({ force = false } = {}) {
       _committeeAt = at;
       _committeeFailedAt = 0;
       _committeeLastOk = { at, ...c };
+      _committeeLastAttempt = { at, ok: true, error: null };
       return c;
     } catch (e) {
+      const at = Date.now();
       _committee = null;
-      _committeeFailedAt = Date.now();
+      _committeeFailedAt = at;
+      // 给健康面板的主文案是中文摘要，原始异常只进下面这条日志
+      _committeeLastAttempt = { at, ok: false, error: '读不到委员会（详情见节点日志）' };
       console.warn(
         `[chain] 读不到链上委员会（arbiters/arbiterThreshold/committeeEpoch）：${e?.message || e}——` +
           `本次按"不知道"处理（仲裁人视角不开放）；` +
@@ -1036,21 +1047,46 @@ export async function isArbiterForOrder(addr, orderId, { force = false } = {}) {
 }
 
 /**
- * 委员会读数的诊断口径（不参与判定）：`known` = 本次窗口内是否**确证**读到了当前届。
+ * 委员会读数的诊断口径（不参与判定）。`state` 是**唯一**判据，取值：
+ *   · `ok`       当前届已经确证读到（`committee` 非 null）；
+ *   · `failed`   最后一次尝试读失败（`lastAttemptAt` / `lastError` 给出时刻与原因）——
+ *                此时鉴权按 fail-closed 处理，合法仲裁人也会被拒；
+ *   · `none`     当前没有读数，且没有失败的尝试（启动后还没有仲裁人访问过，或刚被事件失效）——
+ *                **这不等于读不到**，下一次鉴权请求会实时读；
+ *   · `disabled` 本节点没配置托管合约（纯展示节点），不存在"委员会"这回事。
+ *
+ * 为什么不让调用方用 `committee === null` 自己推：那会把 `none` 与 `failed` 混成一档，
+ * 于是界面只能把"还没问"说成"问坏了"（节点健康页 2026-11-04 实测：一次都没访问过仲裁台，
+ * 也被写成"本次读不到，此时合法委员也会被拒"）。`lastOk` 只是排障线索，不参与判定。
+ *
  * 供 /healthz、运维台与排障使用。
  */
 export function committeeStatus() {
-  return { committee: _committee, known: _committee !== null, lastOk: _committeeLastOk };
+  const state = !config.chain.escrowAddress
+    ? 'disabled'
+    : _committee
+      ? 'ok'
+      : _committeeLastAttempt && !_committeeLastAttempt.ok
+        ? 'failed'
+        : 'none';
+  return {
+    state,
+    committee: _committee,
+    lastOk: _committeeLastOk,
+    lastAttemptAt: _committeeLastAttempt?.at ?? null,
+    lastError: _committeeLastAttempt && !_committeeLastAttempt.ok ? _committeeLastAttempt.error : null,
+  };
 }
 
 /**
- * 仅供测试：清空委员会读数缓存（含"最后一次成功读数"）。
+ * 仅供测试：清空委员会读数缓存（含"最后一次成功读数"与"最后一次尝试"）。
  */
 export function __resetCommitteeCacheForTest() {
   _committee = null;
   _committeeAt = 0;
   _committeeFailedAt = 0;
   _committeeLastOk = null;
+  _committeeLastAttempt = null;
 }
 
 /** 仅供测试：只让 60s 窗口过期，保留 `lastOk`（模拟"缓存自然过期、这次读不到"）。 */

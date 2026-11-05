@@ -139,9 +139,10 @@ async function readJson(res) {
  * 建单前问一次店主的风控服务。
  *
  * @param {{buyer:string, seller:string, productSlug:string, skuKey?:string, quantity?:number,
- *          amountWei?:string, usdtMicro?:number, shippingFeeUsdtMicro?:number, note?:string}} input
- *   金额口径：`amountWei` 是原生 BTY 的最小单位（wei）；`usdtMicro` / `shippingFeeUsdtMicro` 是
- *   **微 USDT**（1 USDT = 1e6）——风控服务按这两个整数判限额，不要当"分"或"元"解读。
+ *          amountWei?:string, priceMicro?:number, priceCurrency?:'USDT'|'BTY', shippingFeeMicro?:number, note?:string}} input
+ *   金额口径：`amountWei` 是支付资产的最小单位（原生 BTY 为 wei；ERC20 为 token 最小单位）；
+ *   `priceMicro` / `shippingFeeMicro` 是**标价币种微单位**（USDT 或 BTY，见 `priceCurrency`）。
+ *   风控服务按币种解读这两个整数，不要当"分"或"元"。
  * @returns {Promise<{ok:true} | {ok:false, reason:string}>}
  */
 export async function checkOrderGate({
@@ -151,8 +152,9 @@ export async function checkOrderGate({
   skuKey,
   quantity,
   amountWei,
-  usdtMicro,
-  shippingFeeUsdtMicro,
+  priceMicro,
+  priceCurrency,
+  shippingFeeMicro,
   note,
 } = {}) {
   /*
@@ -186,8 +188,9 @@ export async function checkOrderGate({
     skuKey,
     quantity,
     amountWei,
-    usdtMicro,
-    shippingFeeUsdtMicro,
+    priceMicro,
+    priceCurrency,
+    shippingFeeMicro,
     at: Date.now(),
   };
   const body = JSON.stringify(payload);

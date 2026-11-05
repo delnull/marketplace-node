@@ -520,7 +520,7 @@ export function evidencePhaseError(order, phase, role, { now = Date.now() } = {}
   if (statusErr) return { code: 1, http: 200, message: statusErr };
   const p = String(phase || '');
   if (!EVIDENCE_PHASES.includes(p)) {
-    return { code: 1, http: 200, message: `phase 需为 ${EVIDENCE_PHASES.join(' / ')}` };
+    return { code: 1, http: 200, message: `阶段参数不合法` };
   }
   const refundStatus = String(order?.refund_status || '');
   if (p === 'refund_request') {
@@ -529,7 +529,7 @@ export function evidencePhaseError(order, phase, role, { now = Date.now() } = {}
       return {
         code: 1,
         http: 200,
-        message: '仅当退款申请待卖家处理（refund_status=requested）时可提交退款理由——请先由买家在链上发起退款申请',
+        message: '仅当退款申请待卖家处理时可提交退款理由——请先由买家在链上发起退款申请',
       };
     }
     return null;
@@ -544,7 +544,7 @@ export function evidencePhaseError(order, phase, role, { now = Date.now() } = {}
       return {
         code: 1,
         http: 200,
-        message: '订单已进入争议（disputed），退款申请阶段结束——请在争议流程中提交仲裁陈述或链上和解退款',
+        message: '订单已进入争议，退款申请阶段结束——请在争议流程中提交仲裁陈述或链上和解退款',
       };
     }
     return null;
@@ -552,7 +552,7 @@ export function evidencePhaseError(order, phase, role, { now = Date.now() } = {}
   // arbitration：只在争议中受理（双方的仲裁陈述是裁决的主要依据）
   if (p === 'arbitration') {
     if (String(order?.status || '') !== 'disputed') {
-      return { code: 1, http: 200, message: '仲裁陈述仅限争议中（disputed）订单提交' };
+      return { code: 1, http: 200, message: '仲裁陈述仅限争议中的订单提交' };
     }
     /*
       陈述时限（双方举证窗口，见 statementWindowOf 的说明）：**放在阶段语义之后判**——
@@ -575,7 +575,7 @@ export function evidencePhaseError(order, phase, role, { now = Date.now() } = {}
     return {
       code: 1,
       http: 200,
-      message: '售后陈述仅在售后案件在途时可提交——确认收货后由买家在链上 openAfterSale 开案，结案后不再受理',
+      message: '售后陈述仅在售后案件在途时可提交——确认收货后由买家在链上申请售后开案，结案后不再受理',
     };
   }
   // 售后案件的陈述时限：锚点是链上开案时刻的本地镜像（after_sale_opened_at），见 statementWindowOf

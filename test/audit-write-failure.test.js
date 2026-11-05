@@ -111,7 +111,7 @@ test('审计失败：三个"响应后再审计"的入口都得到明确失败，
   await withFailingAudit(async () => {
     const batch = await asOwner(request(app).patch('/api/products/batch')).send({
       slugs: [digital.slug],
-      patch: { priceUsdtMicro: 90_000_000 },
+      patch: { priceMicro: 90_000_000 },
     });
     assert.equal(batch.status, 200);
     assert.notEqual(batch.body.code, 0, '批量改价：审计失败必须得到明确的失败结论，而不是 200 + code:0');

@@ -34,6 +34,15 @@ export function toCsv(headers, rows, opts = {}) {
 
 /** 路由直接写文件响应（Content-Type text/csv; charset=utf-8 + 附件下载名） */
 export function sendCsv(res, filename, headers, rows, opts = {}) {
+  /*
+    列数守卫：表头与每行必须同宽。CSV 的列靠**位置**对齐，错一列不会报错，
+    只会让"订单状态"那一列显示成"数量"——对账时看起来完全像真实读数。
+    这条在发送前拦住整批，代价是一次 500，收益是绝不产出错位的账表。
+  */
+  const wrong = rows.findIndex((r) => r.length !== headers.length);
+  if (wrong >= 0) {
+    throw new Error(`CSV 行列数不一致：表头 ${headers.length} 列，第 ${wrong + 1} 行 ${rows[wrong].length} 列`);
+  }
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`);
   res.end(toCsv(headers, rows, opts));

@@ -3,7 +3,8 @@
  *  GET /api/shop/audit?page=&pageSize=&action=&actor= → 本店审计（ownerOnly）
  *    {total, page, pageSize, items:[{id, at(ISO-8601), actor, actorRole, action, targetType, targetId, detail(对象), ip}]}
  *  GET /api/shop/audit/node?…                        → **节点级**审计（**hostOnly**：节点资料、开店审批、
- *    保留期触发、系统动作——这些事件不属于任何一家店，`shop_code IS NULL`）
+ *    店铺/商品/评价图治理、提货争议参数、保留期触发、系统动作——这些事件不属于任何一家店，
+ *    `shop_code IS NULL`）
  *  GET /api/shop/audit/node/self?…                   → **自己的**节点级审计（nodeAdmin：节点主 ∪ 员工；
  *    `actor = 登录地址 AND shop_code IS NULL`——员工能操作、就该能回看自己那一行）
  *  GET /api/shop/audit/node.csv?action=&actor=       → 节点级审计 **CSV 全量导出**（hostOnly）
@@ -42,6 +43,7 @@ import { fail, ok, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js'
 import { exportAudit, logAudit, queryAudit } from '../audit.js';
 import { sendCsv } from '../csv.js';
 import { isShopCodeShape } from '../shops.js';
+import { verifyShopCode } from '../shopCode.js';
 
 const router = Router();
 // 审计行含 IP/操作者/被操作对象：店铺级私域，只认该店店主（节点主看节点级那份，见 GET /node）
@@ -54,7 +56,8 @@ const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 /** 分页与可选过滤（三条列表路由共用，避免几处各解一次参数而漂移） */
 function listParams(req) {
   return {
-    page: Math.max(1, parseInt(req.query.page, 10) || 1),
+    /* 上限防止 `(page-1)*pageSize` 变成科学计数法（3e+21）把 SQL 变成 500；正常翻阅不会到 1000 页 */
+    page: Math.min(1000, Math.max(1, parseInt(req.query.page, 10) || 1)),
     pageSize: Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30)),
     action: String(req.query.action || '') || undefined,
     actor: String(req.query.actor || '') || undefined,
@@ -65,7 +68,9 @@ function listParams(req) {
 function targetShopParam(req) {
   const raw = String(req.query.targetShop || '').trim().toUpperCase();
   if (!raw) return { value: undefined };
-  if (!isShopCodeShape(raw)) return { error: 'targetShop 需为 9 位店铺编号' };
+  if (!isShopCodeShape(raw)) return { error: '目标店铺必须是 9 位店铺编号' };
+  /* 形状对但校验位错（抄错一位）不能返回空列表——那会被读成“这家店没有治理记录” */
+  if (!verifyShopCode(raw)) return { error: '目标店铺校验位不对：请核对店铺编号' };
   return { value: raw };
 }
 

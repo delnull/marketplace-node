@@ -45,7 +45,7 @@ export function parseTanxinAddress(input) {
   if (!EVM_RE.test(s) && !BTY_RE.test(s)) {
     return {
       ok: false,
-      error: '谈信地址需为 0x 开头的 42 位地址，或 1 开头的 BTY 地址（33–35 位，base58）',
+      error: '谈信地址需为 0x 开头的 42 位地址，或 1 开头的 BTY 地址（33–35 位）',
     };
   }
   return { ok: true, value: s };

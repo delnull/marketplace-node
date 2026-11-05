@@ -27,20 +27,20 @@ const CROSS_LANG_FIXTURE = {
     '{"slug":"p-fix-1","title":"测试 \\"商品\\" & co","description":"desc\\nline2","description_blocks":[' +
     '],"media":[{"type":"image","url":"https://a/b.png"},{"type":"video","url":"/api/uploads/00000000' +
     '-0000-0000-0000-000000000000.mp4","poster":"/api/uploads/11111111-1111-1111-1111-111111111111.jp' +
-    'g"}],"kind":"physical","shipping_fee_usdt_micro":5000000,"age_restricted":1,"specs":[{"name":"颜色' +
+    'g"}],"kind":"physical","price_currency":"USDT","shipping_fee_micro":5000000,"age_restricted":1,"specs":[{"name":"颜色' +
     '","options":["黑","白"]},{"name":"尺寸","options":["M"]}],"skus":[["尺寸=M|颜色=白",12000000],["尺寸=M|颜色=黑' +
     '",10000000]],"attributes":[{"name":"成色","value":"全新未拆封"},{"name":"材质","value":"304 不锈钢"}],' +
     '"terms":{"handling_days":2,"return_policy":"no-reason","return_window_days":7,"return_freight":"seller","invoice_supported":null},' +
     '"sku_images":[["尺寸=M|颜色=黑","https://a/black.png"]]}',
-  hash: '0x094fe9b8846ab6b7015ead6110d19786b76f1ce94c8467c1126ede9bbcbba5b8',
+  hash: '0xdd615672aa8b289aad4da7edba1345657e1456564482ac52be880b5845cd5472',
   /** NFT 单：两个键**追加在 sku_images 之后**（顺序错了哈希就变，而没人会报错） */
   nftCanonical:
     '{"slug":"p-fix-nft","title":"NFT 商品","description":"","description_blocks":[],"media":[],"kind":' +
-    '"nft","shipping_fee_usdt_micro":0,"age_restricted":0,"specs":[],"skus":[["",3000000]],"attributes":[],' +
+    '"nft","price_currency":"USDT","shipping_fee_micro":0,"age_restricted":0,"specs":[],"skus":[["",3000000]],"attributes":[],' +
     '"terms":{"handling_days":null,"return_policy":"unspecified","return_window_days":null,"return_freight":null,"invoice_supported":null},' +
     '"sku_images":[],"nft_contr' +
     'act":"0xabc0000000000000000000000000000000000001","nft_standard":"erc1155"}',
-  nftHash: '0xc7a23da865be9ae249a98974c3a4d8088cfd84682b520b2735beefed49a6334a',
+  nftHash: '0x3e3c9b68eab25c817f77f65862ada2a43ce95afe00737618b9671ff962994f67',
 };
 
 test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 keccak（两侧必须逐字节一致）', () => {
@@ -66,7 +66,8 @@ test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 
       },
     ],
     kind: 'physical',
-    shipping_fee_usdt_micro: 5_000_000, // 运费必须进快照（否则店主可在下单前事后加价）
+    price_currency: 'USDT',
+    shipping_fee_micro: 5_000_000, // 运费必须进快照（否则店主可在下单前事后加价）
     age_restricted: 1, // 年龄限制必须进快照
     // skus 故意乱序传入：实现必须按 sku_key 升序排（顺序影响哈希）
     specs: [
@@ -81,8 +82,8 @@ test('snapshot 契约：跨语言共享 fixture —— 与前端断言同一个 
         且按 sku_key 升序（与 skus 同一套排序）。
     */
     skus: [
-      { sku_key: '尺寸=M|颜色=白', price_usdt_micro: 12_000_000, image_url: '' },
-      { sku_key: '尺寸=M|颜色=黑', price_usdt_micro: 10_000_000, image_url: 'https://a/black.png' },
+      { sku_key: '尺寸=M|颜色=白', price_micro: 12_000_000, image_url: '' },
+      { sku_key: '尺寸=M|颜色=黑', price_micro: 10_000_000, image_url: 'https://a/black.png' },
     ],
     attributes: [
       { name: '成色', value: '全新未拆封' },
@@ -109,10 +110,11 @@ test('snapshot 契约：NFT 单的两键追加在 sku_images 之后（与前端�
     description_blocks: [],
     media: [],
     kind: 'nft',
-    shipping_fee_usdt_micro: 0,
+    price_currency: 'USDT',
+    shipping_fee_micro: 0,
     age_restricted: 0,
     specs: [],
-    skus: [{ sku_key: '', price_usdt_micro: 3_000_000 }],
+    skus: [{ sku_key: '', price_micro: 3_000_000 }],
     attributes: [],
     terms: {}, // 未声明任何承诺：三态里的"空承诺"必须是这个形状（不是缺键）
     // 故意大写：实现必须归一成小写（否则同一件商品会得到两个哈希）

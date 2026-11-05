@@ -44,7 +44,7 @@ async function attemptDraft(buyer, product, units = 1) {
 
 /** 上架一件池式商品（`insertProduct` 返回的没有 kind，用例自己带上——闸按 kind 选池） */
 async function insertPoolProduct(spec) {
-  const p = await insertProduct(db, { skus: [{ key: '', priceUsdtMicro: 1_000_000 }], ...spec });
+  const p = await insertProduct(db, { skus: [{ key: '', priceMicro: 1_000_000 }], ...spec });
   return { ...p, kind: spec.kind };
 }
 

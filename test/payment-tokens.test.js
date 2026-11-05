@@ -57,7 +57,7 @@ test('paymentTokens：oracle 不可用时 marked stale，不能冒充行情源�
     symbol: 'USDT',
     decimals: 6,
     mode: 'oracle',
-    priceUrl: 'https://price.invalid/usdt',
+    priceUrl: 'https://price.invalid/price',
     fixedUsdtMicroPerToken: '1000000',
   });
   const oldFetch = globalThis.fetch;

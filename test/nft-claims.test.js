@@ -308,6 +308,17 @@ test('提货争议参数：nodeAdmin 生成 openClaimDispute 的 call（记下 c
   assert.equal(call.fn, 'openClaimDispute');
   assert.equal(call.args.length, 7);
   assert.equal(call.args[0], call.claimId);
+  /*
+    节点级行仍要能回答"这是哪家店的提货争议"：归属不在 shop_code（节点行恒 NULL），
+    而在 detail.shopCode（店铺详情的 targetShop 用它过滤）。漏了它，节点主在店铺详情里
+    看不到这家店生成过争议参数。
+  */
+  const disputeAudit = await db.get(
+    "SELECT * FROM audit_logs WHERE action = 'claim.dispute.prepare' ORDER BY id DESC LIMIT 1"
+  );
+  assert.ok(disputeAudit, '生成争议参数必须留审计');
+  assert.equal(disputeAudit.shop_code, null);
+  assert.equal(disputeAudit.detail.shopCode, shopRef.value);
   assert.equal(call.args[3], owner.address.toLowerCase(), 'seller');
   assert.equal(call.args[4], buyer.address.toLowerCase(), 'claimant');
   assert.equal(call.args[5], o.amountWei, 'amountWei');
@@ -390,6 +401,16 @@ test('提货卖家列表包含本店店员（与处理动作同一授权面）',
     .expect(200);
   assertOk(list);
   assert.ok(list.body.data.claims.some((row) => row.id === c.body.data.id), '店员必须看得到本店提货行');
+
+  // 店员导出：同一份 CSV 的审计行归**这家店**，角色是 staff（不是恒定的 staff/owner 猜测）
+  await request(app)
+    .get(`/api/claims/nft/seller.csv?q=${encodeURIComponent(c.body.data.id)}`)
+    .set('Authorization', `Bearer ${staffToken}`)
+    .expect(200);
+  const staffExp = await db.get("SELECT * FROM audit_logs WHERE action = 'claim.export' ORDER BY id DESC LIMIT 1");
+  assert.ok(staffExp, '店员导出也必须留审计');
+  assert.equal(staffExp.shop_code, shopRef.value);
+  assert.equal(staffExp.actor_role, 'staff', '店员导出记 staff');
 
   const removed = await request(app)
     .put('/api/shop/staff')
@@ -478,4 +499,19 @@ test('卖家提货列表分页/搜索与 CSV 导出（含公式防护）', async
   assert.ok(csv.text.startsWith('\uFEFF'), 'UTF-8 BOM');
   assert.ok(csv.text.includes(claimNo) && csv.text.includes('提货测试 NFT'), '含提货单号与商品字段');
   assert.ok(csv.text.includes("'=1+1"), '收货人公式前缀已加');
+  /*
+    导出审计：**逐店归属 + 真实角色**（2026-11-04 修）。
+    旧实现写 `shopCode: null` + `actorRole: 'staff'`：卖家本人导出自己的提货单被记成店员，
+    而节点级行只有节点主看得见——真正该监督这次导出的店主反而看不到。
+  */
+  const exp = await db.get("SELECT * FROM audit_logs WHERE action = 'claim.export' ORDER BY id DESC LIMIT 1");
+  assert.ok(exp, '导出必须留一行审计');
+  assert.equal(exp.shop_code, shopRef.value, '导出按被导出的行逐店归属（不是节点级）');
+  assert.equal(exp.actor_role, 'owner', '卖家本人导出自己的提货单是店主，不是店员');
+  assert.equal(exp.target_type, 'nft_claim_export');
+  assert.equal(
+    Number((await db.get("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'claim.export' AND shop_code IS NULL")).c),
+    0,
+    '不得再写节点级导出审计行（那会让店主看不到自己的导出）'
+  );
 });

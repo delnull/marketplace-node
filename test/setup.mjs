@@ -82,7 +82,7 @@ export async function makeCtx() {
   // 虚拟托管地址：仅用于"已接入链上托管"分支（paid 的链上校验不在单测覆盖）
   process.env.MK_ESCROW_ADDRESS = '0x2222222222222222222222222222222222222222';
   process.env.MK_STAKING_ADDRESS = '0x3333333333333333333333333333333333333333';
-  process.env.MK_FALLBACK_BTY_USDT = '0.1'; // 1 BTY = 0.1 USDT（唯一的行情腿：USDT→BTY）
+  process.env.MK_FALLBACK_BTY_USDT = '0.1'; // 1 BTY = 0.1 price（唯一的行情腿：price→BTY）
   process.env.MK_TOKEN_SECRET = 'unit-test-secret-0123456789abcdef';
   /*
     汇率 TTL 设 0 = **每次请求都刷新**（`config.js` 用 `intEnvAllowZero` 解析，0 是有效值）。
@@ -118,6 +118,9 @@ export async function makeCtx() {
     ok: true,
     standard: String(declared || 'erc721').toLowerCase() === 'erc1155' ? 'erc1155' : 'erc721',
   }));
+  /* 单测不连 RPC：保证金赔付累计由桩给出（真实链上读失败必须抛错重试，不能写 0） */
+  const { setStakePaidReaderForTest } = await import('../src/escrowWatcher.js');
+  setStakePaidReaderForTest(async () => '0');
 
   /*
     Redis 在测试进程里用假客户端走同一套命令（不是运行时回退）：限流/缓存的生产代码
@@ -324,29 +327,30 @@ export function assertOk(res) {
 }
 
 /**
- * 商品入参样例（88 USDT = 88000000 微 USDT）。
+ * 商品入参样例（88 price = 88000000 微 price）。
  *
  * 接口形状是「specs + skus」：价格与库存**逐组合**给出。
- * 为了不让每个用例都写一遍 skus，这里保留了 `priceUsdtMicro` / `capacity` 两个便捷键，
+ * 为了不让每个用例都写一遍 skus，这里保留了 `priceMicro` / `capacity` 两个便捷键，
  * 由本函数展开成「无规格商品的唯一组合（key=''）」—— 这是**测试侧的书写便利**，
  * 不是产品代码里的兼容分支：服务端只认 specs + skus。
  *
- * 单位是**微 USDT**（1 USDT = 1e6 微）：88 USDT 写 88000000。
+ * 单位是**微 price**（1 price = 1e6 微）：88 price 写 88000000。
  * 旧的 2 位小数标价单位已整体作废，数字不是"改个名字"那么轻——一律 ×10000。
  *
  * 需要测多规格时直接传 specs + skus：
  *   productPayload({ specs: [{name:'颜色',options:['黑','白']}],
- *                    skus: [{key:'黑',priceUsdtMicro:88000000},{key:'白',priceUsdtMicro:99000000}] })
+ *                    skus: [{key:'黑',priceMicro:88000000},{key:'白',priceMicro:99000000}] })
  */
 export function productPayload(overrides = {}) {
-  const { priceUsdtMicro = 88_000_000, capacity = null, specs, skus, ...rest } = overrides;
+  const { priceMicro = 88_000_000, priceCurrency = 'USDT', capacity = null, specs, skus, ...rest } = overrides;
   return {
     title: '测试数字商品',
     description: '单测上架的商品描述，用于校验快照与下单流程。',
     media: [{ type: 'image', url: 'https://example.com/a.jpg' }],
     kind: 'digital',
+    priceCurrency,
     specs: specs ?? [{ name: '规格', options: ['默认'] }],
-    skus: skus ?? [{ key: '', priceUsdtMicro, capacity }],
+    skus: skus ?? [{ key: '', priceMicro, capacity }],
     ...rest,
   };
 }
@@ -408,8 +412,9 @@ const ORDER_SPEC_COLUMNS = {
   quantity: 'quantity',
   status: 'status',
   amountWei: 'amount_wei',
-  usdtMicro: 'usdt_micro',
-  shippingFeeUsdtMicro: 'shipping_fee_usdt_micro',
+  priceCurrency: 'price_currency',
+  priceMicro: 'price_micro',
+  shippingFeeMicro: 'shipping_fee_micro',
   btyUsdtRate: 'bty_usdt_rate',
   holdQty: 'hold_qty',
   releasedAt: 'released_at',
@@ -468,7 +473,8 @@ const PRODUCT_SPEC_COLUMNS = {
   descriptionBlocks: 'description_blocks',
   media: 'media',
   kind: 'kind',
-  shippingFeeUsdtMicro: 'shipping_fee_usdt_micro',
+  priceCurrency: 'price_currency',
+  shippingFeeMicro: 'shipping_fee_micro',
   ageRestricted: 'age_restricted',
   nftContract: 'nft_contract',
   nftStandard: 'nft_standard',
@@ -606,7 +612,8 @@ export async function insertOrder(db, spec = {}) {
       quantity: 1,
       status: 'draft',
       amountWei: '0',
-      usdtMicro: 0,
+      priceCurrency: 'USDT',
+      priceMicro: 0,
       timeoutBlocks: 120960,
       ...spec,
       orderNo: spec.orderNo ?? newOrderId(),
@@ -675,6 +682,7 @@ export async function insertProduct(db, spec = {}) {
     title: '测试商品',
     description: '',
     kind: 'digital',
+    priceCurrency: 'USDT',
     snapshotHash: '0x00',
     descriptionBlocks: [],
     media: [],
@@ -691,12 +699,12 @@ export async function insertProduct(db, spec = {}) {
   const productId = Number(ins.insertId);
   for (const sku of spec.skus ?? []) {
     await db.run(
-      `INSERT INTO product_skus (product_id, sku_key, specs_json, price_usdt_micro, image_url, capacity, committed)
+      `INSERT INTO product_skus (product_id, sku_key, specs_json, price_micro, image_url, capacity, committed)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       productId,
       sku.key ?? '',
       JSON.stringify(sku.specsJson ?? {}),
-      sku.priceUsdtMicro ?? 0,
+      sku.priceMicro ?? 0,
       sku.imageUrl ?? '',
       sku.capacity ?? null,
       sku.committed ?? 0
@@ -725,7 +733,7 @@ export async function orderIdOf(db, orderNo) {
  * 由 API 返回的商品构造「DB 行形状」的对象，供测试复算快照哈希。
  * 快照契约（**键序即契约**，两端必须逐字一致，见 node/src/routes/products.js 的 snapshotObject
  * 与 frontend/src/utils/snapshot.ts）：slug / title / description / description_blocks /
- * media / kind / shipping_fee_usdt_micro / age_restricted / specs / skus（nft 商品在**末尾**
+ * media / kind / price_currency / shipping_fee_micro / age_restricted / specs / skus（nft 商品在**末尾**
  * 追加 nft_contract、nft_standard）——价格不在商品级，每个组合的单价在 skus 里。
  */
 export function rowLikeOf(p) {
@@ -746,12 +754,18 @@ export function rowLikeOf(p) {
     description_blocks: p.descriptionBlocks || [],
     media: p.media || [],
     kind: p.kind,
-    shipping_fee_usdt_micro: p.shippingFeeUsdtMicro ?? 0,
+    price_currency: (() => {
+      if (p.priceCurrency !== 'USDT' && p.priceCurrency !== 'BTY') {
+        throw new Error('rowLikeOf: 缺少/非法 priceCurrency（不允许测试夹具默认成 USDT）');
+      }
+      return p.priceCurrency;
+    })(),
+    shipping_fee_micro: p.shippingFeeMicro ?? 0,
     age_restricted: p.ageRestricted ? 1 : 0,
     specs: p.specs || [],
     skus: (p.skus || []).map((s) => ({
       sku_key: s.key,
-      price_usdt_micro: s.priceUsdtMicro,
+      price_micro: s.priceMicro,
       image_url: s.imageUrl || '',
     })),
     attributes: p.attributes || [],

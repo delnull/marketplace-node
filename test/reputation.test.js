@@ -506,7 +506,7 @@ test('seller 过滤：只算指定那家店的单；显式 null 才是"全部在
       buyer: '0x' + 'b'.repeat(40),
       seller: seq.seller,
       amountWei: '1000',
-      usdtMicro: 1000000,
+      priceMicro: 1000000,
       btyUsdtRate: '0.1',
       escrowOrderId: `0x${String(seq.n).padStart(64, '0')}`,
       paidTxHash: `0x${String(seq.n).padStart(63, 'a')}a`,

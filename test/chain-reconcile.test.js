@@ -88,7 +88,7 @@ async function insertOrder({ status = 'escrowed', paid = true, ageMs = 12 * HOUR
     status,
     productSlug: 'p-x',
     amountWei: AMOUNT,
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     escrowOrderId: `0x${String(seq).padStart(64, '0')}`,
     paidTxHash: paid ? `0x${String(seq).padStart(64, 'f')}` : null,
@@ -459,7 +459,7 @@ test('startChainReconcile：未配置托管合约时不启动（对账同样跳�
     assert.equal(startChainReconcile(), null, 'MK_ESCROW_ADDRESS 未配置：没有链就没有对账');
     const r = await reconcileChainOnce();
     assert.equal(r.skipped, true);
-    assert.match(r.reason, /MK_ESCROW_ADDRESS/);
+    assert.match(r.reason, /托管合约地址/);
   } finally {
     config.chain.escrowAddress = saved;
   }
@@ -561,7 +561,7 @@ async function insertCaseOrder({ status = 'settled', afterSaleStatus = 'none', o
     status,
     productSlug: 'p-x',
     amountWei: AMOUNT,
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     escrowOrderId: `0x${String(seq).padStart(63, '9')}`,
     paidTxHash: `0x${String(seq).padStart(64, 'f')}`,

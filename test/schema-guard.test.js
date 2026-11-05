@@ -135,7 +135,7 @@ test('表与视图清单被钉住：少建一张或多建一张都要当场现�
     'order_token_deliveries',
     'orders', 'payment_tokens', 'product_codes', 'product_nft_tokens', 'product_skus', 'products', 'proxy_drafts',
     'reviews', 'seller_proxy_draft_quota', 'seller_proxy_product_quota', 'shop_applications',
-    'shop_claims', 'shop_operators', 'shop_webhook', 'shops', 'v_orders',
+    'shop_operators', 'shop_webhook', 'shops', 'v_orders',
   ].sort();
   assert.deepEqual(names, expected, 'DDL 里的表/视图清单与预期不一致——多一张少一张都会让某条链路静默失效');
 });
@@ -143,7 +143,7 @@ test('表与视图清单被钉住：少建一张或多建一张都要当场现�
 test('配额计数器的触发器必须与计数器同在（少了它计数只增不减，买家会被永久锁死）', () => {
   /*
     触发器**不在 SCHEMA_DDL 里**：MySQL 的 CREATE TRIGGER 没有 IF NOT EXISTS，
-    所以它们是各自一条 `DROP … IF EXISTS` + `CREATE`，在 migrate() 里跟在建表之后单独下发。
+    所以它们是各自一条 `DROP … IF EXISTS` + `CREATE`，在 createFreshSchema() 里跟在建表之后单独下发。
     因此这里扫的是整个 db.js 源文件，而不是 DDL 那段模板字面量。
   */
   const src = fs.readFileSync(DB_JS, 'utf8');
@@ -171,7 +171,8 @@ test('配额计数器的触发器必须与计数器同在（少了它计数只�
     'trg_orders_product_quota_release',
     'trg_orders_proxy_draft_quota_release',
     'trg_orders_proxy_product_quota_release',
-  ], '少一个触发器就少一条库侧判据（计数只增不减 / 审计行可被改删）——那是静默且永久的错账');
+    'trg_orders_revive_clear_deleted',
+  ], '少一个触发器就少一条库侧判据（计数只增不减 / 审计行可被改删 / 恢复单仍隐藏）——那是静默且永久的错账');
   /*
     新加的两条是"一码一次"的库侧判据（见 db.js 的 order_delivery_claims 与 TRIGGER_DDL ③'）：
       · 插入交付行 ⇒ 把**池内资源**记进认领账（唯一键挡住同一单重复交付同一个码/ tokenId）；

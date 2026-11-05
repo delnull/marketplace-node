@@ -75,7 +75,7 @@ const productQuotaOf = async (buyer, productId) =>
   Number((await db.get('SELECT units AS v FROM buyer_product_quota WHERE buyer = ? AND product_id = ?', buyer, productId))?.v ?? 0);
 
 test('删在途订单 ⇒ 池占位还回去，且等于旧口径现算的真值（此前只增不减）', async () => {
-  const p = await insertProduct(db, { skus: [{ key: '', priceUsdtMicro: 1_000_000 }], kind: 'digital', title: '删单还占位' });
+  const p = await insertProduct(db, { skus: [{ key: '', priceMicro: 1_000_000 }], kind: 'digital', title: '删单还占位' });
   const productId = p.productId;
   await fillPool(productId, 10);
 
@@ -96,7 +96,7 @@ test('删在途订单 ⇒ 池占位还回去，且等于旧口径现算的真值
 });
 
 test('删**已终结**订单 ⇒ 不重复减（终结那一刻已经结清过），只由在途那张决定计数', async () => {
-  const p = await insertProduct(db, { skus: [{ key: '', priceUsdtMicro: 1_000_000 }], kind: 'digital', title: '终结单不重复减' });
+  const p = await insertProduct(db, { skus: [{ key: '', priceMicro: 1_000_000 }], kind: 'digital', title: '终结单不重复减' });
   const productId = p.productId;
   await fillPool(productId, 10);
 
@@ -122,7 +122,7 @@ test('删**已终结**订单 ⇒ 不重复减（终结那一刻已经结清过�
 });
 
 test('交付过的部分不重复还：删单只还「尚未交付」的件数（与 UPDATE 那一侧同一算式）', async () => {
-  const p = await insertProduct(db, { skus: [{ key: '', priceUsdtMicro: 1_000_000 }], kind: 'digital', title: '删单只还剩余' });
+  const p = await insertProduct(db, { skus: [{ key: '', priceMicro: 1_000_000 }], kind: 'digital', title: '删单只还剩余' });
   const productId = p.productId;
   await fillPool(productId, 10);
 
@@ -141,7 +141,7 @@ test('交付过的部分不重复还：删单只还「尚未交付」的件数�
 });
 
 test('删草稿订单 ⇒ 两道免费草稿闸的额度都还回去（此前买家会被永久锁死）', async () => {
-  const p = await insertProduct(db, { skus: [{ key: '', priceUsdtMicro: 1_000_000 }], kind: 'digital', title: '删草稿还额度' });
+  const p = await insertProduct(db, { skus: [{ key: '', priceMicro: 1_000_000 }], kind: 'digital', title: '删草稿还额度' });
   const productId = p.productId;
   const buyer = Wallet.createRandom().address.toLowerCase();
 
@@ -167,7 +167,7 @@ test('删草稿订单 ⇒ 两道免费草稿闸的额度都还回去（此前买
 });
 
 test('删**非草稿**订单 ⇒ 草稿闸不动（它当初就没加过量）', async () => {
-  const p = await insertProduct(db, { skus: [{ key: '', priceUsdtMicro: 1_000_000 }], kind: 'digital', title: '非草稿不动草稿闸' });
+  const p = await insertProduct(db, { skus: [{ key: '', priceMicro: 1_000_000 }], kind: 'digital', title: '非草稿不动草稿闸' });
   const productId = p.productId;
   const buyer = Wallet.createRandom().address.toLowerCase();
 

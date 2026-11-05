@@ -85,7 +85,7 @@ test('商品主图 / 详情图 / 规格图 / 订单快照里的 URL 都算"被�
     title: '清扫引用面测试商品',
     media: [{ type: 'image', url: productImage }],
     descriptionBlocks: [{ type: 'image', url: descriptionImage }],
-    skus: [{ key: '', priceUsdtMicro: 1, imageUrl: skuImage }],
+    skus: [{ key: '', priceMicro: 1, imageUrl: skuImage }],
   });
   await insertOrder(db, {
     buyer: buyer.address.toLowerCase(),

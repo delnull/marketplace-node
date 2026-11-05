@@ -78,7 +78,7 @@ test('评价图：买家上传、随评价公开；外链/他人/非图片拒绝
     .set('Authorization', `Bearer ${buyerToken}`)
     .send({ rating: 5, content: '带图', images: ['https://example.com/a.png'] });
   assert.notEqual(external.body.code, 0);
-  assert.match(String(external.body.message), /\/api\/uploads/);
+  assert.match(String(external.body.message), /本节点上传的图片地址/);
 
   const missing = await request(app)
     .post(`/api/orders/${orderNo}/review`)

@@ -85,7 +85,7 @@ const router = Router();
 function originProtocolGuard(req, res, next) {
   const o = req.headers.origin;
   if (o && !/^https?:\/\//i.test(String(o))) {
-    fail(res, '不支持的来源（Origin 必须为 http/https）——请通过正规网页访问', 403, 403);
+    fail(res, '不支持的访问来源：请通过正规网页访问', 403, 403);
     return;
   }
   next();
@@ -102,7 +102,7 @@ const loginLimiter = simpleRateLimit({ windowMs: 60_000, max: 60 });
 /** 获取 SIWE 签名原文（前端弹出钱包签名后回传） */
 router.get('/nonce', nonceLimiter, originProtocolGuard, wrap(async (req, res) => {
   const address = String(req.query.address || '').trim().toLowerCase();
-  if (!isAddress(address)) return fail(res, 'address 参数无效（需 0x 开头的以太坊地址）');
+  if (!isAddress(address)) return fail(res, '钱包地址无效（需 0x 开头的以太坊地址）');
   const message = await issueSiwe(address);
   ok(res, { message, address, expiresIn: config.siwe.ttlSeconds });
 }));
@@ -110,8 +110,8 @@ router.get('/nonce', nonceLimiter, originProtocolGuard, wrap(async (req, res) =>
 /** 验证签名并登录，签发 HMAC 令牌（**节点级会话**：回执给出这个地址能经营的店与各自角色） */
 router.post('/login', loginLimiter, originProtocolGuard, wrap(async (req, res) => {
   const { address, message, signature } = req.body || {};
-  if (!isAddress(address)) return fail(res, 'address 参数无效');
-  if (!message || !signature) return fail(res, '缺少 message 或 signature');
+  if (!isAddress(address)) return fail(res, '钱包地址无效');
+  if (!message || !signature) return fail(res, '缺少签名原文或签名');
   /*
     `verifySiwe` 用**抛异常**表达业务失败（nonce 过期/不匹配、签名地址不一致、挑战已被消费），
     而 `wrap` 会把未捕获异常折叠成"服务内部错误"（类生产环境不回原文）——

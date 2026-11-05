@@ -149,7 +149,7 @@ async function insertOrder({
     paidTxHash: paidTxHash === undefined ? `0x${String(seq).padStart(64, 'f')}` : paidTxHash,
     productSlug: 'p-af',
     amountWei: AMOUNT,
-    usdtMicro: 1000000,
+    priceMicro: 1000000,
     btyUsdtRate: '0.1',
     trackingNo,
     shippedAt,
@@ -438,7 +438,7 @@ test('仲裁台售后案件队列：只列在途案件 + 待办计数 + 最久�
   assert.equal(row.afterSaleOpenedBlock, 100);
   assert.equal(row.afterSaleNote, null);
   // 字段风格与争议队列一致（共用同一个行映射）：金额拆分/双方地址/事件史一个不少
-  for (const k of ['escrowOrderId', 'buyer', 'seller', 'usdtMicro', 'goodsUsdtMicro', 'amountWei', 'refundedAmountWei', 'delivered', 'evidenceCount', 'onchainEvents']) {
+  for (const k of ['escrowOrderId', 'buyer', 'seller', 'priceMicro', 'goodsPriceMicro', 'amountWei', 'refundedAmountWei', 'delivered', 'evidenceCount', 'onchainEvents']) {
     assert.ok(k in row, `售后案件条目缺字段 ${k}（必须与 /pending 同口径）`);
   }
   assert.equal(row.delivered, true, '已交付事实按 shipped_at/tracking_no/交付行三要素判');

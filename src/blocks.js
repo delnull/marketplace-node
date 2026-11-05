@@ -68,7 +68,7 @@ export async function addBuyerBlock({ buyer, targetType, target, reason } = {}) 
   const addr = String(buyer || '').toLowerCase();
   if (!ADDRESS_RE.test(addr)) return { error: '买家地址非法' };
   const type = String(targetType || '');
-  if (type !== 'shop' && type !== 'seller') return { error: 'targetType 需为 shop / seller' };
+  if (type !== 'shop' && type !== 'seller') return { error: '目标类型必须是「店铺」或「店主」' };
   const raw = String(target || '').trim();
   const why = String(reason || '').trim().slice(0, 200);
 
@@ -108,7 +108,7 @@ export async function removeBuyerBlock({ buyer, id } = {}) {
   const addr = String(buyer || '').toLowerCase();
   const bid = Number(id);
   if (!ADDRESS_RE.test(addr)) return { error: '买家地址非法' };
-  if (!Number.isSafeInteger(bid) || bid <= 0) return { error: '屏蔽 id 非法' };
+  if (!Number.isSafeInteger(bid) || bid <= 0) return { error: '屏蔽编号非法' };
   const foundRows = (await getDb().run('DELETE FROM buyer_blocks WHERE id = ? AND buyer = ?', bid, addr)).foundRows;
   return foundRows ? { removed: true } : { error: '没有这条屏蔽记录', notFound: true };
 }

@@ -84,7 +84,7 @@ export async function nftOwnedBy({ contract, tokenId, claimant }) {
   const c = String(contract || '').toLowerCase();
   const who = String(claimant || '').toLowerCase();
   if (!isAddress(c) || !isAddress(who) || !TOKEN_ID_RE.test(String(tokenId))) {
-    return { owned: null, detail: '合约地址/持有人/ tokenId 形状非法' };
+    return { owned: null, detail: '合约地址、持有人或 NFT 编号格式不对' };
   }
   const nft = new ethers.Contract(c, ERC165_ABI, getProvider());
   try {
@@ -109,9 +109,11 @@ export async function claimRowByNo(claimNo) {
   if (!v) return undefined;
   return await getDb().get(
     `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
+              p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
               (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
               (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id WHERE n.claim_no = ?`,
+       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
+            LEFT JOIN orders o ON o.id = n.order_id WHERE n.claim_no = ?`,
     v
   );
 }
@@ -149,6 +151,13 @@ export function claimDto(row, { as = 'public' } = {}) {
     status: row.status,
     shipping: null,
     claimId: row.dispute_claim_id || null,
+    /** 提货类型：提交时的快照 */
+    claimType: row.claim_type,
+    /**
+     * 提货窗口截止（提交时快照；旧行没有快照 ⇒ null，不拿当前商品窗口猜）。
+     * 过期任务同样只认快照，见 expireOverdueClaims。
+     */
+    claimDeadlineAt: row.claim_deadline_at ? new Date(row.claim_deadline_at).toISOString() : null,
     note: row.reject_reason || '',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -224,6 +233,41 @@ export function claimDeadlineOf({ delivered, now = Date.now() }) {
   return new Date(base + Number(days) * 86_400_000);
 }
 
+/**
+ * 把**超过提货窗口仍未处理**的声明置为 expired。
+ *
+ * 为什么需要生产者：`expired` 在枚举与 UI 文案里都有，但此前没有任何写入点——
+ * 窗口过后列表仍显示"待卖家处理/已通过"，持有人也看不到自己已经过期。
+ * 只处理 `requested/approved`（`shipped` 已在履约中，不能因窗口到期改成过期），
+ * 且只认**提交时写入的 `claim_deadline_at` 快照**；旧行（NULL）跳过，不拿当前商品配置重算——
+ * 否则卖家改小窗口就能把已提交的声明清掉。已有链上争议（state 非 none / claim id 已写）不标过期。
+ * 由 `claimReconcile` 的 5 分钟周期任务调用；失败不影响链上对账。
+ */
+export async function expireOverdueClaims({ limit = 100, now = Date.now() } = {}) {
+  const rows = await getDb().all(
+    `SELECT n.id, n.claim_deadline_at
+       FROM nft_claims n
+      WHERE n.status IN ('requested','approved')
+        AND n.dispute_state = 'none'
+        AND n.dispute_claim_id IS NULL
+        AND n.claim_deadline_at IS NOT NULL
+      ORDER BY n.claim_deadline_at ASC, n.id ASC
+      LIMIT ?`,
+    limit
+  );
+  let expired = 0;
+  for (const r of rows) {
+    const deadline = r.claim_deadline_at instanceof Date ? r.claim_deadline_at : new Date(r.claim_deadline_at);
+    if (!Number.isFinite(deadline.getTime()) || now <= deadline.getTime()) continue;
+    const changed = (await getDb().run(
+      "UPDATE nft_claims SET status = 'expired' WHERE id = ? AND status IN ('requested','approved') AND dispute_state = 'none' AND dispute_claim_id IS NULL",
+      r.id
+    )).foundRows;
+    expired += changed;
+  }
+  return { scanned: rows.length, expired };
+}
+
 /* ── 提交声明 ───────────────────────────────────────────────────────── */
 
 /**
@@ -238,13 +282,12 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
   const c = String(contract || '').trim().toLowerCase();
   const t = String(tokenId ?? '').trim();
   const who = String(claimant || '').trim().toLowerCase();
-  if (!isAddress(c)) return { ok: false, status: 400, message: 'contract 需为 0x 开头的 NFT 合约地址' };
-  if (!TOKEN_ID_RE.test(t)) return { ok: false, status: 400, message: 'tokenId 需为十进制整数（uint256 范围内）' };
+  if (!isAddress(c)) return { ok: false, status: 400, message: '合约地址必须是 0x 开头的 NFT 合约地址' };
+  if (!TOKEN_ID_RE.test(t)) return { ok: false, status: 400, message: 'NFT 编号需为十进制整数（0 到 2^256−1）' };
   if (!isAddress(who)) return { ok: false, status: 400, message: '登录地址非法' };
   const name = String(shipping?.name ?? '').trim().slice(0, NAME_MAX);
   const phone = String(shipping?.phone ?? '').trim().slice(0, PHONE_MAX);
   const address = String(shipping?.address ?? '').trim().slice(0, ADDRESS_MAX);
-  if (!name || !phone || !address) return { ok: false, status: 400, message: '收货信息不全：姓名/电话/地址都必填' };
   const noteText = String(note ?? '').trim().slice(0, NOTE_MAX);
 
   const delivered = await deliveredTokenOf(c, t);
@@ -252,7 +295,7 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
     return {
       ok: false,
       status: 409,
-      message: '这枚 token 没有在本节点的已完成订单里交付过（或合约地址与商品不符）——无法发起提货声明',
+      message: '这枚 NFT 没有在本节点的已完成订单里交付过（或合约地址与商品不符）——无法发起提货声明',
     };
   }
   if (delivered.pii_erased_at != null) {
@@ -263,7 +306,14 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
     };
   }
   if (Number(delivered.claimable) !== 1) {
-    return { ok: false, status: 409, message: '这件商品的卖家没有开启提货兑付（claimable = 0）' };
+    return { ok: false, status: 409, message: '这件商品的卖家没有开启提货兑付' };
+  }
+  /*
+    实物才强制收货信息；数字/服务（claim_type != physical）由卖家按提货说明交付，
+    强制填地址+运单号会把这两类提货逼进一条走不通的实物流程。
+  */
+  if (String(delivered.claim_type || 'physical') === 'physical' && (!name || !phone || !address)) {
+    return { ok: false, status: 400, message: '实物提货的收货信息不全：姓名/电话/地址都必填' };
   }
   const deadline = claimDeadlineOf({ delivered });
   if (deadline && Date.now() > deadline.getTime()) {
@@ -286,7 +336,7 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
     c,
     t
   );
-  if (prior) return { ok: false, status: 409, message: `这枚 token 已兑付过（声明 ${prior.claim_no}），不能重复提货` };
+  if (prior) return { ok: false, status: 409, message: `这枚 NFT 已兑付过（声明 ${prior.claim_no}），不能重复提货` };
   /*
     窗口已过 / 被驳回 / 被取消的旧行不占位（唯一索引只压 requested/approved/shipped/fulfilled）；
     但"过期"只在提交这一刻惰性判定——没有后台扫描也能让新持有人接手。
@@ -297,8 +347,9 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
       const ins = await db.run(
         `INSERT INTO nft_claims
            (claim_no, shop_code, product_id, product_slug, order_id, order_no, seller,
-            token_contract, token_id, claimant, status, shipping_name, shipping_phone, shipping_address, note)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, ?)`,
+            token_contract, token_id, claimant, status, shipping_name, shipping_phone, shipping_address, note,
+            claim_deadline_at, claim_type)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, ?, ?, ?)`,
         claimNo,
         delivered.shop_code,
         delivered.product_id,
@@ -312,7 +363,9 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
         name,
         phone,
         address,
-        noteText
+        noteText,
+        deadline, /* 提交时的窗口快照；null = 不限期 */
+        String(delivered.claim_type || 'physical')
       );
       return ins;
     });
@@ -322,7 +375,7 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
       return {
         ok: false,
         status: 409,
-        message: '这枚 token 已有一条未完结的提货声明（同一枚 token 同时只能有一条）——请等待卖家处理，或先取消旧声明',
+        message: '这枚 NFT 已有一条未完结的提货声明（同一枚 NFT 同时只能有一条）——请等待卖家处理，或先撤回旧声明',
       };
     }
     throw e;
@@ -354,28 +407,31 @@ export const SELLER_CLAIM_ACTIONS = Object.keys(SELLER_ACTIONS);
  */
 export async function sellerClaimAction({ claimNo, seller, action, trackingNo, rejectReason } = {}) {
   const spec = SELLER_ACTIONS[String(action || '')];
-  if (!spec) return { ok: false, status: 400, message: `action 需为 ${SELLER_CLAIM_ACTIONS.join(' / ')}` };
+  if (!spec) return { ok: false, status: 400, message: '动作参数不合法' };
   const row = await claimRowByNo(claimNo);
   if (!row) return { ok: false, status: 404, message: '声明不存在' };
   if (String(row.seller) !== String(seller)) return { ok: false, status: 403, message: '该声明不属于你这家店' };
   if (!spec.from.includes(String(row.status))) {
-    return { ok: false, status: 409, message: `当前状态（${row.status}）不能执行 ${action}` };
+    return { ok: false, status: 409, message: '当前提货单状态不能执行这个动作' };
   }
   if (action === 'ship') {
     const own = await nftOwnedBy({ contract: row.token_contract, tokenId: row.token_id, claimant: row.claimant });
     if (own.owned === null) {
-      return { ok: false, status: 503, message: `读不到链上 NFT 持有人（${own.detail}）：发货前必须确认 token 仍在提交人名下，请稍后重试` };
+      return { ok: false, status: 503, message: `读不到链上 NFT 持有人（${own.detail}）：发货前必须确认这枚 NFT 仍在提交人名下，请稍后重试` };
     }
     if (!own.owned) {
       return {
         ok: false,
         status: 409,
-        message: `这枚 NFT 已不在提交人名下（${own.detail || '链上 ownerOf 不符'}）：请先取消这条声明（cancel），由新持有人重新提交`,
+        message: `这枚 NFT 已不在提交人名下（${own.detail || '链上持有人不符'}）：请先撤回这条声明，由新持有人重新提交`,
       };
     }
   }
   const tracking = action === 'ship' ? String(trackingNo ?? '').trim().slice(0, 100) : null;
-  if (action === 'ship' && !tracking) return { ok: false, status: 400, message: 'ship 需要 trackingNo（发货单号）' };
+  /* 只有实物提货需要运单号；数字/服务可以只写交付说明（仍存 tracking_no 作为凭证文本） */
+  if (action === 'ship' && row.claim_type === 'physical' && !tracking) {
+    return { ok: false, status: 400, message: '发货需要填写发货单号' };
+  }
   const reason = action === 'reject' ? String(rejectReason ?? '').trim().slice(0, REASON_MAX) : '';
 
   const sets = ['status = ?'];
@@ -469,29 +525,29 @@ export async function buildClaimDisputeCall({ claimNo, amountWei, deadlineSecond
   }
   const delivered = await deliveredTokenOf(row.token_contract, row.token_id, { orderId: row.order_id });
   if (!delivered) {
-    return { ok: false, status: 409, message: '声明的订单不再是这枚 token 的已交付订单（可能已被转售/对账漂移），不能开案' };
+    return { ok: false, status: 409, message: '声明的订单不再是这枚 NFT 的已交付订单（可能已被转售/对账漂移），不能开案' };
   }
   const claimDeadline = claimDeadlineOf({ delivered, now });
   if (claimDeadline && now > claimDeadline.getTime()) {
     return { ok: false, status: 409, message: `提货窗口已于 ${claimDeadline.toISOString()} 关闭，链上开案已失去商品政策依据` };
   }
   const chainRow = await getDb().get('SELECT escrow_order_id, refunded_amount_wei, claim_paid_wei FROM order_chain WHERE order_id = ?', row.order_id);
-  if (!chainRow) return { ok: false, status: 409, message: '该声明的订单没有链上托管镜像（无法定位 Escrow 订单）' };
+  if (!chainRow) return { ok: false, status: 409, message: '该声明的订单没有链上托管镜像（无法定位托管订单）' };
   const orderRow = await getDb().get('SELECT amount_wei, seller FROM orders WHERE id = ?', row.order_id);
   if (!orderRow) return { ok: false, status: 409, message: '该声明的订单已不存在' };
   const amount = String(amountWei ?? '').trim();
   if (!/^\d+$/.test(amount) || BigInt(amount) <= 0n) {
-    return { ok: false, status: 400, message: 'amountWei 需为正整数字符串（wei）' };
+    return { ok: false, status: 400, message: '金额需为正整数字符串（最小单位）' };
   }
   const refunded = BigInt(chainRow.refunded_amount_wei || '0');
   const net = BigInt(orderRow.amount_wei || '0') - refunded;
   if (BigInt(amount) > net) {
-    return { ok: false, status: 400, message: `amountWei 超过该订单净额（amount − refunded = ${net.toString()} wei）` };
+    return { ok: false, status: 400, message: `金额超过该订单净额（托管额减已退款 = ${net.toString()}，最小单位）` };
   }
   let dl = deadlineSeconds === undefined || deadlineSeconds === null || deadlineSeconds === ''
     ? Math.floor(now / 1000) + 7 * 86_400
     : Number(deadlineSeconds);
-  if (!Number.isSafeInteger(dl) || dl <= 0) return { ok: false, status: 400, message: 'deadline 需为 unix 秒' };
+  if (!Number.isSafeInteger(dl) || dl <= 0) return { ok: false, status: 400, message: '截止时间必须是正整数（秒级时间戳）' };
   /*
     链上 deadline 是“开案后委员会仍可裁的截止”，不能越过商品的提货窗口：否则节点主可以把
     一个已经关闭的商品政策窗口续到任意未来。未给 deadline 时默认 7 天，也要被窗口上限截住。
@@ -503,7 +559,7 @@ export async function buildClaimDisputeCall({ claimNo, amountWei, deadlineSecond
     }
     if (dl > maxDl) dl = maxDl;
   }
-  if (dl * 1000 <= now) return { ok: false, status: 400, message: 'deadline 已过去：链上会以 ClaimDeadlinePassed 拒绝' };
+  if (dl * 1000 <= now) return { ok: false, status: 400, message: '截止时间已过去：链上会拒绝' };
 
   const claimId = disputeClaimIdOf(row.claim_no);
   const tokenRef = tokenRefOf(row.token_contract, row.token_id);

@@ -91,7 +91,7 @@ test('quantity 参数校验：非整数/越界（0、-1、100、1.5、非数字�
       .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
       .send({ productSlug: p.slug, quantity: q })
       .expect(200);
-    assert.match(blocked(res), /quantity/, `quantity=${q} 应报参数错误`);
+    assert.match(blocked(res), /数量必须/, `quantity=${q} 应报参数错误`);
   }
   // 缺省 quantity=1
   const ok = await createDraft(p.slug);
@@ -100,14 +100,14 @@ test('quantity 参数校验：非整数/越界（0、-1、100、1.5、非数字�
 
 // ── quantity 金额与限量占位 ──
 
-test('quantity=3 下单：金额与 USDT 展示串均为 3 倍；限量商品按量占位（余量按件扣）', async () => {
-  const p = await listProduct(productPayload({ kind: 'physical', title: '按量占位商品', priceUsdtMicro: 88_000_000, capacity: 5 }));
+test('quantity=3 下单：金额与 price 展示串均为 3 倍；限量商品按量占位（余量按件扣）', async () => {
+  const p = await listProduct(productPayload({ kind: 'physical', title: '按量占位商品', priceMicro: 88_000_000, capacity: 5 }));
   const o = await createDraft(p.slug, 3);
 
   assert.equal(o.quantity, 3);
-  assert.equal(o.usdtMicro, 88_000_000 * 3, '锁定金额（微 USDT）= 单价 × 数量');
-  assert.equal(o.usdt, '264', '展示串去净尾零：264 USDT 写作 264（不是 264.00）');
-  // 汇率锁定口径：兜底汇率 1 BTY = 0.1 USDT ⇒ 264 USDT = 2640 BTY（向上取整）
+  assert.equal(o.priceMicro, 88_000_000 * 3, '锁定金额（微 USDT）= 单价 × 数量');
+  assert.equal(o.price, '264', '展示串去净尾零：264 price 写作 264（不是 264.00）');
+  // 汇率锁定口径：兜底汇率 1 BTY = 0.1 USDT ⇒ 264 price = 2640 BTY（向上取整）
   const bty = Number(o.amountWei) / 1e18;
   assert.ok(Math.abs(bty - 2640) < 1e-9, `应付 BTY 应≈2640，实际 ${bty}`);
   // 数量为 3 时的应付应明显大于数量为 1 的单倍应付（期望值同样取自节点自己的折算函数）
@@ -190,10 +190,11 @@ test('NFT quantity=2：同单 tokenId 重复申报 / 一次超量申报 → 链�
     description: 'd',
     media: [{ type: 'image', url: 'https://example.com/n.jpg' }],
     kind: 'nft',
+    priceCurrency: 'USDT',
     nftContract: NFT_CONTRACT,
     // 价格与库存逐组合给出：无规格商品就是 key='' 的唯一组合
     specs: [{ name: '规格', options: ['默认'] }],
-    skus: [{ key: '', priceUsdtMicro: 66_000_000, capacity: null }],
+    skus: [{ key: '', priceMicro: 66_000_000, capacity: null }],
   });
   const importRes = await request(app)
     .post(`/api/products/${p.slug}/tokens`)
@@ -220,7 +221,7 @@ test('NFT quantity=2：同单 tokenId 重复申报 / 一次超量申报 → 链�
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .send({ deliveries: [{ tokenId: '11', txHash }, { tokenId: '12', txHash }, { tokenId: '13', txHash }] })
     .expect(200);
-  assert.match(blocked(over), /需提交 1\.\.2 条交付记录/, '超量申报应在早期被拒');
+  assert.match(blocked(over), /需提交 1 到 2 条交付记录/, '超量申报应在早期被拒');
   assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', o.id)).status, 'escrowed', '拒绝不改变状态');
   assert.deepEqual(await itemsOf(o.id), [], '拒绝不产生交付行');
 });
@@ -308,7 +309,7 @@ test('草稿占用合计上限：同买家同商品 99 件放行、100 件被拒
   为什么这条值得一个用例：本仓的金额一律由 JS Number 承载，而 > 2^53 的值再也读不回来。
   MySQL 下这条路径比 SQLite 时期更安静——驱动不抛错，它把超界整数**转成字符串**返回
   （src/db.js 的 supportBigNumbers + bigNumberStrings:false：宁可响亮，也不要一个悄悄错了的 number），
-  于是订单详情/流水/CSV 里的 `row.usdt_micro + x` 会静默变成字符串拼接。
+  于是订单详情/流水/CSV 里的 `row.price_micro + x` 会静默变成字符串拼接。
   库里另有一道 CHECK（金额上界 = 9007199254740991）让它根本存不下；本用例钉住的是**入口**那道闸：
   商品侧上限（PRICE_MAX_MICRO）保证正常路径到不了这里，这里兜的是绕过校验的历史脏数据与直连调用。
 */
@@ -329,7 +330,7 @@ test('ERC20 支付：草稿按节点固定行情锁定 token 金额并落支付�
     assert.equal(d.paymentDecimals, 6);
     assert.equal(d.paymentRateSource, 'fixed');
     assert.ok(d.paymentRateQuotedAt, '下单时必须记录行情锁定时刻');
-    assert.equal(d.amountWei, String(d.usdtMicro), '1 token = 1 USDT 的固定行情下，6 位 token 金额 = 微 USDT');
+    assert.equal(d.amountWei, String(d.priceMicro), '1 token = 1 USDT 的固定行情下，6 位 token 金额 = 微 USDT');
 
     const row = await db.get('SELECT payment_token, payment_symbol, payment_decimals, token_usdt_micro_per_token, payment_rate_source, bty_usdt_rate FROM v_orders WHERE order_no = ?', d.id);
     assert.equal(row.payment_token, token);
@@ -346,7 +347,7 @@ test('ERC20 支付方式：/api/shop/payment-methods 返回 native + 节点配�
   const token = '0x1111111111111111111111111111111111111111';
   await seedPaymentToken(token);
   try {
-    const res = await request(app).get('/api/shop/payment-methods?usdtMicro=2500000').expect(200);
+    const res = await request(app).get('/api/shop/payment-methods?priceMicro=2500000&priceCurrency=USDT').expect(200);
     assertOk(res);
     assert.equal(res.body.data.native.symbol, 'BTY');
     assert.equal(res.body.data.tokens.length, 1);
@@ -405,8 +406,8 @@ test('支付资产配置写入口：非法地址/非法配置明确拒绝；删�
 
 test('回归：SKU 单价被改成超过安全整数上限的脏数据时，下单必须被明确拒绝且不落库', async () => {
   const p = await listProduct(productPayload({ title: '脏价格商品', capacity: null }));
-  // 直接改库模拟"绕过商品校验写进来的历史行"：1e15 微 = 1e9 USDT（旧上限），×99 件即越过 2^53
-  await db.run('UPDATE product_skus SET price_usdt_micro = ? WHERE product_id = (SELECT id FROM products WHERE slug = ?)', 1_000_000_000_000_000, p.slug);
+  // 直接改库模拟"绕过商品校验写进来的历史行"：1e15 微 = 1e9 price（旧上限），×99 件即越过 2^53
+  await db.run('UPDATE product_skus SET price_micro = ? WHERE product_id = (SELECT id FROM products WHERE slug = ?)', 1_000_000_000_000_000, p.slug);
 
   const before = (await db.get('SELECT COUNT(*) AS c FROM v_orders WHERE product_slug = ?', p.slug)).c;
   const res = await request(app)

@@ -133,8 +133,67 @@ export function refundUsdtMicroOfRow(row) {
   return (refunded * rate) / scale;
 }
 
+/**
+ * 商品排行的**可比金额**：把一行支付资产折算成微 BTY（含 ERC20）。
+ *  - 原生：amount_wei / 1e12（BTY 定价与 USDT 定价都按实际到账 wei）；
+ *  - ERC20：token 最小单位 × 每 token 微 USDT / 1e decimals，再按锁定 bty_usdt_rate 折成微 BTY。
+ * 读不到汇率/精度/金额时返回 null（排序必须把这类行放最后，不能当 0）。
+ */
+function btyMicroOfAssetAmount(row, units) {
+  if (units <= 0n) return 0n;
+  const a = assetOf(row);
+  if (a.native) return units / 10n ** 12n;
+  if (!Number.isInteger(a.decimals) || a.decimals < 0 || a.decimals > 36) return null;
+  const tokenRate = BigInt(row.token_usdt_micro_per_token || '0');
+  if (tokenRate <= 0n) return null;
+  const decimals = BigInt(a.decimals);
+  const usdtMicro = (units * tokenRate) / 10n ** decimals;
+  const raw = String(row.bty_usdt_rate || '0');
+  const m = /^(\d+)(?:\.(\d+))?$/.exec(raw);
+  if (!m) return null;
+  const rateScaled = BigInt(m[1]) * 10_000_000_000n + BigInt((m[2] || '').padEnd(10, '0').slice(0, 10));
+  if (rateScaled <= 0n) return null;
+  return (usdtMicro * 10_000_000_000n) / rateScaled;
+}
+
+/** 一行入账的净额（已退买家扣掉）→ 微 BTY；未知返回 null */
+export function btyComparableMicroOfRow(row) {
+  const amount = BigInt(row.amount_wei || '0');
+  const refunded = BigInt(row.refunded_amount_wei || '0');
+  const net = amount > refunded ? amount - refunded : 0n;
+  return btyMicroOfAssetAmount(row, net);
+}
+
+/** 一行已退买家金额 → 微 BTY；未知返回 null */
+export function refundBtyComparableMicroOfRow(row) {
+  return btyMicroOfAssetAmount(row, BigInt(row.refunded_amount_wei || '0'));
+}
+
 function grossUsdtMicroOfRow(row) {
-  return BigInt(row.usdt_micro || '0');
+  return BigInt(row.price_micro || '0');
+}
+
+/** 本行的标价币种；数据库 ENUM 非空，缺失/非法说明行形状坏了，直接抛错而不是猜 USDT */
+export function priceCurrencyOfRow(row) {
+  const c = row?.price_currency;
+  if (c !== 'USDT' && c !== 'BTY') throw new Error(`订单缺少合法的 price_currency：${JSON.stringify(c)}`);
+  return c;
+}
+
+/** 1 微 BTY = 1e12 wei（BTY 定价单的应付/退款都按这个刻度） */
+const BTY_WEI_PER_MICRO = 10n ** 12n;
+
+/**
+ * 已退买家金额 → **标价币种微单位**：
+ *   · USDT 定价：原生按 bty_usdt_rate、ERC20 按 token 报价折成微 USDT（同 refundUsdtMicroOfRow）；
+ *   · BTY 定价：`refundWei / 1e12` 就是微 BTY（精确、无汇率），因为 1 微 BTY = 1e12 wei。
+ *     **向下取整**：统计不以"多算退款"来乐观；不足 1 微的 wei 不进入统计。
+ */
+export function refundPriceMicroOfRow(row) {
+  if (priceCurrencyOfRow(row) === 'BTY') {
+    return BigInt(row.refunded_amount_wei || '0') / BTY_WEI_PER_MICRO;
+  }
+  return refundUsdtMicroOfRow(row);
 }
 
 /**
@@ -148,7 +207,7 @@ async function incomeRows(days, seller) {
   const marks = INCOME.map(() => '?').join(',');
   const w = windowWhere(days);
   const s = shopWhere(seller);
-  return await db.all(`SELECT buyer, product_id, quantity, amount_wei, refunded_amount_wei, usdt_micro,
+  return await db.all(`SELECT buyer, product_id, quantity, amount_wei, refunded_amount_wei, price_currency, price_micro,
               payment_token, payment_symbol, payment_decimals, bty_usdt_rate, token_usdt_micro_per_token,
               status, updated_at
               FROM v_orders o WHERE o.status IN (${marks})${w.where}${s.where}`, ...INCOME, ...w.params, ...s.params);
@@ -164,7 +223,7 @@ async function incomeRows(days, seller) {
 async function refundedRows(days, seller) {
   const w = windowWhere(days);
   const s = shopWhere(seller);
-  return await getDb().all(`SELECT amount_wei, refunded_amount_wei, usdt_micro,
+  return await getDb().all(`SELECT amount_wei, refunded_amount_wei, price_currency, price_micro,
         payment_token, payment_symbol, payment_decimals, bty_usdt_rate, token_usdt_micro_per_token, updated_at
         FROM v_orders o WHERE refunded_amount_wei <> 0${w.where}${s.where}`, ...w.params, ...s.params);
 }
@@ -184,6 +243,8 @@ export async function overviewStats(days, seller) {
   let refundWei = 0n;
   let gmvNetUsdtMicro = 0n;
   let refundUsdtMicro = 0n;
+  let gmvNetBtyMicro = 0n;
+  let refundBtyMicro = 0n;
   let units = 0;
   let confirmed = 0;
   const buyers = new Set();
@@ -192,7 +253,9 @@ export async function overviewStats(days, seller) {
   for (const r of rows) {
     const a = assetOf(r);
     if (a.native) gmvNetWei += netOfRow(r);
-    gmvNetUsdtMicro += grossUsdtMicroOfRow(r) - refundUsdtMicroOfRow(r);
+    const net = grossUsdtMicroOfRow(r) - refundPriceMicroOfRow(r);
+    if (priceCurrencyOfRow(r) === 'BTY') gmvNetBtyMicro += net;
+    else gmvNetUsdtMicro += net;
     units += r.quantity || 1;
     confirmed += r.status === 'confirmed' ? 1 : 0;
     buyers.add(r.buyer);
@@ -202,7 +265,9 @@ export async function overviewStats(days, seller) {
   // 退款总额 = Σ 实际退回买家的金额（含拆分结算的成交单；不再按整单金额统计）
   for (const r of refunds) {
     refundWei += assetOf(r).native ? BigInt(r.refunded_amount_wei || '0') : 0n;
-    refundUsdtMicro += refundUsdtMicroOfRow(r);
+    const refund = refundPriceMicroOfRow(r);
+    if (priceCurrencyOfRow(r) === 'BTY') refundBtyMicro += refund;
+    else refundUsdtMicro += refund;
   }
   const repeatBuyers = [...buyerOrders.values()].filter((n) => n >= 2).length;
   /*
@@ -212,16 +277,21 @@ export async function overviewStats(days, seller) {
   */
   const activeProducts =
     seller === null
-      ? (await getDb().get('SELECT COUNT(*) AS c FROM products WHERE active = 1 AND node_hidden = 0')).c
-      : (await getDb().get('SELECT COUNT(*) AS c FROM products WHERE active = 1 AND node_hidden = 0 AND shop_code IN (SELECT code FROM shops WHERE seller = ?)', String(seller).toLowerCase())).c;
+      ? (await getDb().get('SELECT COUNT(*) AS c FROM products WHERE deleted_at IS NULL AND active = 1 AND node_hidden = 0')).c
+      : (await getDb().get('SELECT COUNT(*) AS c FROM products WHERE deleted_at IS NULL AND active = 1 AND node_hidden = 0 AND shop_code IN (SELECT code FROM shops WHERE seller = ?)', String(seller).toLowerCase())).c;
   return {
     orders: rows.length,
     units,
+    /** 原生 BTY 实收净额（**两种定价都含**；这是链上真实入账的 BTY） */
     gmvNetWei: gmvNetWei.toString(),
+    /** USDT 定价单的净额（微 USDT；有行情折算的部分） */
     gmvNetUsdtMicro: gmvNetUsdtMicro.toString(),
+    /** BTY 定价单的净额（微 BTY；不经行情，直接由订单金额/退款 wei 折出） */
+    gmvNetBtyMicro: gmvNetBtyMicro.toString(),
     refundOrders: refunds.length,
     refundWei: refundWei.toString(),
     refundUsdtMicro: refundUsdtMicro.toString(),
+    refundBtyMicro: refundBtyMicro.toString(),
     buyers: buyers.size,
     repeatBuyers,
     confirmRate: rows.length > 0 ? Math.round((confirmed / rows.length) * 10000) / 10000 : null,
@@ -254,11 +324,11 @@ export async function trendStats(days, seller) {
   // 窗口 = [start, 现在]：与 eff 个自然日桶严格同界（桶 key 由同一 start 逐日 +DAY 生成，
   // 与行归属同公式，杜绝滚动窗口的日界错位/漏日）。比较阈值是 Date（见 windowWhere 的说明）。
   const marks = INCOME.map(() => '?').join(',');
-  const rows = await db.all(`SELECT amount_wei, refunded_amount_wei, usdt_micro,
+  const rows = await db.all(`SELECT amount_wei, refunded_amount_wei, price_currency, price_micro,
        payment_token, payment_symbol, payment_decimals, bty_usdt_rate, token_usdt_micro_per_token, updated_at
        FROM v_orders o
        WHERE o.status IN (${marks}) AND o.updated_at >= ?${s.where}`, ...INCOME, new Date(start), ...s.params);
-  const refunds = await db.all(`SELECT amount_wei, refunded_amount_wei, usdt_micro,
+  const refunds = await db.all(`SELECT amount_wei, refunded_amount_wei, price_currency, price_micro,
         payment_token, payment_symbol, payment_decimals, bty_usdt_rate, token_usdt_micro_per_token, updated_at
         FROM v_orders o
         WHERE o.refunded_amount_wei <> 0 AND o.updated_at >= ?${s.where}`, new Date(start), ...s.params);
@@ -271,8 +341,10 @@ export async function trendStats(days, seller) {
       orders: 0,
       netWei: '0',
       netUsdtMicro: '0',
+      netBtyMicro: '0',
       refundWei: '0',
       refundUsdtMicro: '0',
+      refundBtyMicro: '0',
     });
   }
   const add = (key, field, v) => {
@@ -286,14 +358,18 @@ export async function trendStats(days, seller) {
     if (b) {
       b.orders += 1;
       if (assetOf(r).native) b.netWei = (BigInt(b.netWei) + netOfRow(r)).toString();
-      b.netUsdtMicro = (BigInt(b.netUsdtMicro) + grossUsdtMicroOfRow(r) - refundUsdtMicroOfRow(r)).toString();
+      const net = grossUsdtMicroOfRow(r) - refundPriceMicroOfRow(r);
+      if (priceCurrencyOfRow(r) === 'BTY') b.netBtyMicro = (BigInt(b.netBtyMicro) + net).toString();
+      else b.netUsdtMicro = (BigInt(b.netUsdtMicro) + net).toString();
     }
   }
   for (const r of refunds) {
     const key = dayKey(r.updated_at);
     if (!buckets.has(key)) continue;
     if (assetOf(r).native) add(key, 'refundWei', BigInt(r.refunded_amount_wei || '0'));
-    add(key, 'refundUsdtMicro', refundUsdtMicroOfRow(r));
+    const refund = refundPriceMicroOfRow(r);
+    if (priceCurrencyOfRow(r) === 'BTY') add(key, 'refundBtyMicro', refund);
+    else add(key, 'refundUsdtMicro', refund);
   }
   return [...buckets.values()];
 }
@@ -306,19 +382,30 @@ export async function productStats(days, sort = 'gmv', page = 1, pageSize = 20, 
   // 入账行与退款行一次发出、一次解构（理由见 overviewStats 里那段）
   const [rows, refundRows] = await Promise.all([
     incomeRows(days, seller),
-    getDb().all(`SELECT product_id, amount_wei, refunded_amount_wei, usdt_micro,
+    getDb().all(`SELECT product_id, amount_wei, refunded_amount_wei, price_currency, price_micro,
         payment_token, payment_symbol, payment_decimals, bty_usdt_rate, token_usdt_micro_per_token,
         COUNT(*) OVER (PARTITION BY product_id) AS order_count
        FROM v_orders o WHERE o.refunded_amount_wei <> 0 AND o.product_id IS NOT NULL${marks.where}${s.where}`, ...marks.params, ...s.params),
   ]);
   const refundWeiByProduct = new Map();
   const refundUsdtByProduct = new Map();
+  const refundBtyByProduct = new Map();
+  const refundComparableByProduct = new Map();
+  const refundComparableUnknown = new Set();
   const refundCountByProduct = new Map();
   for (const r of refundRows) {
     if (assetOf(r).native) {
       refundWeiByProduct.set(r.product_id, (refundWeiByProduct.get(r.product_id) || 0n) + BigInt(r.refunded_amount_wei || '0'));
     }
-    refundUsdtByProduct.set(r.product_id, (refundUsdtByProduct.get(r.product_id) || 0n) + refundUsdtMicroOfRow(r));
+    const refund = refundPriceMicroOfRow(r);
+    if (priceCurrencyOfRow(r) === 'BTY') {
+      refundBtyByProduct.set(r.product_id, (refundBtyByProduct.get(r.product_id) || 0n) + refund);
+    } else {
+      refundUsdtByProduct.set(r.product_id, (refundUsdtByProduct.get(r.product_id) || 0n) + refund);
+    }
+    const comparable = refundBtyComparableMicroOfRow(r);
+    if (comparable === null) refundComparableUnknown.add(r.product_id);
+    else refundComparableByProduct.set(r.product_id, (refundComparableByProduct.get(r.product_id) || 0n) + comparable);
     refundCountByProduct.set(r.product_id, r.order_count);
   }
   const agg = new Map(); // product_id -> {...}
@@ -330,13 +417,21 @@ export async function productStats(days, sort = 'gmv', page = 1, pageSize = 20, 
       orders: 0,
       netWei: 0n,
       netUsdtMicro: 0n,
+      netBtyMicro: 0n,
+      netComparableBtyMicro: 0n,
+      comparableUnknown: false,
       buyers: new Set(),
       lastSaleAt: 0,
     };
     a.orders += 1;
     a.units += r.quantity || 1;
     if (assetOf(r).native) a.netWei += netOfRow(r);
-    a.netUsdtMicro += grossUsdtMicroOfRow(r) - refundUsdtMicroOfRow(r);
+    const comparable = btyComparableMicroOfRow(r);
+    if (comparable === null) a.comparableUnknown = true;
+    else a.netComparableBtyMicro += comparable;
+    const net = grossUsdtMicroOfRow(r) - refundPriceMicroOfRow(r);
+    if (priceCurrencyOfRow(r) === 'BTY') a.netBtyMicro += net;
+    else a.netUsdtMicro += net;
     a.buyers.add(r.buyer);
     /*
       `lastSaleAt` 是**对外契约里的 ISO-8601 时刻**（全仓时间只有这一种表示，见 db.js 的说明）。
@@ -349,37 +444,57 @@ export async function productStats(days, sort = 'gmv', page = 1, pageSize = 20, 
   const db = getDb();
   const rowsOut = [];
   for (const [productId, a] of agg) {
-    const p = await db.get('SELECT slug, title, active FROM products WHERE id = ?', productId);
+    const p = await db.get('SELECT slug, title, price_currency, active, deleted_at FROM products WHERE id = ?', productId);
     rowsOut.push({
       productId,
       slug: p ? p.slug : `#${productId}`,
       title: p ? p.title : '(商品已删除)',
-      active: p ? !!p.active : false,
+      active: p ? !!p.active && p.deleted_at == null : false,
+      /** 当前商品的标价币种（用于给下面两列的金额配单位）；历史订单可能跨币种，两列分别给 */
+      priceCurrency: p ? p.price_currency : null,
       orders: a.orders,
       units: a.units,
       netWei: a.netWei.toString(),
       netUsdtMicro: a.netUsdtMicro.toString(),
+      netBtyMicro: a.netBtyMicro.toString(),
+      /** 跨支付资产可比的净额（微 BTY）；null = 该商品有汇率/精度读不到的单 */
+      netBtyComparableMicro: a.comparableUnknown ? null : a.netComparableBtyMicro.toString(),
       refundWei: (refundWeiByProduct.get(productId) || 0n).toString(),
       refundUsdtMicro: (refundUsdtByProduct.get(productId) || 0n).toString(),
+      refundBtyMicro: (refundBtyByProduct.get(productId) || 0n).toString(),
+      /** 跨支付资产可比的退款额（微 BTY）；null = 有退款行无法折算 */
+      refundBtyComparableMicro: refundComparableUnknown.has(productId)
+        ? null
+        : (refundComparableByProduct.get(productId) || 0n).toString(),
       refunds: refundCountByProduct.get(productId) || 0,
       buyers: a.buyers.size,
       lastSaleAt: a.lastSaleAt ? new Date(a.lastSaleAt).toISOString() : null,
     });
   }
 
-  // 稳定排序：相等返回 0（此前恒 -1 使等值项顺序依赖引擎、JS sort 不稳）
-  const byNetDesc = (a, b) => {
-    const d = BigInt(b.netUsdtMicro) - BigInt(a.netUsdtMicro);
-    return d > 0n ? 1 : d < 0n ? -1 : 0;
+  /*
+    `gmv`/`refund` 排序按**跨支付资产可比的微 BTY**：原生按实际 wei，ERC20 按锁定
+    token USDT 报价与 bty_usdt_rate 折算。读不到折算率的商品排最后（不能当 0）。
+    USDT/BTY 各自的标价净额仍分行下发，界面按币种显示。
+  */
+  const byComparableDesc = (key, tie) => (a, b) => {
+    const av = a[key];
+    const bv = b[key];
+    if (av === null && bv === null) return tie(a, b);
+    if (av === null) return 1;
+    if (bv === null) return -1;
+    const d = BigInt(bv) - BigInt(av);
+    if (d > 0n) return 1;
+    if (d < 0n) return -1;
+    return tie(a, b);
   };
+  const byOrders = (a, b) => b.orders - a.orders;
+  const byRefundCount = (a, b) => b.refunds - a.refunds;
   const cmp = {
-    gmv: byNetDesc,
-    orders: (a, b) => b.orders - a.orders,
-    refund: (a, b) => {
-      const d = BigInt(b.refundUsdtMicro) - BigInt(a.refundUsdtMicro);
-      return d > 0n ? 1 : d < 0n ? -1 : 0;
-    },
-  }[sort] || byNetDesc;
+    gmv: byComparableDesc('netBtyComparableMicro', byOrders),
+    orders: byOrders,
+    refund: byComparableDesc('refundBtyComparableMicro', byRefundCount),
+  }[sort] || byComparableDesc('netBtyComparableMicro', byOrders);
   rowsOut.sort(cmp);
   const total = rowsOut.length;
   const paged = rowsOut.slice((page - 1) * pageSize, page * pageSize);

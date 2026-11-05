@@ -159,7 +159,7 @@ async function main() {
   const ownerToken = await login(owner);
   const product = await api('POST', '/api/products', {
     title: `E2E 冒烟 ${tag}`, description: '主网全链路验收商品（脚本自动生成）',
-    media: [], kind: 'digital', priceUsdtMicro: PRICE_MICRO,
+    media: [], kind: 'digital', priceCurrency: 'USDT', specs: [{ name: '规格', options: ['默认'] }], skus: [{ key: '', priceMicro: PRICE_MICRO }],
   }, ownerToken);
   console.log(`商品 ${product.slug} snapshotHash=${product.snapshotHash.slice(0, 18)}…`);
   const codes = Array.from({ length: 6 }, (_, i) => `E2E-${tag}-${i + 1}`);

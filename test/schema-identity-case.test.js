@@ -137,7 +137,6 @@ test('清单从 SCHEMA_DDL 派生：28 个 CHAR(42) 地址列、10 个 CHAR(9) �
       'seller_proxy_product_quota.buyer',
       'seller_proxy_product_quota.seller',
       'shop_applications.seller',
-      'shop_claims.address',
       'shop_operators.address',
       'shops.seller',
     ]
@@ -151,7 +150,6 @@ test('清单从 SCHEMA_DDL 派生：28 个 CHAR(42) 地址列、10 个 CHAR(9) �
       'nft_claims.shop_code',
       'orders.shop_code',
       'products.shop_code',
-      'shop_claims.shop_code',
       'shop_operators.shop_code',
       'shop_webhook.shop_code',
       'shops.code',
@@ -209,12 +207,6 @@ test('地址录入口：带校验和的写法在每张表上都被拒（不是�
     TEST_SHOP_CODE,
     UPPER,
   ]);
-  await checkRejected(
-    'shop_claims.address',
-    'INSERT INTO shop_claims (shop_code, kind, value, address, message, signature) VALUES (?, ?, ?, ?, ?, ?)',
-    [TEST_SHOP_CODE, 'domain', 'probe.example', UPPER, 'm', 's']
-  );
-
   await checkRejected('products.nft_contract', 'UPDATE products SET nft_contract = ? WHERE id = ?', [UPPER, nft.productId]);
   for (const column of ['buyer', 'seller']) {
     // 列名来自上面的派生清单，不是从请求里拼的：这里只跑确定在 schema 里的列
@@ -283,7 +275,7 @@ test('合法写法不被误拒：小写地址、NULL 三态照旧能写', async 
   await db.run('UPDATE shops SET seller = seller WHERE code = ?', TEST_SHOP_CODE);
 });
 
-test('门禁：删掉一条新增的 CHECK ⇒ 报 check-missing，并给出可执行的 ADD CONSTRAINT 修复', async () => {
+test('门禁：删掉一条新增的 CHECK ⇒ 报 check-missing（差异带期望表达式）', async () => {
   await db.run('ALTER TABLE shops DROP CHECK ck_shops_seller_lower');
   try {
     const broken = await inspectSchemaStructure();
@@ -293,13 +285,8 @@ test('门禁：删掉一条新增的 CHECK ⇒ 报 check-missing，并给出可�
     );
     assert.ok(diff, `必须报出缺的 CHECK：${JSON.stringify(broken.diffs)}`);
     assert.match(String(diff.expected), /lower\(`seller`\)/, '差异里要带期望表达式');
-    assert.equal(
-      broken.repairs.some((r) => r.includes('ADD CONSTRAINT `ck_shops_seller_lower` CHECK')),
-      true,
-      '修复清单必须给出 ADD CONSTRAINT（照做即可，不用人抄建表语句）'
-    );
 
-    // 按差异里带的期望表达式补回去（证明它不是一段只能看不能用的文本），门禁应恢复通过
+    // 按差异里带的期望表达式补回去，证明期望形状本身是可执行的
     await db.run(`ALTER TABLE shops ADD CONSTRAINT \`ck_shops_seller_lower\` CHECK ${diff.expected}`);
     const after = await inspectSchemaStructure();
     assert.equal(after.ok, true, `补回 CHECK 后应通过：${JSON.stringify(after.diffs)}`);

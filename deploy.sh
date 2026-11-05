@@ -843,6 +843,9 @@ ensure_redis_container() {
     info "创建 Redis 容器：$REDIS_CONTAINER（镜像 $REDIS_IMAGE，仅加入网络 $DB_NETWORK）"
     umask 077
     printf 'requirepass %s\nappendonly no\n' "$REDIS_PASSWORD" > "$REDIS_CONF_FILE"
+    # redis:7-alpine 以 uid 999 运行；配置若保持 root:0600，容器里的 redis-server 连读都读不到
+    # （表现为“can't open config file: Permission denied”而不是密码错误）。
+    chown 999:999 "$REDIS_CONF_FILE" 2>/dev/null || true
     chmod 600 "$REDIS_CONF_FILE"
     dk run -d --name "$REDIS_CONTAINER" \
       --restart unless-stopped \

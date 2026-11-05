@@ -17,8 +17,8 @@ export function isProdLike(nodeEnv = process.env.NODE_ENV) {
   return nodeEnv !== 'test' && nodeEnv !== 'development';
 }
 
-/** 统一成功响应 */
-export function ok(res, data = null, message = 'success') {
+/** 统一成功响应（message 也是给人看的：默认值不能是英文 `success`） */
+export function ok(res, data = null, message = '成功') {
   res.json({ code: 0, message, data });
 }
 

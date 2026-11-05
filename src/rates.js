@@ -1,16 +1,21 @@
 /**
- * 汇率服务：USDT 计价 → 原生 BTY 支付换算的行情来源。
+ * 汇率服务：**USDT 定价**商品的 USDT → 原生 BTY 换算行情来源。
+ *
+ * BTY 定价商品**不走这里**：它们的应付 wei 由微 BTY 直接乘 1e12 得到（`btyMicroToWei`），
+ * 全程不读行情。本模块只服务"以 USDT 标价、但要收原生 BTY"的那一类订单。
  *
  * 唯一数据源：官方行情 mainnet.bityuan.com/tapi/ticker（BTY-USDT：
  * code==0 且 data.data.USDT.BTY.last）——缓存短（默认 60 秒，MK_BTY_TTL_MS）：
  * 它直接决定"买家要付多少 BTY"，要跟得住。
  * 上游不可用时回退 config.rates.fallback.btyUsdt 手工汇率（标记 stale=true）。
  *
- * 为什么只有一条腿（2026-10 改标价单位为 USDT）：标价本身就是 USDT（微 USDT，6 位小数），
- * 而链上托管只收原生 BTY，所以**唯一**需要的换算是「USDT → BTY」。旧实现还有一条
- * USDT→CNY 的法币腿（3 家免密钥公共接口 + 中位数 + 合理性区间），那是为"人民币标价"服务的；
- * 标价改成 USDT 之后它与定价再无关系，整条腿连同其数据源、缓存 TTL、兜底汇率与
- * orders.usdt_cny_rate 快照列一并删除——留着只会是"看起来还在参与定价"的死代码。
+ * 为什么只有一条腿（2026-10 改标价单位为 USDT）：USDT 定价单的标价本身就是 USDT
+ * （微 USDT，6 位小数），而链上托管只收原生 BTY，所以**唯一**需要的换算是「USDT → BTY」。
+ * 旧实现还有一条 USDT→CNY 的法币腿（3 家免密钥公共接口 + 中位数 + 合理性区间），
+ * 那是为"人民币标价"服务的；标价改成 USDT 之后它与定价再无关系，整条腿连同其数据源、
+ * 缓存 TTL、兜底汇率与 orders.usdt_cny_rate 快照列一并删除——留着只会是"看起来还在参与定价"的死代码。
+ * 2026-11 增加 BTY 直接定价：那一类订单根本不到本文件（见 `btyMicroToWei`），
+ * 所以"只有一条腿"依然成立。
  *
  * 汇率仅用于：商品详情展示换算、下单时锁定应付金额（订单快照记录汇率，
  * 实际支付金额由买家签名确认的 wei 数为准）。波动风险由买家签名前确认承担。
@@ -22,13 +27,17 @@ import { redisGetJson, redisSetJson, redisDel } from './redis.js';
 const BTY_TICKER_URL = 'https://mainnet.bityuan.com/tapi/ticker';
 
 /**
- * 缓存：`atBty` 记的是**上一次尝试时刻**（失败也更新），这样失败自然进入负缓存，
- * 不会因为"有个旧值"就每个请求都去打一轮上游。除了本进程的 single-flight 状态，
+ * 缓存：`atBty` 是**成功取到这份报价的时刻**（对外“报价于”），
+ * `attemptedBty` 才是上一次尝试时刻（失败也更新），供负缓存/重试节奏使用——
+ * 两者分开，失败时不会把“最后一次失败”冒充成“报价时间”。
  * 最新读数还会写 Redis（多进程/多实例共用同一份行情窗口，避免各自打上游）。
  */
 let cache = {
   btyUsdt: null, // 1 BTY = x USDT
+  /** 成功取到这份报价的时刻（对外“报价于”；失败不更新） */
   atBty: 0,
+  /** 上一次尝试时刻（失败也更新）：只服务负缓存/重试节奏，不对外当报价时间 */
+  attemptedBty: 0,
   btyError: null,
   /*
     当前服务的是**手工兜底值**（不是实时行情）。
@@ -57,7 +66,7 @@ async function hydrateSharedCache() {
   if (sharedValue === null || !Number.isFinite(sharedValue) || sharedValue <= 0) return;
   const at = Math.min(Number(shared.atBty), Date.now() + 5_000);
   if (at <= cache.atBty) return;
-  cache = { btyUsdt: sharedValue, atBty: at, btyError: null, btyFallback: false };
+  cache = { btyUsdt: sharedValue, atBty: at, attemptedBty: at, btyError: null, btyFallback: false };
 }
 
 /** 上游一律带上可识别的 UA：公共行情接口普遍对"无 UA/默认 UA"更激进地限速（也便于对方联系我们） */
@@ -136,7 +145,7 @@ function legDue(at, value, ttlMs, isFallback) {
  */
 export async function refreshRates(force = false) {
   await hydrateSharedCache();
-  if (!force && !legDue(cache.atBty, cache.btyUsdt, config.rates.btyTtlMs, cache.btyFallback)) return cache;
+  if (!force && !legDue(cache.attemptedBty, cache.btyUsdt, config.rates.btyTtlMs, cache.btyFallback)) return cache;
   if (inflight) {
     // 抓住手里这一轮（inflight 可能马上被清空）；它必然覆盖这条唯一的腿
     const round = inflight;
@@ -162,10 +171,12 @@ async function doRefresh() {
     const v = await fetchBtyUsdt();
     cache.btyUsdt = v;
     cache.atBty = Date.now();
+    cache.attemptedBty = cache.atBty;
     cache.btyError = null;
     cache.btyFallback = false; // 拿到实时值 → 不再算"兜底中"
   } catch (e) {
-    cache.atBty = Date.now();
+    /* 失败更新“尝试时刻”供负缓存，但不更新 atBty（它是这份报价的生成时刻） */
+    cache.attemptedBty = Date.now();
     cache.btyError = `BTY-USDT: ${e?.message || e}`;
   }
   // 拉取失败：保留旧值；从未成功过则回退手工兜底汇率（未配置为 0 则保持 null）。
@@ -183,7 +194,7 @@ async function doRefresh() {
 
 /** 测试隔离：清掉本进程与 Redis 的汇率缓存。 */
 export async function __resetRatesCacheForTest() {
-  cache = { btyUsdt: null, atBty: 0, btyError: null, btyFallback: false };
+  cache = { btyUsdt: null, atBty: 0, attemptedBty: 0, btyError: null, btyFallback: false };
   await redisDel(SHARED_CACHE_KEY);
 }
 
@@ -211,6 +222,23 @@ export async function getRates() {
   const r = await refreshRates();
   if (!r.btyUsdt) return null;
   return snapshot();
+}
+
+/**
+ * BTY 定价商品：微 BTY（1e-6 BTY）→ 原生 wei。
+ *
+ * **不经过任何行情**：`amountWei = micro × 1e12`。1 微 BTY = 1e12 wei，天然是
+ * BTY 原生最小转账单位 1e10 wei 的整数倍（见 `usdtMicroToPayWei` 的说明：非 1e10 整数倍
+ * 的 value 在链上原生转账阶段就会 revert，且 BTY 网关不返回 revert data）。
+ * 纯整数运算，入参在商品/订单上限内（≤ 9e15 微），结果远小于 uint256。
+ * @returns {string} wei 字符串；非法入参返回 '0'（调用方用 isPayableAmount 拦）
+ */
+export function btyMicroToWei(btyMicro) {
+  const n = Number(btyMicro);
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  const micro = BigInt(Math.trunc(n));
+  if (micro <= 0n) return '0';
+  return (micro * 10n ** 12n).toString();
 }
 
 /**

@@ -18,7 +18,7 @@ let seq = 0;
 const payHash = () => '0x' + String(++seq).padStart(64, '0');
 
 /**
- * 上架商品（66 USDT）→ 店主代买家下单 → 模拟 watcher/paid 回写 escrowed（落支付凭证），
+ * 上架商品（66 price）→ 店主代买家下单 → 模拟 watcher/paid 回写 escrowed（落支付凭证），
  * 返回订单草稿 DTO。
  */
 async function settledEscrow(slug, who = buyer.address) {
@@ -52,7 +52,7 @@ test('买家确认收货后计入流水（confirmed）', async () => {
   const listed = await request(app)
     .post('/api/products')
     .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
-    .send(productPayload({ title: '流水测试商品A', priceUsdtMicro: 66_000_000 }))
+    .send(productPayload({ title: '流水测试商品A', priceMicro: 66_000_000 }))
     .expect(200);
   assertOk(listed);
   productSlug = listed.body.data.slug;
@@ -87,7 +87,7 @@ test('买家确认收货后计入流水（confirmed）', async () => {
     微 USDT 汇总现在是**字符串**（与 wei 侧同款：节点用 BigInt 累加后 toString()）——
     Number 累加在 9.007e15 以上 ulp 变成 2…16，而这是要拿去对账的整数金额（源码评审 2026-10，P2）。
     断言用 `String(...)` 比较，这样"哪天有人又改回 Number"时这里只会在超出安全整数时红——
-    真正钉住的是**逐值相等**：66000000 微 = 66.00 USDT。
+    真正钉住的是**逐值相等**：66000000 微 = 66.00 price。
   */
   assert.equal(String(summary.usdtMicro), '66000000');
   assert.equal(summary.amountWei, o.amountWei, '累计金额应等于本单应付 wei（字符串精确）');
@@ -192,7 +192,7 @@ test('混合资产：ERC20 单不进 wei 汇总，mixedAssets=true 让调用方�
     seller: owner.address.toLowerCase(),
     status: 'confirmed',
     amountWei: '5000000',
-    usdtMicro: '5000000',
+    priceMicro: '5000000',
   });
   await db.run(
     "UPDATE orders SET payment_token = ?, payment_symbol = ?, payment_decimals = ? WHERE order_no = ?",

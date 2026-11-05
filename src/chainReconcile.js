@@ -201,7 +201,7 @@ export function planChainRepair(local, onchain) {
     // 现在读不到就**这一轮不修**（reason 里写明，下一轮重试），绝不拿一个 0 去补。
     const refundedWei = readRefundedWei(refundedRaw);
     if (refundedWei === null) {
-      return { action: 'none', unreadable: true, reason: `链上已退金额读不到（refundedAmount=${String(refundedRaw)}）：不推进终态，等下一轮` };
+      return { action: 'none', unreadable: true, reason: `链上已退金额读不到（本次读到：${String(refundedRaw)}）：不推进终态，等下一轮` };
     }
     const to = mapChainTerminal(chainStatus, refundedWei, local.amount_wei);
     if (to === null) {
@@ -219,7 +219,7 @@ export function planChainRepair(local, onchain) {
     // 链上查不到：本地 escrowed + 有支付凭证 = 最可疑的组合（钱可能真在链上）——
     // 不改状态、不释放占位，只告警人工核实（可能只是 RPC 读到了别的链/合约）
     if (localStatus === 'escrowed' && local.paid_tx_hash) {
-      return { action: 'missing', reason: '链上查不到该托管单，但本地有支付凭证（疑似 RPC/节点侧异常，需人工核实）' };
+      return { action: 'missing', reason: '链上查不到该托管单，但本地有支付凭证（疑似链上节点侧异常，需人工核实）' };
     }
     return { action: 'none', reason: 'chain-none' };
   }
@@ -242,7 +242,7 @@ export function planChainRepair(local, onchain) {
   if (chainStatus === 'Created' && (localStatus === 'draft' || localStatus === 'cancelled')) {
     return {
       action: 'restore',
-      reason: '链上资金仍在托管而本地停在未托管态（OrderCreated 漏扫后被清扫/取消的残镜像）',
+      reason: '链上资金仍在托管而本地停在未托管态（链上托管事件漏扫后被清扫/取消的残镜像）',
     };
   }
   return { action: 'none', reason: `chain-${chainStatus}` };
@@ -683,7 +683,7 @@ export async function reconcileAfterSaleOnce({ now = Date.now(), batch = AFTER_S
  */
 export async function reconcileChainOnce({ now = Date.now(), minAgeMs = MIN_AGE_MS, batch = BATCH_SIZE } = {}) {
   if (!config.chain.escrowAddress) {
-    return { skipped: true, reason: 'MK_ESCROW_ADDRESS 未配置' };
+    return { skipped: true, reason: '托管合约地址未配置' };
   }
   /*
     终态只能从**确认过的区块**读：watcher 等 head−finality，对账不能读 latest 就写 settled/refunded。
@@ -693,7 +693,8 @@ export async function reconcileChainOnce({ now = Date.now(), minAgeMs = MIN_AGE_
   try {
     blockTag = await finalizedBlockTag();
   } catch (e) {
-    return { skipped: true, reason: `确认边界读取失败：${e?.message || e}` };
+    console.error('[chainReconcile] 读链上确认边界失败：', e?.message || e);
+    return { skipped: true, reason: `确认边界读取失败（链上节点暂时不可用）` };
   }
   const db = getDb();
   const cutoff = new Date(now - minAgeMs);
@@ -852,7 +853,8 @@ export function startChainReconcile() {
       reconcileStatus.lastAfterSaleScanned = r?.afterSaleScanned ?? 0;
       reconcileStatus.lastAfterSaleRepaired = r?.afterSaleRepaired ?? 0;
     } catch (e) {
-      reconcileStatus.lastError = String(e?.message || e);
+      // 主文案给用户/店主看，原文只进日志（运维照着日志定位）
+      reconcileStatus.lastError = '本轮对账失败（详情见节点日志）';
       console.error('[chainReconcile] 本轮对账异常（下轮重试）:', e?.message || e);
     } finally {
       busy = false;

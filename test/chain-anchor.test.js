@@ -38,7 +38,7 @@ async function insertInflight(seq, status = 'escrowed') {
     status,
     productSlug: 'anchor-slug',
     amountWei: '1000000000000000000',
-    usdtMicro: 100,
+    priceMicro: 100,
     holdQty: 0,
     escrowOrderId: '0x' + String(seq).padStart(64, '0'),
     paidTxHash: '0x' + String(seq + 100).padStart(64, '0'),
@@ -152,7 +152,7 @@ test('草稿（未上链）与无单号行不计入在途链上单', async () =>
     status: 'draft',
     productSlug: 'anchor-slug',
     amountWei: '1',
-    usdtMicro: 1,
+    priceMicro: 1,
     escrowOrderId: null,
   });
   assert.equal(await inflightChainOrders(), 0, '草稿从没上链，换址与它无关（不该拦启动）');

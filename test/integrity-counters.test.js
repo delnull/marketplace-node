@@ -38,7 +38,7 @@ async function makeOrder(spec = {}) {
     buyer: BUYER,
     seller: SELLER,
     amountWei: '0',
-    usdtMicro: 0,
+    priceMicro: 0,
     ...spec,
   });
 }
@@ -54,7 +54,7 @@ const COUNTER_KINDS = [
 ];
 
 test('账自洽时一条计数器噪声都没有（正向基线，防"见谁都报"）', async () => {
-  const p = await makeProduct({ kind: 'physical', title: '限量实物', skus: [{ key: '', priceUsdtMicro: 1_000_000, capacity: 5, committed: 1 }] });
+  const p = await makeProduct({ kind: 'physical', title: '限量实物', skus: [{ key: '', priceMicro: 1_000_000, capacity: 5, committed: 1 }] });
   await makeOrder({ productId: p.productId, productSlug: p.slug, skuKey: '', quantity: 1, holdQty: 1 });
   const { issues, counts, checked } = await findIntegrityIssues(db);
   assert.deepEqual(
@@ -88,7 +88,7 @@ test('reserved_tokens 偏小（在途 NFT 订单 2 枚，计数器却是 0）⇒
 });
 
 test('product_skus.committed 与"仍押着的占位"不一致 ⇒ 报漂移（它正是"还剩几件"的唯一读数）', async () => {
-  const p = await makeProduct({ kind: 'physical', title: '实物商品', skus: [{ key: '红', priceUsdtMicro: 1_000_000, capacity: 9, committed: 2 }] });
+  const p = await makeProduct({ kind: 'physical', title: '实物商品', skus: [{ key: '红', priceMicro: 1_000_000, capacity: 9, committed: 2 }] });
   await makeOrder({ productId: p.productId, productSlug: p.slug, skuKey: '红', quantity: 1, holdQty: 1 });
   const { issues } = await findIntegrityIssues(db);
   const hit = issues.find((i) => i.kind === 'committed-drift' && i.resource === p.slug);
@@ -98,7 +98,7 @@ test('product_skus.committed 与"仍押着的占位"不一致 ⇒ 报漂移（�
 });
 
 test('hold_qty 不是 0 也不是 quantity ⇒ 报漂移（释放/恢复会按错的数量加减 committed）', async () => {
-  const p = await makeProduct({ kind: 'physical', title: '数量不一致', skus: [{ key: '', priceUsdtMicro: 1_000_000, capacity: 9 }] });
+  const p = await makeProduct({ kind: 'physical', title: '数量不一致', skus: [{ key: '', priceMicro: 1_000_000, capacity: 9 }] });
   const o = await makeOrder({ productId: p.productId, productSlug: p.slug, skuKey: '', quantity: 2, holdQty: 3 });
   const { issues } = await findIntegrityIssues(db);
   const hit = issues.find((i) => i.kind === 'hold-qty-mismatch' && i.orderId === o.orderNo);
@@ -108,7 +108,7 @@ test('hold_qty 不是 0 也不是 quantity ⇒ 报漂移（释放/恢复会按�
 });
 
 test('押着占位却找不到 SKU 行（组合键被改/商品被删）⇒ 报出来而不是当成 0', async () => {
-  const p = await makeProduct({ kind: 'physical', title: '组合丢了', skus: [{ key: '旧组合', priceUsdtMicro: 1_000_000, capacity: 9 }] });
+  const p = await makeProduct({ kind: 'physical', title: '组合丢了', skus: [{ key: '旧组合', priceMicro: 1_000_000, capacity: 9 }] });
   const o = await makeOrder({ productId: p.productId, productSlug: p.slug, skuKey: '新组合', quantity: 1, holdQty: 1 });
   // 让 (商品, 新组合) 没有 SKU 行：占位不属于任何 committed 计数器
   const { issues } = await findIntegrityIssues(db);
