@@ -50,3 +50,46 @@ test('重复操作是 409，不会静默成功', async () => {
   const r = await call(true).expect(409);
   assert.equal(r.body.code, 409);
 });
+
+/**
+ * 卖家面板的店铺行必须读**节点现读**的 `operatedShops`。
+ *
+ * 暂停店不进公开在售列表，旧前端因此拿登录回执补目录缺口——回执是登录那一刻的快照，
+ * 于是歇业后仍显示"经营中"、头像还被拼丢。本用例钉住节点这一侧的事实形状：
+ * 同一个钱包的同一家店，`shops`（公开）里没有它，`operatedShops` 里有且带暂停状态与头像。
+ */
+test('GET /api/shops：operatedShops 现读暂停状态与头像，未登录为 null', async () => {
+  const avatar = `/api/uploads/${'a'.repeat(64)}.png`;
+  await db.run('UPDATE shops SET avatar_url = ? WHERE code = ?', avatar, shopRef.value);
+  await call(false, '今天休息').expect(200);
+
+  const asOwner = await request(app)
+    .get('/api/shops')
+    .set('Authorization', `Bearer ${token}`)
+    .expect(200);
+  assertOk(asOwner);
+  const row = asOwner.body.data.operatedShops.find((s) => s.code === shopRef.value);
+  assert.ok(row, 'operatedShops 必须包含暂停接单的店（否则卖家面板进不了自己的店）');
+  assert.equal(row.listed, false, '回执/目录必须给现读的接单状态');
+  assert.match(row.listedReason, /^店主歇业：/, '暂停原因随店铺行下发');
+  assert.equal(row.avatarUrl, avatar, '头像等展示字段不能在这个入口丢');
+  assert.equal(row.role, 'owner');
+  assert.equal(
+    asOwner.body.data.shops.some((s) => s.code === shopRef.value),
+    false,
+    '公开在售列表仍然不含暂停店（两条口径不混）'
+  );
+
+  const anon = await request(app).get('/api/shops').expect(200);
+  assert.equal(anon.body.data.operatedShops, null, '没有令牌时节点不替任何人断言"你有哪些店"');
+
+  await call(true).expect(200);
+  const resumed = await request(app)
+    .get('/api/shops')
+    .set('Authorization', `Bearer ${token}`)
+    .expect(200);
+  const fresh = resumed.body.data.operatedShops.find((s) => s.code === shopRef.value);
+  assert.ok(fresh, '复业后 operatedShops 仍须有这家店');
+  assert.equal(fresh.listed, true);
+  assert.equal(fresh.listedReason, '');
+});

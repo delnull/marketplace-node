@@ -11,18 +11,23 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { login, makeCtx, productPayload, assertOk, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, owner } = ctx;
 const ownerToken = (await login(ctx, owner)).token;
+// 上传目录随本进程（setup 给每个测试进程一份 MK_ATTACH_DIR），见 setup 的说明
+const { uploadsDir } = await import('../src/productMedia.js');
 
 /** 1x1 PNG（最小合法图片） */
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   'base64'
 );
+/** 合法的"存储名"URL（形状对、文件不存在）：只用在这些用例的校验/快照输入里 */
+const storedUrl = (hexChar, ext) => `/api/uploads/${String(hexChar).repeat(64)}.${ext}`;
 
 /**
  * 合成一个"MP4 容器"：偏移 4 起必须是 `ftyp` box（判据见 node/src/mediaKinds.js）。
@@ -51,11 +56,45 @@ test('上传商品图：落盘并返回节点相对 URL + sha256', async () => {
   const res = await upload(PNG, { type: 'image/png' }).expect(200);
   assertOk(res);
   const { url, kind, mime, sha256, size } = res.body.data;
-  assert.match(url, /^\/api\/uploads\/[0-9a-f-]{36}\.png$/, '返回节点相对路径（换域名不回填历史数据）');
+  assert.match(url, /^\/api\/uploads\/[0-9a-f]{64}\.png$/, '返回节点相对路径（换域名不回填历史数据）');
   assert.equal(kind, 'image');
   assert.equal(mime, 'image/png');
   assert.equal(size, PNG.length);
   assert.equal(sha256, createHash('sha256').update(PNG).digest('hex'), 'sha256 可复算');
+});
+
+test('内容寻址：同一份字节上传两次 → 同一个 URL、磁盘一份；主图区同 URL 只留一条', async () => {
+  // 在合法 PNG 后面追加一段字节：嗅探只看文件头，内容因此与其它用例不同（哈希唯一）
+  const bytes = Buffer.concat([PNG, Buffer.from(' dedupe-probe')]);
+  const a = await upload(bytes, { type: 'image/png' }).expect(200);
+  const b = await upload(bytes, { type: 'image/png' }).expect(200);
+  assertOk(a);
+  assertOk(b);
+  assert.equal(a.body.data.sha256, b.body.data.sha256, 'sha256 是内容哈希');
+  assert.equal(a.body.data.url, b.body.data.url, '同一份内容必须复用同一个 URL');
+
+  const name = a.body.data.url.split('/').pop();
+  assert.equal(
+    fs.readdirSync(uploadsDir()).filter((n) => n === name).length,
+    1,
+    '磁盘上只有一份（文件名就是内容哈希，同名不可能两份）'
+  );
+
+  const created = await request(app)
+    .post('/api/products')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send(
+      productPayload({
+        title: '同一内容只留一条',
+        media: [
+          { type: 'image', url: a.body.data.url },
+          { type: 'image', url: b.body.data.url },
+        ],
+      })
+    )
+    .expect(200);
+  assertOk(created);
+  assert.equal(created.body.data.media.length, 1, '同一 URL 重复提交只保留第一次出现');
 });
 
 test('上传视频：按字节认成 mp4/webm，返回 kind=video', async () => {
@@ -152,6 +191,11 @@ test('media：形状、上限、URL 白名单、视频只收本站、封面必�
   assert.notEqual(badScheme.body.code, 0);
   assert.match(badScheme.body.message, /http\/https|本站上传/);
 
+  // 本站路径必须是存储名（sha256.ext）：媒体读取端只认内容地址，任意串写进商品只会是永久裂图
+  const badLocal = await post({ media: [{ type: 'image', url: '/api/uploads/notahash.png' }] }).expect(200);
+  assert.notEqual(badLocal.body.code, 0);
+  assert.match(badLocal.body.message, /本站上传/);
+
   // 视频只收本站上传（外链绕过"类型由字节判定"）
   const extVid = await post({
     media: [{ type: 'video', url: 'https://cdn.example.com/a.mp4', poster: 'https://cdn.example.com/a.jpg' }],
@@ -161,23 +205,23 @@ test('media：形状、上限、URL 白名单、视频只收本站、封面必�
 
   // 封面必填
   const noPoster = await post({
-    media: [{ type: 'video', url: '/api/uploads/00000000-0000-0000-0000-000000000000.mp4' }],
+    media: [{ type: 'video', url: storedUrl(0, 'mp4') }],
   }).expect(200);
   assert.notEqual(noPoster.body.code, 0);
   assert.match(noPoster.body.message, /封面图/);
 
-  // 视频个数上限
-  const many = Array.from({ length: 4 }, () => ({
+  // 视频个数上限（四个**不同**的视频；同一 URL 会被内容寻址去重成一条）
+  const many = Array.from({ length: 4 }, (_, i) => ({
     type: 'video',
-    url: '/api/uploads/00000000-0000-0000-0000-000000000000.mp4',
-    poster: '/api/uploads/11111111-1111-1111-1111-111111111111.jpg',
+    url: `/api/uploads/${String(i).repeat(64)}.mp4`,
+    poster: `/api/uploads/${String(i + 4).repeat(64)}.jpg`,
   }));
   const tooMany = await post({ media: many }).expect(200);
   assert.notEqual(tooMany.body.code, 0);
   assert.match(tooMany.body.message, /视频最多 3 个/);
 
-  // 合计上限
-  const manyItems = Array.from({ length: 11 }, () => ({ type: 'image', url: 'https://example.com/a.jpg' }));
+  // 合计上限（11 个**不同**的图片）
+  const manyItems = Array.from({ length: 11 }, (_, i) => ({ type: 'image', url: `https://example.com/a${i}.jpg` }));
   const tooManyItems = await post({ media: manyItems }).expect(200);
   assert.notEqual(tooManyItems.body.code, 0);
   assert.match(tooManyItems.body.message, /主图区最多 10 项/);
@@ -193,8 +237,8 @@ test('media 入快照：顺序与元素都是校验输入，改媒体/改顺序�
         media: [
           {
             type: 'video',
-            url: '/api/uploads/00000000-0000-0000-0000-000000000000.mp4',
-            poster: '/api/uploads/11111111-1111-1111-1111-111111111111.jpg',
+            url: storedUrl(2, 'mp4'),
+            poster: storedUrl(3, 'jpg'),
           },
           { type: 'image', url: 'https://example.com/a.jpg' },
         ],
@@ -205,7 +249,7 @@ test('media 入快照：顺序与元素都是校验输入，改媒体/改顺序�
   const p = created.body.data;
   assert.equal(p.media.length, 2);
   assert.equal(p.media[0].type, 'video');
-  assert.equal(p.media[0].poster, '/api/uploads/11111111-1111-1111-1111-111111111111.jpg');
+  assert.equal(p.media[0].poster, storedUrl(3, 'jpg'));
   const before = p.snapshotHash;
 
   // 只调换顺序也要换哈希（顺序是展示语义，买家据此核验主图没被换）
@@ -254,7 +298,7 @@ test('详情块：空块丢弃、相邻文字合并、图片 URL 白名单', asy
         descriptionBlocks: [
           { type: 'text', text: '第一段' },
           { type: 'text', text: '第二段' },
-          { type: 'image', url: '/api/uploads/00000000-0000-0000-0000-000000000000.png' },
+          { type: 'image', url: storedUrl(4, 'png') },
           { type: 'text', text: '   ' }, // 空块 → 丢弃
           { type: 'image', url: 'https://example.com/x.jpg' },
         ],
@@ -376,8 +420,8 @@ test('批量改价：快照重算必须带上描述块与主图区（漏一个�
           { type: 'image', url: 'https://e.com/a.jpg' },
           {
             type: 'video',
-            url: '/api/uploads/00000000-0000-0000-0000-000000000000.mp4',
-            poster: '/api/uploads/11111111-1111-1111-1111-111111111111.jpg',
+            url: storedUrl(5, 'mp4'),
+            poster: storedUrl(6, 'jpg'),
           },
         ],
       })

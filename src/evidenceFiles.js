@@ -5,6 +5,9 @@
  *  - 白名单 image/png|jpeg|webp、application/pdf；**magic bytes 嗅探**（防改扩展名伪装）；
  *  - 单文件 ≤2MB；单条 evidence ≤6 个 / ≤20MB；单订单累计 ≤20MB；
  *  - 磁盘文件名 = uuid.安全扩展名（与原始文件名隔离，防路径穿越/编码诡计）；
+ *  - **同一订单**内 sha256 相同的附件复用同一个磁盘文件（跨订单不共享：附件按订单整目录删除，
+ *    跨单共享会让一单的 PII 擦除删掉另一单的证据）；配额仍按**行**计——同一文件提交两次是
+ *    两条附件（受理量），磁盘只有一份（存储）；
  *  - sha256 存证；可见矩阵与 evidence 文本一致（buyer/owner；arbiter 仅 disputed **或有在途
  *    售后案件的终局单**——后者是契约 2026-10 第二批的裁决面，见 afterSale.js）；
  *  - 附件不可删除/修改（证据语义）；
@@ -214,16 +217,44 @@ export async function storeFiles({ orderId, evidence, files }) {
   const dir = orderAttachDir(orderKey);
   fs.mkdirSync(dir, { recursive: true });
   const created = [];
+  /** 本批新建/补写的文件；`shared=true` 的名字来自已提交的行，回滚时不能删（别的行还在用） */
   const written = [];
   try {
-    // 阶段二：逐个落盘（事务之外，见上方说明）；sha256 与磁盘名在这里定下来，供阶段三写行
+    /*
+      阶段二：逐个落盘（事务之外，见上方说明）；sha256 与磁盘名在这里定下来，供阶段三写行。
+      磁盘文件按**内容**在同一个订单内复用：
+        · 本批内同 sha256 → 共用第一次定下的 stored_name；
+        · 本订单已提交过同 sha256 → 直接复用那一行的 stored_name（索引 idx_evidence_files_sha）；
+        · 跨订单**不复用**——附件删除是按订单整目录，跨单共享会让一单的 PII 擦除删掉另一单。
+      并发提交可能各自写一份（两边都看不到对方未提交的行），这只是少省一次盘，不会产生悬空引用。
+    */
+    const bySha = new Map();
     const staged = [];
     for (const { data, meta } of prepared) {
-      const stored = `${crypto.randomUUID()}.${meta.ext}`;
-      const disk = path.join(dir, stored);
-      fs.writeFileSync(disk, data, { flag: 'wx' });
-      written.push(disk);
-      staged.push({ meta, stored, sha: crypto.createHash('sha256').update(data).digest('hex'), size: data.length });
+      const sha = crypto.createHash('sha256').update(data).digest('hex');
+      let entry = bySha.get(sha);
+      if (!entry) {
+        const existing = await db.get(
+          'SELECT stored_name FROM evidence_files WHERE order_id = ? AND sha256 = ? ORDER BY id ASC LIMIT 1',
+          orderKey,
+          sha
+        );
+        entry = existing?.stored_name
+          ? { stored: existing.stored_name, shared: true }
+          : { stored: `${crypto.randomUUID()}.${meta.ext}`, shared: false };
+        bySha.set(sha, entry);
+      }
+      const disk = path.join(dir, entry.stored);
+      if (!fs.existsSync(disk)) {
+        try {
+          fs.writeFileSync(disk, data, { flag: 'wx' });
+          written.push({ disk, shared: entry.shared });
+        } catch (e) {
+          // 并发批次刚写好同一个名字（同 sha256 ⇒ 同内容）；EEXIST 不是失败
+          if (e?.code !== 'EEXIST') throw e;
+        }
+      }
+      staged.push({ meta, stored: entry.stored, sha, size: data.length });
     }
     /*
       阶段三：整批行**同一个事务**（进程中断也不留半批行——一个订单的附件要么全在要么全不在，
@@ -274,8 +305,13 @@ export async function storeFiles({ orderId, evidence, files }) {
       }
     });
   } catch (e) {
-    // DB 行（与配额占位）随事务回滚；已写文件在这里手动清理（没有行指向它们，就是孤儿）
-    for (const disk of written) {
+    /*
+      DB 行（与配额占位）随事务回滚；本批**新建**的文件在这里手动清理（没有行指向它们，就是孤儿）。
+      `shared=true` 的名字来自已提交的 evidence_files 行（本批只是补写缺失文件），
+      不能因为本批失败就删掉——否则别的行会变成悬空引用。
+    */
+    for (const { disk, shared } of written) {
+      if (shared) continue;
       try {
         fs.rmSync(disk, { force: true });
       } catch {

@@ -541,7 +541,7 @@ async function orderToPublic(o, opts = {}) {
     /** 个人信息擦除锚点（`Date`；null = 从未擦过）。**只写这一列、绝不写 `updated_at`**（口径见 piiErase.js） */
     piiErasedAt: o.pii_erased_at ?? null,
     /**
-     * 这一单**还欠一次清理**（附件文件未删净；见 piiErase.js）。
+     * 这一单**还欠一次清理**（附件/评价图文件未删净；见 piiErase.js）。
      *
      * 为什么必须与 `piiErasedAt` 分开下发：锚点说的是"库内那批字段已擦"，而清理是**另一件事**——
      * 擦了一半时锚点会照常落定（库内确实没数据了），只有这个布尔能说明"盘上还有东西、已排队等重试"。

@@ -67,6 +67,9 @@ import { checkNftStandard } from '../nftStandard.js';
 import { checkErc20Contract } from '../erc20Sale.js';
 import { ok, fail, wrap, makeAuthMiddleware, bearerToken, listedShopScope, simpleRateLimit } from '../http.js';
 import { productReviews, productReviewSummary } from '../reviews.js';
+// 节点内「综合」排序（成交 + 评价 + 新鲜度 + 店铺可信度）：纯计算在 src/productRank.js，
+// 路由只提供已拼好的公开可见性/筛选 WHERE 与作用域，不在这里复制第二份筛选逻辑。
+import { rankProductRows } from '../productRank.js';
 import { logAudit } from '../audit.js';
 import { notifyRaw } from '../webhook.js';
 import { roleOf, isStaff, isHost } from '../auth.js';
@@ -96,11 +99,13 @@ import { assertParsedJsonColumn, cleanLabel, normalizeTags, parseTagsColumn, tag
 // 商品参数（键值对）与商品级承诺（受控枚举 + 数字）—— **各自唯一实现**，两个写入入口共用
 import { attrPairOf, normalizeAttributes, parseAttributesColumn } from '../attributes.js';
 import { EMPTY_TERMS, normalizeTerms, parseTermsColumn } from '../productTerms.js';
+import { PAID_SALES_WHERE } from '../paidSales.js';
 // 主图区（图片 + 视频）的字节判据、上限与 URL 规则 —— **唯一实现**（与前端共用同一份常量）
 import {
   MAX_MEDIA_ITEMS,
   MAX_VIDEO_ITEMS,
   UPLOAD_URL_PREFIX,
+  firstMediaThumb,
   mediaUrlAllowed,
   normalizeMediaUrl,
 } from '../mediaKinds.js';
@@ -708,6 +713,42 @@ async function withSkus(row) {
   return { ...row, skus: await loadSkus(row.id) };
 }
 
+/**
+ * 公开销量：已支付件数，剔除全额退款、取消和自买。
+ *
+ * `committed` 是库存占用（含未付款草稿），不能拿来当销量；不限量商品也走这里。
+ * 列表用下面的一次 GROUP BY；单商品详情才逐行补。
+ */
+async function paidSalesMap(productIds) {
+  const ids = [...new Set(productIds.filter((id) => id != null))];
+  if (!ids.length) return new Map();
+  const marks = ids.map(() => '?').join(',');
+  const rows = await getDb().all(
+    `SELECT o.product_id AS pid, COALESCE(SUM(o.quantity), 0) AS qty
+       FROM v_orders o
+      WHERE o.product_id IN (${marks}) AND ${PAID_SALES_WHERE}
+      GROUP BY o.product_id`,
+    ...ids
+  );
+  return new Map(rows.map((r) => [Number(r.pid), Number(r.qty) || 0]));
+}
+
+async function withSalesBatch(rows) {
+  if (!rows.length) return rows;
+  const by = await paidSalesMap(rows.map((r) => r.id));
+  return rows.map((r) => ({ ...r, sales: by.get(Number(r.id)) ?? 0 }));
+}
+
+async function paidSalesOf(productId) {
+  const row = await getDb().get(
+    `SELECT COALESCE(SUM(o.quantity), 0) AS qty
+       FROM v_orders o
+      WHERE o.product_id = ? AND ${PAID_SALES_WHERE}`,
+    productId
+  );
+  return Number(row?.qty) || 0;
+}
+
 /** 解析商品的规格定义（`products.specs`，JSON 列；坏形状当作空数组，仅用于读旧行/历史快照） */
 function parseSpecsColumn(row) {
   const v = assertParsedJsonColumn(row?.specs, 'products.specs');
@@ -752,6 +793,7 @@ async function saveSkus(productId, skus) {
  *  行需先经 withSkus() 挂上 skus —— 本函数因此是 async（读 skus 要 await，见 withSkus）。 */
 async function rowToPublic(row) {
   const r = await withSkus(row);
+  const sales = r.sales == null ? await paidSalesOf(r.id) : Number(r.sales) || 0;
   const snap = snapshotObject(r);
   const priceCurrency = snap.price_currency;
   const unit = priceUnitOf(priceCurrency);
@@ -875,6 +917,8 @@ async function rowToPublic(row) {
     available: capacity === null ? null : Math.max(0, capacity - committed),
     capacity,
     committed,
+    /** 公开销量：已支付件数（剔除全额退款、取消、自买）；不限量也计 */
+    sales,
     outOfStock: skus.length > 0 && skus.every((s) => !s.active || (s.capacity !== null && s.available <= 0)),
     active: !!r.active,
     /*
@@ -1094,7 +1138,7 @@ function validateProduct(v) {
 
     - 上限（合计 ≤10 项、视频 ≤3）来自 `mediaKinds.js` —— 与前端预检**同一份常量**，
       不在两边各写一个数字；
-    - URL 规则走唯一判据 `mediaUrlAllowed`（http(s) 外链或本站 /api/uploads/…），
+    - URL 规则走唯一判据 `mediaUrlAllowed`（http(s) 外链或本站 `/api/uploads/<sha256>.<ext>`），
       与详情块图片同一条；图片允许外链（店主自备图床是既有能力），
       **视频只收本站上传**：外链视频会绕过"类型由字节判定"这条判据（服务端从没见过那些字节），
       而主图区视频要进快照、要长期可播，不该建立在别人图床挂不挂上；
@@ -1105,39 +1149,52 @@ function validateProduct(v) {
   if (!Array.isArray(v.media)) {
     errors.push('主图必须是数组（图片项或视频项）');
   } else {
-    if (v.media.length > MAX_MEDIA_ITEMS) errors.push(`主图区最多 ${MAX_MEDIA_ITEMS} 项（图片 + 视频合计）`);
-    let videos = 0;
-    media = v.media.slice(0, MAX_MEDIA_ITEMS).flatMap((raw) => {
-      const type = String(raw?.type || '');
-      const url = normalizeMediaUrl(raw?.url);
-      if (type === 'image') {
-        if (!url) return [];
-        if (!mediaUrlAllowed(url)) {
-          errors.push('图片地址仅支持网页外链或本站上传路径');
-          return [];
+    const seen = new Set();
+    media = v.media
+      .flatMap((raw) => {
+        const type = String(raw?.type || '');
+        const url = normalizeMediaUrl(raw?.url);
+        if (type === 'image') {
+          if (!url) return [];
+          if (!mediaUrlAllowed(url)) {
+            errors.push('图片地址仅支持网页外链或本站上传路径');
+            return [];
+          }
+          return [{ type: 'image', url }];
         }
-        return [{ type: 'image', url }];
-      }
-      if (type === 'video') {
-        videos += 1;
-        if (videos > MAX_VIDEO_ITEMS) {
-          errors.push(`视频最多 ${MAX_VIDEO_ITEMS} 个`);
-          return [];
+        if (type === 'video') {
+          if (!url.startsWith(UPLOAD_URL_PREFIX)) {
+            errors.push('视频仅支持上传到本站（不收外链视频）');
+            return [];
+          }
+          const poster = normalizeMediaUrl(raw?.poster);
+          if (!poster || !mediaUrlAllowed(poster)) {
+            errors.push('每个视频都要有封面图（上传时由浏览器抓首帧生成）');
+            return [];
+          }
+          return [{ type: 'video', url, poster }];
         }
-        if (!url.startsWith(UPLOAD_URL_PREFIX)) {
-          errors.push('视频仅支持上传到本站（不收外链视频）');
-          return [];
-        }
-        const poster = normalizeMediaUrl(raw?.poster);
-        if (!poster || !mediaUrlAllowed(poster)) {
-          errors.push('每个视频都要有封面图（上传时由浏览器抓首帧生成）');
-          return [];
-        }
-        return [{ type: 'video', url, poster }];
-      }
-      errors.push('主图条目只能是图片或视频');
-      return [];
-    });
+        errors.push('主图条目只能是图片或视频');
+        return [];
+      })
+      /*
+        同一 URL 只留第一次出现：媒体现在是内容寻址的（同一份字节 = 同一个 URL），
+        重复上传得到的两条记录没有任何展示语义；只允许一条，避免"同一张图出现两次"。
+        先归一再判上限——否则同图重复会把商品的 10 项额度白吃掉。
+      */
+      .filter((item) => {
+        const key = `${item.type}\u0000${item.url}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    if (media.length > MAX_MEDIA_ITEMS) {
+      errors.push(`主图区最多 ${MAX_MEDIA_ITEMS} 项（图片 + 视频合计）`);
+      media = media.slice(0, MAX_MEDIA_ITEMS);
+    }
+    if (media.filter((m) => m.type === 'video').length > MAX_VIDEO_ITEMS) {
+      errors.push(`视频最多 ${MAX_VIDEO_ITEMS} 个`);
+    }
   }
   const kind = String(v.kind ?? '');
   if (!['digital', 'physical', 'nft', 'erc20'].includes(kind)) errors.push('商品类型必须是数字、实物、NFT 或 ERC20');
@@ -1362,13 +1419,14 @@ function validateProduct(v) {
  *  可选 attr ：`参数名:值` 的**精确匹配**，与 tag 同一套口径（两侧都折成键，再拼成索引键
  *              `pair = nameKey + NUL + valueKey`，走多值索引 `attributes->'$[*].pair'`）。
  *              分隔符是**第一个**冒号（值里可以再出现冒号），三种失败都进 `attrError` 且结果为空。
- *  可选 order：asc（默认，保持既有行为）| desc（**最新上架优先**——聚合前端首屏
- *              必须用它，否则展示的是每家店最早上架的商品）
+ *  可选 sort ：newest（默认，id 倒序 = 最新上架优先）| oldest（id 升序）| composite（节点内
+ *              综合排序：成交 + 评价 + 新鲜度 + 店铺可信度，见 src/productRank.js）。
+ *              composite 的游标是 **offset**；newest/oldest 的游标是 id。
  *  可选 kind ：逗号分隔的商品类型分面（physical/digital/nft/erc20）。非法值**不静默**：
  *              进 `kindError` 且结果为空（与 tag/attr 同款三态——"没按类型过滤"/"参数写错了"
  *              /"没有这种商品"是三件事，混成一件会让 `?kind=digial` 拿到全站商品）。
  *
- *  四个过滤维度（q / tag / attr / kind）与光标分页、order **正交**：都是同一组 WHERE 条件，
+ *  四个过滤维度（q / tag / attr / kind）与分页、sort **正交**：都是同一组 WHERE 条件，
  *  每页都是过滤后的结果。
  *
  *  ⚠️ **目录面与店铺面是同一个端点的两个作用域**（2026-10-18 收口）：
@@ -1377,8 +1435,8 @@ function validateProduct(v) {
  *      返回 409，与商品详情看不了的理由同源）。旧实现只校验头、不按 `shop_code` 过滤，于是
  *      `/shop/<code>` 会显示同节点其它店的商品——页面身份与商品归属对不上。
  *
- *  游标语义：两种方向都以 id 为 keyset 游标，只是比较方向相反——
- *  asc 用 `id > cursor`、desc 用 `id < cursor`；cursor=0 表示首屏无游标。
+ *  游标语义：newest/oldest 以 id 为 keyset 游标，方向相反（`id < cursor` / `id > cursor`）；
+ *  composite 以 **offset** 为游标（排序键不是 id，keyset 无法直接表达）。`cursor=0` 表示首屏。
  *  `nextCursor` 仅在**确有下一页**时非空（多取一行做前瞻判定），
  *  调用方据此即可准确判断到底，无需再发一次空请求。 */
 const PRODUCT_KINDS = new Set(['digital', 'physical', 'nft', 'erc20']);
@@ -1388,7 +1446,15 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
   if (cursor > 100_000) return fail(res, '翻页位置过大：请改用筛选条件缩小范围', 1, 400);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
   const q = String(req.query.q ?? '').trim().slice(0, 60);
-  const order = String(req.query.order ?? '').toLowerCase() === 'desc' ? 'desc' : 'asc';
+  /*
+    排序是**一个枚举**，不是“order + 另一个开关”：newest/oldest 走 id keyset，
+    composite 走 offset（排序键不是 id）。非法值必须响亮拒绝——静默回退会让调用方
+    把“排序没生效”当成“综合排序就是这顺序”。
+  */
+  const sort = String(req.query.sort ?? 'newest').toLowerCase();
+  if (sort !== 'newest' && sort !== 'oldest' && sort !== 'composite') {
+    return fail(res, '排序只支持 newest / oldest / composite', 400, 400);
+  }
   /*
     `?kind=` 的**非法值与 tag/attr 同一套口径**（2026-10-16 收口）：
     此前这里是 `.filter((s) => PRODUCT_KINDS.has(s))` —— 认不出的值被**静默丢弃**，
@@ -1506,10 +1572,6 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
     where.push('shop_code = ?');
     args.push(String(req.shop.code));
   }
-  if (cursor > 0) {
-    where.push(order === 'desc' ? 'id < ?' : 'id > ?');
-    args.push(cursor);
-  }
   if (q) {
     /*
       LIKE 通配符转义（`ESCAPE '\\'`：MySQL 的字符串字面量里反斜杠要写两个，
@@ -1561,12 +1623,58 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
     args.push(...kinds);
   }
 
-  // 多取一行用于「是否还有下一页」的精确判定（避免满页到底时多一次空请求）
-  const raw = await db.all(`SELECT * FROM products WHERE ${where.join(' AND ')} ORDER BY id ${order === 'desc' ? 'DESC' : 'ASC'} LIMIT ?`, ...args, pageSize + 1);
-  const hasMore = raw.length > pageSize;
-  const rows = hasMore ? raw.slice(0, pageSize) : raw;
+  /*
+    composite 的排序键不是 id，keyset 游标无法直接表达（两个不同的分数之间没有可比
+    的“上一页边界”），所以它用 offset；newest/oldest 仍走 id keyset。两种游标都只在
+    **确有下一页**时非空，调用方不需要空请求试探。
+  */
+  let rows;
+  let nextCursor;
+  if (sort === 'composite') {
+    const ranked = await rankProductRows({
+      whereSql: where.join(' AND '),
+      args,
+      shopCode: req.shop?.code ?? null,
+      offset: cursor,
+      pageSize,
+      // 只缓存无筛选的默认流：筛选组合不可控，且默认流是首页/店铺页的热路径
+      cacheable:
+        !q &&
+        !tagKey &&
+        !attrPair &&
+        kinds.length === 0 &&
+        !priceCurrency &&
+        !reviewed &&
+        !tagError &&
+        !attrError &&
+        !kindError &&
+        !priceError &&
+        !reviewedError,
+    });
+    rows = ranked.rows;
+    nextCursor = ranked.nextCursor;
+  } else {
+    const newest = sort === 'newest';
+    const sqlWhere = [...where];
+    const sqlArgs = [...args];
+    if (cursor > 0) {
+      sqlWhere.push(`id ${newest ? '<' : '>'} ?`);
+      sqlArgs.push(cursor);
+    }
+    // 多取一行用于「是否还有下一页」的精确判定（避免满页到底时多一次空请求）
+    const raw = await db.all(
+      `SELECT * FROM products WHERE ${sqlWhere.join(' AND ')} ORDER BY id ${newest ? 'DESC' : 'ASC'} LIMIT ?`,
+      ...sqlArgs,
+      pageSize + 1
+    );
+    const hasMore = raw.length > pageSize;
+    rows = hasMore ? raw.slice(0, pageSize) : raw;
+    nextCursor = hasMore && rows.length ? rows[rows.length - 1].id : null;
+  }
 
-  const products = await Promise.all((await withSkusBatch(rows)).map((row) => rowToPublic(row)));
+  const withSkuRows = await withSkusBatch(rows);
+  const withSalesRows = await withSalesBatch(withSkuRows);
+  const products = await Promise.all(withSalesRows.map((row) => rowToPublic(row)));
   // 商品卡社会信号（P 评审 B12）：列表批量附评价聚合（一次 GROUP BY；avg/count 供卡片展示）
   if (rows.length) {
     const marks = rows.map(() => '?').join(',');
@@ -1585,7 +1693,6 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
       if (sm) p.reviewSummary = sm;
     }
   }
-  const last = hasMore && rows.length ? rows[rows.length - 1].id : null;
   const rates = await getRates();
   // 形状与 GET /api/rates 对齐：列表接口的 rates 一旦非空即代表可用，
   // 因此显式补 available:true（此前缺失该键，消费方按 RatesData 类型判断
@@ -1594,7 +1701,8 @@ router.get('/', publicProductListLimiter, listedShopScope, wrap(async (req, res)
     res,
     {
       products,
-      nextCursor: last,
+      nextCursor,
+      sort,
       rates: rates ? { available: true, ...rates } : null,
       // 本次实际生效的标签**键**（规范形，就是拿去做 `MEMBER OF` 匹配的那个字节）与未生效的原因：
       // 三态纪律——"没按标签过滤"（null）与"按标签过滤了但查不到"（key 非空、结果空）
@@ -1934,7 +2042,9 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
     }
   }
   // 池口径：poolBuilt=已建池资源总数（0=未建池，手动交付型）；poolUnused=未用数（0 且已建池=池空）
-  const products = await Promise.all((await withSkusBatch(rows)).map(async (r) => {
+  const withSkuRows = await withSkusBatch(rows);
+  const withSalesRows = await withSalesBatch(withSkuRows);
+  const products = await Promise.all(withSalesRows.map(async (r) => {
     const base = await rowToPublic(r);
     const alert = r.stock_alert_at;
     // 低库存：**任一组合**余量 ≤ 阈值即算（价格与库存逐组合不同，只看商品级汇总
@@ -2025,7 +2135,7 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
     args.push(like, like, like);
   }
   const rows = await getDb().all(
-    `SELECT p.id, p.slug, p.title, p.kind, p.price_currency, p.active, p.node_hidden, p.node_hidden_reason,
+    `SELECT p.id, p.slug, p.title, p.media, p.kind, p.price_currency, p.active, p.node_hidden, p.node_hidden_reason,
             p.node_hidden_at, p.deleted_at, p.deleted_reason, p.updated_at, p.shop_code, s.name AS shop_name, s.listed AS shop_listed,
             (SELECT MIN(k.price_micro) FROM product_skus k WHERE k.product_id = p.id) AS min_price
        FROM products p JOIN shops s ON s.code = p.shop_code
@@ -2040,6 +2150,15 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
     products: page.map((r) => ({
       slug: r.slug,
       title: r.title,
+      /**
+       * 列表缩略图（主图区第一项的图 URL，视频取封面）。
+       *
+       * 为什么由服务端给：列表只读一行文本时，节点主看不出"这件货长什么样"——
+       * 强制下架/删除要靠看图判断，而逐行再请求详情是 N+1。
+       * 值可能是 `/api/uploads/…` 相对路径（与商品 DTO 的其它媒体字段同一口径），
+       * 绝对化由前端按节点 origin 解析（`mediaSrc`）。
+       */
+      thumb: firstMediaThumb(parseMediaColumn(r.media)),
       kind: r.kind,
       shopCode: r.shop_code,
       shopName: shopDisplayName({ name: r.shop_name }),
@@ -2767,7 +2886,7 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
       const cm = prevSkus.get(s.key)?.committed || 0;
       if (s.capacity !== null && cm > s.capacity) {
         return abortTx({
-          fail: `组合「${s.key || '默认'}」总库存不能小于已占位/已售 ${cm} 件（销量随订单取消/退款/超时自动释放，编辑不释放）`,
+          fail: `组合「${s.key || '默认'}」总库存不能小于已占位 ${cm} 件（占用量含未支付草稿，取消/退款/超时后释放；编辑不释放）`,
         });
       }
     }

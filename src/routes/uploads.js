@@ -2,9 +2,9 @@
  * 商品媒体（主图区图片 + 视频）上传与读取。
  *
  *  POST /api/uploads          店主/操作员上传一段商品媒体（**请求体就是文件字节**，流式写入）
- *                             → { url:'/api/uploads/<file>', kind:'image'|'video', mime, size, sha256 }
- *  GET  /api/uploads/:name    公开读取（商品媒体本就是公开内容；文件名为随机 UUID，
- *                             不可枚举，等价于「知道链接即可访问」——公开商品图/视频不需要更强保密）。
+ *                             → { url:'/api/uploads/<sha256>.<ext>', kind:'image'|'video', mime, size, sha256 }
+ *  GET  /api/uploads/:name    公开读取（商品媒体本就是公开内容；文件名是内容的 sha256，
+ *                             不知道同一份字节就猜不出 URL——等价于「知道链接即可访问」）。
  *                             `res.sendFile` 自带 Range/206：视频拖动进度条不需要另写流式读取。
  *
  * 传输形状：**原始字节流**，不是 base64 JSON。
@@ -105,7 +105,7 @@ router.get(
     const hit = findMedia(req.params.name);
     if (!hit) return fail(res, '媒体不存在', 404, 404);
     res.setHeader('Content-Type', hit.mime);
-    // 文件名是随机 UUID、内容永不变化 → 可长缓存
+    // 文件名是内容哈希、内容永不变化 → 可长缓存
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     res.sendFile(hit.disk);
   })

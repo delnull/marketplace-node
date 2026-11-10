@@ -125,8 +125,8 @@ router.post('/orders/:orderNo/erase-pii', ownerOnly, erasePiiLimiter, wrap(async
     */
     residual: r.residual ?? null,
     /*
-      这一单是否**仍欠一次清理**（附件文件未删净）。它由内核的 `pii_cleanup_pending` 列回答，
-      而那一列现在只由**附件这一条腿**驱动（库内个人数据已随事务删除；日志侧的残留删不掉，
+      这一单是否**仍欠一次清理**（附件/评价图文件未删净）。它由内核的 `pii_cleanup_pending` 列回答，
+      而那一列由**磁盘附件 + 评价图待清理队列**共同驱动（库内个人数据已随事务删除；日志侧的残留删不掉，
       重试也没有意义，不参与 pending）。它是界面该看的那个结论，且三态同款：pending=true
       表示"已排队等下一轮重试"（候选判据里有 `OR pii_cleanup_pending = 1`），不是"永远不会重来"。
     */
@@ -250,9 +250,9 @@ router.post('/retention/run', hostOnly, retentionLimiter, wrap(async (req, res) 
   const message = r.disabled
     ? '自动擦除已关闭（MK_PII_RETENTION_DAYS=0）：本次未擦除任何数据；如需立即执行，请在请求体给出天数（如 {"days":180}）'
     : r.erased > 0
-      ? `已擦除 ${r.erased} 个终局订单的个人信息（资金流终结且静置 > ${r.days} 天）${r.truncated ? '；本次达到单轮上限，可再次运行处理剩余订单' : ''}${r.cleanupPending > 0 ? `；另有 ${r.cleanupPending} 单只擦了一半（附件文件未删净），已排队等待下一轮重试` : ''}`
+      ? `已擦除 ${r.erased} 个终局订单的个人信息（资金流终结且静置 > ${r.days} 天）${r.truncated ? '；本次达到单轮上限，可再次运行处理剩余订单' : ''}${r.cleanupPending > 0 ? `；另有 ${r.cleanupPending} 单只擦了一半（附件/评价图文件未删净），已排队等待下一轮重试` : ''}`
       : r.candidates > 0
-        ? `本次扫到 ${r.candidates} 单到期，但一单都没能擦干净（${r.cleanupPending} 单只擦了一半：附件文件未删净）——这些单仍欠清理，已排队等待下一轮重试；若是目录权限/文件占用，请先处理附件目录`
+        ? `本次扫到 ${r.candidates} 单到期，但一单都没能擦干净（${r.cleanupPending} 单只擦了一半：附件/评价图文件未删净）——这些单仍欠清理，已排队等待下一轮重试；若是目录权限/文件占用，请先处理附件目录`
         : `无到期订单（终局且静置 > ${r.days} 天的订单为 0）`;
   // 记下这次运行，供 2 秒内的重复请求复用（见文件上方说明）
   retentionLast = { at: Date.now(), days, data, message };

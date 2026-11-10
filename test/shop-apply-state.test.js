@@ -12,6 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
 import { makeCtx, login, assertOk } from './setup.mjs';
+import { newShopCode } from '../src/ids.js';
 
 const ctx = await makeCtx();
 const { app, request, db, owner } = ctx;
@@ -174,4 +175,30 @@ test('审批与再次提交并发：后到的申请一定 409，不会留下"已
   const shops = await db.get('SELECT code FROM shops WHERE seller = ?', wallet.address.toLowerCase());
   assert.ok(shops?.code);
   assert.equal((await shopsAs(token)).mine.shop.code, shops.code);
+});
+
+test('数据库唯一键：同一钱包在本节点不能插入第二家店（不经过申请路由）', async () => {
+  const wallet = Wallet.createRandom();
+  const seller = wallet.address.toLowerCase();
+  const first = newShopCode();
+  const second = newShopCode();
+  await db.run(
+    'INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, ?, ?, 1)',
+    first,
+    seller,
+    '唯一键第一家',
+    ''
+  );
+  await assert.rejects(
+    async () =>
+      await db.run(
+        'INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, ?, ?, 1)',
+        second,
+        seller,
+        '唯一键第二家',
+        ''
+      ),
+    /uq_shops_seller/,
+    '同一 seller 的第二行必须由库的唯一键拒绝，不能只靠申请路由'
+  );
 });

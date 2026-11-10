@@ -11,13 +11,11 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { Wallet } from 'ethers';
 import { makeCtx, login, assertOk, productPayload, shopRef, orderIdOf } from './setup.mjs';
 
-// 附件目录（独立临时目录；擦除用例要验证"磁盘文件真的没了"，不能用共享目录）
-process.env.MK_ATTACH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mk-pii-'));
+// 附件目录由 setup 按测试进程隔离（MK_ATTACH_DIR）；擦除用例要验证"磁盘文件真的没了"
 
 /*
   **保留期运行的结果复用窗口拉长到 60 秒**（默认 2 秒，见 config 的 PII_RETENTION_REUSE_MS）：

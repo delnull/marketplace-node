@@ -197,13 +197,13 @@ test('履约画像同源窗口：窗外创建、窗内确认的旧单不再污�
   ];
   const r = computeReputation(rows, now);
   assert.equal(r.windows.all.confirmed, 1);
-  assert.equal(r.windows.d30.orders, 0, '40 天前创建的订单不进 d30 分母');
+  assert.equal(r.windows.d30.escrowOrders, 0, '40 天前创建的订单不进 d30 分母');
   assert.equal(r.windows.d30.confirmed, 0, '其确认也不进 d30 分子（同源）——旧实现分子=1/分母=0 失真');
-  assert.equal(r.windows.d30.confirmRate, null);
-  assert.equal(r.windows.d90.orders, 1, '40 天在 d90/d365 窗口内（同源分母=分子）');
-  assert.equal(r.windows.d90.confirmRate, 1);
-  assert.equal(r.windows.d365.orders, 1);
-  assert.equal(r.windows.d365.confirmRate, 1, 'd365 窗口完整（同源 1/1）');
+  assert.equal(r.windows.d30.escrowConfirmRate, null);
+  assert.equal(r.windows.d90.escrowOrders, 1, '40 天在 d90/d365 窗口内（同源分母=分子）');
+  assert.equal(r.windows.d90.escrowConfirmRate, 1);
+  assert.equal(r.windows.d365.escrowOrders, 1);
+  assert.equal(r.windows.d365.escrowConfirmRate, 1, 'd365 窗口完整（同源 1/1）');
 });
 
 test('码池敏感读取入审计（code.read）且 detail 不含码原文', async () => {

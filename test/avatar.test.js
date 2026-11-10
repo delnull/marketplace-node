@@ -17,6 +17,11 @@ const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64'
 );
+/** 另一张合法 PNG：替换头像的用例必须换内容，否则内容寻址会返回同一个 URL（那正是去重语义） */
+const PNG2 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64'
+);
 
 const diskOf = (url) => `${uploadsDir()}/${String(url).split('/').pop()}`;
 
@@ -30,8 +35,20 @@ test('店铺头像：店主上传/替换/移除，旧文件同批删掉，公开
     .expect(200);
   assertOk(up);
   const url = up.body.data.avatarUrl;
-  assert.match(url, /^\/api\/uploads\/[0-9a-f-]{36}\.png$/);
+  assert.match(url, /^\/api\/uploads\/[0-9a-f]{64}\.png$/);
   assert.equal(fs.existsSync(diskOf(url)), true, '上传成功必须真的落盘');
+
+  // 同一份字节再传一次：内容寻址 ⇒ 同一个 URL，不产生第二份文件
+  const again = await request(app)
+    .post('/api/shop/avatar')
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('X-Mk-Shop', shopRef.value)
+    .set('Content-Type', 'image/png')
+    .send(PNG)
+    .expect(200);
+  assertOk(again);
+  assert.equal(again.body.data.avatarUrl, url, '同一份内容必须复用同一个文件');
+  assert.equal(fs.existsSync(diskOf(url)), true);
 
   const row = await db.get('SELECT avatar_url FROM shops WHERE code = ?', TEST_SHOP_CODE);
   assert.equal(row.avatar_url, url);
@@ -54,11 +71,11 @@ test('店铺头像：店主上传/替换/移除，旧文件同批删掉，公开
     .set('Authorization', `Bearer ${ownerToken}`)
     .set('X-Mk-Shop', shopRef.value)
     .set('Content-Type', 'image/png')
-    .send(PNG)
+    .send(PNG2)
     .expect(200);
   assertOk(up2);
   const url2 = up2.body.data.avatarUrl;
-  assert.notEqual(url2, url);
+  assert.notEqual(url2, url, '换一张图必须得到新的内容地址');
   assert.equal(fs.existsSync(diskOf(url)), false, '替换后旧头像文件必须删除');
   assert.equal(fs.existsSync(diskOf(url2)), true);
 
@@ -80,7 +97,7 @@ test('节点头像：节点主可上传/移除，公开 DTO 带上；员工与�
     .expect(200);
   assertOk(up);
   const url = up.body.data.avatarUrl;
-  assert.match(url, /^\/api\/uploads\/[0-9a-f-]{36}\.png$/);
+  assert.match(url, /^\/api\/uploads\/[0-9a-f]{64}\.png$/);
 
   const row = await db.get('SELECT avatar_url FROM node WHERE id = 1');
   assert.equal(row.avatar_url, url);

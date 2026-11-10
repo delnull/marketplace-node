@@ -37,6 +37,9 @@
  */
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { after } from 'node:test';
 import mysql from 'mysql2/promise';
 import { Wallet } from 'ethers';
@@ -49,6 +52,19 @@ import request from 'supertest';
 const OWN_DB_NAME = `mk_test_${process.pid}_${randomBytes(4).toString('hex')}`;
 process.env.MK_DB_NAME = process.env.MK_DB_NAME || OWN_DB_NAME;
 const ownsDbName = process.env.MK_DB_NAME === OWN_DB_NAME;
+
+/**
+ * 每个测试进程一份**独立**的上传/附件根目录。
+ *
+ * 媒体文件名 = 内容的 sha256（同字节 = 同文件）：若继续共用 `node/uploads`，两个并行测试进程
+ * （各自一个库，互相看不见对方的引用）里只要有一个删文件，就会把另一个正在用的同名文件删掉。
+ * 目录形状与生产一致：`MK_ATTACH_DIR=<root>/attachments` ⇒ uploads 在 `<root>/uploads`。
+ * 跑完在 after 里整棵删掉，不在仓库里留下上传产物。
+ */
+const TEST_MEDIA_ROOT = process.env.MK_ATTACH_DIR
+  ? ''
+  : fs.mkdtempSync(path.join(os.tmpdir(), `mk-test-media-${process.pid}-`));
+if (TEST_MEDIA_ROOT) process.env.MK_ATTACH_DIR = path.join(TEST_MEDIA_ROOT, 'attachments');
 
 /** 本进程的库与连接参数：建库前填上（没建过库就没有可清的）；见 dropTestDatabase */
 let testDb = null;
@@ -257,6 +273,13 @@ async function dropTestDatabase() {
   （runner 本来就传 --test-force-exit）。
 */
 after(async () => {
+  if (TEST_MEDIA_ROOT) {
+    try {
+      fs.rmSync(TEST_MEDIA_ROOT, { recursive: true, force: true });
+    } catch {
+      /* 临时目录删不掉不影响测试结论 */
+    }
+  }
   if (!testDb) return;
   await dropTestDatabase();
   process.exit(process.exitCode ?? 0);
@@ -272,6 +295,13 @@ after(async () => {
   这一步失败一律静默——进程正在退出，告警也未必有人看，而它本来就是兜底。
 */
 process.on('exit', () => {
+  if (TEST_MEDIA_ROOT) {
+    try {
+      fs.rmSync(TEST_MEDIA_ROOT, { recursive: true, force: true });
+    } catch {
+      /* 进程正在退出，忽略 */
+    }
+  }
   if (dropState !== 'idle' || !testDb) return;
   dropState = 'running';
   const { name, host, port, user, password } = testDb;

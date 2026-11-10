@@ -65,7 +65,7 @@ import { getDb, withTransaction, abortTx, serverCapabilities } from './db.js';
 import { logAudit } from './audit.js';
 import { orderAttachDir, removeOrderAttachments } from './evidenceFiles.js';
 import { clearReviewImages } from './reviews.js';
-import { removeMediaByUrl } from './productMedia.js';
+import { removeMediaUrls } from './mediaSweep.js';
 // 节点主地址（`node.owner`）：保留期扫描的审计主体
 import { nodeOwner } from './shops.js';
 // 状态集合的唯一出处（见下方再导出说明）：本文件内部要用，所以先 import 再 export
@@ -371,11 +371,23 @@ export async function eraseOrderPii(orderNo) {
     await db.run('UPDATE orders SET evidence_bytes = 0 WHERE id = ? AND evidence_bytes != 0', orderId);
     /*
       评价图同样可能是个人信息（人像/住址/聊天截图）。正文按既有口径保留，
-      图片 URL 从评价行移除并在提交后删盘；先落库再删文件，避免回滚后只剩悬空 URL。
+      图片 URL 从评价行移除；提交后按**全库引用**决定是否删盘（共享文件保留）。
+      先落库再删文件，避免回滚后只剩悬空 URL。
+
+      同时把 URL 放进 `pii_pending_media`（同一事务）：删盘在 COMMIT 之后，
+      进程若在"库已清、盘未删"之间崩溃，这张表就是下一轮重试的唯一线索——
+      光靠 `reviews.images=[]` 是找不回那些 URL 的。
     */
     const reviewImages = await clearReviewImages(orderId);
     reviewImageUrls = reviewImages.urls;
-    counts.reviewImages = reviewImageUrls.length;
+    for (const url of reviewImageUrls) {
+      await db.run('INSERT IGNORE INTO pii_pending_media (order_id, url) VALUES (?, ?)', orderId, url);
+    }
+    // 已有历史待清理项（上一次没删干净）也要把 pending 标志点亮，候选 SQL 才会重试
+    const pending = await db.get('SELECT COUNT(*) AS c FROM pii_pending_media WHERE order_id = ?', orderId);
+    if (Number(pending.c) > 0) {
+      await db.run('UPDATE orders SET pii_cleanup_pending = 1 WHERE id = ?', orderId);
+    }
     return null; // 事务里该做的都做了：下面的磁盘删除必须在 COMMIT 之后
   });
   if (refusal) return refusal;
@@ -386,8 +398,41 @@ export async function eraseOrderPii(orderNo) {
   */
   const attachmentFiles = removeAttachmentsFromDisk(orderId);
   counts.attachmentFiles = attachmentFiles.removed;
-  // 评价图在事务里已清 URL；文件删除放在提交后，删不掉的孤儿由媒体清扫兜底。
-  counts.reviewImages = reviewImageUrls.filter((u) => removeMediaByUrl(u)).length;
+  /*
+    评价图：先从工作队列读出待删 URL（首次擦除时刚插进去；重试时是上次失败留下的），
+    再按**全库引用**删除。删成功/已不存在/仍被别处引用 ⇒ 从队列移除；
+    仍删不掉（权限/占用/引用查询失败）⇒ 留在队列，下一轮接着试。
+  */
+  let reviewMediaFailed = 0;
+  try {
+    const pendingRows = await db.all('SELECT url FROM pii_pending_media WHERE order_id = ? ORDER BY id ASC', orderId);
+    const urls = [...new Set([...reviewImageUrls, ...pendingRows.map((r) => r.url)])];
+    if (urls.length) {
+      const result = await removeMediaUrls(urls);
+      counts.reviewImages = result.removed;
+      const done = urls.filter((u) => !result.failed.includes(u));
+      if (done.length) {
+        await db.run(
+          `DELETE FROM pii_pending_media WHERE order_id = ? AND url IN (${done.map(() => '?').join(',')})`,
+          orderId,
+          ...done
+        );
+      }
+      const left = await db.get('SELECT COUNT(*) AS c FROM pii_pending_media WHERE order_id = ?', orderId);
+      // 以**队列里实际还剩几条**为准（含删除语句静默没命中的情况），不只信本次的 failed 列表
+      reviewMediaFailed = Math.max(Number(left.c) || 0, result.failed.length);
+    }
+  } catch (e) {
+    // 引用查询/删盘本身失败：队列一行也不动，全部留到下一轮重试
+    console.error(`[pii] 评价图清理失败（已留在 pii_pending_media 等下一轮）：${e?.message || e}`);
+    try {
+      const pending = await db.get('SELECT COUNT(*) AS c FROM pii_pending_media WHERE order_id = ?', orderId);
+      reviewMediaFailed = Math.max(1, Number(pending.c) || 0);
+    } catch {
+      // 连计数都读不到：按"仍有待清理"处理，不能报干净
+      reviewMediaFailed = 1;
+    }
+  }
   /*
     ── 附件删盘失败**不算擦干净**（2026-10-14 审计修订：旧判据是死代码）──────────────
     旧实现把判据写成 `!attachmentFiles.ok && attachmentFiles.failed > 0`，而
@@ -410,22 +455,28 @@ export async function eraseOrderPii(orderNo) {
     根因是判据挂错了层——"还欠一次清理"是**工作状态**，不是时间锚点能表达的东西。
     现在两者分开、各司其职：
       · `pii_erased_at` = "库内这批个人数据已擦"（时间锚点，供保留期去重与排序）；
-      · `pii_cleanup_pending` = "这一单还有没清完的清理工作"——**只剩磁盘附件这一条腿**
-        （库服务器侧的残留随 InnoDB 一起成为"删不掉"的那一类，见 residualReport：重试也没有意义）。
-    保留期候选判据里加上 `OR pii_cleanup_pending = 1`，于是"下一轮扫描会重试"变成真的，
-    而且是**有界的一次**（清干净即置 0，不再反复入选）。
+      · `pii_cleanup_pending` = "这一单还有没清完的清理工作"——**磁盘附件 + 评价图**
+        （评价图的待删 URL 在 `pii_pending_media`，库服务器侧残留仍不在重试范围，
+        见 residualReport：那一段重试也没有意义）。
+    保留期候选判据里加上 `OR pii_cleanup_pending = 1`（以及待清理队列存在即重试），
+    于是"下一轮扫描会重试"变成真的；清干净即置 0，不再反复入选。
   */
-  const clean = !diskFailed;
+  const clean = !diskFailed && reviewMediaFailed === 0;
+  const reasons = [];
+  if (attachmentFiles.remaining < 0) {
+    reasons.push('附件目录无法读取（权限/挂载异常），无法确认磁盘上的附件是否已删除');
+  } else if (attachmentFiles.remaining > 0) {
+    reasons.push(`附件索引已清空，但磁盘上还剩 ${attachmentFiles.remaining} 个文件未删除（目录权限/文件被占用）`);
+  }
+  if (reviewMediaFailed > 0) {
+    reasons.push(`评价图还有 ${reviewMediaFailed} 个待删 URL 未清理（权限/占用或引用查询失败），已留在待清理队列`);
+  }
   await db.run('UPDATE orders SET pii_cleanup_pending = ? WHERE id = ?', clean ? 0 : 1, orderId);
   return {
     ok: clean,
     error: clean
       ? undefined
-      : `${
-          attachmentFiles.remaining < 0
-            ? '附件目录无法读取（权限/挂载异常），无法确认磁盘上的附件是否已删除'
-            : `附件索引已清空，但磁盘上还剩 ${attachmentFiles.remaining} 个文件未删除（目录权限/文件被占用）`
-        }——已记为待清理，下一轮保留期扫描会重试（也可再次调用本接口立即重试）`,
+      : `${reasons.join('；')}——已记为待清理，下一轮保留期扫描会重试（也可再次调用本接口立即重试）`,
     // 对外回的是**订单号**（调用方手里那个），内部键只用于子表与磁盘目录
     orderNo: no,
     status: order.status,
@@ -532,9 +583,9 @@ async function runPiiRetentionInner({ days, now, limit }) {
   let examined = 0;
   /**
    * 本轮"库内已擦、但还有没清完的清理工作"的单数（见 eraseOrderPii 的 pending 分支）：
-   * 现在只剩磁盘附件一条腿（库服务器侧的残留节点删不掉、重试也没有意义）。
-   * 它们**不是"永远不会重来"**——候选判据里有 `OR pii_cleanup_pending = 1`，
-   * 所以每一轮扫描都会把它们排在队首重试（`ORDER BY` 那一项）。
+   * 现在有**磁盘附件 + 评价图**两条腿（库服务器侧的残留节点删不掉、重试也没有意义）。
+   * 它们**不是"永远不会重来"**——候选判据里有 `OR pii_cleanup_pending = 1`
+   * 以及 `pii_pending_media` 存在即重试，所以每一轮扫描都会把它们排在队首重试。
    */
   let diskFailed = 0;
   let cleanupPending = 0;
@@ -548,8 +599,9 @@ async function runPiiRetentionInner({ days, now, limit }) {
   while (examined < limit) {
     const rows = await db.all(
       `SELECT order_no, shop_code FROM v_orders o WHERE status IN (${ERASABLE_MARKS}) AND ${AFTER_SALE_NOT_OPEN_SQL} ` +
-        `AND ${ACTIVE_CLAIM_SQL} AND (${AGE_SQL} <= ? OR pii_cleanup_pending = 1) ` +
-        `ORDER BY (pii_cleanup_pending = 1) DESC, ${AGE_SQL} ASC LIMIT ?`,
+        `AND ${ACTIVE_CLAIM_SQL} AND (${AGE_SQL} <= ? OR pii_cleanup_pending = 1 ` +
+        `OR EXISTS (SELECT 1 FROM pii_pending_media pm WHERE pm.order_id = o.order_id)) ` +
+        `ORDER BY (pii_cleanup_pending = 1 OR EXISTS (SELECT 1 FROM pii_pending_media pm WHERE pm.order_id = o.order_id)) DESC, ${AGE_SQL} ASC LIMIT ?`,
       ...PII_ERASABLE_STATUS,
       cutoff,
       RETENTION_BATCH
@@ -636,7 +688,7 @@ const retentionStatus = {
   lastScanned: 0,
   lastErased: 0,
   lastDiskFailed: 0,
-  /** 仍欠清理的单数（只剩磁盘附件这一条腿）：它们每轮都会被重试，运维据此判断"清目录"这件事做完没有 */
+  /** 仍欠清理的单数（磁盘附件 + 评价图待清理队列）：它们每轮都会被重试，运维据此判断"清目录"这件事做完没有 */
   lastCleanupPending: 0,
   lastCounts: null,
 };
@@ -673,13 +725,13 @@ export function startPiiRetentionSweep() {
       retentionStatus.lastCounts = r.counts || null;
       /*
         "库内已擦、但还有没清完的清理工作"是**半成功**，不能报绿。
-        现在这条只剩磁盘附件一条腿（库服务器侧的残留删不掉）。这些单会被下一轮重试
+        现在这条有**磁盘附件 + 评价图**两条腿（库服务器侧的残留删不掉）。这些单会被下一轮重试
         （候选判据里有 `OR pii_cleanup_pending = 1`），所以这里写的是"还剩几单待清"，
         而不是"再也不会重来"。
       */
       retentionStatus.lastError =
         retentionStatus.lastCleanupPending > 0
-          ? `有 ${retentionStatus.lastCleanupPending} 单的个人信息还没清完（附件文件未删净）——已排队等待下一轮重试；若是目录权限/占用导致，请一并处理`
+          ? `有 ${retentionStatus.lastCleanupPending} 单的个人信息还没清完（附件/评价图文件未删净）——已排队等待下一轮重试；若是目录权限/占用导致，请一并处理`
           : null;
       if (r.erased > 0) {
         console.log(`[pii] 保留期擦除：${r.erased} 个终局订单（静置 > ${r.days} 天）的收货信息/备注/陈述正文/证据附件已擦除`);

@@ -147,15 +147,50 @@ export function mediaExt(mime) {
 }
 
 /**
- * 商品媒体 URL 规则（**唯一判据**）：只接受 http(s) 外链或本站上传路径。
+ * 存储名的扩展名并集（`png|jpg|webp|gif|mp4|webm`）。
+ * 扫描引用面与文件名校验共用这一份，改 `MEDIA` 表即改这里。
+ */
+export const STORED_EXT_PATTERN = [...new Set(PRODUCT_MEDIA_MIMES.map((m) => mediaExt(m)))].join('|');
+
+/** sha256.(png|jpg|webp|gif|mp4|webm) → 内容地址白名单（文件名就是内容的哈希） */
+export const STORED_NAME_RE = new RegExp(`^[0-9a-f]{64}\\.(?:${STORED_EXT_PATTERN})$`);
+
+/**
+ * 对外 URL → 存储名（`/api/uploads/<sha256>.<ext>`）。形状不合法返回 null。
+ *
+ * 这是"什么算一个本节点媒体 URL"的**唯一实现**：商品读取、头像与评价图的写入口、
+ * 孤儿清扫的引用正则都从这里派生——各自写一份 UUID/哈希正则是上一版漂移的来源。
+ */
+export function storedMediaNameOf(url) {
+  const v = String(url ?? '').trim();
+  if (!v.startsWith(UPLOAD_URL_PREFIX)) return null;
+  const name = v.slice(UPLOAD_URL_PREFIX.length);
+  if (!name || name.includes('/')) return null;
+  return STORED_NAME_RE.test(name) ? name : null;
+}
+
+/** 存储名的媒体种类（image/video）；形状不合法返回 null。用于"头像/评价图只收图片"的写入口 */
+export function storedMediaKindOf(name) {
+  const base = String(name || '');
+  if (!STORED_NAME_RE.test(base)) return null;
+  const ext = base.slice(base.lastIndexOf('.') + 1);
+  const mime = PRODUCT_MEDIA_MIMES.find((m) => mediaExt(m) === ext);
+  return mime ? MEDIA[mime].kind : null;
+}
+
+/**
+ * 商品媒体 URL 规则（**唯一判据**）：只接受 http(s) 外链或本站的**存储名** URL
+ * （`/api/uploads/<sha256>.<ext>`）。
  *
  * 为什么必须收口：`javascript:` / `data:` 这类 scheme 一旦进入未来的富文本或别的渲染上下文
  * 就可能被利用（当前 `<img>`/`<video>` 的 src 上下文执行面≈0，但判据不该依赖"当前怎么渲染"）。
- * 商品主图、详情块图片走的是同一个函数——同一条规则只有一处。
+ * 本站路径还必须通过 `storedMediaNameOf`：媒体读取端只认内容地址，写进商品的
+ * `/api/uploads/任意串` 只会变成永久裂图。商品主图、详情块图片、规格图走的是同一个函数。
  */
 export function mediaUrlAllowed(url) {
   const u = String(url || '').trim();
-  return /^https?:\/\//i.test(u) || u.startsWith(UPLOAD_URL_PREFIX);
+  if (/^https?:\/\//i.test(u)) return true;
+  return !!storedMediaNameOf(u);
 }
 
 /** 校验结果里的 URL 归一（trim + 截断），与 `mediaUrlAllowed` 配套使用 */

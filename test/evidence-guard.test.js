@@ -19,14 +19,10 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { makeCtx, login, assertOk, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
 let setChainOrderFetcher;
 
-// 附件目录（擦除用例要验证"磁盘真的动过"；独立临时目录避免与他人共享）
-process.env.MK_ATTACH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mk-evguard-'));
+// 附件目录由 setup 按测试进程隔离（MK_ATTACH_DIR）
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;

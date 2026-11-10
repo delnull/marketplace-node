@@ -42,7 +42,19 @@ export declare function sniffMediaMime(buf: Uint8Array | number[]): string | nul
 /** MIME → 存储扩展名（表里没有的类型返回 null） */
 export declare function mediaExt(mime: string): string | null;
 
-/** 商品媒体 URL 规则（http(s) 外链或本站上传路径） */
+/** 存储名扩展名的并集（`png|jpg|webp|gif|mp4|webm`） */
+export declare const STORED_EXT_PATTERN: string;
+
+/** `<sha256>.<ext>` 存储名白名单 */
+export declare const STORED_NAME_RE: RegExp;
+
+/** 对外 URL → 存储名（`/api/uploads/<sha256>.<ext>`）；形状不合法返回 null */
+export declare function storedMediaNameOf(url: unknown): string | null;
+
+/** 存储名的媒体种类；形状不合法返回 null */
+export declare function storedMediaKindOf(name: unknown): MediaKind | null;
+
+/** 商品媒体 URL 规则（http(s) 外链或本站存储名 URL） */
 export declare function mediaUrlAllowed(url: unknown): boolean;
 
 /** URL 归一（trim + 截断） */

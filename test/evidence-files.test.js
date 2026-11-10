@@ -4,13 +4,11 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { Wallet } from 'ethers';
 import { makeCtx, login, assertOk, productPayload, shopRef, orderIdOf } from './setup.mjs';
 
-// 附件目录（独立临时目录，结束清理）；仲裁人地址（下载矩阵 disputed 场景）
-process.env.MK_ATTACH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mk-att-'));
+// 附件目录由 setup 按测试进程隔离（MK_ATTACH_DIR），不再各自建临时目录
 const arbiter = Wallet.createRandom();
 // 2026-10-18：仲裁人不再是单个环境变量，改为链上当前届名单（测试注入取值）
 
@@ -136,6 +134,76 @@ test('买家上传 PNG 附件成功：sha256/时间线 files 元数据/本人可
     .get(`/api/orders/${order.id}/evidence/${evId}/files/${ev.files[0].id}`)
     .set('Authorization', `Bearer ${strangerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(404);
+});
+
+test('同一订单内同 sha256 的附件复用同一个磁盘文件；跨订单不共享', async () => {
+  const p = await listProduct(productPayload({ kind: 'physical', title: '附件内容复用' }));
+  const order = await createDraft(p.slug);
+  await escrowed(order);
+  assert.equal(await applyEvent('RefundRequested', { orderId: order.escrowOrderId }), 1);
+  await submitEvidence(order.id, { phase: 'refund_request', content: '第一段' }, buyerToken);
+  const ev1 = await latestEvidenceId(order.id);
+
+  const png = pngBytes(5, 16);
+  const up1 = await uploadFiles(
+    order.id,
+    ev1,
+    [{ name: 'a.png', mime: 'image/png', dataB64: b64(png) }],
+    buyerToken
+  );
+  assertOk(up1);
+
+  // 第二条陈述再传同一份字节：复用第 1 行的 stored_name
+  await submitEvidence(order.id, { phase: 'refund_request', content: '第二段' }, buyerToken);
+  const ev2 = await latestEvidenceId(order.id);
+  const up2 = await uploadFiles(
+    order.id,
+    ev2,
+    [{ name: 'b.png', mime: 'image/png', dataB64: b64(png) }],
+    buyerToken
+  );
+  assertOk(up2);
+  assert.equal(up2.body.data.uploaded[0].sha256, up1.body.data.uploaded[0].sha256);
+
+  const internal = await orderIdOf(db, order.id);
+  let rows = await db.all('SELECT stored_name FROM evidence_files WHERE order_id = ? ORDER BY id ASC', internal);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].stored_name, rows[1].stored_name, '同一订单内同内容复用同一个磁盘名');
+  assert.equal(fs.readdirSync(orderAttachDir(internal)).length, 1, '磁盘上只有一份');
+
+  // 同一批里重复传同一份内容：两行、同一个名字、仍然一份文件
+  const batch = await uploadFiles(
+    order.id,
+    ev2,
+    [
+      { name: 'c.png', mime: 'image/png', dataB64: b64(png) },
+      { name: 'd.png', mime: 'image/png', dataB64: b64(png) },
+    ],
+    buyerToken
+  );
+  assertOk(batch);
+  assert.equal(batch.body.data.uploaded.length, 2);
+  rows = await db.all('SELECT stored_name FROM evidence_files WHERE order_id = ? ORDER BY id ASC', internal);
+  assert.equal(new Set(rows.map((r) => r.stored_name)).size, 1, '整单只指向同一个磁盘名');
+  assert.equal(fs.readdirSync(orderAttachDir(internal)).length, 1);
+
+  // 跨订单不共享：另一单同样字节落在自己的目录（附件删除按订单整目录，不能共享）
+  const p2 = await listProduct(productPayload({ kind: 'physical', title: '附件内容复用二' }));
+  const order2 = await createDraft(p2.slug);
+  await escrowed(order2);
+  assert.equal(await applyEvent('RefundRequested', { orderId: order2.escrowOrderId }), 1);
+  await submitEvidence(order2.id, { phase: 'refund_request', content: '另一单' }, buyerToken);
+  const ev3 = await latestEvidenceId(order2.id);
+  const up3 = await uploadFiles(
+    order2.id,
+    ev3,
+    [{ name: 'a.png', mime: 'image/png', dataB64: b64(png) }],
+    buyerToken
+  );
+  assertOk(up3);
+  const internal2 = await orderIdOf(db, order2.id);
+  assert.notEqual(orderAttachDir(internal), orderAttachDir(internal2));
+  assert.equal(fs.readdirSync(orderAttachDir(internal2)).length, 1);
 });
 
 test('白名单与魔数校验：html/svg/伪装拒绝；越权与终局门控', async () => {

@@ -1462,6 +1462,13 @@ const SCHEMA_DDL = `
     code          CHAR(9) NOT NULL,                     -- 本节点铸造：8 位数据 + 1 位加权校验
     seller        CHAR(42) NOT NULL,                    -- 店主钱包（小写）= 订单的 seller
     name          VARCHAR(60) NOT NULL DEFAULT '',
+    /*
+      后台店铺搜索列：店名/编号/店主地址的规范化拼接，供 ngram FULLTEXT 使用。
+      用 STORED 生成列而不是应用层维护：直接 SQL 插入（测试/运维）也不会漏；
+      ai_ci 让 ngram 词元同时忽略大小写与重音（Café / cafe）。
+    */
+    search_text   VARCHAR(200) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+                  GENERATED ALWAYS AS (LOWER(CONCAT_WS(' ', name, code, seller))) STORED,
     notice        VARCHAR(500) NOT NULL DEFAULT '',
     /* 本店谈信地址（公开客服联系方式）；形状与保存口径见 node 表的同名列说明 */
     tanxin_address VARCHAR(64) NULL,
@@ -1488,6 +1495,7 @@ const SCHEMA_DDL = `
     */
     UNIQUE KEY uq_shops_seller (seller),
     KEY idx_shops_listed (listed, code),
+    FULLTEXT KEY ft_shops_search (search_text) WITH PARSER ngram,
     CONSTRAINT ck_shops_code_upper CHECK (code = UPPER(code)),
     CONSTRAINT ck_shops_seller_lower CHECK (seller = LOWER(seller)),
     CONSTRAINT ck_shops_listed_bool CHECK (listed IN (0, 1))
@@ -1769,7 +1777,7 @@ const SCHEMA_DDL = `
     invoice_needed TINYINT(1) NOT NULL DEFAULT 0,
     -- 个人信息擦除的记账
     pii_erased_at DATETIME(3) NULL,
-    pii_cleanup_pending TINYINT(1) NOT NULL DEFAULT 0,  -- 1 = 还欠一次清理（附件文件未删净）
+    pii_cleanup_pending TINYINT(1) NOT NULL DEFAULT 0,  -- 1 = 还欠一次清理（附件/评价图文件未删净）
     /*
       证据附件的**订单级**累计字节数（计数器，不是"插行前 SUM 一次"）。
       为什么必须有这一列：dispute_evidence 上的计数器只管**一条陈述**（≤6 件 / ≤20MB），
@@ -2228,13 +2236,14 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     CONSTRAINT ck_evidence_quota CHECK (file_count <= 6 AND file_bytes <= 20971520)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
-  /* 证据附件（白名单 png/jpeg/webp/pdf；单文件 ≤2MB；磁盘名 uuid 隔离，sha256 存证） */
+  /* 证据附件（白名单 png/jpeg/webp/pdf；单文件 ≤2MB；磁盘名 uuid 隔离，sha256 存证）
+     同一订单内相同 sha256 复用同一个磁盘文件（跨订单不共享，见 evidenceFiles.js 文件头）。 */
   CREATE TABLE IF NOT EXISTS evidence_files (
     id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     evidence_id  BIGINT UNSIGNED NOT NULL,
     order_id     BIGINT UNSIGNED NOT NULL,
     filename     VARCHAR(120) NOT NULL,                 -- 原始文件名（清洗后，仅展示）
-    stored_name  VARCHAR(64) NOT NULL,                  -- uuid.安全扩展名（磁盘名，与原始名隔离）
+    stored_name  VARCHAR(64) NOT NULL,                  -- uuid.安全扩展名（同订单同内容复用同一个名字）
     mime         VARCHAR(64) NOT NULL,
     size         INT UNSIGNED NOT NULL,
     sha256       CHAR(64) NOT NULL,
@@ -2242,8 +2251,24 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     PRIMARY KEY (id),
     KEY idx_evidence_files_ev (evidence_id),
     KEY idx_evidence_files_order (order_id),
+    KEY idx_evidence_files_sha (order_id, sha256),
     CONSTRAINT fk_evidence_files_evidence FOREIGN KEY (evidence_id) REFERENCES dispute_evidence (id) ON DELETE CASCADE,
     CONSTRAINT fk_evidence_files_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+
+  /*
+    PII 擦除时**没删掉**的媒体 URL（工作队列，不是引用面）：
+    评价图 URL 先从 reviews 行移除，若文件删不掉就留在这里等下一轮重试；
+    媒体清扫**不看这张表**——否则待删文件会被当成"仍被引用"而永远删不掉。
+  */
+  CREATE TABLE IF NOT EXISTS pii_pending_media (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    order_id    BIGINT UNSIGNED NOT NULL,
+    url         VARCHAR(255) NOT NULL,
+    created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_pii_pending_media (order_id, url),
+    CONSTRAINT fk_pii_pending_media_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
   /* 买家评价（一单一评 + 店主单次回复） */
@@ -2254,7 +2279,7 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     buyer         CHAR(42) NOT NULL,
     rating        TINYINT UNSIGNED NOT NULL,
     content       VARCHAR(1000) NOT NULL DEFAULT '',
-    /* 评价图（最多 3 张；节点相对 URL /api/uploads/<uuid>.<ext>）。 */
+    /* 评价图（最多 3 张；节点相对 URL /api/uploads/<sha256>.<ext>）。 */
     images        JSON NOT NULL DEFAULT ('[]'),
     /* 追评（一次；可带图）。followup_at IS NULL = 还没追评。 */
     followup_content VARCHAR(1000) NOT NULL DEFAULT '',

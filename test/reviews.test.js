@@ -156,6 +156,11 @@ test('商品评价列表聚合（count/avg/dist）与匿名短地址；详情带
   assert.equal(total, 3);
   assert.equal(summary.count, 3);
   assert.equal(summary.avg, 4.3, '平均分保留 1 位');
+  /*
+    评价带**下单时**的规格快照：默认规格的契约形状是 `{规格:'默认'}`（见 orderToPublic.skuSpecs）。
+    老数据没有快照时是 `{}`，界面不显示——这里钉住"接口不会拿商品当前规格补"。
+  */
+  assert.deepEqual(items[0].specs, { 规格: '默认' }, '评价列表带下单时的规格快照');
   // 聚合只给 count/avg：界面用不到星级分布，多算一次 GROUP BY 没有意义
   assert.ok(!('dist' in summary), '聚合不下发星级分布');
   assert.equal(items.length, 3);

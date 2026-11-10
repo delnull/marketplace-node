@@ -213,14 +213,14 @@ export function createApp() {
       */
       res.setHeader('Cache-Control', 'no-store');
     } else if (
-      // 公开只读端点（商品/店铺/汇率/履约画像/店铺评价）：不含隐私字段，
+      // 公开只读端点（商品/店铺/汇率/履约画像/店铺评价/批量店铺统计）：不含隐私字段，
       // 允许共享缓存 30s + 后台续期 60s。联邦前端一次首页会向 N 个节点各打 3~4 个
       // 这类请求——节点无任何服务端缓存（reputation 每次全表重算），缓存收益明显。
       // 明确排除 /api/arbitration/pending（含完整买卖双方地址）与 /api/products/all（staff）。
       // Vary: Origin —— cors 反射请求 Origin，共享缓存必须按 Origin 分桶，
       // 否则会把 A 站的 ACAO 响应喂给 B 站导致跨域被浏览器拦截。
       req.method === 'GET' &&
-      /^\/(api\/(products(\/[^/]+)?|shop(\/(reputation|reviews\/stats))?|rates))$/.test(req.path || '')
+      /^\/(api\/(products(\/[^/]+)?|shop(\/(reputation|reviews\/stats))?|shops\/stats|rates))$/.test(req.path || '')
     ) {
       res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
       /*

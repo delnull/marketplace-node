@@ -398,7 +398,9 @@ export async function operatedShopCodes(address, { force = false } = {}) {
     `UNION`（不是 `UNION ALL`）是**判据的一部分**：同一个地址同时是某店的 seller 又被写进
     该店店员名单时，重复的一行会让"只经营一家店"被数成两家——于是那家店唯一的店主
     在没有请求头时反而收到"请指明哪一家"的 400。去重让"集合大小"就是能经营的店数。
-    `ORDER BY code`：编号是链上铸造的，排序即登记顺序（同一份清单在登录回执里也稳定可读）。
+    `ORDER BY code`：编号是**随机**的（不是时间序），这里只为一个稳定顺序——
+    同一份清单在登录回执与 `GET /api/shops` 的 `operatedShops` 里读出来次序一致。
+    要开店先后请读 `created_at`。
   */
   const rows = await getDb().all(
     `SELECT code FROM (

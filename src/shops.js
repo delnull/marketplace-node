@@ -48,6 +48,7 @@ import { getDb } from './db.js';
 import { isAddress, isZeroAddress } from './chain.js';
 import { tanxinAddressOf } from './tanxin.js';
 import { isShopCodeShape } from './shopCode.js';
+import { storedMediaKindOf, storedMediaNameOf } from './mediaKinds.js';
 
 /** 店铺句柄的请求头（卖家面的**范围提示**：带了必须指得中；不带则取唯一经营的那家，多店时必须点名——见 http.js） */
 export const SHOP_HEADER = 'x-mk-shop';
@@ -132,25 +133,30 @@ export function shopDisplayNotice(row) {
 }
 
 /**
- * 头像 URL 的唯一判据：只收**本节点上传目录**里的相对路径。
+ * 头像 URL 的唯一判据：只收**本节点上传目录**里的图片。
  *
  * 为什么不允许外链：头像是买家第一眼看到的东西，外链可被换成任意内容；而 `/api/uploads/`
- * 的文件由本节点自己写盘、不可枚举，内容和 URL 同生同死。空串 = 没设置（前端回退到
- * 按身份地址生成的色块，不是"读不到"）。
+ * 的文件由本节点自己写盘、URL 由内容哈希决定（不知道字节就猜不出），内容与 URL 同生同死。
+ * 空串 = 没设置（前端回退到按身份地址生成的色块，不是"读不到"）。
+ *
+ * 形状判据走 `mediaKinds` 的 `storedMediaNameOf/storedMediaKindOf`（与上传落盘同一份）：
+ * 文件名是内容的 sha256，头像只能是图片（视频/文档 URL 在这里就被拒）。
  */
-const AVATAR_URL_RE =
-  /^\/api\/uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:png|jpe?g|webp|gif)$/i;
+function isStoredAvatarUrl(url) {
+  const name = storedMediaNameOf(url);
+  return !!name && storedMediaKindOf(name) === 'image';
+}
 
 /** 一行 → 可展示的头像 URL（非法/缺失一律空串；渲染层据此回退生成头像） */
 export function avatarUrlOf(row) {
   const v = String(row?.avatar_url || '').trim();
-  return AVATAR_URL_RE.test(v) ? v : '';
+  return isStoredAvatarUrl(v) ? v : '';
 }
 
 /** 写入口断言：只接受本节点 /api/uploads/ 下的图片 URL（空串 = 清除） */
 export function assertAvatarUrl(url) {
   const v = String(url ?? '').trim();
-  if (v !== '' && !AVATAR_URL_RE.test(v)) {
+  if (v !== '' && !isStoredAvatarUrl(v)) {
     throw new Error('头像 URL 必须是本节点 /api/uploads/ 下的图片地址');
   }
   return v;
@@ -209,14 +215,32 @@ export async function listShopRows() {
  * 只给 `nodeAdmin` 用：`hidden_product_count` 是节点处置的读数，不是买家该看到的经营数据。
  * 三个 COUNT 放在同一句里（相关子查询各走一次 `idx_products_shop`），避免逐店 N+1。
  */
-export async function listShopRowsWithCounts() {
+export async function listShopRowsWithCounts({ q = '' } = {}) {
+  const term = String(q ?? '').trim().slice(0, 80);
+  let where = '';
+  let params = [];
+  if (term) {
+    if ([...term].length >= 2) {
+      /*
+        ngram FULLTEXT：按词元命中，仍能覆盖店名/编号/地址的连续片段；
+        用引号包成短语，避免用户输入 + - * 等被 BOOLEAN MODE 当成操作符。
+      */
+      where = 'WHERE MATCH(s.search_text) AGAINST (? IN BOOLEAN MODE)';
+      params = [`"${term.replace(/"/g, '')}"`];
+    } else {
+      /* 单字低于 ngram token size（默认 2）：退回 LIKE，语义仍是“包含”。 */
+      const like = `%${term.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
+      where = "WHERE s.search_text LIKE ? ESCAPE '\\\\'";
+      params = [like];
+    }
+  }
   return await getDb().all(`SELECT s.*,
          (SELECT COUNT(*) FROM products p WHERE p.shop_code = s.code AND p.deleted_at IS NULL) AS product_count,
          (SELECT COUNT(*) FROM products p
            WHERE p.shop_code = s.code AND p.deleted_at IS NULL AND p.active = 1 AND p.node_hidden = 0) AS listed_product_count,
          (SELECT COUNT(*) FROM products p
            WHERE p.shop_code = s.code AND p.deleted_at IS NULL AND p.node_hidden = 1) AS hidden_product_count
-       FROM shops s ORDER BY s.created_at ASC, s.code ASC`);
+       FROM shops s ${where} ORDER BY s.created_at ASC, s.code ASC`, ...params);
 }
 
 /** 只出**在售**店铺（公开聚合面用；listed=0 的店不进聚合） */

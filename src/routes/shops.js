@@ -2,7 +2,11 @@
  * 店铺目录与开店审批（挂 `/api/shops`）——**店铺完全在节点链下**。
  *
  *  GET  /                    公开：本节点**在售**店铺列表（编号/店名/卖家地址/在售状态）；
- *                            带登录令牌时附 `mine`（这个钱包在本节点的开店状态，含暂停店与待审批申请）
+ *                            带登录令牌时另附 `mine`（这个钱包在本节点的开店状态，含暂停店与待审批申请）
+ *                            与 `operatedShops`（这个钱包能经营的店，含暂停店；卖家面板读它）
+ *  GET  /stats               公开：按编号批量返回店铺评价聚合 + 有效单量（目录页一次取一页，避免 2N 请求）；
+ *                            编号用**重复的 `code` 参数**传（`?code=A&code=B`），不能用逗号拼接——
+ *                            逗号本身是合法校验位（见 src/shopCode.js）。
  *  GET  /admin/all           节点管理员：本节点**全部**店铺（含暂停接单，用于节点主恢复）
  *  PATCH /admin/listing       节点管理员：批量暂停/恢复接单 {codes, listed, reason}
  *  PATCH /admin/:code/listing 节点管理员：暂停/恢复一家店的接单（原因必填）
@@ -46,12 +50,20 @@ import {
   resolveShopRef,
   isShopCodeShape,
 } from '../shops.js';
+import { shopOrderCount } from '../reputation.js';
+import { shopReviewStats } from '../reviews.js';
+import { operatedShops } from '../operatedShops.js';
 
 const router = Router();
 const requireAuth = makeAuthMiddleware(verifySession);
 const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 // 开店申请是免费 SIWE 的写入口：不限流时可用大量地址填满申请队列与库（节点主审核面 DoS）
 const applicationLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '开店申请过于频繁，请稍后再试' });
+/*
+  批量统计每批最多带 24 家店，单次要算 24 次画像 + 24 次评价聚合；按“每批代价”把窗口收紧，
+  避免用一次请求绕过 `/api/shop/reputation` 的单次限额。目录页每节点只会发一批，30 秒 HTTP 缓存也会兜住重复。
+*/
+const shopStatsBatchLimiter = simpleRateLimit({ windowMs: 60_000, max: 10, message: '店铺统计批量查询过于频繁，请稍后再试' });
 
 /**
  * 可选登录：目录公开可读。带令牌时同时用于两件事——
@@ -247,6 +259,12 @@ router.get('/', wrap(async (req, res) => {
      * 前端据此把"申请开店"换成"我的店铺 / 申请审批中"。
      */
     mine: buyer ? await mineAtNode(buyer, nodeAddr) : null,
+    /**
+     * 当前登录钱包在本节点**能经营的店**（含暂停接单），与登录回执的 `shops[]` 同形。
+     * 卖家面板的店名/头像/接单状态/暂停原因只读这一份（**现读**，不是登录时的快照）。
+     * 没有令牌 = `null`（节点不替匿名请求断言"你有哪些店"）。
+     */
+    operatedShops: buyer ? await operatedShops(buyer, nodeAddr) : null,
   });
 }));
 
@@ -259,7 +277,8 @@ router.get('/', wrap(async (req, res) => {
  */
 router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
   const nodeAddr = await nodeOwner();
-  const rows = await listShopRowsWithCounts();
+  const q = String(req.query.q ?? '').trim().slice(0, 80);
+  const rows = await listShopRowsWithCounts({ q });
   ok(res, {
     host: nodeAddr || null,
     shops: rows.map((r) => ({
@@ -342,6 +361,66 @@ router.patch('/admin/:code/listing', nodeAdmin, wrap(async (req, res) => {
     shopDto(fresh, await nodeOwner()),
     listed ? '已恢复接单（商品重新进入聚合面）' : `已暂停接单：${reason}`
   );
+}));
+
+/**
+ * 公开：按店铺编号批量取「评价聚合 + 有效单量」。
+ *
+ * 目录页一屏 24 家店；让前端逐店发 `/api/shop/reputation` + `/api/shop/reviews/stats`
+ * 就是 48 个请求，节点限流时整批旁路读数会消失。这里一次取一页，每批按 `code` 重复参数返回：
+ *   `{ shops: { [code]: { review, reputation: { effectiveOrders } } } }`
+ * 只返回**在售**且属于本节点的编号；未知/暂停/非法编号不出现在结果里（前端按未知处理，不印 0）。
+ * 单店的评价或有效单量读取失败时该字段为 null，不带垮同一批其他店。
+ *
+ * 为什么用重复 `code` 而不是 `codes=A,B`：店铺编号的**校验位可以是逗号**（`src/shopCode.js`
+ * 的扩展符号 `-._~,`），逗号分隔会把一个合法编号拆成两个非法片段。重复参数由 Express
+ * 原样解析，编号里的逗号不需要转义协议。
+ */
+router.get('/stats', shopStatsBatchLimiter, wrap(async (req, res) => {
+  const raw = req.query.code;
+  const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  const codes = [
+    ...new Set(
+      list
+        .map((s) => String(s).trim().toUpperCase())
+        .filter((s) => s && isShopCodeShape(s))
+    ),
+  ];
+  if (codes.length === 0) return ok(res, { shops: {} });
+  /* 与前端 `SHOP_STATS_BATCH_MAX` 对齐：超过上限必须由调用方分块，服务端不静默截断。 */
+  if (codes.length > 24) return fail(res, '一次最多查询 24 家店铺', 400, 400);
+
+  const db = getDb();
+  const rows = await db.all(
+    `SELECT code, seller FROM shops WHERE listed = 1 AND code IN (${codes.map(() => '?').join(',')})`,
+    ...codes
+  );
+  /*
+    评价按 seller（同一 seller 可能有多家店，按 seller 去重）；有效单量按 code。
+    目录卡只需要有效单量，因此出口只下发 `{ effectiveOrders }`，不透传完整履约画像
+    （窗口/交付/备注对卡片没用，24 家店会让响应体积大一个量级）。
+  */
+  const reviewBySeller = new Map();
+  const effectiveOrdersByCode = new Map();
+  const reviewOf = (seller) => {
+    if (!reviewBySeller.has(seller)) {
+      reviewBySeller.set(seller, shopReviewStats(seller).catch(() => null));
+    }
+    return reviewBySeller.get(seller);
+  };
+  const effectiveOrdersOf = (code) => {
+    if (!effectiveOrdersByCode.has(code)) {
+      effectiveOrdersByCode.set(code, shopOrderCount(code).catch(() => null));
+    }
+    return effectiveOrdersByCode.get(code);
+  };
+  const entries = await Promise.all(
+    rows.map(async (row) => {
+      const [review, effectiveOrders] = await Promise.all([reviewOf(row.seller), effectiveOrdersOf(row.code)]);
+      return [row.code, { review, reputation: effectiveOrders == null ? null : { effectiveOrders } }];
+    })
+  );
+  ok(res, { shops: Object.fromEntries(entries) });
 }));
 
 /**

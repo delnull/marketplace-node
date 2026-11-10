@@ -112,7 +112,7 @@ test('跨资产退款折算：原生按 BTY 锁定汇率、ERC20 按 token 精�
   );
 });
 
-test('overview：入账净额与退款并列、件数/买家/复购去重、确认率', async () => {
+test('overview：入账净额与退款并列、件数/买家/复购去重、入账确认率', async () => {
   const p1 = await listProduct(productPayload({ kind: 'physical', title: '看板A', capacity: 99, priceMicro: 100_000_000 }));
   const p2 = await listProduct(productPayload({ kind: 'digital', title: '看板B', priceMicro: 200_000_000 }));
   // p1 两单（qty 2 + 1）→ confirmed + expired；p2 一单 confirmed
@@ -132,12 +132,12 @@ test('overview：入账净额与退款并列、件数/买家/复购去重、确�
   const o30 = await request(app).get('/api/shop/stats/overview?days=30').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assertOk(o30);
   const s = o30.body.data;
-  assert.equal(s.orders, 3, '窗口内入账 3 单（confirmed×2+expired×1）');
+  assert.equal(s.incomeOrders, 3, '窗口内入账 3 单（confirmed×2+expired×1）');
   assert.ok(s.units >= 4, '件数 = 2+1+1');
   assert.equal(s.refundOrders, 1);
   assert.equal(s.buyers, 1, '同买家去重');
   assert.equal(s.repeatBuyers, 1, '成交 ≥2 单 → 复购');
-  assert.equal(s.confirmRate, 0.6667, '确认率 4 位小数（2/3）');
+  assert.equal(s.incomeConfirmRate, 0.6667, '入账确认率 4 位小数（2/3）');
   // GMV 净额 = 三单 amount 之和（没有退款、没有费腿）
   const amtOf = async (orderNo) => BigInt((await db.get('SELECT amount_wei FROM v_orders WHERE order_no = ?', orderNo)).amount_wei);
   const expectNet = (await amtOf(a1.id)) + (await amtOf(a2.id)) + (await amtOf(b1.id));
@@ -148,7 +148,7 @@ test('overview：入账净额与退款并列、件数/买家/复购去重、确�
 
   // 全量口径（days=0）含窗口外单
   const oAll = await request(app).get('/api/shop/stats/overview?days=0').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
-  assert.equal(oAll.body.data.orders, 4, '全量含 31 天前单');
+  assert.equal(oAll.body.data.incomeOrders, 4, '全量含 31 天前单');
 });
 
 test('部分退款：净额 = 毛额 − 已退买家（缺退款读数时那一行不算净额）', async () => {
@@ -187,8 +187,8 @@ test('trend：按天补零、退款额并入对应日', async () => {
   };
   const today = items.find((i) => i.day === keyOf(now));
   const yesterday = items.find((i) => i.day === keyOf(now - 26 * 3600_000));
-  assert.ok(today && today.orders >= 1, '今日入账单计入');
-  assert.ok(yesterday && yesterday.orders >= 1, '昨日入账单计入（含本测试单）');
+  assert.ok(today && today.incomeOrders >= 1, '今日入账单计入');
+  assert.ok(yesterday && yesterday.incomeOrders >= 1, '昨日入账单计入（含本测试单）');
   assert.ok(BigInt(yesterday.refundWei) > 0n, '退款额并入对应日');
   assert.equal(items.every((i) => i.day.length === 10), true);
 });
@@ -200,14 +200,14 @@ test('products 排行：排序与分页；越权拒绝', async () => {
     await settle(o.id, 'confirmed');
   }
   const res = await request(app)
-    .get('/api/shop/stats/products?days=0&sort=orders&page=1&pageSize=5')
+    .get('/api/shop/stats/products?days=0&sort=incomeOrders&page=1&pageSize=5')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(res);
   const { products, total } = res.body.data;
   assert.ok(total >= 1);
   const mine = products.find((x) => x.slug === p.slug);
-  assert.ok(mine && mine.orders === 3 && mine.units === 3);
+  assert.ok(mine && mine.incomeOrders === 3 && mine.units === 3);
   assert.equal(mine.buyers, 1);
 
   // 越权：匿名/买家
@@ -240,10 +240,10 @@ test('D7 days 参数归一：缺省=默认档、0=全量、非法拒绝、越界
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
     .expect(200);
   assertOk(def);
-  assert.equal(def.body.data.orders, d30.body.data.orders, '缺省 days = 默认 30（不再被 ||0 吞成全量）');
-  assert.equal(big.body.data.orders, cap.body.data.orders, '超大 days 钳制到 366（400 亦钳制）——两者同界');
-  assert.ok(all.body.data.orders >= big.body.data.orders, '全量(0) ≥ 366 天钳制窗');
-  assert.ok(big.body.data.orders >= d30.body.data.orders, '366 天窗口 ≥ 30 天窗口');
+  assert.equal(def.body.data.incomeOrders, d30.body.data.incomeOrders, '缺省 days = 默认 30（不再被 ||0 吞成全量）');
+  assert.equal(big.body.data.incomeOrders, cap.body.data.incomeOrders, '超大 days 钳制到 366（400 亦钳制）——两者同界');
+  assert.ok(all.body.data.incomeOrders >= big.body.data.incomeOrders, '全量(0) ≥ 366 天钳制窗');
+  assert.ok(big.body.data.incomeOrders >= d30.body.data.incomeOrders, '366 天窗口 ≥ 30 天窗口');
 
   // 非法：负数 / 非数字 / trend=0
   const neg = await request(app).get('/api/shop/stats/overview?days=-1').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value);
@@ -272,7 +272,7 @@ test('D6 趋势自然日对齐：窗口与桶同界（今天零点起 days 个�
   assertOk(res);
   const items = res.body.data.items;
   assert.equal(items.length, 7, '7 个自然日桶');
-  const sumForProduct = items.reduce((acc, i) => acc + i.orders, 0);
+  const sumForProduct = items.reduce((acc, i) => acc + i.incomeOrders, 0);
   /*
     ⚠️ 对照查询的边界**必须是 `Date`**：`startOfToday - 6*24*3600_000` 是毫秒**整数**，
     而 MySQL 拿一个数字去比 `DATETIME(3)` 时会把日期折成 `YYYYMMDDHHMMSS` 再按数值比

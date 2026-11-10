@@ -2,10 +2,10 @@
  * 店铺履约画像统计（公开只读，链下信誉索引）。
  *
  * 口径（每项标注数据源与可审计性）：
- *  - 事件计数（托管单量/买家确认/超时释放/争议/仲裁判向）取自订单事件史（`order_chain.events`，
- *    读模型 `v_orders` 里叫 `onchain_events`）——watcher 对 Escrow 链上事件的**本地位移镜像**
- *    （每事件含 txHash/块号，可链上对账），节点虚报统计可被第三方重算戳穿；
- *    `at` 为节点落库时刻（近似事件时刻，诚实标注）。
+ *  - 托管单量取支付凭证（`paid_tx_hash` 非空）；买家确认 / 超时释放 / 争议 / 仲裁判向
+ *    取自订单事件史（`order_chain.events`，读模型 `v_orders` 里叫 `onchain_events`）——
+ *    watcher 对 Escrow 链上事件的**本地位移镜像**（每事件含 txHash/块号，可链上对账），
+ *    节点虚报统计可被第三方重算戳穿；`at` 为节点落库时刻（近似事件时刻，诚实标注）。
  *  - 仲裁判向不在事件史字段内（Arbitrated 参数未落库），以订单**终局状态**反推：
  *    refunded = 判买家 / settled = 判卖家（只统计**含 Arbitrated 事件**的行）。
  *    注意 refunded/settled 两态**也可由 `RefundApproved` 产生**（卖家同意退款 / 争议中和解，
@@ -24,6 +24,14 @@
  *    隐私：只出计数与比率，**不下发**具体交易对/买家地址（那等于把"某地址买了 N 次"单笔化披露）。
  *  - 隐私口径：只出聚合统计，不下发单笔订单（买家地址/商品/金额均不出现）。
  *
+ * **出口字段名（口径自描述，2026-11）**：
+ *  - `escrowOrders` = 累计托管单量（全部有支付凭证的托管单，含全额退款/取消/自买）；
+ *  - `effectiveOrders` = 有效单量（`escrowOrders` 再剔除全额退款/取消/自买）；
+ *  - `escrowConfirmRate` / `escrowTimeoutRate` / `escrowDisputeRate` 的分母是 `escrowOrders`；
+ *  - `refundedToBuyerShare` 的分母是 `disputes`（判买家数 / 争议数），不是单量。
+ *    页面上任何"单量 + 确认率"并排的块必须用 `escrowOrders` 配这组比率；`effectiveOrders`
+ *    只能单独作为有效单量展示，不能拿去当比率分母（分子没有按同一口径重算）。
+ *
  * 量级：单节点一家店，全表扫描 + 行内 JSON 解析为毫秒级，公开只读低频端点不做缓存。
  */
 import { getDb } from './db.js';
@@ -31,6 +39,7 @@ import { getDb } from './db.js';
 import config from './config.js';
 // 「这一单有没有争过」的唯一判据（本模块与 buyerSignal 共用，见 orderFacts.js 的说明）
 import { rowEverDisputed } from './orderFacts.js';
+import { PAID_SALES_WHERE, isEffectivePaidOrder } from './paidSales.js';
 
 /** 时间窗（键按 JSON 输出；days=0 表示累计全量） */
 const WINDOWS = [
@@ -165,7 +174,10 @@ export function computeReputation(rows, nowMs = Date.now()) {
   const win = {};
   for (const w of WINDOWS) {
     win[w.key] = {
-      orders: 0, confirmed: 0, timeouts: 0, disputes: 0,
+      // escrowOrders = 累计托管单量（有支付凭证，含退款/取消/自买）；公开比率的分母。
+      // effectiveOrders = 有效单量（再剔除全额退款/取消/自买）；只做计数，不做比率分母。
+      escrowOrders: 0, confirmed: 0, timeouts: 0, disputes: 0,
+      effectiveOrders: 0,
       settledToSeller: 0, refundedToBuyer: 0,
       deliveries: [], // 发货耗时样本（ms）
       pairs: new Map(), // 交易对键 → 该窗内的成交单数（重复交易对信号的原始材料）
@@ -176,8 +188,9 @@ export function computeReputation(rows, nowMs = Date.now()) {
     **事件史读不出来的行数**（2026-10-16 补，三态纪律）：`order_chain.events` 是 JSON 列，
     驱动会解析成 JS 值——但配置/列类型/读模型任何一处变化都可能让它以**字符串**回来。
     宽容地把非数组折成 `[]` 是对的（一份坏数据不该让整页读数炸掉），但**折成 0 事件就不对了**：
-    画像里的单量、确认率、超时率、争议率全部按事件计数算，于是一次格式漂移会让整个节点的
-    公开画像静默变成"这家店什么历史都没有"，而 `/api/shop/reputation` 仍然 200。
+    画像里的确认率、超时率、争议率等事件计数会受影响（单量走 `paid_tx_hash`，不受事件史影响），
+    于是一次格式漂移会让整个节点的公开画像静默变成"这家店什么历史都没有"，
+    而 `/api/shop/reputation` 仍然 200。
     这是买家用来判断"这家店靠不靠谱"的主要信号，答案必须是**能不能读**而不是一个默认值。
     所以这里把"读不出来的行数"作为**独立结论**带回出口（调用方据此显示"画像不完整"，
     而不是显示一个看起来正常的零）。与 `poolAlert` 为"快照读不到 ≠ 没有池"做三态同款。
@@ -210,7 +223,7 @@ export function computeReputation(rows, nowMs = Date.now()) {
     // 每笔订单以「OrderCreated 落库时刻」归属窗口（窗口语义 = 近 N 天创建的托管单），
     // 该单其后所有事件（确认/争议/仲裁/超时…）全部计入同一批窗口——
     // 比率分子分母同源：窗内不会出现「窗外创建的旧单在窗内确认/裁决」的孤儿分子，
-    // confirmRate/disputeRate/refundRate 恒 ∈ [0,1]。
+    // escrowConfirmRate/escrowDisputeRate/refundedToBuyerShare 恒 ∈ [0,1]。
     /*
       ── 托管**证明**与窗口锚点都不再依赖"事件史里还留着 OrderCreated"（2026-10-15 修 D3）──
       旧实现的判据是"事件史里找得到 OrderCreated"，而 `onchain_events` 只保留**最后 20 条**
@@ -236,8 +249,10 @@ export function computeReputation(rows, nowMs = Date.now()) {
       下面的逐事件计数最多每行各一次 ⇒ `分子 ≤ 分母` 是**结构上**成立的，
       而不是靠"跳过没有 OrderCreated 的行"来回避（旧口径的代价是整单消失，见上）。
     */
+    const effective = isEffectivePaidOrder(row);
     for (const w of orderWindows) {
-      win[w.key].orders += 1;
+      win[w.key].escrowOrders += 1;
+      if (effective) win[w.key].effectiveOrders += 1;
       const key = pairKeyOf(row);
       win[w.key].pairs.set(key, (win[w.key].pairs.get(key) || 0) + 1);
     }
@@ -251,7 +266,7 @@ export function computeReputation(rows, nowMs = Date.now()) {
       `status='disputed'`、钱冻在链上的单，公开页印「争议率 0%」，而同一时刻 buyerSignal 印「争议 7 单」。
       更要紧的是它让**分子脱离分母**：判向计数（`refundedToBuyer`/`settledToSeller`）是
       **按行**数的（行上有 `Arbitrated` 就算），而分母是**按事件**数的 —— 混合口径能算出
-      `refundRate = 1.4`（「争议 5 笔中判买家 7 笔」）。现在两者同源（都以本行为单位），
+      `refundedToBuyerShare = 1.4`（「争议 5 笔中判买家 7 笔」）。现在两者同源（都以本行为单位），
       因此 `refundedToBuyer + settledToSeller ≤ disputes` 恒成立，比率回到 [0,1]。
     */
     if (rowEverDisputed(row, events)) for (const w of orderWindows) win[w.key].disputes += 1;
@@ -304,27 +319,28 @@ export function computeReputation(rows, nowMs = Date.now()) {
       两项都只在小样本之上才给（否则 null）。
     */
     const distinctPairs = b.pairs.size;
-    const repeatOrders = Math.max(0, b.orders - distinctPairs);
+    const repeatOrders = Math.max(0, b.escrowOrders - distinctPairs);
     const topPairOrders = b.pairs.size ? Math.max(...b.pairs.values()) : 0;
-    const sybilTooSmall = b.orders < SYBIL_SAMPLE_MIN;
+    const sybilTooSmall = b.escrowOrders < SYBIL_SAMPLE_MIN;
     windows[w.key] = {
-      orders: b.orders,
+      escrowOrders: b.escrowOrders,
+      effectiveOrders: b.effectiveOrders,
       confirmed: b.confirmed,
       timeouts: b.timeouts,
       disputes,
       settledToSeller: b.settledToSeller,
       refundedToBuyer: b.refundedToBuyer,
       // 样本不足：争议相关率不展示（其余字段照常，窗内 0 争议视为健康而非样本问题）
-      disputeRate: sampleTooSmall ? null : ratio(disputes, b.orders),
-      refundRate: sampleTooSmall ? null : ratio(b.refundedToBuyer, disputes),
-      confirmRate: ratio(b.confirmed, b.orders),
-      timeoutRate: ratio(b.timeouts, b.orders),
+      escrowDisputeRate: sampleTooSmall ? null : ratio(disputes, b.escrowOrders),
+      refundedToBuyerShare: sampleTooSmall ? null : ratio(b.refundedToBuyer, disputes),
+      escrowConfirmRate: ratio(b.confirmed, b.escrowOrders),
+      escrowTimeoutRate: ratio(b.timeouts, b.escrowOrders),
       sampleTooSmall,
       sybil: {
         distinctPairs,
         repeatOrders,
-        repeatPairShare: sybilTooSmall ? null : ratio(repeatOrders, b.orders),
-        topPairShare: sybilTooSmall ? null : ratio(topPairOrders, b.orders),
+        repeatPairShare: sybilTooSmall ? null : ratio(repeatOrders, b.escrowOrders),
+        topPairShare: sybilTooSmall ? null : ratio(topPairOrders, b.escrowOrders),
         sampleTooSmall: sybilTooSmall,
       },
     };
@@ -419,4 +435,27 @@ export async function reputationSummary(seller) {
        JOIN shops s ON s.code = o.shop_code AND s.listed = 1
        ${sel ? 'WHERE o.seller = ?' : ''}`, ...(sel ? [sel] : []));
   return computeReputation(rows, Date.now());
+}
+
+/**
+ * 有效单量的轻量读法（目录卡批量统计用）。
+ *
+ * 与公开销量同一份判据（`paidSales.PAID_SALES_WHERE`）：有支付凭证、不是全额退款/取消、
+ * 不是自买。按**店铺编号**计数，不按 seller：一个 seller 在本节点只有一家店，但
+ * 这里仍然只认编号，避免将来出现多店时两家店共用同一个数字。
+ *
+ * 参数：`shopCode` 必须显式给出；漏传直接抛错（默认成全店就是一次静默跨店混算）。
+ */
+export async function shopOrderCount(shopCode) {
+  if (shopCode === undefined || shopCode === null || shopCode === '') {
+    throw new Error('shopOrderCount 需要显式的 shopCode（漏传会静默跨店混算）');
+  }
+  const code = String(shopCode).trim().toUpperCase();
+  const row = await getDb().get(
+    `SELECT COUNT(*) AS c
+       FROM v_orders o
+      WHERE o.shop_code = ? AND ${PAID_SALES_WHERE}`,
+    code
+  );
+  return Number(row?.c) || 0;
 }

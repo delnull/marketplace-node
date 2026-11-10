@@ -16,17 +16,17 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { insertOrder, insertProduct, makeCtx, TEST_SHOP_CODE } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { db, owner, buyer } = ctx;
-const { MEDIA_REF_SOURCES, referencedMediaUrls } = await import('../src/mediaSweep.js');
+const { MEDIA_REF_SOURCES, referencedMediaUrls, referencedMediaUrlsOf } = await import('../src/mediaSweep.js');
 
 /** 列名里出现这些词，就按"可能存媒体 URL"对待（新增字段命名基本逃不出这张表） */
 const MEDIA_COLUMN_RE = /(^|_)(image|images|media|poster|video|avatar|banner|logo|thumbnail|thumb|cover|photo)(_|$)/i;
 
-const mediaUrl = (ext = 'png') => `/api/uploads/${randomUUID()}.${ext}`;
+const mediaUrl = (ext = 'png') => `/api/uploads/${randomBytes(32).toString('hex')}.${ext}`;
 
 test('schema 里每个媒体字段都在清扫的引用面里（漏一处就会删掉在用的文件）', async () => {
   const columns = await db.all(
@@ -72,6 +72,9 @@ test('节点头像与店铺头像的 URL 也算"被引用"（否则清扫会删�
   const refs = await referencedMediaUrls();
   assert.ok(refs.has(nodeAvatar), `节点头像 ${nodeAvatar} 没被清扫的引用面收到`);
   assert.ok(refs.has(shopAvatar), `店铺头像 ${shopAvatar} 没被清扫的引用面收到`);
+
+  const targeted = await referencedMediaUrlsOf([nodeAvatar, shopAvatar, mediaUrl()]);
+  assert.deepEqual([...targeted].sort(), [nodeAvatar, shopAvatar].sort(), '批量查询也要认头像引用');
 });
 
 test('商品主图 / 详情图 / 规格图 / 订单快照里的 URL 都算"被引用"', async () => {
@@ -103,4 +106,18 @@ test('商品主图 / 详情图 / 规格图 / 订单快照里的 URL 都算"被�
     assert.ok(refs.has(url), `${label} ${url} 没被清扫的引用面收到——它会被当成孤儿删掉`);
   }
   assert.equal(refs.has(unreferenced), false, '没有行引用过的 URL 不应出现在引用集合里');
+
+  // 批量引用查询（显式删除前的判据）必须与全量扫描同口径
+  const targeted = await referencedMediaUrlsOf([
+    productImage,
+    descriptionImage,
+    skuImage,
+    snapshotImage,
+    unreferenced,
+  ]);
+  assert.deepEqual(
+    [...targeted].sort(),
+    [productImage, descriptionImage, skuImage, snapshotImage].sort(),
+    '批量查询漏一处引用 = 删掉在用的图'
+  );
 });

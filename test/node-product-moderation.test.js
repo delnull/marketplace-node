@@ -52,6 +52,11 @@ test('节点强制下架：公开面消失、店主改不动；恢复后重新�
   assert.ok(adminRow, '节点管理列表必须能看到被强制下架的商品');
   assert.equal(adminRow.nodeHidden, true);
   assert.equal(adminRow.nodeHiddenReason, '疑似假货，待店主举证');
+  /*
+    列表要能直接给缩略图：强制下架/删除靠看图判断，逐行再请求详情是 N+1。
+    值与商品主图的第一项同源（视频取封面），相对路径由前端按节点 origin 解析。
+  */
+  assert.equal(adminRow.thumb, 'https://example.com/a.jpg', '节点商品列表必须带主图缩略图');
 
   const shopRow = (
     await request(app)
@@ -228,6 +233,11 @@ test('节点商品列表可按店铺筛选；非法店铺编号 400', async () =
     filtered.body.data.products.every((p) => p.shopCode === '0000SHP02'),
     true,
     '按店铺筛选不能混进别家的商品'
+  );
+  assert.equal(
+    filtered.body.data.products.find((p) => p.slug === slug)?.thumb,
+    null,
+    '没有主图的商品 thumb 必须是 null，不能编一个占位图'
   );
 
   const second = await insertProduct(db, { shopCode: '0000SHP02', title: '第二家店的商品 2' });

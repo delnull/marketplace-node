@@ -280,7 +280,12 @@ export async function overviewStats(days, seller) {
       ? (await getDb().get('SELECT COUNT(*) AS c FROM products WHERE deleted_at IS NULL AND active = 1 AND node_hidden = 0')).c
       : (await getDb().get('SELECT COUNT(*) AS c FROM products WHERE deleted_at IS NULL AND active = 1 AND node_hidden = 0 AND shop_code IN (SELECT code FROM shops WHERE seller = ?)', String(seller).toLowerCase())).c;
   return {
-    orders: rows.length,
+    /**
+     * 入账单量：status ∈ INCOME_STATUS（confirmed/settled/expired）。
+     * 不含在途、不含退款，也不剔除自买——这是"钱已到卖家"的口径，与公开画像的
+     * `escrowOrders`（含退款/自买）和 `effectiveOrders`（剔除退款/自买，含在途）都不是一回事。
+     */
+    incomeOrders: rows.length,
     units,
     /** 原生 BTY 实收净额（**两种定价都含**；这是链上真实入账的 BTY） */
     gmvNetWei: gmvNetWei.toString(),
@@ -294,7 +299,8 @@ export async function overviewStats(days, seller) {
     refundBtyMicro: refundBtyMicro.toString(),
     buyers: buyers.size,
     repeatBuyers,
-    confirmRate: rows.length > 0 ? Math.round((confirmed / rows.length) * 10000) / 10000 : null,
+    /** 入账确认率：confirmed / 入账单量（分母是 `incomeOrders`，不是公开画像的 `escrowOrders`）。 */
+    incomeConfirmRate: rows.length > 0 ? Math.round((confirmed / rows.length) * 10000) / 10000 : null,
     soldProducts: soldProducts.size,
     activeProducts,
   };
@@ -338,7 +344,7 @@ export async function trendStats(days, seller) {
     const key = dayKey(start + i * DAY_MS);
     buckets.set(key, {
       day: key,
-      orders: 0,
+      incomeOrders: 0,
       netWei: '0',
       netUsdtMicro: '0',
       netBtyMicro: '0',
@@ -350,13 +356,13 @@ export async function trendStats(days, seller) {
   const add = (key, field, v) => {
     const b = buckets.get(key);
     if (!b) return;
-    if (field === 'orders') b.orders += v;
+    if (field === 'incomeOrders') b.incomeOrders += v;
     else b[field] = (BigInt(b[field]) + v).toString();
   };
   for (const r of rows) {
     const b = buckets.get(dayKey(r.updated_at));
     if (b) {
-      b.orders += 1;
+      b.incomeOrders += 1;
       if (assetOf(r).native) b.netWei = (BigInt(b.netWei) + netOfRow(r)).toString();
       const net = grossUsdtMicroOfRow(r) - refundPriceMicroOfRow(r);
       if (priceCurrencyOfRow(r) === 'BTY') b.netBtyMicro = (BigInt(b.netBtyMicro) + net).toString();
@@ -374,7 +380,7 @@ export async function trendStats(days, seller) {
   return [...buckets.values()];
 }
 
-/** 商品维度排行（窗口内入账聚合；sort=gmv|orders|refund；退款列与窗口口径一致） */
+/** 商品维度排行（窗口内入账聚合；sort=gmv|incomeOrders|refund；退款列与窗口口径一致） */
 export async function productStats(days, sort = 'gmv', page = 1, pageSize = 20, seller) {
   // 退款毛额与退款单数统一按窗口过滤（与 overview/trend 同口径），并同样按店铺限定
   const marks = windowWhere(days);
@@ -414,7 +420,7 @@ export async function productStats(days, sort = 'gmv', page = 1, pageSize = 20, 
     if (key == null) continue;
     const a = agg.get(key) || {
       units: 0,
-      orders: 0,
+      incomeOrders: 0,
       netWei: 0n,
       netUsdtMicro: 0n,
       netBtyMicro: 0n,
@@ -423,7 +429,7 @@ export async function productStats(days, sort = 'gmv', page = 1, pageSize = 20, 
       buyers: new Set(),
       lastSaleAt: 0,
     };
-    a.orders += 1;
+    a.incomeOrders += 1;
     a.units += r.quantity || 1;
     if (assetOf(r).native) a.netWei += netOfRow(r);
     const comparable = btyComparableMicroOfRow(r);
@@ -452,7 +458,7 @@ export async function productStats(days, sort = 'gmv', page = 1, pageSize = 20, 
       active: p ? !!p.active && p.deleted_at == null : false,
       /** 当前商品的标价币种（用于给下面两列的金额配单位）；历史订单可能跨币种，两列分别给 */
       priceCurrency: p ? p.price_currency : null,
-      orders: a.orders,
+      incomeOrders: a.incomeOrders,
       units: a.units,
       netWei: a.netWei.toString(),
       netUsdtMicro: a.netUsdtMicro.toString(),
@@ -488,13 +494,13 @@ export async function productStats(days, sort = 'gmv', page = 1, pageSize = 20, 
     if (d < 0n) return -1;
     return tie(a, b);
   };
-  const byOrders = (a, b) => b.orders - a.orders;
+  const byIncomeOrders = (a, b) => b.incomeOrders - a.incomeOrders;
   const byRefundCount = (a, b) => b.refunds - a.refunds;
   const cmp = {
-    gmv: byComparableDesc('netBtyComparableMicro', byOrders),
-    orders: byOrders,
+    gmv: byComparableDesc('netBtyComparableMicro', byIncomeOrders),
+    incomeOrders: byIncomeOrders,
     refund: byComparableDesc('refundBtyComparableMicro', byRefundCount),
-  }[sort] || byComparableDesc('netBtyComparableMicro', byOrders);
+  }[sort] || byComparableDesc('netBtyComparableMicro', byIncomeOrders);
   rowsOut.sort(cmp);
   const total = rowsOut.length;
   const paged = rowsOut.slice((page - 1) * pageSize, page * pageSize);

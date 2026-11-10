@@ -2,7 +2,7 @@
  * 有限库存占位/释放（防超卖）——逐单占位记账：
  *
  * - product_skus.capacity 列 = 该组合的总量（NULL=不限量）；
- * - product_skus.committed 列 = 该组合的销量/已占位（件数口径）；
+ * - product_skus.committed 列 = 该组合的已占位件数（含未支付草稿；取消/退款/超时后释放）；
  *   定位键是 (product_id, sku_key) —— 默认规格（唯一组合）的 sku_key 为 ''；
  * - orders.hold_qty（TINYINT UNSIGNED）= 该订单「应占位件数」：下单事务内商品限量且占位成功
  *   → quantity，不限量/池式商品 → 0。随订单行存续，是释放/恢复的唯一记账依据——

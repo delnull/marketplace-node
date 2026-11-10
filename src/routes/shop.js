@@ -43,9 +43,9 @@ import { logAudit } from '../audit.js';
 import { auditChanges } from '../auditDiff.js';
 import { isAddress, isZeroAddress } from '../chain.js';
 import { assertPublicHttpTarget } from '../netguard.js';
-import { sweepOrphanUploads } from '../mediaSweep.js';
+import { removeMediaUrls, sweepOrphanUploads } from '../mediaSweep.js';
 import { withRedisLock } from '../redis.js';
-import { mediaUsage, REVIEW_IMAGE_MIMES, removeMediaByUrl } from '../productMedia.js';
+import { mediaUsage, REVIEW_IMAGE_MIMES } from '../productMedia.js';
 import {
   MediaUploadError,
   UploadQuotaError,
@@ -637,11 +637,27 @@ router.put('/', staffOnly, wrap(async (req, res) => {
 }));
 
 /**
+ * 删旧头像/失败回滚：内容寻址后同一 URL 可能还被商品、订单快照或另一个头像引用，
+ * 所以走 `removeMediaUrls` 的全库引用判据（仍被引用就保留）。删不掉不影响头像更新本身，
+ * 孤儿由每日媒体清扫兜底。
+ */
+async function dropAvatarFile(url) {
+  if (!url) return 0;
+  try {
+    const result = await removeMediaUrls([url]);
+    return result.removed;
+  } catch (e) {
+    console.error(`[avatar] 头像文件删除失败（留给孤儿清扫）：${e?.message || e}`);
+    return 0;
+  }
+}
+
+/**
  * 店铺头像（ownerOnly）：请求体就是图片字节（与 /api/uploads 同一种传输形状）。
  *
  * 头像是**店铺对买家的身份**，和店名/谈信地址同级：只有店主能改（店员改头像同样能把
- * 买家导流/冒充），所以这里用 ownerOnly 而不是 staffOnly。上传成功后把旧文件删掉——
- * 头像没有订单快照引用，不适用"孤儿媒体刻意不删"那条（见 productMedia.js）。
+ * 买家导流/冒充），所以这里用 ownerOnly 而不是 staffOnly。上传成功后把旧文件按全库引用
+ * 删掉：仍被商品/订单快照/另一个头像引用时保留（共享文件不能按一处引用删）。
  */
 router.post('/avatar', ownerOnly, avatarLimiter, wrap(async (req, res) => {
   const shop = req.shop;
@@ -659,13 +675,13 @@ router.post('/avatar', ownerOnly, avatarLimiter, wrap(async (req, res) => {
   try {
     await setShopAvatar(shop.code, stored.url);
   } catch (e) {
-    // 写库失败就把刚落的文件删掉：不能让一个没人引用的头像占着盘
-    removeMediaByUrl(stored.url);
+    // 写库失败就把刚落的文件删掉（仍被别处引用时 removeMediaUrls 会保留它）
+    await dropAvatarFile(stored.url);
     throw e;
   }
-  if (old && old !== stored.url) removeMediaByUrl(old);
+  if (old && old !== stored.url) await dropAvatarFile(old);
   await audit(req, 'shop.avatar.update', 'shop', shop.code, { size: stored.size, mime: stored.mime }, shop.code);
-  ok(res, { avatarUrl: stored.url }, '店铺头像已更新（旧头像文件已清理）');
+  ok(res, { avatarUrl: stored.url }, '店铺头像已更新');
 }));
 
 /** 店铺头像移除（ownerOnly；幂等） */
@@ -673,7 +689,7 @@ router.delete('/avatar', ownerOnly, wrap(async (req, res) => {
   const shop = req.shop;
   const old = avatarUrlOf(shop);
   await setShopAvatar(shop.code, '');
-  if (old) removeMediaByUrl(old);
+  if (old) await dropAvatarFile(old);
   await audit(req, 'shop.avatar.clear', 'shop', shop.code, { hadAvatar: !!old }, shop.code);
   ok(res, { avatarUrl: '' }, '店铺头像已移除（回退为按身份生成的色块）');
 }));
@@ -698,12 +714,12 @@ router.post('/node/avatar', hostOnly, avatarLimiter, wrap(async (req, res) => {
   try {
     await setNodeAvatar(stored.url);
   } catch (e) {
-    removeMediaByUrl(stored.url);
+    await dropAvatarFile(stored.url);
     throw e;
   }
-  if (old && old !== stored.url) removeMediaByUrl(old);
+  if (old && old !== stored.url) await dropAvatarFile(old);
   await audit(req, 'node.avatar.update', 'node', 'node', { size: stored.size, mime: stored.mime }, null);
-  ok(res, { avatarUrl: stored.url }, '节点头像已更新（旧头像文件已清理）');
+  ok(res, { avatarUrl: stored.url }, '节点头像已更新');
 }));
 
 /** 节点头像移除（hostOnly；幂等） */
@@ -711,7 +727,7 @@ router.delete('/node/avatar', hostOnly, wrap(async (req, res) => {
   const node = await nodeRow();
   const old = avatarUrlOf(node);
   await setNodeAvatar('');
-  if (old) removeMediaByUrl(old);
+  if (old) await dropAvatarFile(old);
   await audit(req, 'node.avatar.clear', 'node', 'node', { hadAvatar: !!old }, null);
   ok(res, { avatarUrl: '' }, '节点头像已移除（回退为按身份生成的色块）');
 }));
@@ -992,7 +1008,7 @@ router.get('/stats/trend', ownerOnly, wrap(async (req, res) => {
   ok(res, { days, items: await trendStats(days, req.shop.seller) });
 }));
 
-/** 商品排行（sort=gmv|orders|refund；缺省 30 天；days=0 全量） */
+/** 商品排行（sort=gmv|incomeOrders|refund；缺省 30 天；days=0 全量） */
 router.get('/stats/products', ownerOnly, wrap(async (req, res) => {
   const days = normalizeStatsDays(req.query.days, 30);
   if (days === null) return fail(res, '天数无效（需 0 或正整数；0=全量；上限 366 天）');

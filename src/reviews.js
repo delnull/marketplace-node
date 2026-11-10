@@ -24,7 +24,9 @@
  */
 import { getDb } from './db.js';
 import config from './config.js';
-import { findMedia, removeMediaByUrl } from './productMedia.js';
+import { findMedia } from './productMedia.js';
+import { storedMediaNameOf } from './mediaKinds.js';
+import { removeMediaUrls } from './mediaSweep.js';
 import { INCOME_STATUS as ORDER_INCOME_STATUS } from './orderStatus.js';
 
 /** 可评价（成交）状态：与收款流水 INCOME_STATUS 同口径 */
@@ -32,10 +34,6 @@ export const REVIEWABLE_STATUS = ORDER_INCOME_STATUS; // 与入账口径同源�
 
 /** 一条评价最多几张图（首次评价与追评各自独立计数） */
 export const REVIEW_MAX_IMAGES = 3;
-
-/** 节点本地上传的图片 URL（文件名是随机 UUID；与 productMedia 的落盘形状同源） */
-const REVIEW_IMAGE_URL_RE =
-  /^\/api\/uploads\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:png|jpe?g|webp|gif))$/i;
 
 /** JSON 列 → 图片 URL 数组（只保留字符串；DB 里的形状由写入端保证） */
 export function parseReviewImages(value) {
@@ -58,13 +56,13 @@ function normalizeReviewImages(input) {
   for (const raw of input) {
     const url = String(raw ?? '').trim();
     if (!url) continue;
-    const m = REVIEW_IMAGE_URL_RE.exec(url);
-    if (!m) return { error: '评价图必须是本节点上传的图片地址' };
+    const name = storedMediaNameOf(url);
+    if (!name) return { error: '评价图必须是本节点上传的图片地址' };
     if (images.includes(url)) continue;
     if (images.length >= REVIEW_MAX_IMAGES) {
       return { error: `评价图最多 ${REVIEW_MAX_IMAGES} 张` };
     }
-    const hit = findMedia(m[1]);
+    const hit = findMedia(name);
     if (!hit) return { error: '评价图不存在（请重新上传）' };
     if (hit.kind !== 'image') return { error: '评价图只能是图片' };
     images.push(url);
@@ -218,15 +216,26 @@ export async function replyReview({ order, content }) {
   return { ok: true };
 }
 
-/** 公开单条评价（匿名短地址；不含买家完整地址与订单金额） */
+/** 公开单条评价（匿名短地址；不含买家完整地址与订单金额；只额外带下单时的规格快照） */
 export function reviewToPublic(row) {
   const images = parseReviewImages(row.images);
+  /*
+    下单时的规格快照（`orders.sku_specs`，由 productReviews 的 JOIN 带出；回复/追评路径没有这一列）。
+    `{}` = 老数据没有快照/默认规格没有记录，界面不显示；默认规格是新单里的 `{规格:'默认'}`，
+    会显示「默认」——两者不是同一种形状，别在注释里合并。
+  */
+  const specs =
+    row.order_sku_specs && typeof row.order_sku_specs === 'object' && !Array.isArray(row.order_sku_specs)
+      ? row.order_sku_specs
+      : {};
   return {
     id: row.id,
     rating: row.rating,
     content: row.content || null,
     /** 评价图（节点相对 URL） */
     images,
+    /** 下单时规格快照；空对象 = 没有可显示的快照 */
+    specs,
     buyerShort: shortBuyer(row.buyer),
     reply: row.reply_content || null,
     replyAt: row.reply_at || null,
@@ -261,7 +270,8 @@ export async function clearReviewImages(orderId) {
 }
 
 /**
- * 逐图下架（节点管理员）：只按 URL 删除一次，JSON 里同步移除，随后删盘。
+ * 逐图下架（节点管理员）：JSON 里同步移除，随后**按全库引用**决定是否删盘
+ * （同一份内容可能还被商品/订单快照/别的评价引用，共享文件保留）。
  * 返回 `remaining` 便于界面刷新；重复删除是 404 语义（图片已不在该评价里）。
  */
 export async function removeReviewImage({ orderId, kind, url }) {
@@ -275,7 +285,12 @@ export async function removeReviewImage({ orderId, kind, url }) {
   if (!images.includes(target)) return { error: '该图片不在这条评价里（可能已被下架）', notFound: true };
   const next = images.filter((u) => u !== target);
   await db.run(`UPDATE reviews SET ${col} = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ?`, JSON.stringify(next), row.id);
-  removeMediaByUrl(target);
+  try {
+    await removeMediaUrls([target]);
+  } catch (e) {
+    // 删盘失败不该把"已下架"回滚（DB 已是事实）；孤儿由每日清扫兜底
+    console.error(`[reviews] 评价图删盘失败（留给孤儿清扫）：${e?.message || e}`);
+  }
   return { ok: true, remaining: next.length };
 }
 
@@ -314,18 +329,34 @@ export async function productReviews(slug, page, pageSize, filter = 'all', sort 
 
   // 白名单拼 SQL（不把用户输入带进语句；只有这三个片段可能出现在 WHERE 里）
   const where =
-    filter === 'good' ? ' AND rating >= 4' : filter === 'bad' ? ' AND rating <= 3' : '';
+    filter === 'good' ? ' AND r.rating >= 4' : filter === 'bad' ? ' AND r.rating <= 3' : '';
   const order =
     sort === 'old'
-      ? 'created_at ASC'
+      ? 'r.created_at ASC'
       : sort === 'high'
-        ? 'rating DESC, created_at DESC'
+        ? 'r.rating DESC, r.created_at DESC'
         : sort === 'low'
-          ? 'rating ASC, created_at DESC'
-          : 'created_at DESC';
+          ? 'r.rating ASC, r.created_at DESC'
+          : 'r.created_at DESC';
 
-  const total = Number((await db.get(`SELECT COUNT(*) AS c FROM reviews WHERE product_id = ?${where}`, product.id)).c);
-  const rows = await db.all(`SELECT * FROM reviews WHERE product_id = ?${where} ORDER BY ${order} LIMIT ? OFFSET ?`, product.id, pageSize, (page - 1) * pageSize);
+  const total = Number((await db.get(`SELECT COUNT(*) AS c FROM reviews r WHERE r.product_id = ?${where}`, product.id)).c);
+  /*
+    列表带上**下单时的规格快照**（`orders.sku_specs`，不是商品当前规格）：
+    评价是按商品聚合的，多规格商品不写规格，读者无法判断这条评价属于哪一档；
+    默认规格是 `{规格:'默认'}`，老数据没有快照时是 `{}`（界面不显示）。
+    JOIN 后 `rating/created_at` 两张表都有，WHERE/ORDER BY 必须带 `r.` 前缀。
+  */
+  const rows = await db.all(
+    `SELECT r.*, o.sku_specs AS order_sku_specs
+       FROM reviews r
+       JOIN orders o ON o.id = r.order_id
+      WHERE r.product_id = ?${where}
+      ORDER BY ${order}
+      LIMIT ? OFFSET ?`,
+    product.id,
+    pageSize,
+    (page - 1) * pageSize
+  );
   return {
     // summary 始终是**全量**聚合（与筛选无关）：它是"这个商品总体怎么样"，筛选只影响列表
     summary: await productReviewSummary(product.id),

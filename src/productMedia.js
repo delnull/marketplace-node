@@ -6,10 +6,14 @@
  * 买家看到的商品与下单时锁定的快照就脱钩了（快照哈希只覆盖 URL 字符串，覆盖不到内容）。
  * 落盘到本节点后，URL 与内容是同一份事实，节点在则媒体在。
  *
- * 存储布局：`<MK_ATTACH_DIR 的父目录>/uploads/<uuid>.<ext>`（默认 `<cwd>/uploads/`）
+ * 存储布局：`<MK_ATTACH_DIR 的父目录>/uploads/<sha256>.<ext>`（默认 `<cwd>/uploads/`）
  *  - 与证据附件**同根**（都由 evidenceFiles.attachmentsRoot 派生）：一个旋钮决定两条数据目录，
  *    容器里两者一起落在挂载卷内，不会出现"附件进了卷、商品图留在临时层"
- *  - 文件名用随机 UUID，不用原始名：防路径穿越、防覆盖、防原始名泄露店主本地信息
+ *  - 文件名 = **内容的 sha256**（不是随机 UUID）：同一份字节无论上传几次都落在同一个路径上，
+ *    "同一文件两份副本"在存储层不可表达——不需要额外的去重表/引用计数（两套真相必然漂移）。
+ *    它同时天然满足"防路径穿越、防原始名泄露"；同名文件只可能是同一份内容，覆盖是幂等的
+ *  - 代价：一个文件可能被多条记录（商品、订单快照、评价、头像）共享，删除必须走
+ *    `mediaSweep.removeMediaUrls` 的**全库引用判据**，不能按调用方手里的那一条引用直接删
  *
  * 安全约定：
  *  - **类型由字节判定**（`mediaKinds.js` 的 `sniffMediaMime`）：白名单是
@@ -17,9 +21,9 @@
  *    不收 mkv（EBML 同头但 DocType 是 matroska，浏览器放不了）。
  *  - 单文件上限按类型（图片 2MB / 视频 50MB）；**传输上限**是表内最大者，
  *    超出即断流并删除临时文件（见 `storeMediaStream`）。
- *  - 落盘用 flag 'wx'（不覆盖已存在文件）；上传先写同目录临时文件，校验通过后 rename
- *    —— 同目录 rename 是原子的，读取方永远不会看到"半个文件"。
- *  - 对外只返回**相对路径** `/api/uploads/<file>`，由前端按媒体所属节点的 origin 拼绝对地址。
+ *  - 上传先写同目录临时文件，校验通过后 rename 到内容地址（同名 = 同内容，覆盖是幂等的）；
+ *    同目录 rename 是原子的，读取方永远不会看到"半个文件"。
+ *  - 对外只返回**相对路径** `/api/uploads/<sha256>.<ext>`，由前端按媒体所属节点的 origin 拼绝对地址。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -31,6 +35,7 @@ import {
   MEDIA,
   PRODUCT_MEDIA_MIMES,
   MAX_UPLOAD_BYTES,
+  STORED_NAME_RE,
   UPLOAD_URL_PREFIX,
   mediaExt,
   sniffMediaMime,
@@ -128,8 +133,24 @@ function finalize({
       `${what}超过 ${MB(spec.maxBytes)}MB 上限（当前 ${(size / 1024 / 1024).toFixed(1)}MB）`
     );
   }
-  const stored = `${crypto.randomUUID()}.${spec.ext}`;
-  fs.renameSync(tmp, path.join(dir, stored));
+  const stored = `${sha256}.${spec.ext}`;
+  const dest = path.join(dir, stored);
+  try {
+    fs.renameSync(tmp, dest);
+  } catch (e) {
+    /*
+      并发上传同一份内容：另一个请求可能已经把它 rename 到位。同名即同内容，丢掉临时文件即可；
+      如果 dest 不存在（或不是普通文件），那才是真的写盘失败（临时文件也一并清掉，别留 .tmp-*.part）。
+    */
+    discard(tmp);
+    let existing = false;
+    try {
+      existing = fs.statSync(dest).isFile();
+    } catch {
+      existing = false;
+    }
+    if (!existing) throw e;
+  }
   return { url: `${UPLOAD_URL_PREFIX}${stored}`, kind: spec.kind, mime, size, sha256 };
 }
 
@@ -221,15 +242,8 @@ export function storeMediaBuffer(data) {
   return finalize({ dir, tmp, size: buf.length, sha256: crypto.createHash('sha256').update(buf).digest('hex') });
 }
 
-/** uuid.(png|jpg|webp|gif|mp4|webm) → 扩展名白名单（与类型表同源，改表即改这里） */
-const STORED_NAME_RE = new RegExp(
-  `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(${[
-    ...new Set(PRODUCT_MEDIA_MIMES.map((m) => mediaExt(m))),
-  ].join('|')})$`
-);
-
 /**
- * 按对外文件名定位磁盘文件。只接受 `uuid.ext` 形状 ——
+ * 按对外文件名定位磁盘文件。只接受 `sha256.ext` 形状 ——
  * 直接把用户输入拼进路径是最经典的穿越漏洞来源，这里用白名单正则收口。
  * @returns {{ disk: string, mime: string, kind: string } | null}
  */
@@ -247,30 +261,14 @@ export function findMedia(name) {
 }
 
 /**
- * 删除一个本节点上传文件（按对外 URL）。只接受 `/api/uploads/<uuid>.<ext>` 形状，
- * 与 findMedia 同一白名单；不存在返回 false（重复删除幂等）。
- */
-export function removeMediaByUrl(url) {
-  const m = /^\/api\/uploads\/([^/]+)$/.exec(String(url || ''));
-  if (!m) return false;
-  const hit = findMedia(m[1]);
-  if (!hit) return false;
-  try {
-    fs.unlinkSync(hit.disk);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * 上传目录用量（{ files, bytes, readable }），60 秒缓存。
  *
  * 这是**本机文件系统**的读数，不是可跨进程共享的业务缓存：进程所在磁盘/挂载可能不同，
  * 用 Redis 存一份会让多实例读到别人的磁盘用量；因此保留进程内 60 秒缓存，仅用于降低
  * 反复 readdir 的成本。
  *
- * 为什么要暴露它：孤儿媒体**刻意不删**（订单快照锁的是 URL 字符串，删文件会让历史订单变裂图），
+ * 为什么要暴露它：**商品媒体**的孤儿刻意不删（订单快照锁的是 URL 字符串，删文件会让历史订单变裂图；
+ * 评价图/头像另有显式删除入口，见 `mediaSweep.removeMediaUrls`），
  * 而视频把单个孤儿的成本从 2MB 抬到 50MB —— 磁盘成了这个功能新引入的失败面，
  * 运维必须能在 `/healthz` 上看见它（否则只有"写满磁盘那天"才发现）。
  *

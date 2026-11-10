@@ -44,12 +44,12 @@ async function makeOrder(title) {
   return { slug: p.body.data.slug, orderNo: o.body.data.id };
 }
 
-async function uploadImage(orderNo, token) {
+async function uploadImage(orderNo, token, bytes = PNG) {
   return await request(app)
     .post(`/api/orders/${orderNo}/review/images`)
     .set('Authorization', `Bearer ${token}`)
     .set('Content-Type', 'image/png')
-    .send(PNG);
+    .send(bytes);
 }
 
 test('评价图：买家上传、随评价公开；外链/他人/非图片拒绝', async () => {
@@ -69,8 +69,13 @@ test('评价图：买家上传、随评价公开；外链/他人/非图片拒绝
   const up = await uploadImage(orderNo, buyerToken);
   assertOk(up);
   assert.equal(up.body.data.kind, 'image');
-  assert.match(up.body.data.url, /^\/api\/uploads\/[0-9a-f-]{36}\.png$/);
+  assert.match(up.body.data.url, /^\/api\/uploads\/[0-9a-f]{64}\.png$/);
   const url = up.body.data.url;
+
+  // 同一份字节再传一次：内容寻址 ⇒ 同一个 URL（不会多一份文件）
+  const again = await uploadImage(orderNo, buyerToken);
+  assertOk(again);
+  assert.equal(again.body.data.url, url);
 
   // 外链/不存在的本地文件不能混进评价图
   const external = await request(app)
@@ -86,7 +91,7 @@ test('评价图：买家上传、随评价公开；外链/他人/非图片拒绝
     .send({
       rating: 5,
       content: '带图',
-      images: ['/api/uploads/00000000-0000-4000-8000-000000000000.png'],
+      images: ['/api/uploads/0000000000000000000000000000000000000000000000000000000000000000.png'],
     });
   assert.notEqual(missing.body.code, 0);
   assert.match(String(missing.body.message), /不存在/);
@@ -154,7 +159,8 @@ test('评价图最多 3 张', async () => {
   const { orderNo } = await makeOrder('评价图上限商品');
   const urls = [];
   for (let i = 0; i < 4; i += 1) {
-    const up = await uploadImage(orderNo, buyerToken);
+    // 四张**不同**的图：同一份字节会被内容寻址去重成同一个 URL
+    const up = await uploadImage(orderNo, buyerToken, Buffer.concat([PNG, Buffer.from(` limit-${i}`)]));
     assertOk(up);
     urls.push(up.body.data.url);
   }

@@ -13,13 +13,9 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { makeCtx, login, assertOk, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
 
-// 附件目录（附件端点也要走到同一道门控，这里验证"被拒时真的没落盘"）
-process.env.MK_ATTACH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mk-stmt-'));
+// 附件目录由 setup 按测试进程隔离（MK_ATTACH_DIR）；这里验证"被拒时真的没落盘"
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;

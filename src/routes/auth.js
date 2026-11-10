@@ -16,14 +16,17 @@
  * 把 `shop` 改成"可选"只会让"登录是否绑店"继续有两种形状，所以整条参数删掉。
  *
  * 登录回执给出 `shops`：这个地址在本节点能经营的店与**各自**的角色（前端据此画店铺切换器，
- * 也据此回答"我在这家店是不是店主"）。回执里**没有** node 级的 `code`/`role`/`isOwner`/`isStaff`：
+ * 也据此回答"我在这家店是不是店主"）。这份清单与 `GET /api/shops` 的 `operatedShops`
+ * 共用 `operatedShops()` 一个实现，且每次现读——回执不是店铺状态的快照。
+ * 回执里**没有** node 级的 `code`/`role`/`isOwner`/`isStaff`：
  * 那四个字段是"这次登录针对的那家店"的结论，而那个维度已经不存在——留着它们只能填一个
  * 与任何店铺都对不上的值（那正是本次要删掉的那类假话）。
  */
 import { Router } from 'express';
-import { issueSiwe, verifySiwe, issueToken, verifySession, revokeSession, roleOf, isHost, operatedShopCodes, isNodeStaffOf } from '../auth.js';
+import { issueSiwe, verifySiwe, issueToken, verifySession, revokeSession, isHost, operatedShopCodes, isNodeStaffOf } from '../auth.js';
 import { isAddress } from '../chain.js';
-import { shopDto, shopRowByCode, nodeOwner } from '../shops.js';
+import { nodeOwner } from '../shops.js';
+import { operatedShops } from '../operatedShops.js';
 import config from '../config.js';
 // clientIp：来源 IP 的唯一实现（trust proxy 只解析一次，见 http.js）
 import { ok, fail, wrap, clientIp, bearerToken, simpleRateLimit } from '../http.js';
@@ -40,13 +43,7 @@ async function loginPayload(address, hostNow) {
   const recovered = String(address).toLowerCase();
   const nodeAddr = await nodeOwner();
   const nodeStaff = await isNodeStaffOf(recovered);
-  const shops = [];
-  for (const code of await operatedShopCodes(recovered)) {
-    const row = await shopRowByCode(code);
-    if (!row) continue;
-    const role = await roleOf(recovered, code);
-    if (role === 'owner' || role === 'staff') shops.push({ ...shopDto(row, nodeAddr), role });
-  }
+  const shops = await operatedShops(recovered, nodeAddr);
   return {
     token: await issueToken(recovered),
     address: recovered,

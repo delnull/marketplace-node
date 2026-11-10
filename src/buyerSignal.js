@@ -70,7 +70,7 @@ function hasRefundedToBuyer(row) {
  * **样本**（比率的分子分母同源，这是本仓反复强调的那条纪律）= 该买家在本店**真实发生过托管**
  * 的订单，判据是 `paid_tx_hash` 非空（支付凭证不变量：escrowed 及以上必有凭证，见 routes/orders.js
  * 文件头）。刻意**不用** `escrow_order_id`：那一列在**下单草稿**时就已生成（orderId 随草稿落库），
- * 拿它当"成交"会把一堆从未付款的草稿算进分母——"5 张单 0 次履约"就会看起来像履约记录。
+ * 拿它当"托管单"会把一堆从未付款的草稿算进分母——"5 张单 0 次履约"就会看起来像履约记录。
  *
  * @param {Array<object>} rows 该买家在**本店**的订单行（读模型 `v_orders`）
  * @param {{address?: string, seller?: string|null, minSamples?: number, now?: number}} opts

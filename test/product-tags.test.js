@@ -243,16 +243,16 @@ test('编辑 PATCH：非法标签整体拒绝，列里不留半写状态', async
 // ── ③ 店内检索：?tag= 任意写法归一成键；?q= 复用既有实现 ──
 
 test('?tag= 精确匹配（按键）：只出上架商品，展示形/大小写/多空格都命中同一批', async () => {
-  const d = await list('?tag=gpu');
+  const d = await list('?tag=gpu&sort=oldest');
   assert.deepEqual(d.products.map((p) => p.slug), [pA.slug, pB.slug], '下架商品不进筛选结果');
   assert.equal(d.tag, 'gpu', '回显的是本次真正用于匹配的**键**');
   assert.equal(d.tagError, null);
 
-  const upper = await list('?tag=GPU'); // 大写写法 → 归一成同一个键
+  const upper = await list('?tag=GPU&sort=oldest'); // 大写写法 → 归一成同一个键
   assert.deepEqual(upper.products.map((p) => p.slug), [pA.slug, pB.slug]);
   assert.equal(upper.tag, 'gpu');
 
-  const cn = await list(`?tag=${encodeURIComponent('二手')}`);
+  const cn = await list(`?tag=${encodeURIComponent('二手')}&sort=oldest`);
   assert.deepEqual(cn.products.map((p) => p.slug), [pA.slug, pC.slug], '中文标签原样匹配');
 });
 
@@ -314,8 +314,8 @@ test('?tag= 与既有 ?q= 关键词搜索、kind 分面、光标分页**正交**
   );
   assert.equal(page2.tag, 'gpu', '翻页时标签条件不丢');
 
-  // order=desc（最新上架优先）与标签同样正交
-  const desc = await list('?tag=gpu&order=desc');
+  // sort=newest（最新上架优先）与标签同样正交
+  const desc = await list('?tag=gpu&sort=newest');
   assert.deepEqual(desc.products.map((p) => p.slug), [pB.slug, pA.slug]);
 });
 

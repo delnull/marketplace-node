@@ -133,7 +133,7 @@ test('表与视图清单被钉住：少建一张或多建一张都要当场现�
     'evidence_files', 'nft_claims', 'node', 'node_staff', 'order_alerts', 'order_chain',
     'order_delivery_claims', 'order_delivery_items', 'order_returns', 'order_shipping',
     'order_token_deliveries',
-    'orders', 'payment_tokens', 'product_codes', 'product_nft_tokens', 'product_skus', 'products', 'proxy_drafts',
+    'orders', 'payment_tokens', 'pii_pending_media', 'product_codes', 'product_nft_tokens', 'product_skus', 'products', 'proxy_drafts',
     'reviews', 'seller_proxy_draft_quota', 'seller_proxy_product_quota', 'shop_applications',
     'shop_operators', 'shop_webhook', 'shops', 'v_orders',
   ].sort();

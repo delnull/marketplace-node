@@ -9,7 +9,6 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Wallet } from 'ethers';
 import { makeCtx, login, assertOk, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
@@ -18,13 +17,23 @@ const secondCode = '0000TEST2';
 const batchPath = '/api/shops/admin/listing';
 
 test('批量暂停/恢复：缺一家整批拒绝；全批存在时一次改完并同步公开目录', async () => {
-  const secondSeller = Wallet.createRandom().address.toLowerCase();
+  const secondSeller = '0x' + '11'.repeat(20);
   await db.run(
     `INSERT INTO shops (code, seller, name, notice, listed)
      VALUES (?, ?, ?, ?, 1)`,
     secondCode,
     secondSeller,
     '批量测试二号店',
+    '',
+    1
+  );
+  const accentCode = '0000TEST3';
+  await db.run(
+    `INSERT INTO shops (code, seller, name, notice, listed)
+     VALUES (?, ?, ?, ?, 1)`,
+    accentCode,
+    '0x' + '22'.repeat(20),
+    'Café 店',
     '',
     1
   );
@@ -74,6 +83,44 @@ test('批量暂停/恢复：缺一家整批拒绝；全批存在时一次改完�
     .expect(200);
   assertOk(restored);
   assert.deepEqual([...restored.body.data.updated].sort(), [shopRef.value, secondCode].sort());
+  const searched = await request(app)
+    .get('/api/shops/admin/all?q=批量测试二号')
+    .set(auth)
+    .expect(200);
+  assert.deepEqual(
+    searched.body.data.shops.map((s) => s.code),
+    [secondCode],
+    'q 按店名过滤；不能因搜索把别的店带回来'
+  );
+  const searchedByCode = await request(app)
+    .get('/api/shops/admin/all?q=0000test2')
+    .set(auth)
+    .expect(200);
+  assert.deepEqual(searchedByCode.body.data.shops.map((s) => s.code), [secondCode], 'q 按编号不区分大小写');
+  const searchedBySeller = await request(app)
+    .get(`/api/shops/admin/all?q=${secondSeller.toUpperCase()}`)
+    .set(auth)
+    .expect(200);
+  assert.deepEqual(
+    searchedBySeller.body.data.shops.map((s) => s.code),
+    [secondCode],
+    'q 也匹配店主地址且不区分大小写'
+  );
+  const searchedNone = await request(app)
+    .get('/api/shops/admin/all?q=不存在-的-店')
+    .set(auth)
+    .expect(200);
+  assert.deepEqual(searchedNone.body.data.shops, [], '无匹配返回空数组，不是全量');
+  const searchedWildcard = await request(app)
+    .get('/api/shops/admin/all?q=%25')
+    .set(auth)
+    .expect(200);
+  assert.deepEqual(searchedWildcard.body.data.shops, [], 'LIKE 的 % 必须当字面量转义，不能匹配全量');
+  const searchedAccent = await request(app)
+    .get('/api/shops/admin/all?q=cafe')
+    .set(auth)
+    .expect(200);
+  assert.deepEqual(searchedAccent.body.data.shops.map((s) => s.code), [accentCode], 'ngram 搜索忽略重音');
   const publicAgain = await request(app).get('/api/shops').expect(200);
   for (const code of [shopRef.value, secondCode]) {
     assert.ok(

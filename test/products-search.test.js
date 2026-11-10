@@ -3,7 +3,8 @@
  *  - 标题/描述 LIKE 匹配（SQLite 大小写不敏感），仅上架商品可搜到；
  *  - %/_ 通配符按字面匹配（ESCAPE 转义），防「q=% 命中全部」式通配放大；
  *  - 与光标分页组合：每页均为过滤结果；
- *  - order=asc|desc：keyset 游标方向随之翻转（desc = 最新上架优先）；
+ *  - sort=newest|oldest：id keyset 方向随之翻转（newest = 最新上架优先）；
+ *  - sort=composite：节点内综合排序（见 product-rank.test.js），游标是 offset；
  *  - kind=：服务端真过滤（非法值静默忽略），与搜索/分页正交；
  *  - nextCursor（2026-09 修正）：**仅在确有下一页时非空**——多取一行做前瞻判定，
  *    调用方据此即可准确判底，无需再发一次空请求试探。
@@ -118,23 +119,23 @@ test('整页取满且恰好到底：nextCursor 为 null', async () => {
   assert.equal(r.nextCursor, null, '满页但仍到底 → null（前瞻一行判定，不能靠"未取满"推断）');
 });
 
-test('order=desc：最新上架优先（聚合首屏依赖）', async () => {
-  const asc = await search('', 0, 30, { order: 'asc' });
-  const desc = await search('', 0, 30, { order: 'desc' });
-  assert.equal(desc.products.length, asc.products.length, '两种方向数量一致');
+test('sort=newest/oldest：最新上架优先与最早上架优先（聚合首屏依赖 newest）', async () => {
+  const oldest = await search('', 0, 30, { sort: 'oldest' });
+  const newest = await search('', 0, 30, { sort: 'newest' });
+  assert.equal(newest.products.length, oldest.products.length, '两种方向数量一致');
   assert.deepEqual(
-    desc.products.map((p) => p.slug),
-    [...asc.products].reverse().map((p) => p.slug),
-    'desc 与 asc 恰为逆序（id 严格递增，无并列）'
+    newest.products.map((p) => p.slug),
+    [...oldest.products].reverse().map((p) => p.slug),
+    'newest 与 oldest 恰为逆序（id 严格递增，无并列）'
   );
-  // 翻页方向同样成立：desc 用 id < cursor
-  const d1 = await search('', 0, 1, { order: 'desc' });
-  const d2 = await search('', d1.nextCursor, 1, { order: 'desc' });
-  assert.notEqual(d2.products[0].slug, d1.products[0].slug, '第二页不得重复第一页');
+  // 翻页方向同样成立：newest 用 id < cursor
+  const n1 = await search('', 0, 1, { sort: 'newest' });
+  const n2 = await search('', n1.nextCursor, 1, { sort: 'newest' });
+  assert.notEqual(n2.products[0].slug, n1.products[0].slug, '第二页不得重复第一页');
   assert.ok(
-    asc.products.findIndex((p) => p.slug === d2.products[0].slug) <
-      asc.products.findIndex((p) => p.slug === d1.products[0].slug),
-    'desc 第二页的 id 严格小于第一页'
+    oldest.products.findIndex((p) => p.slug === n2.products[0].slug) <
+      oldest.products.findIndex((p) => p.slug === n1.products[0].slug),
+    'newest 第二页的 id 严格小于第一页'
   );
 });
 

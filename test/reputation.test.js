@@ -22,7 +22,7 @@ let buyerToken;
 let slug;
 
 const { applyEvent } = await import('../src/escrowWatcher.js');
-const { computeReputation, reputationSummary } = await import('../src/reputation.js');
+const { computeReputation, reputationSummary, shopOrderCount } = await import('../src/reputation.js');
 const { default: appConfig } = await import('../src/config.js');
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -102,25 +102,25 @@ test('履约画像：近窗事件计数与比率全对（5 争议 ≥ 样本阈�
   const w = r.windows.d30;
 
   // 近窗 8 单：确认 2、超时 1、争议 5（判买家 2 / 判卖家 2 / 未决 1）
-  assert.equal(w.orders, 8);
+  assert.equal(w.escrowOrders, 8);
   assert.equal(w.confirmed, 2);
   assert.equal(w.timeouts, 1);
   assert.equal(w.disputes, 5);
   assert.equal(w.settledToSeller, 2, '判卖家 2（终局 settled 反推）');
   assert.equal(w.refundedToBuyer, 2, '判买家 2（终局 refunded 反推）');
   assert.equal(w.sampleTooSmall, false, '5 争议达样本阈值');
-  assert.equal(w.confirmRate, 0.25);
-  assert.equal(w.timeoutRate, 0.125);
-  assert.equal(w.disputeRate, 0.625, '5/8');
-  assert.equal(w.refundRate, 0.4, '判买家 2/5（卖家过错近似）');
+  assert.equal(w.escrowConfirmRate, 0.25);
+  assert.equal(w.escrowTimeoutRate, 0.125);
+  assert.equal(w.escrowDisputeRate, 0.625, '5/8');
+  assert.equal(w.refundedToBuyerShare, 0.4, '判买家 2/5（卖家过错近似）');
 
   // d30/d90/d365 口径一致（老单 500 天前只进 all）
-  assert.equal(r.windows.d90.orders, 8);
-  assert.equal(r.windows.d365.orders, 8);
-  assert.equal(r.windows.all.orders, 9, 'all 含 500 天前老单');
+  assert.equal(r.windows.d90.escrowOrders, 8);
+  assert.equal(r.windows.d365.escrowOrders, 8);
+  assert.equal(r.windows.all.escrowOrders, 9, 'all 含 500 天前老单');
   assert.equal(r.windows.all.confirmed, 3);
-  assert.equal(r.windows.all.confirmRate, 0.3333, '3/9 舍入 4 位小数');
-  assert.equal(r.windows.all.refundRate, 0.4);
+  assert.equal(r.windows.all.escrowConfirmRate, 0.3333, '3/9 舍入 4 位小数');
+  assert.equal(r.windows.all.refundedToBuyerShare, 0.4);
 
   /*
     重复交易对信号也随响应下发（端点走 reputationSummary，buyer/seller 两列必须真的被查出来——
@@ -158,10 +158,10 @@ test('单元：paid 快路径订单（OrderCreated 由 paid 补写）参与单�
     mk('confirmed', [e('OrderCreated', now - 2000), e('ReceiptConfirmed', now - 1000)]),
     mk('confirmed', [e('OrderCreated', now - 1500), e('ReceiptConfirmed', now - 500)]),
   ], now);
-  assert.equal(r.windows.all.orders, 2, '补写后订单基数完整');
+  assert.equal(r.windows.all.escrowOrders, 2, '补写后订单基数完整');
   assert.equal(r.windows.all.confirmed, 2);
-  assert.equal(r.windows.all.confirmRate, 1, '2/2');
-  assert.equal(r.windows.d30.orders, 2, '事件时刻均在近窗');
+  assert.equal(r.windows.all.escrowConfirmRate, 1, '2/2');
+  assert.equal(r.windows.d30.escrowOrders, 2, '事件时刻均在近窗');
 });
 
 test('单元：争议 <5 样本不足时争议率/判买家率置 null（防小样本误导）', async () => {
@@ -186,12 +186,12 @@ test('单元：争议 <5 样本不足时争议率/判买家率置 null（防小�
       e('Arbitrated', now - 200),
     ]),
   ], now);
-  assert.equal(small.windows.all.orders, 3);
+  assert.equal(small.windows.all.escrowOrders, 3);
   assert.equal(small.windows.all.disputes, 2);
   assert.equal(small.windows.all.sampleTooSmall, true);
-  assert.equal(small.windows.all.disputeRate, null, '争议率隐藏');
-  assert.equal(small.windows.all.refundRate, null, '判买家率隐藏');
-  assert.equal(small.windows.all.confirmRate, 0.3333, '1/3 舍入 4 位小数——非争议指标不受样本阈值影响');
+  assert.equal(small.windows.all.escrowDisputeRate, null, '争议率隐藏');
+  assert.equal(small.windows.all.refundedToBuyerShare, null, '判买家率隐藏');
+  assert.equal(small.windows.all.escrowConfirmRate, 0.3333, '1/3 舍入 4 位小数——非争议指标不受样本阈值影响');
   assert.equal(small.windows.all.refundedToBuyer, 1, '原始计数仍输出（供前端标注 n 笔）');
 });
 
@@ -238,7 +238,7 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
   assert.equal(old.delivery.d30.count, 0, '老交付不进 d30');
   assert.equal(old.delivery.d30.medianMs, null);
 
-  // 0 争议 = 健康而非样本问题：disputeRate 0、refundRate null（无争议可判）
+  // 0 争议 = 健康而非样本问题：escrowDisputeRate 0、refundedToBuyerShare null（无争议可判）
   const clean = computeReputation([
     {
       status: 'confirmed',
@@ -250,16 +250,16 @@ test('单元：中位数（偶数均值）与 0 争议/空库/无事件行边界
   ], now);
   assert.equal(clean.windows.all.disputes, 0);
   assert.equal(clean.windows.all.sampleTooSmall, false);
-  assert.equal(clean.windows.all.disputeRate, 0);
-  assert.equal(clean.windows.all.refundRate, null);
+  assert.equal(clean.windows.all.escrowDisputeRate, 0);
+  assert.equal(clean.windows.all.refundedToBuyerShare, null);
 
   // 空库 / 无链上事件行（草稿/取消）：零输出不报错
   const empty = computeReputation([], now);
-  assert.equal(empty.windows.all.orders, 0);
+  assert.equal(empty.windows.all.escrowOrders, 0);
   assert.equal(empty.firstOrderAt, null);
   assert.equal(empty.delivery.all.medianMs, null);
   const drafts = computeReputation([{ status: 'draft', delivered_at: null, onchain_events: [] }], now);
-  assert.equal(drafts.windows.all.orders, 0);
+  assert.equal(drafts.windows.all.escrowOrders, 0);
 });
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -298,7 +298,7 @@ test('单元：重复交易对占比 =（总成交 − 不同交易对数）/ �
     now
   );
   const s = r.windows.all.sybil;
-  assert.equal(r.windows.all.orders, 6);
+  assert.equal(r.windows.all.escrowOrders, 6);
   assert.equal(s.distinctPairs, 3, '同一买家 + 同一家店 = 同一个交易对');
   assert.equal(s.repeatOrders, 3, '6 单 − 3 对 = 第 2 笔及以后的 3 笔');
   assert.equal(s.repeatPairShare, 0.5, '3/6');
@@ -317,7 +317,7 @@ test('单元：重复交易对占比 =（总成交 − 不同交易对数）/ �
 
   // 小样本（<5 单）：比率置 null（"3 单里 2 单同一个人"读起来像 67% 的异常，其实什么都说明不了）
   const tiny = computeReputation([row(A, SHOP, now - 2000), row(A, SHOP, now - 1000)], now);
-  assert.equal(tiny.windows.all.orders, 2);
+  assert.equal(tiny.windows.all.escrowOrders, 2);
   assert.equal(tiny.windows.all.sybil.sampleTooSmall, true);
   assert.equal(tiny.windows.all.sybil.repeatPairShare, null);
   assert.equal(tiny.windows.all.sybil.topPairShare, null);
@@ -329,7 +329,7 @@ test('单元：重复交易对占比 =（总成交 − 不同交易对数）/ �
     now
   );
   assert.equal(old.windows.all.sybil.repeatOrders, 1);
-  assert.equal(old.windows.d30.orders, 0);
+  assert.equal(old.windows.d30.escrowOrders, 0);
   assert.equal(old.windows.d30.sybil.repeatOrders, 0, '分子分母同源：窗外单不会在窗内冒出重复笔数');
 });
 
@@ -339,7 +339,7 @@ test('单元：重复交易对占比 =（总成交 − 不同交易对数）/ �
    病：公开画像只在事件名恰好是 `DisputeRequested` 时计争议，而镜像会被 `/sync` 与后台对账
    按链上真值修好（那一路写的事件名是 `Sync:disputed`）⇒ 争议读成 0；同一时刻 buyerSignal
    用"状态 ∨ 事件"读出 7 单 —— 同一批单两个答案。且判向计数是按**行**数的、分母是按**事件**
-   数的，混合口径能算出 `refundRate = 1.4`（公开页会印「争议 5 笔中判买家 7 笔」）。
+   数的，混合口径能算出 `refundedToBuyerShare = 1.4`（公开页会印「争议 5 笔中判买家 7 笔」）。
    药：判据收进 `orderFacts.rowEverDisputed`（状态 ∨ DisputeRequested ∨ Arbitrated），
    两处共用；分子分母都以**本行**为单位。
    ══════════════════════════════════════════════════════════════════════ */
@@ -362,11 +362,11 @@ test('争议计数：被 /sync 或对账修好的争议（事件名 Sync:dispute
   ];
   const r = computeReputation(rows, now);
   assert.equal(r.windows.all.disputes, 5, '状态为 disputed 的单必须计入争议（不许因为事件名不同就漏掉）');
-  assert.equal(r.windows.all.disputeRate, 1, '5/5');
+  assert.equal(r.windows.all.escrowDisputeRate, 1, '5/5');
   assert.equal(r.windows.all.sampleTooSmall, false, '这 5 单是确证发生过争议，不该被当成"样本不足"');
 });
 
-test('判向比率：分子分母同源 ⇒ refundRate ≤ 1（不再出现"争议 5 笔中判买家 7 笔"）', async () => {
+test('判向比率：分子分母同源 ⇒ refundedToBuyerShare ≤ 1（不再出现"争议 5 笔中判买家 7 笔"）', async () => {
   const now = Date.now();
   const e = (name, at) => ({ name, txHash: null, block: null, at });
   // 真实可达的行都带链上支付凭证（paid_tx_hash）——画像是**按它证明托管发生过**的（2026-10-15）
@@ -384,7 +384,7 @@ test('判向比率：分子分母同源 ⇒ refundRate ≤ 1（不再出现"争�
   const w = computeReputation(rows, now).windows.all;
   assert.equal(w.disputes, 12, '7 单仲裁 + 5 单在途争议 = 12 单"争过"');
   assert.equal(w.refundedToBuyer, 7);
-  assert.ok(w.refundRate !== null && w.refundRate <= 1, `判买家率必须 ≤ 1（实际 ${w.refundRate}）`);
+  assert.ok(w.refundedToBuyerShare !== null && w.refundedToBuyerShare <= 1, `判买家率必须 ≤ 1（实际 ${w.refundedToBuyerShare}）`);
   assert.ok(
     w.refundedToBuyer + w.settledToSeller <= w.disputes,
     '判向计数是分母的子集——分子不许脱离分母（这正是旧口径算出 1.4 的原因）'
@@ -416,11 +416,11 @@ test('托管证明是耐久凭据：OrderCreated 被 20 条可重复事件挤掉
     }),
   ];
   const w = computeReputation(spammed, now).windows.all;
-  assert.equal(w.orders, 2, '凭证在 ⇒ 这一单必须计入（不许因为事件被挤掉就整单消失）');
+  assert.equal(w.escrowOrders, 2, '凭证在 ⇒ 这一单必须计入（不许因为事件被挤掉就整单消失）');
   assert.equal(w.disputes, 1, '它争过，争议也要计');
   assert.equal(w.refundedToBuyer, 1, '判向按行数，与争议同源');
   assert.equal(w.confirmed, 1);
-  assert.equal(w.confirmRate, 0.5, '1/2——分母含它，分子自然也含得住');
+  assert.equal(w.escrowConfirmRate, 0.5, '1/2——分母含它，分子自然也含得住');
   assert.equal(w.sybil.distinctPairs, 2, '交易对计数同样不因事件裁剪而丢（重复交易对信号的分母）');
 
   /*
@@ -435,9 +435,9 @@ test('托管证明是耐久凭据：OrderCreated 被 20 条可重复事件挤掉
     ],
     now
   ).windows.all;
-  assert.equal(emptied.orders, 2, '事件史为空但凭证在 ⇒ 仍然计入单量（老店不会变新店）');
+  assert.equal(emptied.escrowOrders, 2, '事件史为空但凭证在 ⇒ 仍然计入单量（老店不会变新店）');
   assert.equal(emptied.confirmed, 0, '事件没了，确认计数自然是 0（分子不凭空出现）');
-  assert.equal(emptied.confirmRate, 0, '0/2 = 0——是"确实没有确认记录"，不是 null');
+  assert.equal(emptied.escrowConfirmRate, 0, '0/2 = 0——是"确实没有确认记录"，不是 null');
 });
 
 test('没有链上支付凭证的行不进画像（证明在哪一层，计数就在哪一层）', async () => {
@@ -450,9 +450,9 @@ test('没有链上支付凭证的行不进画像（证明在哪一层，计数�
     mk('confirmed', [e('OrderCreated', now - 800), e('ReceiptConfirmed', now - 700)], { paid_tx_hash: '0x' + 'cd'.repeat(32), created_at: now - 800 }),
   ];
   const w = computeReputation(rows, now).windows.all;
-  assert.equal(w.orders, 1, '只有带凭证的那一单进画像');
+  assert.equal(w.escrowOrders, 1, '只有带凭证的那一单进画像');
   assert.equal(w.confirmed, 1);
-  assert.equal(w.confirmRate, 1, '分子分母同源 ⇒ 不会 > 1');
+  assert.equal(w.escrowConfirmRate, 1, '分子分母同源 ⇒ 不会 > 1');
 });
 
 test('三个比率恒 ∈ [0,1]（口径承诺的机器判据）', async () => {
@@ -470,10 +470,10 @@ test('三个比率恒 ∈ [0,1]（口径承诺的机器判据）', async () => {
   for (const key of ['all', 'd30']) {
     const w = computeReputation(rows, now).windows[key];
     for (const [name, v] of [
-      ['disputeRate', w.disputeRate],
-      ['refundRate', w.refundRate],
-      ['confirmRate', w.confirmRate],
-      ['timeoutRate', w.timeoutRate],
+      ['escrowDisputeRate', w.escrowDisputeRate],
+      ['refundedToBuyerShare', w.refundedToBuyerShare],
+      ['escrowConfirmRate', w.escrowConfirmRate],
+      ['escrowTimeoutRate', w.escrowTimeoutRate],
     ]) {
       if (v === null) continue;
       assert.ok(v >= 0 && v <= 1, `${key}.${name} = ${v} 超出 [0,1]`);
@@ -493,18 +493,45 @@ test('三个比率恒 ∈ [0,1]（口径承诺的机器判据）', async () => {
    多店改造把"哪一家店"从**可变的全局常量**换成**显式入参**：调用方漏传即抛错，
    于是"忘了按店过滤"不再可能悄悄发生（旧写法里只要有人改了全局，过滤条件就整体失效）。
    ══════════════════════════════════════════════════════════════════════ */
-test('seller 过滤：只算指定那家店的单；显式 null 才是"全部在售店铺"', async () => {
+test('窗口单量：escrowOrders 是全部有凭证订单；effectiveOrders 剔除全额退款/取消/自买', () => {
+  const now = Date.now();
+  const base = {
+    paid_tx_hash: '0x' + '1'.repeat(64),
+    status: 'escrowed',
+    buyer: '0x' + 'b'.repeat(40),
+    seller: '0x' + 'a'.repeat(40),
+    created_at: new Date(now - 1000),
+    onchain_events: [],
+    delivered_at: null,
+  };
+  const r = computeReputation([
+    base,
+    { ...base, status: 'refunded' },
+    { ...base, buyer: base.seller },
+    { ...base, paid_tx_hash: '' },
+    { ...base, status: 'cancelled' },
+  ], now);
+  assert.equal(r.windows.all.escrowOrders, 4, '有支付凭证的 4 单（含退款/取消/自买）');
+  assert.equal(r.windows.all.effectiveOrders, 1, '有效单量只留未退款/未取消/非自买');
+});
+
+test('seller 过滤：只算指定那家店的单；单量按店铺编号计数', async () => {
   const A = '0x' + 'a1'.repeat(20);
   const B = '0x' + 'b2'.repeat(20);
+  const codeA = '0000AAA01';
+  const codeB = '0000BBB01';
+  await db.run('INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, ?, ?, 1)', codeA, A, 'A 店', '');
+  await db.run('INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, ?, ?, 1)', codeB, B, 'B 店', '');
   const at = Date.now() - 1000;
   const insert = async (seq) =>
     await insertOrderRow(db, {
       status: 'confirmed',
       productSlug: 'p-rep-f',
-      // 这一行**刻意不指向任何真实店铺**：本用例钉的是"画像按 seller 过滤"，
+      // 这一行**刻意不指向任何真实店铺的商品**：本用例钉的是"画像按 seller 过滤"，
       // 而 seller 列没有外键（它是逐行写入的事实），所以这里可以放两个不同的钱包
       buyer: '0x' + 'b'.repeat(40),
       seller: seq.seller,
+      shopCode: seq.shopCode,
       amountWei: '1000',
       priceMicro: 1000000,
       btyUsdtRate: '0.1',
@@ -512,22 +539,18 @@ test('seller 过滤：只算指定那家店的单；显式 null 才是"全部在
       paidTxHash: `0x${String(seq.n).padStart(63, 'a')}a`,
       updatedAt: new Date(at),
     });
-  await insert({ n: 1, seller: A });
-  await insert({ n: 2, seller: A });
-  await insert({ n: 3, seller: B });
+  await insert({ n: 1, seller: A, shopCode: codeA });
+  await insert({ n: 2, seller: A, shopCode: codeA });
+  await insert({ n: 3, seller: B, shopCode: codeB });
 
-  assert.equal((await reputationSummary(A)).windows.all.orders, 2, '只算 A 店的单');
-  assert.equal((await reputationSummary(B)).windows.all.orders, 1, '只算 B 店的单');
+  assert.equal((await reputationSummary(A)).windows.all.escrowOrders, 2, '只算 A 店的单');
+  assert.equal((await reputationSummary(B)).windows.all.escrowOrders, 1, '只算 B 店的单');
+  assert.equal(await shopOrderCount(codeA), 2, '轻量单量按店铺编号，与画像同口径');
+  assert.equal(await shopOrderCount(codeB), 1);
+  await assert.rejects(async () => await shopOrderCount(undefined), /shopCode/, '漏传店铺编号必须响亮失败');
   /*
     漏传（undefined）⇒ **抛错**，不是"退化成全部"。这是刻意的：默认成"全部"就是一次静默的
     跨店混算，表现是"画像数字看起来正常、只是把别人家的生意算进来了"——最难查的一类。
   */
   await assert.rejects(async () => await reputationSummary(undefined), /需要显式的 seller/, '漏传店铺必须响亮失败');
-  /*
-    显式 `null` = "该节点全部在售店铺的合计"（只有节点级读数才这么用）。
-    期望值按**同一条证明判据**从库里算出来——本文件别的用例也往这个内存库插过单。
-  */
-  const proven = (await db.get("SELECT COUNT(1) AS c FROM v_orders WHERE paid_tx_hash IS NOT NULL")).c;
-  assert.equal((await reputationSummary(null)).windows.all.orders, proven, 'null = 不过滤（节点级合计）');
-  assert.ok(proven > 3, `前置：库里除本用例这 3 单还有别的行（实际 ${proven}）——上一条断言才有意义`);
 });
