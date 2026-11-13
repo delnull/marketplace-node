@@ -72,7 +72,13 @@ async function hydrateSharedCache() {
 /** 上游一律带上可识别的 UA：公共行情接口普遍对"无 UA/默认 UA"更激进地限速（也便于对方联系我们） */
 const UA = 'marketplace-node/0.1 (+https://github.com/delnull/marketplace-node)';
 
-async function fetchJson(url, timeoutMs = 8000) {
+/**
+ * 上游行情读取：普通公网 HTTPS，按慢网络给预算。
+ * 8 秒是旧值：一次官方 ticker 在弱网/上游限速时可能刚好卡在 8 秒边界，
+ * 会把"这次没报价"变成频繁的"汇率读不到"（界面只能显示 BTY 待汇率）。
+ * 15 秒仍有界；行情有缓存与 fallback 标记，读不到不会被当成 0。
+ */
+async function fetchJson(url, timeoutMs = 15_000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -116,6 +122,20 @@ async function fetchBtyUsdt() {
 let inflight = null;
 
 /**
+ * 共享缓存是**增强**，不是请求路径上的硬依赖：Redis 已连接但慢/卡时，
+ * `hydrateSharedCache` 可能挂到客户端超时之后。这里给它 1 秒预算——
+ * 读不到就按本进程缓存继续（最坏是指标少一次跨实例合并，不会把 /api/rates 挂住）。
+ */
+function withBudget(promise, ms) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
  * 这条腿是否到了该刷新的时刻。
  * 有**实时**值 → 按自己的 TTL；从未取到过值、或当前服务的是**手工兜底值** → 按失败负缓存
  * （NEGATIVE_TTL_MS），否则"上游全挂"会被放大成"每个请求都去打一轮上游"（这正是要防的封杀路径）。
@@ -144,7 +164,7 @@ function legDue(at, value, ttlMs, isFallback) {
  *   那套协调逻辑（planRefresh / starvedLegs / 负缓存轮询）随之删除：一轮刷新必然覆盖全部需要的东西。
  */
 export async function refreshRates(force = false) {
-  await hydrateSharedCache();
+  await withBudget(hydrateSharedCache().catch(() => undefined), 1_000);
   if (!force && !legDue(cache.attemptedBty, cache.btyUsdt, config.rates.btyTtlMs, cache.btyFallback)) return cache;
   if (inflight) {
     // 抓住手里这一轮（inflight 可能马上被清空）；它必然覆盖这条唯一的腿
@@ -205,20 +225,40 @@ export async function __resetRatesCacheForTest() {
  * 上一轮的实时值"对买家的含义完全不同（一个是店主填的数、一个是旧行情），
  * 所以必须分开报：只报 `stale` 会让店主以为"只是有点滞后"（源码评审 2026-10，P1）。
  */
-function snapshot() {
+function snapshot(forceStale = false) {
   return {
     btyUsdt: cache.btyUsdt,
     // 1 USDT = x BTY
     usdtToBty: 1 / cache.btyUsdt,
-    stale: Boolean(cache.btyError),
+    stale: Boolean(cache.btyError) || forceStale,
     fallback: cache.btyFallback,
     error: cache.btyError || null,
     updatedAt: cache.atBty,
   };
 }
 
-/** 当前汇率（可能触发一次后台刷新）；无任何可用值时返回 null 由调用方降级 */
+/**
+ * 当前汇率（stale-while-revalidate）：**有旧值就先给旧值，同时在后台刷新**。
+ *
+ * 为什么不再在请求路径上等上游：ticker 是公网 HTTPS，慢/限流时一次要等满 15 秒；
+ * 有上一轮的值时，让买家/店主先拿到它（`stale=true` 如实标出）比让整个
+ * `/api/rates`、支付方式查询跟着卡 15 秒更合理。后台刷新由 single-flight 收口，
+ * 并发请求不会各打一轮上游；刷新失败会写进 `btyError`，下一次请求如实带出。
+ * 只有在**从未取到过值**时才同步等一轮（此时没有旧值可先给）。
+ *
+ * `stale=true` 有两种来源：上一轮刷新失败（`error` 非空），或缓存到期、后台刷新还没回来
+ * （`error` 为空）——对买家都表示"这不是刚取到的价"；手工兜底另有 `fallback` 单独标记。
+ */
 export async function getRates() {
+  if (cache.btyUsdt) {
+    const due = legDue(cache.attemptedBty, cache.btyUsdt, config.rates.btyTtlMs, cache.btyFallback);
+    if (due) {
+      /* 后台刷新：不 await；single-flight 保证并发只打一轮 */
+      void refreshRates(true).catch(() => undefined);
+      return snapshot(true);
+    }
+    return snapshot();
+  }
   const r = await refreshRates();
   if (!r.btyUsdt) return null;
   return snapshot();

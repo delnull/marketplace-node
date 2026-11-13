@@ -53,6 +53,12 @@ function handleRpc(j) {
     const data = String(j.params?.[0]?.data || '');
     const selector = data.slice(0, 10);
     if (selector === iface.getFunction('getOrder').selector) {
+      const refunded =
+        chainCase.refundedAmount !== undefined
+          ? BigInt(chainCase.refundedAmount)
+          : chainCase.status === 'Refunded'
+            ? BigInt(chainCase.amount)
+            : 0n;
       return {
         result: iface.encodeFunctionResult('getOrder', [
           chainCase.buyer,
@@ -62,7 +68,7 @@ function handleRpc(j) {
           7n, // createdAtBlock
           false, // refundRequested
           false, // refundRejected
-          chainCase.status === 'Refunded' ? BigInt(chainCase.amount) : 0n,
+          refunded,
           STATUS_INDEX[chainCase.status],
           true, // buyerConfirmed：售后案件正是"买家确认过之后"的救济路径
         ]),
@@ -459,7 +465,7 @@ test('仲裁台售后案件队列：只列在途案件 + 待办计数 + 最久�
   assert.equal(p.body.data.disputes[0].afterSaleStatus, 'none', '争议单的售后案件字段恒为 none（两套流程互斥）');
 });
 
-test('卖家待办徽标含在途售后案件数（终局单不会出现在 byStatus 里）', async () => {
+test('店主待办徽标含在途售后案件数（终局单不会出现在 byStatus 里）', async () => {
   const o = await insertOrder({ status: 'settled', afterSaleStatus: 'open', afterSaleOpenedAt: new Date(Date.now()) });
   const res = await request(app).get('/api/orders/seller/status-counts').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assertOk(res);
@@ -510,6 +516,29 @@ test('POST /:id/sync 按链上真值双向回填售后案件（漏扫 AfterSaleO
   const closedAt = row.after_sale_closed_at;
   await request(app).post(`/api/orders/${o.orderNo}/sync`).set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
   assert.equal((await rowOf(o.orderId)).after_sale_closed_at.getTime(), closedAt.getTime());
+});
+
+test('sync 回填 confirmed 单漏扫的 SellerRefunded 已退金额', async () => {
+  const o = await insertOrder({ status: 'confirmed' });
+  chainCase = {
+    open: false,
+    openedAtBlock: 0,
+    status: 'Settled',
+    buyer: BUYER,
+    seller: SELLER,
+    amount: AMOUNT,
+    refundedAmount: '500000000000000000',
+  };
+  const res = await request(app)
+    .post(`/api/orders/${o.orderNo}/sync`)
+    .set('Authorization', `Bearer ${buyerToken}`)
+    .set('X-Mk-Shop', shopRef.value)
+    .expect(200);
+  assertOk(res);
+  assert.match(res.body.message, /本地账本落后/, '已退金额补录后不能再说“本地状态与链上一致”');
+  const row = await rowOf(o.orderId);
+  assert.equal(row.status, 'confirmed', '状态不变');
+  assert.equal(row.refunded_amount_wei, '500000000000000000');
 });
 
 test('sync 的安全边界：链上查不到该单时不改动本地案件状态', async () => {

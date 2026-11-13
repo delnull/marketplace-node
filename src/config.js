@@ -7,7 +7,7 @@
  * 节点不读取任何 Registry；目录登记由 operator 钱包在客户端按目标目录完成。
  * 商品上架/发货等写操作由 `roleOf(address, shopCode)` 判"他在**这家店**里是什么角色"。
  *
- * 零费模型：没有平台费、没有节点抽成；托管结算只有买家/卖家两条腿。
+ * 零费模型：没有平台费、没有节点抽成；托管结算只有买家/店主两条腿。
  *
  * 环境变量注入：启动时经 `node --env-file-if-exists=.env` 加载（见 package.json scripts）。
  */
@@ -151,6 +151,16 @@ export function parseRpcUrls(raw) {
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
       throw new Error(`MK_RPC_URL 只接受 http/https：${JSON.stringify(value)}`);
     }
+    /*
+      RPC 是 watcher/交付/结算的信任根：明文 http 只允许本机 anvil；
+      公网 http 会被任何中间人替换链上读数，必须在启动期拒绝。
+    */
+    if (u.protocol === 'http:') {
+      const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+      if (!['127.0.0.1', 'localhost', '::1'].includes(host)) {
+        throw new Error(`MK_RPC_URL 的 http 只允许本机（127.0.0.1/localhost/::1）；公网请用 https：${JSON.stringify(value)}`);
+      }
+    }
     if (!out.includes(u.href)) out.push(u.href);
   }
   return out;
@@ -209,7 +219,7 @@ export function resolveNodeDomain() {
  * 语义：**资金流已终结**的订单（confirmed/settled/refunded/expired/cancelled）静置超过 N 天后，
  * 其收货信息/买家备注/售后陈述正文/证据附件由 src/piiErase.js 自动擦除（金额、状态、链上单号、
  * 支付哈希、事件史与不带 PII 的评价一律保留——账目与链上凭证不可删）。
- * 非终局订单（draft/escrowed/shipped/disputed）**永不**自动擦除：卖家还得靠收货信息发货。
+ * 非终局订单（draft/escrowed/shipped/disputed）**永不**自动擦除：店主还得靠收货信息发货。
  * 单独具名导出：piiErase.js 与单测直接读它，不必为改一个阈值去重载整个 config。
  */
 export const PII_RETENTION_DAYS = intEnvAllowZero('MK_PII_RETENTION_DAYS', 180);
@@ -260,7 +270,7 @@ const config = {
     // 换 operator = 换一台机器（重新部署 + 各目录自行登记）。
     owner: process.env.MK_SHOP_OWNER || '',
     // 店名/公告/店员名单/通知 webhook 等经营参数一律是库里的列/行，
-    // 在卖家面板「店铺设置」网页维护，不在配置文件出现。
+    // 在店主面板「店铺设置」网页维护，不在配置文件出现。
   },
 
   /**
@@ -286,7 +296,7 @@ const config = {
     escrowAddress: chainAddressOf('MK_ESCROW_ADDRESS', process.env.MK_ESCROW_ADDRESS),
     /*
       本节点的保证金合约（节点部署，与 escrow 一对一）。留空 = 未接入保证金层：
-      卖家不能质押，罚没/提货赔付路径不可用；节点仍可下单（托管本身不依赖 staking）。
+      店主不能质押，罚没/提货赔付路径不可用；节点仍可下单（托管本身不依赖 staking）。
     */
     stakingAddress: chainAddressOf('MK_STAKING_ADDRESS', process.env.MK_STAKING_ADDRESS),
     /*
@@ -353,7 +363,7 @@ const config = {
 
   /*
     链上状态对账（src/chainReconcile.js）：watcher 只回放日志、从不回滚，链上已终局而本地
-    仍停在非终态的订单会永久滞留（卖家发货/退款面板上一直是"待处理"）。对账轮询按间隔复查
+    仍停在非终态的订单会永久滞留（店主发货/退款面板上一直是"待处理"）。对账轮询按间隔复查
     这类订单并以 watcher 同一套映射修复。间隔放宽到 10 分钟——对账是兜底路径（正常收敛由
     事件回写完成），间隔越短只是越早发现异常，代价是 RPC 读取次数。
   */
@@ -363,8 +373,10 @@ const config = {
 
   webhook: {
     // 通知 URL/签名密钥为经营参数（kv + 店铺设置网页维护，见 webhook.js 动态读取）；
-    // 此处仅保留投递运行参数
-    timeoutMs: intEnv('MK_WEBHOOK_TIMEOUT_MS', 5000),
+    // 此处仅保留投递运行参数。
+    // 10 秒：投递是节点→店主的公网 HTTPS，5 秒对慢接收端太紧；失败本就会重试并记投递日志，
+    // 放宽只影响"多久判这次失败"，不会改变投递语义。
+    timeoutMs: intEnv('MK_WEBHOOK_TIMEOUT_MS', 10_000),
     // 失败重试退避基数（毫秒；测试可调小）
     retryBaseMs: intEnv('MK_WEBHOOK_RETRY_MS', 2000),
     // 店主（owner）登录即推 webhook 告警（'1' 开启；auth.owner_login 事件，含地址与来源 IP——
@@ -376,7 +388,7 @@ const config = {
 
 
   // 卡密自动交付：数字商品买家托管成功后，若码池有未用码则自动发码置 shipped
-  //（免卖家手动发货）；'0' 关闭。getter 动态读取便于测试切换。
+  //（免店主手动发货）；'0' 关闭。getter 动态读取便于测试切换。
   get autoDeliver() {
     return process.env.MK_AUTO_DELIVER !== '0';
   },
@@ -388,7 +400,7 @@ const config = {
     可以在建单前把这一单交给自己配置的服务问一句，服务说不行就不卖。
     这是**运营方自己的**策略执行点：节点只是把请求转发过去、按应答放行或拒单，平台不参与也不提供风控。
 
-    数据最小化：只发订单本身的交易要素（商品/规格/数量/金额/买家卖家地址/时间），
+    数据最小化：只发订单本身的交易要素（商品/规格/数量/金额/买家店主地址/时间），
     **永不**发收货人姓名/电话/地址/买家备注——风控服务不能变成个人信息外流通道（见 src/orderGate.js 白名单）。
 
     getter 动态读取（与 webhook.ownerLoginAlert / autoDeliver 同款）：URL 是运维参数，
@@ -401,13 +413,15 @@ const config = {
       return (process.env.MK_ORDER_GATE_URL || '').trim();
     },
     // 签名密钥（选填）：配置后请求带 x-mk-signature = HMAC-SHA256(密钥, 请求体原文)，
-    // 与卖家通知 webhook（src/webhook.js）同一套方案——风控服务只需实现一个校验器
+    // 与店主通知 webhook（src/webhook.js）同一套方案——风控服务只需实现一个校验器
     get secret() {
       return process.env.MK_ORDER_GATE_SECRET || '';
     },
-    // 单次请求超时（毫秒）：超时按"不可达"处理 → 拒单（fail-closed）；0/非法回退默认值
+    // 单次请求超时（毫秒）：超时按"不可达"处理 → 拒单（fail-closed）；0/非法回退默认值。
+    // 10 秒是给**远端**风控服务的：3 秒对公网/跨机房的服务太紧，慢一点就会把正常订单拒掉；
+    // 代价是风控服务真挂了时，下单要先等这 10 秒才收到明确拒单（仍有界）。
     get timeoutMs() {
-      return intEnv('MK_ORDER_GATE_TIMEOUT_MS', 3000);
+      return intEnv('MK_ORDER_GATE_TIMEOUT_MS', 10_000);
     },
   },
 

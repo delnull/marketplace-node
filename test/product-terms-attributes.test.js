@@ -127,14 +127,15 @@ test('承诺三态：未提交 = 不动；提交完整对象 = 覆盖；显式�
 
 /* ── 参数 ───────────────────────────────────────────────────────────── */
 
-test('参数：去重按大小写不敏感的键；只写一半报错；超长报错；条数有上限', async () => {
+test('参数：去重按大小写不敏感的 (名,值) 组合；只写一半报错；超长报错；条数有上限', async () => {
   const p = await create(
     productPayload({
       title: '参数形状',
       attributes: [
         { name: '成色', value: '全新' },
         { name: 'Brand', value: 'A' },
-        { name: 'brand', value: 'B' }, // 与上一条同键（ASCII 折小写）→ 只留先出现的那种写法
+        { name: 'brand', value: 'B' }, // 同名不同值是合法参数（接口的多档值）
+        { name: 'BRAND', value: 'a' }, // 与第二条 (name,value) 全等（ASCII 折小写）→ 丢弃
         { name: '', value: '' }, // 整行没填：丢弃，不是错误
       ],
     })
@@ -142,6 +143,7 @@ test('参数：去重按大小写不敏感的键；只写一半报错；超长�
   assert.deepEqual(p.attributes, [
     { name: '成色', value: '全新' },
     { name: 'Brand', value: 'A' },
+    { name: 'brand', value: 'B' },
   ]);
 
   const half = await request(app)

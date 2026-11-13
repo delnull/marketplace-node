@@ -1318,6 +1318,27 @@ async function createFreshSchema() {
 }
 
 /**
+ * 建单幂等键映射（一次性迁移脚本也引用这一份 DDL，避免两处各写一张表）。
+ *
+ * 键是 `(发起人, 幂等键)`：发起人 = 本次登录的钱包（自购=买家，代客=店主）。
+ * `order_no` 唯一：一个订单最多被一个幂等键认领。订单行删除后这里的孤儿映射
+ * 由路由在回放查不到订单时清掉（不做 FK：删除订单的路径不止一处）。
+ */
+export const ORDER_IDEMPOTENCY_DDL = `
+  CREATE TABLE IF NOT EXISTS order_idempotency (
+    initiator CHAR(42) NOT NULL,
+    idem_key  VARCHAR(64) NOT NULL,
+    order_no  CHAR(21) NOT NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (initiator, idem_key),
+    UNIQUE KEY uk_order_idempotency_order (order_no),
+    /* 清扫按 created_at 过滤（90 天保留窗口），没有索引会每小时全表扫 */
+    KEY idx_order_idempotency_created (created_at),
+    CONSTRAINT ck_order_idempotency_initiator_lower CHECK (initiator = LOWER(initiator))
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+`;
+
+/**
  * 全库 DDL。多语句一次性下发（只有这里允许；业务语句一律单条——见 baseConnectionOptions
  * 的 `multipleStatements: false`）。
  */
@@ -1383,7 +1404,7 @@ const SCHEMA_DDL = `
     /*
       本节点的保证金合约地址锚（MK_STAKING_ADDRESS）。它与 escrow 一对一（链上 Registry
       登记时校验 escrow.staking() / staking.escrow() 互为对方），节点只读它算出金下限。
-      留空 = 未接入保证金层（卖家不能质押，罚没/提货赔付路径不可用）。
+      留空 = 未接入保证金层（店主不能质押，罚没/提货赔付路径不可用）。
     */
     staking_address CHAR(42) NULL,
     watcher_block BIGINT UNSIGNED NULL,                 -- 事件轮询游标（已处理到的块）
@@ -1603,7 +1624,7 @@ const SCHEMA_DDL = `
     snapshot_hash CHAR(66) NOT NULL,
     auto_deliver  TINYINT NOT NULL DEFAULT -1,          -- -1 跟随全局 / 0 关 / 1 开
     /*
-      **提货声明**（NFT 商品：买家买的是一枚 token，实物/服务由卖家在链下兑付）。
+      **提货声明**（NFT 商品：买家买的是一枚 token，实物/服务由店主在链下兑付）。
       四个列只对 kind='nft' 有意义，但**不进商品快照**：它们是履约政策，改了不该让
       已成交订单的快照哈希失效。判据与流程见 src/nftClaim.js。
        · claimable = 1 才允许 POST /api/claims；0 = 这枚 token 只是收藏品，没有线下兑付；
@@ -1689,10 +1710,10 @@ const SCHEMA_DDL = `
       /* ── 订单 ──
      拆成三张 1:1，判据是**谁写它**与**它是什么**，不是"读起来顺不顺"：
        orders          订单事实与履约（路由写）
-       order_shipping  **个人信息**（买家/卖家写；擦除时整行删除）
+       order_shipping  **个人信息**（买家/店主写；擦除时整行删除）
        order_chain     链上镜像（watcher 独占写，高频）
      拆 shipping 的理由是**承诺**：擦除从"六列都改对了吗"变成"那一行还在不在"，可以证明。
-     拆 chain 的理由是**锁**：watcher 高频回写的那一行，不再与买家/卖家读写的行是同一行。
+     拆 chain 的理由是**锁**：watcher 高频回写的那一行，不再与买家/店主读写的行是同一行。
 
      ⚠️ **本表的状态列牵着三张配额表，改它的人必须知道**（隐含控制流写在这里，见 TRIGGER_DDL）：
        · status 从 'draft' 变到别的值 ⇒ 该买家的 buyer_draft_quota.active_drafts 减 1、
@@ -1721,7 +1742,7 @@ const SCHEMA_DDL = `
     status        ENUM('draft','escrowed','shipped','confirmed','disputed','settled','refunded','expired','cancelled')
                   NOT NULL DEFAULT 'draft',
     -- 金额：建单时冻结。**零费模型**：没有平台费、没有节点抽成，
-    -- 结算只有买家/卖家两条腿 ⇒ 本地只记毛额（本列）与链上已退额（order_chain.refunded_amount_wei），
+    -- 结算只有买家/店主两条腿 ⇒ 本地只记毛额（本列）与链上已退额（order_chain.refunded_amount_wei），
     -- 净额 = amount_wei − refunded_amount_wei（读模型 v_orders.amount_net_wei 现算）。
     amount_wei    DECIMAL(38,0) NOT NULL,               -- 支付资产最小单位（原生 wei 或 ERC20 token 单位）
     payment_token CHAR(42) NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
@@ -1931,7 +1952,7 @@ const SCHEMA_DDL = `
     claim_paid_wei DECIMAL(38,0) NOT NULL DEFAULT 0, -- 提货争议赔给 claimant（与买家退款分开）
     /*
       Staking.penalizedByOrderTotal 的镜像（同一订单全部保证金赔付：普通罚没 + 提货赔付）。
-      原生单的 refunded_amount_wei 含这笔（Escrow._accountBuyerCredit），但它从卖家保证金出、
+      原生单的 refunded_amount_wei 含这笔（Escrow._accountBuyerCredit），但它从店主保证金出、
       不减 sellerPending；用它把“买家退款”与“保证金赔付”拆开。
     */
     stake_paid_wei DECIMAL(38,0) NOT NULL DEFAULT 0,
@@ -1953,9 +1974,9 @@ const SCHEMA_DDL = `
   /*
     ── NFT 提货声明（**节点链下**；链上只有"提货争议"那一步，见 Escrow.ClaimCase）──
 
-    流程：持有人对"某枚已被卖家在已完成订单里交付过的 token"提交兑付声明（收货信息），
-    卖家 approve → shipped → fulfilled，或 rejected；提交人在提交后绑定（A-policy），
-    卖家发货前可复核链上持有人，若 token 已转手则取消（新持有人可再声明）。
+    流程：持有人对"某枚已被店主在已完成订单里交付过的 token"提交兑付声明（收货信息），
+    店主 approve → shipped → fulfilled，或 rejected；提交人在提交后绑定（A-policy），
+    店主发货前可复核链上持有人，若 token 已转手则取消（新持有人可再声明）。
 
     为什么 claim_no 与 id 分开：id 是内部主键（子表/日志用），claim_no 是给持有人报的
     对外标识（与订单号同一套 Crockford 格式，不可枚举）。
@@ -1971,12 +1992,12 @@ const SCHEMA_DDL = `
     product_slug  CHAR(11) NOT NULL,
     order_id      BIGINT UNSIGNED NOT NULL,             -- 交付这枚 token 的订单（必须是终局成交态）
     order_no      CHAR(21) NOT NULL,
-    seller        CHAR(42) NOT NULL,                    -- 该订单的卖家（提货由他兑付；= orders.seller 快照）
+    seller        CHAR(42) NOT NULL,                    -- 该订单的店主（提货由他兑付；= orders.seller 快照）
     token_contract CHAR(42) NOT NULL,                   -- NFT 合约（小写）
     token_id      VARCHAR(78) NOT NULL,                 -- 十进制字符串（防 uint256 精度丢失）
     /*
       提交人 = **提交那一刻**的链上持有人（A-policy：声明与提交人绑定，不随后续转手漂移）。
-      之后 token 若已转手，卖家可在发货前复核并取消；新持有人可以另提一条声明。
+      之后 token 若已转手，店主可在发货前复核并取消；新持有人可以另提一条声明。
     */
     claimant      CHAR(42) NOT NULL,
     status        ENUM('requested','approved','shipped','fulfilled','rejected','cancelled','expired')
@@ -1993,11 +2014,11 @@ const SCHEMA_DDL = `
     claim_amount_wei DECIMAL(38,0) NULL,                -- 争议金额上限（NULL = 未申请）
     claim_paid_at_open DECIMAL(38,0) NULL,              -- 开案时订单累计提货赔付快照（对账零赔付用）
     /*
-      提交时的提货截止快照：卖家事后改商品 claim_window_days 不得追溯改变已提交声明的生死。
+      提交时的提货截止快照：店主事后改商品 claim_window_days 不得追溯改变已提交声明的生死。
       NULL = 旧行（提交时还没有这一列）；过期任务跳过它们，不用当前商品配置重算。
     */
     claim_deadline_at DATETIME(3) NULL,
-    /* 提交时的提货类型快照：卖家事后改商品 claim_type 不得追溯改变已提交声明的交付规则 */
+    /* 提交时的提货类型快照：店主事后改商品 claim_type 不得追溯改变已提交声明的交付规则 */
     claim_type ENUM('physical','digital','service') NOT NULL DEFAULT 'physical',
     dispute_claim_id CHAR(66) NULL,
     dispute_state ENUM('none','opened','closed','cancelled') NOT NULL DEFAULT 'none',
@@ -2138,7 +2159,7 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     CONSTRAINT fk_delivery_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
-  /* ERC20 商品的交付凭证：一笔卖家→买家的 token 转账覆盖若干份。
+  /* ERC20 商品的交付凭证：一笔店主→买家的 token 转账覆盖若干份。
      独立成表（不塞进 order_delivery_items）：那张表按"一件一行"建模，码/NFT 的触发器、
      唯一键与库存消费者都按行数计数；ERC20 是金额→份数，口径不同。
      tx_hash 全局唯一：同一笔转账不能被两个订单/两次交付重复认领。 */
@@ -2149,7 +2170,7 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     amount_raw     VARCHAR(78) NOT NULL,                -- 本笔交付的 token 最小单位
     units          INT UNSIGNED NOT NULL,               -- 本笔覆盖的份数
     tx_hash        CHAR(66) NOT NULL,
-    input_hash     CHAR(66) NOT NULL,                   -- 卖家提交的哈希（可能是 Chain33 或 EVM 哈希）
+    input_hash     CHAR(66) NOT NULL,                   -- 店主提交的哈希（可能是 Chain33 或 EVM 哈希）
     block_number   BIGINT UNSIGNED NOT NULL,
     created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
@@ -2186,7 +2207,7 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     order_id      BIGINT UNSIGNED NOT NULL,
     status        ENUM('open','shipped','received') NOT NULL DEFAULT 'open',
-    waived        TINYINT(1) NOT NULL DEFAULT 0,        -- 卖家放弃追索（确认释放额度）
+    waived        TINYINT(1) NOT NULL DEFAULT 0,        -- 店主放弃追索（确认释放额度）
     /*
       本次退货覆盖的件数（1..订单 quantity）。多件订单允许**部分退货**；释放占位只能按
       这个数，不能按整单 hold_qty。字段没有默认值：所有写入都必须显式给出件数。
@@ -2196,7 +2217,7 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     note          VARCHAR(1000) NOT NULL DEFAULT '',
     tracking_no   VARCHAR(100) NULL,
     carrier       VARCHAR(40) NULL,                     -- 归一在 src/shipping.js（同一条路不留半条）
-    received_at   DATETIME(3) NULL,                     -- 卖家确认收到（占位释放凭据）
+    received_at   DATETIME(3) NULL,                     -- 店主确认收到（占位释放凭据）
     /* 该退货单覆盖的件数已释放到 committed 的时刻（一次性认领；防止 watcher 终局释放与
        receive 动作各释放一次，多件订单会被退一次却回补两次）。 */
     released_at   DATETIME(3) NULL,
@@ -2219,7 +2240,7 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     CONSTRAINT fk_alerts_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
-  /* 售后证据（退款理由 / 卖家回复 / 仲裁陈述 / 售后陈述） */
+  /* 售后证据（退款理由 / 店主回复 / 仲裁陈述 / 售后陈述） */
   CREATE TABLE IF NOT EXISTS dispute_evidence (
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     order_id      BIGINT UNSIGNED NOT NULL,
@@ -2414,6 +2435,9 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     */
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
 
+  /* 建单幂等键映射：表定义只有 ORDER_IDEMPOTENCY_DDL 一份（迁移脚本也用它） */
+  ${ORDER_IDEMPOTENCY_DDL}
+
   CREATE TABLE IF NOT EXISTS seller_proxy_draft_quota (
     seller        CHAR(42) NOT NULL,
     buyer         CHAR(42) NOT NULL,
@@ -2459,7 +2483,7 @@ CREATE TABLE IF NOT EXISTS product_nft_tokens (
     o.seller_deleted_at, o.buyer_deleted_at,
     /*
       **净额 = amount_wei − refunded_amount_wei**（零费模型：没有平台费、没有节点抽成，
-      结算只有退款 + 卖家两条腿）。退款额住在 order_chain（链上镜像表，LEFT JOIN 可能为 NULL），
+      结算只有退款 + 店主两条腿）。退款额住在 order_chain（链上镜像表，LEFT JOIN 可能为 NULL），
       所以用 COALESCE 兜成 0：**"这单没有链上镜像"时净额就是毛额**（一分钱都还没退过），
       这与链上"未退款托管单"的语义一致，不是把"读不到"当 0。
     */

@@ -506,7 +506,7 @@ function statementGateError(order, phase, now) {
  * "未开启 / 期内 / 已过期"（**前端同批改**：旧契约给的是毫秒整数）。
  *
  * 为什么是**一个**字段而不是每阶段一个：订单不可能同时"争议中"与"有在途售后案件"
- * （案件要求订单已终局、钱已判给卖家，见 afterSale.js 文件头），所以此刻有效的窗口至多一个；
+ * （案件要求订单已终局、钱已判给店主，见 afterSale.js 文件头），所以此刻有效的窗口至多一个；
  * 阶段作用域由**门控**决定（只有 arbitration / after_sale 两阶段受约束），DTO 只回答"截止在什么时候"。
  * 前端据此对两个阶段用同一个截止时刻——与节点门控是同一套口径，不会出现"界面放行、服务端拒绝"。
  *
@@ -565,7 +565,7 @@ export function evidencePhaseError(order, phase, role, { now = Date.now() } = {}
       return {
         code: 1,
         http: 200,
-        message: '仅当退款申请待卖家处理时可提交退款理由——请先由买家在链上发起退款申请',
+        message: '仅当退款申请待店主处理时可提交退款理由——请先由买家在链上发起退款申请',
       };
     }
     return null;
@@ -602,7 +602,7 @@ export function evidencePhaseError(order, phase, role, { now = Date.now() } = {}
 
     门控只有一个判据：**案件在途**（after_sale_status='open'，唯一实现在 afterSale.js）。
     刻意不加"双方各只能……"之类的附加条件：售后案件是"收到货才发现问题"的救济路径，
-    买卖双方都要能把话说清（买家说明问题、卖家给出处理方案/反驳）。
+    买卖双方都要能把话说清（买家说明问题、店主给出处理方案/反驳）。
     也刻意**不**复用 arbitration 的 disputed 判据：案件里的订单状态是终局，链上根本没有
     DisputeRequested —— 用 status 判就会把整条路径拒之门外。结案（closed）后立即停止受理，
     但历史陈述仍留在时间线上可溯（与退款阶段收口同口径）。

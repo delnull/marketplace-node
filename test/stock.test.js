@@ -4,7 +4,7 @@
  *  - 终结未成交态自动回补：草稿超时取消 / 仲裁退款 / 超时释放；
  *  - 成交态不释放：确认收货 / 仲裁判付 / 草稿转正（escrowed）；
  *  - 不限量（capacity NULL）与池式商品（数字码池/NFT 交付池）不参与占位；
- *  - 卖家/详情接口 poolEmpty 提示（数字码池/NFT 池无未用资源）。
+ *  - 店主/详情接口 poolEmpty 提示（数字码池/NFT 池无未用资源）。
  * 状态迁移不经真实链上（单测无 RPC）——与 watcher.test 同款：直调 applyEvent。
  */
 import { test, before } from 'node:test';
@@ -78,7 +78,7 @@ const availOf = async (slug) => {
   const r = await invRow(slug);
   return r.capacity === null ? null : Math.max(0, r.capacity - (r.committed || 0));
 };
-/** 总量（capacity 列，卖家编辑口径） */
+/** 总量（capacity 列，店主编辑口径） */
 const capOf = async (slug) => (await invRow(slug)).capacity;
 /** 销量/已占位（committed 列，订单驱动） */
 const commOf = async (slug) => (await invRow(slug)).committed || 0;
@@ -183,7 +183,7 @@ test('仲裁退款（disputed→refunded）回补；仲裁判付（settled）不
   assert.equal(await applyEvent('Arbitrated', { orderId: d1.escrowOrderId, refundWei: d1.amountWei }), 1);
   assert.equal(await availOf(p.slug), 1, '退款单回补 1');
 
-  // d2 争议 → 仲裁判付卖家：钱货两清，不释放
+  // d2 争议 → 仲裁判付店主：钱货两清，不释放
   assert.equal(await applyEvent('DisputeRequested', { orderId: d2.escrowOrderId }), 1);
   assert.equal(await applyEvent('Arbitrated', { orderId: d2.escrowOrderId, refundWei: 0n }), 1);
   assert.equal(await availOf(p.slug), 1, '判付单不释放');
@@ -202,7 +202,7 @@ test('超时释放（escrowed→expired）回补；确认收货（→confirmed�
   await escrowed(e1);
   await escrowed(e2);
 
-  // escrowed → expired（超时释放给卖家，货物从未交付）：回补
+  // escrowed → expired（超时释放给店主，货物从未交付）：回补
   assert.equal(await applyEvent('OrderExpiredReleased', { orderId: e1.escrowOrderId }), 1);
   assert.equal(await availOf(p.slug), 1, '超时释放单回补 1');
 
@@ -224,7 +224,7 @@ test('草稿转正（escrowed）不回补（占位随订单存活）', async () 
 
 // ── poolEmpty 提示 ──
 
-test('卖家列表 poolEmpty：数字码池空为 true，导入后 false；实物恒 false', async () => {
+test('店主列表 poolEmpty：数字码池空为 true，导入后 false；实物恒 false', async () => {
   // autoDeliver=0（本测试只验证 poolEmpty 口径提示，不被「导入后自动补发」特性改变订单状态；
   // 补货自动补发行为见 auto-deliver.test.js「码池补货自动补发」用例）
   const p = await listProduct(productPayload({ title: '码池提示商品', autoDeliver: 0 }));
@@ -237,7 +237,7 @@ test('卖家列表 poolEmpty：数字码池空为 true，导入后 false；实�
     .expect(200);
   assertOk(listEmpty);
   const found1 = listEmpty.body.data.orders.find((o) => o.id === d.id);
-  assert.ok(found1, '卖家列表应含该单');
+  assert.ok(found1, '店主列表应含该单');
   assert.equal(found1.poolEmpty, true, '未建码池的数字订单提示缺货');
 
   const importRes = await request(app)
@@ -266,7 +266,7 @@ test('卖家列表 poolEmpty：数字码池空为 true，导入后 false；实�
   assert.equal(found3.poolEmpty, false, '实物无池概念，恒 false');
 });
 
-test('卖家列表 poolEmpty：NFT 交付池空为 true，导入 tokenId 后 false', async () => {
+test('店主列表 poolEmpty：NFT 交付池空为 true，导入 tokenId 后 false', async () => {
   const p = await listProduct(nftPayload());
   const d = (await createDraft(p.slug)).body.data;
   await escrowed(d);
@@ -351,11 +351,104 @@ test('编辑填的是总量不是余量：占位列不被触碰；总量下限 =
   assert.equal(await availOf(p.slug), 3);
 });
 
+test('已成交的限量 SKU 可以改名/退役（不再被历史 hold 永久钉死）', async () => {
+  const p = await listProduct(
+    productPayload({
+      kind: 'physical',
+      title: '已售规格退役商品',
+      specs: [{ name: '颜色', options: ['红'] }],
+      skus: [{ key: '红', priceMicro: 10_000_000, capacity: 2 }],
+    })
+  );
+  const d = (await createDraft(p.slug, buyer.address, { skuKey: '红' })).body.data;
+  await db.run("UPDATE orders SET status = 'confirmed' WHERE order_no = ?", d.id);
+
+  const res = await request(app)
+    .patch(`/api/products/${p.slug}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({
+      specs: [{ name: '颜色', options: ['深红'] }],
+      skus: [{ key: '深红', priceMicro: 10_000_000, capacity: 2 }],
+    })
+    .expect(200);
+  assertOk(res);
+  const keys = (await db.all('SELECT sku_key FROM product_skus WHERE product_id = (SELECT id FROM products WHERE slug = ?)', p.slug))
+    .map((r) => r.sku_key);
+  assert.deepEqual(keys, ['深红'], '已售旧组合可以被新组合替换');
+  const renamed = await db.get(
+    'SELECT committed, capacity FROM product_skus WHERE product_id = (SELECT id FROM products WHERE slug = ?) AND sku_key = ?',
+    p.slug,
+    '深红'
+  );
+  assert.equal(Number(renamed.committed), 1, '改名必须把旧键的已售件数搬到新键，不能凭空释放库存');
+  assert.equal(Number(renamed.capacity), 2);
+});
+
+test('两个组合同时改名且旧键有已售件数 ⇒ 拒绝，不丢 committed', async () => {
+  const p = await listProduct(
+    productPayload({
+      kind: 'physical',
+      title: '多组合改名守卫商品',
+      specs: [{ name: '颜色', options: ['红', '蓝'] }],
+      skus: [
+        { key: '红', priceMicro: 10_000_000, capacity: 2 },
+        { key: '蓝', priceMicro: 10_000_000, capacity: 2 },
+      ],
+    })
+  );
+  const d = (await createDraft(p.slug, buyer.address, { skuKey: '红' })).body.data;
+  await db.run("UPDATE orders SET status = 'confirmed' WHERE order_no = ?", d.id);
+
+  const res = await request(app)
+    .patch(`/api/products/${p.slug}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({
+      specs: [{ name: '颜色', options: ['深红', '深蓝'] }],
+      skus: [
+        { key: '深红', priceMicro: 10_000_000, capacity: 2 },
+        { key: '深蓝', priceMicro: 10_000_000, capacity: 2 },
+      ],
+    })
+    .expect(200);
+  assert.notEqual(res.body.code, 0, '多个旧键同时消失且仍有已售件数时必须拒绝');
+  assert.match(String(res.body.message || ''), /已售|映射/);
+
+  const rows = await db.all(
+    'SELECT sku_key, committed FROM product_skus WHERE product_id = (SELECT id FROM products WHERE slug = ?) ORDER BY sku_key',
+    p.slug
+  );
+  assert.deepEqual(
+    Object.fromEntries(rows.map((r) => [r.sku_key, Number(r.committed)])),
+    { 红: 1, 蓝: 0 },
+    '拒绝后旧组合与 committed 必须原样保留'
+  );
+});
+
+test('改类型：physical 在途单存在时必须拒绝，即使池计数器为 0', async () => {
+  const p = await listProduct(
+    productPayload({
+      kind: 'physical',
+      title: '改类型闸门商品',
+      shippingFeeMicro: 0,
+      capacity: 5,
+    })
+  );
+  await createDraft(p.slug);
+  const res = await request(app)
+    .patch(`/api/products/${p.slug}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ kind: 'digital' })
+    .expect(200);
+  assert.notEqual(res.body.code, 0, 'physical 在途单让改型必须失败');
+  assert.match(res.body.message || '', /未终结订单|变更类型/);
+  assert.equal((await db.get('SELECT kind FROM products WHERE slug = ?', p.slug)).kind, 'physical');
+});
+
 // ── 释放单点：共享 escrow_order_id 多行同批迁出聚合回补 ──
 
-// ── 口径冲突预警：卖家列表附池资源统计（poolBuilt/poolUnused）──
+// ── 口径冲突预警：店主列表附池资源统计（poolBuilt/poolUnused）──
 
-test('卖家列表（/all）附池口径统计；公开列表不带；池用尽后未用=0', async () => {
+test('店主列表（/all）附池口径统计；公开列表不带；池用尽后未用=0', async () => {
   const p = await listProduct(productPayload({ kind: 'digital', title: '口径对照商品', capacity: 10 }));
 
   const pub = await request(app).get('/api/products').expect(200);
@@ -412,7 +505,7 @@ test('sweeper 关单后链上托管落定：watcher 自动恢复为 escrowed 并
   assert.equal(await commOf(p.slug), 0, '关单释放占位');
   assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', d.id)).status, 'cancelled');
 
-  // 链上托管事件落定（金额/卖家/买家全匹配）→ watcher 自动恢复：restock 回补 + 置 escrowed + 落凭证
+  // 链上托管事件落定（金额/店主/买家全匹配）→ watcher 自动恢复：restock 回补 + 置 escrowed + 落凭证
   const changed = await applyEvent(
     'OrderCreated',
     {
@@ -434,7 +527,7 @@ test('sweeper 关单后链上托管落定：watcher 自动恢复为 escrowed 并
 test('不限量期下单 → 取消 → 改限量 → 迟到付款恢复：必须按当前容量补占位', async () => {
   /*
     回归：旧 `restockOrder` 对 hold_qty=0 直接 return true（"从未占位，无需恢复"）。
-    但取消之后卖家可以把组合改成限量；此时买家迟到付款、watcher 恢复为 escrowed，
+    但取消之后店主可以把组合改成限量；此时买家迟到付款、watcher 恢复为 escrowed，
     committed 仍是 0 ⇒ 该件货可被再卖一次（超卖）。恢复必须以**当前** SKU 重新占位。
   */
   const p = await listProduct(productPayload({ kind: 'physical', title: '迟到付款商品', capacity: null }));
@@ -517,7 +610,7 @@ test('限量下单 → 改不限量 → 取消：hold 记账照常回补，无�
   assert.equal(await commOf(p.slug), 1);
   assert.equal((await db.get('SELECT hold_qty FROM v_orders WHERE order_no = ?', d.id)).hold_qty, 1);
 
-  // 卖家改不限量（编辑不触碰 committed/hold_qty——放开的是承诺上限，不是已占位）
+  // 店主改不限量（编辑不触碰 committed/hold_qty——放开的是承诺上限，不是已占位）
   const open = await request(app)
     .patch(`/api/products/${p.slug}`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
@@ -551,7 +644,7 @@ test('部分交付（escrowed 已有交付行）超时释放：不回补占位�
   await escrowed(d);
   assert.equal(await commOf(p.slug), 1, '下单占位 1 件');
   /*
-    卖家已部分交付（NFT 形态的部分交付行；此处直接落一条交付行模拟 escrowed + 有交付记录）。
+    店主已部分交付（NFT 形态的部分交付行；此处直接落一条交付行模拟 escrowed + 有交付记录）。
 
     ⚠️ 两个都容易写错的地方：
       · `order_delivery_items.order_id` 是**内部数值主键**（外键指向 orders.id），

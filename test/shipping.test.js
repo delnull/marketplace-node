@@ -84,7 +84,7 @@ test('实物商品下单携带收货信息：买家本人/店主可见，匿名�
     .expect(200);
   assert.equal(listAnon.body.data.orders.find((x) => x.id === o.id), undefined, '匿名列表不出现草稿行');
 
-  // 卖家列表（/seller）亦可见
+  // 店主列表（/seller）亦可见
   const sellerList = await request(app)
     .get('/api/orders/seller')
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)

@@ -9,12 +9,12 @@
  * 为 disputed（事件史追加 DisputeRequested）→ 仲裁人在前端「仲裁台」从各可达
  * 节点聚合本端点 → 行级查看详情（GET /api/orders/:orderNo，仲裁人身份可读全字段含交付证据）
  * → 钱包直调链上 Escrow.voteSettlement(orderId, refundWei) **票决**（达到当届阈值的那一票执行裁决：
- * 可全额退买家 / 全额判卖家 / 按金额拆分；节点不经手资金，无写接口）→ 各节点 watcher 轮询
+ * 可全额退买家 / 全额判店主 / 按金额拆分；节点不经手资金，无写接口）→ 各节点 watcher 轮询
  * Arbitrated 事件回写 settled/refunded，本列表自动收敛。
  *
  * **为什么售后案件是独立路由而不是并进 /pending 的一个 `kind`**：
  *  1. 两者是**不同的钱、不同的链上动作、不同的收口**：争议单资金还锁在托管里，裁决走
- *     `Escrow.voteSettlement` 票决；售后案件的钱**只从 Staking 的卖家保证金出**（BTY），
+ *     `Escrow.voteSettlement` 票决；售后案件的钱**只从 Staking 的店主保证金出**（BTY），
  *     收口走 `voteAfterSale`/`closeAfterSale`（`voteAfterSale` 内部就是调 `Staking.penalize`）。
  *     合成一个列表后每个调用点都得按 kind 再分叉一次
  *     ——那正是本仓反对的"在调用点补判据"。
@@ -150,7 +150,7 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null, delivered, e
     escrowOrderId: o.escrow_order_id,
     /*
       订单身份的另一半：**快照哈希**。仲裁动作要在本地复算
-      `orderId = keccak(快照哈希 ‖ 卖家 ‖ 买家 ‖ 本地单号)` 并与节点下发的
+      `orderId = keccak(快照哈希 ‖ 店主 ‖ 买家 ‖ 本地单号)` 并与节点下发的
       `escrowOrderId` 逐字比对，才能挡住“同一对当事人、同一金额、换一笔单”的签名目标替换。
       哈希本身是公开事实（商品快照的哈希，订单详情里本来就展示），不含个人信息。
     */
@@ -232,7 +232,7 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null, delivered, e
     refundRejectedAt: o.refund_rejected_at || null,
     /*
       零费模型：订单上没有平台费/节点抽成的费率快照可下发——仲裁人按
-      "毛额 − 已退买家"与卖家的在途敞口/保证金读数判断可罚没上限与应退金额。
+      "毛额 − 已退买家"与店主的在途敞口/保证金读数判断可罚没上限与应退金额。
     */
     // 子表用**内部订单键**（dispute_evidence.order_id 是它的外键）
     evidenceCount: evidenceCount === undefined

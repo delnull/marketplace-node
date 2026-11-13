@@ -1,5 +1,5 @@
 /**
- * 卖家经营看板统计（P1-①，ownerOnly 私域）。
+ * 店主经营看板统计（P1-①，ownerOnly 私域）。
  *
  * 口径：
  *  - 入账（GMV）= confirmed/settled/expired 的**净额**（金额 − 已退买家额）；
@@ -282,7 +282,7 @@ export async function overviewStats(days, seller) {
   return {
     /**
      * 入账单量：status ∈ INCOME_STATUS（confirmed/settled/expired）。
-     * 不含在途、不含退款，也不剔除自买——这是"钱已到卖家"的口径，与公开画像的
+     * 不含在途、不含退款，也不剔除自买——这是"钱已到店主"的口径，与公开画像的
      * `escrowOrders`（含退款/自买）和 `effectiveOrders`（剔除退款/自买，含在途）都不是一回事。
      */
     incomeOrders: rows.length,
@@ -448,9 +448,17 @@ export async function productStats(days, sort = 'gmv', page = 1, pageSize = 20, 
     agg.set(key, a);
   }
   const db = getDb();
+  const ids = [...agg.keys()];
+  const productRows = ids.length
+    ? await db.all(
+        `SELECT id, slug, title, price_currency, active, deleted_at FROM products WHERE id IN (${ids.map(() => '?').join(',')})`,
+        ...ids
+      )
+    : [];
+  const productById = new Map(productRows.map((p) => [Number(p.id), p]));
   const rowsOut = [];
   for (const [productId, a] of agg) {
-    const p = await db.get('SELECT slug, title, price_currency, active, deleted_at FROM products WHERE id = ?', productId);
+    const p = productById.get(Number(productId));
     rowsOut.push({
       productId,
       slug: p ? p.slug : `#${productId}`,

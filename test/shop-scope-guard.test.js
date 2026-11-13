@@ -1,9 +1,9 @@
 /**
- * **跨店作用域守卫**（多租户节点）：卖家面的入口必须回答"这一单/这件商品属于这家店吗"。
+ * **跨店作用域守卫**（多租户节点）：店主面的入口必须回答"这一单/这件商品属于这家店吗"。
  *
  * ## 为什么要有它（它守的是一次真链实测出来的事故）
  *
- * 一个节点上有多家店，而卖家面的入口只回答了"**你是不是请求头那家店的店主/店员**"，
+ * 一个节点上有多家店，而店主面的入口只回答了"**你是不是请求头那家店的店主/店员**"，
  * 没有回答"**你要动的东西属于那家店吗**"。2026-10-15 的真链实测里，凭据属于 A 店的人
  * 对 B 店的东西动手，**五条全部成功**：给别店的托管单发货（数字商品连兑换码原文一起回）、
  * 批量发货、导出别店订单 CSV（含买家姓名/电话/地址）、擦除别店订单 PII（不可逆）、
@@ -15,7 +15,7 @@
  *
  * ## 例外表
  *
- * 确实有不按"订单归属"门控的卖家面路由（例如 `requireAuth` 的买家/店主共用入口，
+ * 确实有不按"订单归属"门控的店主面路由（例如 `requireAuth` 的买家/店主共用入口，
  * 它们按"本人的单或本店的人"判，是**另一条**判据）。例外必须写进 `EXEMPT` 并给理由——
  * "漏了"与"决定不这么判"在代码上必须长得不一样。
  */
@@ -28,15 +28,15 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
-/** 被扫的路由文件：卖家面（店主/店员）与 PII 面 */
+/** 被扫的路由文件：店主面（店主/店员）与 PII 面 */
 const ROUTE_FILES = ['node/src/routes/orders.js', 'node/src/routes/returns.js', 'node/src/routes/pii.js'];
 
 /**
- * 例外（每条必须带理由）：按 `:id` 取订单但**不**按订单归属门控的卖家面路由。
+ * 例外（每条必须带理由）：按 `:id` 取订单但**不**按订单归属门控的店主面路由。
  * 理由说的是"这条路由的判据是什么"，不是"先这样"。
  */
 const EXEMPT = {
-  // 'orders.js POST /:id/xxx': '这条按买家的单判（req.auth.address === order.buyer），不是卖家面',
+  // 'orders.js POST /:id/xxx': '这条按买家的单判（req.auth.address === order.buyer），不是店主面',
 };
 
 const SELLER_MW = /\b(staffOnly|ownerOnly)\b/;
@@ -60,14 +60,14 @@ function routesOf(file, src) {
   return out;
 }
 
-test('卖家面按 :id 取订单的路由必须经 findOrderInShop（跨店越权的唯一收口）', () => {
+test('店主面按 :id 取订单的路由必须经 findOrderInShop（跨店越权的唯一收口）', () => {
   const bad = [];
   let scoped = 0;
   for (const file of ROUTE_FILES) {
     if (!fs.existsSync(path.join(ROOT, file))) continue;
     for (const r of routesOf(file, read(file))) {
       if (!r.path.includes(':id')) continue;
-      // 卖家面判据只认**声明行**上的中间件（handler 里出现同名字符串不算）
+      // 店主面判据只认**声明行**上的中间件（handler 里出现同名字符串不算）
       if (!SELLER_MW.test(r.head)) continue;
       const key = `${path.basename(file)} ${r.method.toUpperCase()} ${r.path}`;
       if (EXEMPT[key]) continue;
@@ -82,8 +82,8 @@ test('卖家面按 :id 取订单的路由必须经 findOrderInShop（跨店越�
       scoped += 1;
     }
   }
-  assert.deepEqual(bad, [], `卖家面存在未按店铺作用域取订单的路由：\n  ${bad.join('\n  ')}`);
-  assert.ok(scoped >= 3, `只检查到 ${scoped} 条受作用域保护的卖家面路由——守卫本身可能失配（路由写法变了？）`);
+  assert.deepEqual(bad, [], `店主面存在未按店铺作用域取订单的路由：\n  ${bad.join('\n  ')}`);
+  assert.ok(scoped >= 3, `只检查到 ${scoped} 条受作用域保护的店主面路由——守卫本身可能失配（路由写法变了？）`);
 });
 
 test('下单时的店铺只有一个来源：商品行的 shop_code（收款人与库存不可能分属两家）', () => {
@@ -94,7 +94,7 @@ test('下单时的店铺只有一个来源：商品行的 shop_code（收款人�
     /shopRowByCode\(product\.shop_code\)/,
     '建草稿没有从商品行取店铺：收款人（shops.seller）与库存/码池必须读同一列'
   );
-  assert.match(draft.body, /shop\.seller,\s*shop\.code/, '订单落库的卖家与店铺编号必须来自同一行');
+  assert.match(draft.body, /shop\.seller,\s*shop\.code/, '订单落库的店主与店铺编号必须来自同一行');
   /*
     `X-Mk-Shop` 现在是**范围提示**，不是买家动作的输入（见 http.js）：店铺从目标推导，
     一次登录就能买本节点任何一家店的东西。旧形状要求买家先声明一家店、再校验它与商品的

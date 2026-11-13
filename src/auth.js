@@ -224,7 +224,7 @@ export async function issueSiwe(address) {
 export async function verifySiwe(address, message, signature) {
   const addr = String(address).toLowerCase();
   const stored = await redisGetChallenge(addr);
-  if (stored == null) throw new Error('nonce 不存在，请重新获取签名原文');
+  if (stored == null) throw new Error('签名原文已过期，请重新获取');
   if (stored !== message) throw new Error('签名原文不匹配，请重新获取');
 
   /*
@@ -389,7 +389,7 @@ export async function isStaff(address, shopCode = '', { force = false } = {}) {
  * 成功、没有任何报错。所以中间件要能数出这个集合的大小。
  *
  * 两个 `=` 比较依赖"地址列一律小写落库"这条既有不变量（见 shops.js 的 shopRowBySeller 说明）；
- * 大小写不敏感的比较会让 `uq_shops_seller` 这一侧的索引失效，而每次卖家面请求都要走这里。
+ * 大小写不敏感的比较会让 `uq_shops_seller` 这一侧的索引失效，而每次店主面请求都要走这里。
  */
 export async function operatedShopCodes(address, { force = false } = {}) {
   const addr = String(address || '').toLowerCase();
@@ -451,11 +451,16 @@ function signPayload(payloadB64) {
  * 与**下发的报文**，令牌内部的过期判定是它自己的协议（与 SIWE 消息里的 RFC 3339 文本同理）。
  */
 /**
- * 令牌受众：链 + 节点 operator + 该节点 Escrow。令牌只在本节点有效；
- * 两个节点即使复用同一个 `MK_TOKEN_SECRET`，也不会互相认对方的令牌。
+ * 令牌受众：链 + 节点 operator + 该节点 Escrow + 节点实例（库名）。
+ * 只带前三项时，同配置的双节点会互相认令牌；实例 ID 把“这台机器”也钉进受众。
  */
 export function tokenAudience() {
-  return `${config.chain.chainId}:${String(config.shop.owner || '').toLowerCase()}:${String(config.chain.escrowAddress || '').toLowerCase()}`;
+  return [
+    config.chain.chainId,
+    String(config.shop.owner || '').toLowerCase(),
+    String(config.chain.escrowAddress || '').toLowerCase(),
+    String(config.db.name || '').toLowerCase(),
+  ].join(':');
 }
 
 export async function issueToken(address) {

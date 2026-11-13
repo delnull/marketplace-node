@@ -95,15 +95,19 @@ test('代次探针：必须覆盖合约伙伴/提货争议/委员会那几组读
 test('代次探针：运行时 getCommittee / committeeForOrder 用到的选择器必须在清单里（源码对拍）', () => {
   /*
     只钉一份"必须包含"的名单还不够：新增一个裁决委员会读法（例如换掉 orderThreshold）时，
-    清单与运行时代码会各走各的。这里从 chain.js 的**委员会区段**里抽出所有 `escrow.<name>(`
-    调用，再要求它们逐个出现在探针清单里——"清单写着 A、代码调 B"在文本层面就红。
+    清单与运行时代码会各走各的。这里从 chain.js 的**委员会区段**里抽出所有读法：
+      · `escrow.<name>(`（provider 调用）；
+      · `read('<name>'`（原始 JSON-RPC 的编码读法，见 readEscrowCall）；
+    再要求它们逐个出现在探针清单里——"清单写着 A、代码调 B"在文本层面就红。
   */
   const start = CHAIN_SRC.indexOf('// ── 委员会');
   const end = CHAIN_SRC.indexOf('// ── 委员会读取结束');
   assert.ok(start > 0 && end > start, 'chain.js 的委员会区段标记变了——本守卫需要同步更新');
-  const used = new Set(
-    [...CHAIN_SRC.slice(start, end).matchAll(/\bescrow\.(\w+)\s*\(/g)].map((m) => m[1])
-  );
+  const section = CHAIN_SRC.slice(start, end);
+  const used = new Set([
+    ...[...section.matchAll(/\bescrow\.(\w+)\s*\(/g)].map((m) => m[1]),
+    ...[...section.matchAll(/\bread\(\s*['"](\w+)['"]/g)].map((m) => m[1]),
+  ]);
   assert.ok(used.size >= 3, `委员会区段至少要读到 3 个选择器（实际 ${[...used].join(', ') || '无'}）`);
   const probed = new Set(ESCROW_GENERATION_PROBES.map((p) => p.shape.split('(')[0]));
   const missing = [...used].filter((name) => !probed.has(name));

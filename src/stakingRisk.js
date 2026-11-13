@@ -111,7 +111,7 @@ export async function stakingShortfall({ force = false } = {}) {
       belowFloor: below,
       shortfallWei,
       shortfallDecimal: weiToDecimal(shortfallWei),
-      checkedAt: Date.now(),
+      checkedAt: new Date().toISOString(),
     };
     cache = { at: Date.now(), value };
     return value;

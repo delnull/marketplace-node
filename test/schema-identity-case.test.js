@@ -28,7 +28,7 @@ const DB_JS = path.join(here, '..', 'src', 'db.js');
 
 const ctx = await makeCtx();
 const { db, owner, buyer } = ctx;
-const { inspectSchemaStructure } = await import('../src/db.js');
+const { inspectSchemaStructure, ORDER_IDEMPOTENCY_DDL } = await import('../src/db.js');
 
 /** 小写规范形（合法） */
 const LOWER = `0x${'ab'.repeat(20)}`;
@@ -76,7 +76,7 @@ function charColumns(ddl, width) {
   return out;
 }
 
-const ddl = readDdl();
+const ddl = readDdl().replace('${ORDER_IDEMPOTENCY_DDL}', ORDER_IDEMPOTENCY_DDL);
 const addressColumns = charColumns(ddl, 42);
 const codeColumns = charColumns(ddl, 9);
 
@@ -124,6 +124,7 @@ test('清单从 SCHEMA_DDL 派生：28 个 CHAR(42) 地址列、10 个 CHAR(9) �
       'node.owner',
       'node.staking_address',
       'node_staff.address',
+      'order_idempotency.initiator',
       'order_token_deliveries.token_contract',
       'orders.buyer',
       'orders.payment_token',

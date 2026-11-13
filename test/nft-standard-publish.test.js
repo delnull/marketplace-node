@@ -1,5 +1,5 @@
 /**
- * 发布 NFT 商品时，节点必须把卖家选择的标准与链上 ERC165 检测结果核对；
+ * 发布 NFT 商品时，节点必须把店主选择的标准与链上 ERC165 检测结果核对；
  * 错配不能落库（否则买家付款后才发现交付事件对不上）。
  */
 import { test, before } from 'node:test';
@@ -120,7 +120,7 @@ test('编辑 NFT：PATCH 检测 RPC 读不到 ⇒ 503 fail-closed', async () => 
   assert.match(res.body.message, /链上节点/);
 });
 
-test('发布前的标准预检接口：返回实际标准，不替卖家做发布决定', async () => {
+test('发布前的标准预检接口：返回实际标准，不替店主做发布决定', async () => {
   const { setNftStandardCheck } = await import('../src/nftStandard.js');
   setNftStandardCheck(async () => ({
     ok: false,

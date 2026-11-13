@@ -6,12 +6,12 @@
  *   ReceiptConfirmed    escrowed/shipped/disputed → confirmed（买家确认收货；争议中=买家撤诉放款）
  *   DisputeRequested    escrowed/shipped → disputed（买家发起争议）
  *   Arbitrated          disputed  → refundWei == amount ? refunded : settled
- *                       （**拆分结算**：refundWei 退买家、余额扣费后判卖家，两者都发生在同一笔里，
+ *                       （**拆分结算**：refundWei 退买家、余额扣费后判店主，两者都发生在同一笔里，
  *                        所以状态由退款额决定而不是由"谁赢了"决定；见 settleByRefundSplit）
- *   OrderExpiredReleased draft/escrowed/shipped → expired（超时释放给卖家，refundWei 恒 0）
+ *   OrderExpiredReleased draft/escrowed/shipped → expired（超时释放给店主，refundWei 恒 0）
  *   RefundRequested     escrowed/shipped → 同状态 + refund_status=requested（两级售后第一级：
- *                       买家链上申请退款，资金冻结/超时释放被禁，等待卖家 approve/reject）
- *   RefundRejected      escrowed/shipped → 同状态 + refund_status=rejected（卖家拒绝，
+ *                       买家链上申请退款，资金冻结/超时释放被禁，等待店主 approve/reject）
+ *   RefundRejected      escrowed/shipped → 同状态 + refund_status=rejected（店主拒绝，
  *                       买家获得 requestDispute 资格——第二级入口；合约不接受被拒后重复申请）
  *   PartialRefundAccepted escrowed/shipped/disputed/… → **状态不变**，只把买家授权的部分退款额
  *                       写进 accepted_partial_refund_wei（授权不转移资金、不冻结订单，见下）
@@ -19,7 +19,7 @@
  *                       或争议中和解）/ settled（refundWei == 买家授权额的部分退款）
  *                       （合约 2026-09 收紧：approveRefund 只接受「全额」或「acceptedPartialRefund
  *                       里买家精确授权过的那个数」，其它一律 `RefundAmountNotAccepted`——旧的
- *                       `RefundNotFull` 已删除。卖家退部分金额**必须**先拿到买家对那个数字的授权，
+ *                       `RefundNotFull` 已删除。店主退部分金额**必须**先拿到买家对那个数字的授权，
  *                       而拆分裁决（任意比例、无需授权）仍只归仲裁人票决 `voteSettlement(orderId, refundWei)`
  *                       （达到当届阈值的那一票执行结算）。
  *                       占位仅回补「从未交付」的行——交付后退款视为货在买家侧需线下回收，
@@ -32,12 +32,12 @@
  * 迁移失败（foundRows=0）的事件不记录事件史，幂等重复扫描不重复记账。
  *
  * 售后案件（AfterSaleOpened/Closed）同样只是**叠加在终局之上的第二层**镜像：确认收货后货款进入
- * 7 天留存期，案件在途时这笔货款不释放（重新冻结到结案）；赔款只从 Staking 的卖家保证金出。
+ * 7 天留存期，案件在途时这笔货款不释放（重新冻结到结案）；赔款只从 Staking 的店主保证金出。
  * 因此这两个分支刻意**不碰 orders.status**（见 src/afterSale.js 文件头的完整理由）；
  * 人工 /sync 与后台对账按链上 afterSaleOpen/afterSaleOpenedAtBlock 回填同几列，判据同源。
  *
  * ⚠️ 上表的 from 集是**正常路径**；代码里每个分支的 from 集都更宽，用来收敛"节点停机/漏扫"
- * 留下的残镜像（`draft`/`cancelled` 也接受，否则这些单会永远停在非终态、卖家流水漏计）。
+ * 留下的残镜像（`draft`/`cancelled` 也接受，否则这些单会永远停在非终态、店主流水漏计）。
  * 以 `applyEventCore`（`case 'ReceiptConfirmed'` / `case 'OrderExpiredReleased'` 里的 FROM_SET）
  * 与 `settleByRefundSplit` / `markEscrowDisputed` 里的实际集合为准。
  *
@@ -106,8 +106,11 @@ import { applyAfterSaleOpened, applyAfterSaleClosed } from './afterSale.js';
 const STAKING_PAID_ABI = ['function penalizedByOrderTotal(bytes32 orderId) view returns (uint256)'];
 
 /**
- * 读本单的保证金赔付累计（绝对读数）。读不到**必须抛**：事件会按失败重试，
- * 不能把未知写成 0（那会让买家退款/卖家净额多算）。
+ * 读本单的保证金赔付累计（绝对读数）。
+ *
+ * 这是**派生镜像**（`stake_paid_wei` 只用于展示“其中有多少来自保证金”），
+ * 读不到时由 `stakePaidOf` 返回 null、SQL 用 COALESCE 保留旧值；
+ * 绝不能因为这一项读不到而阻断 `refunded_amount_wei` / `claim_paid_wei` 的链上事实落库。
  */
 async function readStakePaidFromChain(orderId) {
   if (!config.chain.stakingAddress) throw new Error('未配置 Staking 地址，无法读保证金赔付累计');
@@ -123,8 +126,21 @@ export function setStakePaidReaderForTest(fn) {
   stakePaidReader = fn || readStakePaidFromChain;
 }
 
+let stakePaidWarned = false;
+
 async function stakePaidOf(orderId) {
-  return await stakePaidReader(orderId);
+  try {
+    return await stakePaidReader(orderId);
+  } catch (e) {
+    if (!stakePaidWarned) {
+      stakePaidWarned = true;
+      console.warn(
+        '[escrowWatcher] 保证金赔付读数不可用：本次事件仍会落账，stake_paid_wei 保留旧值（只影响展示拆分，不影响退款额/提货赔付事实）:',
+        e?.message || e
+      );
+    }
+    return null;
+  }
 }
 
 /* ─────────────────── node 单例行的写口（读只有 nodeRow 一处）─────────────────── */
@@ -213,6 +229,29 @@ function quarantineEntriesOf(raw) {
   return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
 }
 
+/**
+ * 人工重放隔离事件：清空清单，并把游标回退到最早隔离事件的前一块（哈希清空避开重组比对）。
+ * 必须与轮询共用 `escrow-watcher` 单飞锁，否则“刚清空又被本轮内存清单写回”。
+ */
+export async function replayQuarantinedEvents() {
+  const run = await withDbLock('escrow-watcher', async () => {
+    const row = await getDb().get('SELECT quarantined_events FROM node WHERE id = 1');
+    const entries = Object.values(quarantineEntriesOf(row?.quarantined_events));
+    if (!entries.length) return { cleared: 0, rewindTo: null };
+    const first = Math.min(...entries.map((e) => Number(e?.block)).filter((n) => Number.isFinite(n)));
+    if (!Number.isFinite(first)) return { cleared: 0, rewindTo: null };
+    const rewindTo = Math.max(0, first - 1);
+    await getDb().run(
+      'UPDATE node SET quarantined_events = ?, watcher_block = ?, watcher_hash = NULL, updated_at = CURRENT_TIMESTAMP(3) WHERE id = 1',
+      '{}',
+      rewindTo
+    );
+    return { cleared: entries.length, rewindTo };
+  });
+  if (!run.acquired) return { busy: true, cleared: 0, rewindTo: null };
+  return run.value;
+}
+
 async function setQuarantinedEvents(byFp, run) {
   // byFp 是 Map（见 pollOnce 里的 quarantined）；Object.entries(Map) 恒为空。
   const entries = [...byFp.entries()]
@@ -248,8 +287,7 @@ const REORG_REWIND_BLOCKS = 64;
  * `node.quarantined_events` 并经 /healthz 暴露（事件不静默消失：每轮告警 + 清单可查 + 可人工处理后清理重放）。
  */
 const MAX_EVENT_RETRIES = 3;
-/** 隔离清单条目上限（防无界增长；超出丢最旧，见 setQuarantinedEvents） */
-const FAILED_EVENTS_MAX = 50;
+/** 隔离清单条目上限（防无界增长；超出丢最旧，见 setQuarantinedEvents） */const FAILED_EVENTS_MAX = 50;
 
 /**
  * 原始 JSON-RPC 只读调用（块哈希读取专用）：BTY 主网区块含系统交易（to=0x16 的奖励交易
@@ -361,7 +399,7 @@ export const EVENTS = [
   'RefundRequested',
   'RefundRejected',
   // 买家对具体金额的部分退款授权（approveRefund 退部分金额的唯一合法来源）——
-  // **漏挂即静默**：卖家面板永远看不到买家授权额，只能拿 RefundAmountNotAccepted 的 revert 试错
+  // **漏挂即静默**：店主面板永远看不到买家授权额，只能拿 RefundAmountNotAccepted 的 revert 试错
   'PartialRefundAccepted',
   'RefundApproved',
   /*
@@ -489,7 +527,7 @@ async function recordEvent(escrowOrderId, ev) {
  * release 系 / restock / autoDeliver 的事务自动降级为内层保存点。
  *
  * 副作用时序（源码审计 2026-09 修复）：webhook 通知与自动交付原在事务内发出——若后续语句
- * 抛错整体回滚，卖家已收到「订单已托管」而本地仍是 draft（回滚后重扫会再报一次）。
+ * 抛错整体回滚，店主已收到「订单已托管」而本地仍是 draft（回滚后重扫会再报一次）。
  * 现统一压入 meta.afterCommit，**COMMIT 成功之后**才执行（顺序与原先一致：先 order.escrowed，
  * 后自动交付的 order.shipped）；单个副作用抛错只告警，不影响已提交的状态。
  * 这些副作用里既有 `notify`（同步发起、fire-and-forget）也有链上复核 + 自动交付（真异步），
@@ -516,7 +554,7 @@ export async function applyEvent(name, args, meta = {}) {
  * 「链上已退买家金额」的**唯一判据**：读得到 → `bigint`（≥ 0），读不到 → `null`。
  *
  * 为什么必须把"读不到"与"确证为 0"分开（2026-10 生产化清理）：
- *   · `0n` 在这套语义里是一个**具体结论**——"从未退款 / 全额判卖家"（见 `mapChainTerminal`）；
+ *   · `0n` 在这套语义里是一个**具体结论**——"从未退款 / 全额判店主"（见 `mapChainTerminal`）；
  *   · 而字段缺失、ABI 漂移、脏字符串是**不知道**。用一个 0 去代表"不知道"，等于替链上说了一句
  *     它没说过的话：全额退款会被写成 `settled` + `refunded_amount_wei='0'`，**买家钱的下落记反**，
  *     而且对账脚本会认为"本地与链上一致"（两边同错，自证清白）。
@@ -544,11 +582,11 @@ export function readRefundedWei(v) {
  * 链上终局（status + refundedAmount）→ 本地终态（**唯一实现**）。
  *
  * 链上状态本身无法区分"买家确认收货 / 超时释放 / 仲裁判付"（三者都是 Settled），
- * 所以不猜事件名：只有全额退回买家的才是 refunded，其余（含 refundedAmount = 0 = 全判卖家）一律 settled。
+ * 所以不猜事件名：只有全额退回买家的才是 refunded，其余（含 refundedAmount = 0 = 全判店主）一律 settled。
  *
  * 判据与链上 `Escrow._settle` 逐字一致：
  *   refundWei == amount → 状态 Refunded（全额退买家，不扣费）
- *   0 ≤ refundWei < amount → 状态 Settled（拆分结算或全额判卖家）
+ *   0 ≤ refundWei < amount → 状态 Settled（拆分结算或全额判店主）
  * 而 `getOrder` 的 `refundedAmount` 正是那个 refundWei 的镜像，故快照路径（chainReconcile 兜底
  * 对账 / `POST /:id/sync` 手动同步）与事件路径必须共用本函数——否则同一笔单走事件回写还是走
  * 快照同步会得到两种说法（历史上 `/sync` 把 refundedAmount=0 的 Settled 落成 `confirmed`，
@@ -556,7 +594,7 @@ export function readRefundedWei(v) {
  * 这个**买家动作**，只有真实 ReceiptConfirmed 事件才能证明）。
  *
  * **第三态（2026-10 生产化清理）**：返回 `null` = 判不了。此前"解析失败按 0 处理、永不抛错"，
- * 于是"不知道"被写成了"全额判卖家"——账目不可逆。现在只有在下列情况下才允许继续判：
+ * 于是"不知道"被写成了"全额判店主"——账目不可逆。现在只有在下列情况下才允许继续判：
  *   · 状态是 `Refunded`（状态自己就是结论）；
  *   · 状态是 `Settled`（合约语义：不是全额退款才发 Settled）——此时缺的只是**金额**，
  *     调用方必须按"读不到"处理（不许写 0）；
@@ -579,10 +617,10 @@ export function mapChainTerminal(chainStatus, refundedAmountWei, amountWei) {
 /**
  * 链上「按退款额拆分结算」→ 本地终态（RefundApproved / Arbitrated 共用，**唯一实现**）。
  *
- * 合约侧语义（Escrow._settle）：refundWei 退买家，余额 amount−refundWei 扣费后给卖家；
+ * 合约侧语义（Escrow._settle）：refundWei 退买家，余额 amount−refundWei 扣费后给店主；
  *   refundWei == amount → 状态 Refunded（全额退款）
- *   refundWei <  amount → 状态 Settled（拆分：部分退款 + 部分结算，含 refundWei=0 全额判卖家）
- * 本地镜像必须与之一致：全额退 → 'refunded'；拆分/判卖家 → 'settled'。两者都记
+ *   refundWei <  amount → 状态 Settled（拆分：部分退款 + 部分结算，含 refundWei=0 全额判店主）
+ * 本地镜像必须与之一致：全额退 → 'refunded'；拆分/判店主 → 'settled'。两者都记
  * `refunded_amount_wei`（净额 = amount − refunded；零费模型下没有第三腿，UI 据此展示拆分）。
  *
  * 两列分住两张表（状态在 `orders`、金额与退款标记在 `order_chain`）：先写状态
@@ -591,7 +629,7 @@ export function mapChainTerminal(chainStatus, refundedAmountWei, amountWei) {
  *
  * @param {{get: Function, run: Function}} db 查询门面
  * @param {string} orderId 链上托管单号
- * @param {string|number|bigint} refundWeiArg 事件里的退款额（**必填**：读不到即抛出，不再有"缺失按全额判卖家"的兼容路径）
+ * @param {string|number|bigint} refundWeiArg 事件里的退款额（**必填**：读不到即抛出，不再有"缺失按全额判店主"的兼容路径）
  * @returns {number} 受影响行数（0 = 未命中可迁移的行 / 本节点没有这一单）
  * @throws 退款额或本地托管额读不到时抛出（**不落终态**，由调用方的失败/重试机制接管）
  *
@@ -639,12 +677,12 @@ export async function settleByRefundSplit(db, orderId, refundWeiArg) {
   if (amount === null || refunded === null) {
     /*
       **退款额读不到 ⇒ 一个字都不写**（2026-10 生产化清理）。
-      这个字段就是"全额退买家 还是 拆分/全额判卖家"的**唯一依据**——按 0 兜底会把全额退款写成
+      这个字段就是"全额退买家 还是 拆分/全额判店主"的**唯一依据**——按 0 兜底会把全额退款写成
       settled + refunded_amount_wei='0'，买家钱的下落就此记反（不可逆，且事后两边同错）。
       这里**抛出**而不是返回 0：0 会被上游当成"没有需要迁移的行"，事件照旧算处理完成、游标继续前进，
       那一单就永远停在非终态、也不会再有人来修。抛出则进 `applyEvent` 既有的失败处理
       （记重试 → 连续失败转持久化隔离清单 + 每轮告警），下一轮带着健康的读数再来一次。
-      真实链上事件经 ABI 解码必然带 refundWei；**没有"字段缺失就按全额判卖家"这条兼容路径了**
+      真实链上事件经 ABI 解码必然带 refundWei；**没有"字段缺失就按全额判店主"这条兼容路径了**
       （旧版 `refundToBuyer=false` 的语义已随合约删除）。
     */
     throw new Error(
@@ -676,10 +714,10 @@ export async function settleByRefundSplit(db, orderId, refundWeiArg) {
       // 全额退款：占位按「未交付行」口径回补（已交付后退款视为货在买家侧，需线下回收，防超卖）
       await releaseRefundedEscrow(orderId);
     } else {
-      // 拆分/判卖家：成交向终态——已交付行若退货已确认收货/放弃追索则回补占位（D1 口径）
+      // 拆分/判店主：成交向终态——已交付行若退货已确认收货/放弃追索则回补占位（D1 口径）
       await releaseHoldsForReturnReceived(orderId);
       /*
-        取消时占位已经释放；链上随后才结算给卖家（拆分/判付）时，本地不能继续把这件货
+        取消时占位已经释放；链上随后才结算给店主（拆分/判付）时，本地不能继续把这件货
         标成“可再售”。补占位失败只告警（资金已上链，订单必须收敛），由店主核账扩容。
       */
       if (from === 'cancelled' && !(await restockOrder(local.order_id))) {
@@ -704,7 +742,7 @@ export async function settleByRefundSplit(db, orderId, refundWeiArg) {
  * 而链上那笔钱已经真的被冻结在 Disputed 里。
  *
  * **从 cancelled 复活必须把库存占位补回来**（2026-10-22 复审）：取消流程释放过占位，
- * 只改状态会让同一件货同时"可再售"又"已有在途单"（争议判给卖家即超卖）。见函数体内说明。
+ * 只改状态会让同一件货同时"可再售"又"已有在途单"（争议判给店主即超卖）。见函数体内说明。
  * @returns {number} 受影响行数（0 = 未命中可迁移的行 / 本节点没有这一单）
  */
 export async function markEscrowDisputed(db, orderId, { afterCommit } = {}) {
@@ -735,7 +773,7 @@ export async function markEscrowDisputed(db, orderId, { afterCommit } = {}) {
 
     取消（草稿清扫/买家取消）时占位已经释放；而"订单已取消、链上却已支付、`OrderCreated` 又漏扫"
     是真实竞态，其后的第一手链上事实可能是 Disputed（买家已申请退款/发起争议）。旧实现只把
-    状态推成 disputed，却不碰占位——于是这件商品同时"可再售"又"已有在途单"，一旦争议判给卖家
+    状态推成 disputed，却不碰占位——于是这件商品同时"可再售"又"已有在途单"，一旦争议判给店主
     就是一次超卖，而 Created 恢复分支（`restockOrder` + 告警）早就做了同一件事。
     占位恢复失败**不阻断争议推进**：钱已经冻在链上，本地状态必须先与链上一致；差额交给店主核账，
     与 Created 分支同一口径（那里是 `abortTx`，因为那时钱还在托管里、可以拒绝恢复）。
@@ -781,7 +819,7 @@ export async function markEscrowDisputed(db, orderId, { afterCommit } = {}) {
  * 两条路径共用本函数：事件路径（`PartialRefundAccepted` 分支）与快照路径
  * （`POST /:id/sync` 读链上只读视图 `acceptedPartialRefund(orderId)` 兜底）——
  * 各写一份 SQL 迟早漂移（一边写 updated_at、一边不写；一边容忍脏值、一边不容忍），
- * 而这一列是卖家给出"链上真的会接受的退款金额"的唯一依据（契约 2026-09：
+ * 而这一列是店主给出"链上真的会接受的退款金额"的唯一依据（契约 2026-09：
  * `approveRefund` 只接受「全额」或 `acceptedPartialRefund[orderId]`）。
  *
  * 口径：
@@ -855,7 +893,7 @@ async function applyClaimChainEvent(name, args) {
       争议结案必须同时推进**链下声明状态**：requested/approved/shipped 仍占着
       `uq_claims_active_token` 的唯一槽位，只改 dispute_state 会让这枚 token 之后
       再也无法被新持有人声明。赔偿 >0 ⇒ fulfilled（已兑付，继续占位防二次赔付）；
-      判卖家无责 ⇒ rejected（让位给后续持有人）。`claim_amount_wei` 有 CHECK >0，
+      判店主无责 ⇒ rejected（让位给后续持有人）。`claim_amount_wei` 有 CHECK >0，
       无法用 0 表示"没有赔付"，所以零赔付写 NULL。
     */
     const terminalStatus = amount === '0' ? 'rejected' : 'fulfilled';
@@ -900,28 +938,28 @@ async function applyEventCore(name, args, meta = {}) {
   if (!local) return 0;
   /*
     防伪托管（**全事件**口径，源码审计 2026-09 修复）：此前只有 OrderCreated 分支核对
-    金额/卖家/买家，终局与冻结类事件（Expired / Arbitrated / Refund* / DisputeRequested /
+    金额/店主/买家，终局与冻结类事件（Expired / Arbitrated / Refund* / DisputeRequested /
     ReceiptConfirmed）**只按 orderId + 本地状态**落地——而草稿的 escrowOrderId 并不是秘密：
     匿名列表虽不下发它，但详情页以不可枚举的 order_no 为键、拿到那张 URL 的人就能读出。
     攻击者据此对任意
     **未付款草稿**的 orderId 用 1 wei + timeoutBlocks=1 建一笔自己的链上单，再调
     releaseExpired 触发 OrderExpiredReleased：本地 draft 被改成 expired（库存占位被释放、
-    事件史写入攻击者 txHash、并按 INCOME_STATUS 计入卖家流水），此后买家真实支付因
+    事件史写入攻击者 txHash、并按 INCOME_STATUS 计入店主流水），此后买家真实支付因
     OrderExists 永久 revert，只能作废重下——每开一张草稿即可被定点打断一次。
-    现要求：凡带 meta.chainParams（pollOnce 以 getOrder 预取的链上真值；买家/卖家/金额
+    现要求：凡带 meta.chainParams（pollOnce 以 getOrder 预取的链上真值；买家/店主/金额
     自创建起不可变）的事件，必须先与本行锁定值逐项一致，不一致则整条事件不落地。
     注：单测直调/兼容旧调用不带 chainParams 时跳过（与 OrderCreated 分支同口径）。
   */
   if (name !== 'OrderCreated' && meta.chainParams && !chainParamsMatch(local, meta.chainParams)) {
     console.warn(
-      `[escrowWatcher] 忽略与链上真值不符的事件: ${name} orderId=${orderId} 买家/卖家/金额/验货窗口与本地订单锁定不一致（疑似他人对同一 orderId 的诱饵单）`
+      `[escrowWatcher] 忽略与链上真值不符的事件: ${name} orderId=${orderId} 买家/店主/金额/验货窗口与本地订单锁定不一致（疑似他人对同一 orderId 的诱饵单）`
     );
     return 0;
   }
   let changed;
   switch (name) {
     case 'OrderCreated': {
-      // 防伪托管（与 paid/sync 同规则）：事件里的金额/卖家/买家必须与本地锁定值一致，
+      // 防伪托管（与 paid/sync 同规则）：事件里的金额/店主/买家必须与本地锁定值一致，
       // 且 chainParams 里的 token 必须等于本地 payment_token——ERC20 单的金额是 token
       // 最小单位，只比数字会让同数字的原生灰尘单顶替。字段缺失（单测直调）时跳过事件字段比对，
       // 但真实路径的 chainParams 已由 pollOnce 预取并逐项校验。
@@ -941,7 +979,7 @@ async function applyEventCore(name, args, meta = {}) {
       if (match && meta.chainParams) match = chainParamsMatch(local, meta.chainParams);
       if (!match) {
         console.warn(
-          `[escrowWatcher] 忽略疑似伪造托管事件: orderId=${orderId} 金额/卖家/买家/验货窗口与本地订单锁定不符`
+          `[escrowWatcher] 忽略疑似伪造托管事件: orderId=${orderId} 金额/店主/买家/验货窗口与本地订单锁定不符`
         );
         return 0; // 不推进、不记录事件史、不触发自动交付
       }
@@ -963,7 +1001,7 @@ async function applyEventCore(name, args, meta = {}) {
         await db.run('UPDATE order_chain SET paid_tx_hash = COALESCE(paid_tx_hash, ?) WHERE order_id = ?', txHash, local.order_id);
       } else if (local.status === 'cancelled' && !local.paid_tx_hash) {
         // 草稿超时被清扫（sweeper）/手动取消后链上托管才落定的竞态恢复：
-        // 事件金额/卖家/买家已与本地一致 → 链上资金真实存在。先按逐单占位记账回补占位
+        // 事件金额/店主/买家已与本地一致 → 链上资金真实存在。先按逐单占位记账回补占位
         // （restockOrder 失败=取消期间限量库存被卖完，仅记告警——资金已上链，订单优先恢复，
         // 差额由店主人工核账扩容），再置 escrowed 并自动交付。
         if (!(await restockOrder(local.order_id))) {
@@ -1058,8 +1096,8 @@ async function applyEventCore(name, args, meta = {}) {
       // 买家确认收货可发生在退款申请后（链上 confirmReceipt 不要求未申请）——终局同时复位售后镜像；
       // v2+ 争议中买家撤诉放款同样发本事件（Escrow.confirmReceipt 扩 Disputed 态）→ disputed → confirmed
       // from 集对齐 /sync 的 Settled 口径（源码审计 2026-09）：draft/cancelled 行是「节点漏扫
-      // OrderCreated」的残镜像——链上既已收到本事件，说明该单确实托管过且已结算给卖家，
-      // 本地必须收敛到成交终局（此前这些行永远停在 draft/cancelled，卖家流水漏计）。
+      // OrderCreated」的残镜像——链上既已收到本事件，说明该单确实托管过且已结算给店主，
+      // 本地必须收敛到成交终局（此前这些行永远停在 draft/cancelled，店主流水漏计）。
       // settled 也要收：/sync 在漏扫事件时可能先落 settled，真实 ReceiptConfirmed 到达后
       // 必须能补成 confirmed（确认率/文案依赖它）。
       const claim = await claimOrderState(
@@ -1098,8 +1136,8 @@ async function applyEventCore(name, args, meta = {}) {
         }
         // 终局复位退款镜像（链上列，见文件头的两表说明）：只在迁移真的发生了的时候写
         await db.run("UPDATE order_chain SET refund_status = 'none' WHERE order_id = ?", local.order_id);
-        // D1：已交付行若退货已确认收货/放弃追索（received_at 非空，货已实际回卖家侧/卖家放弃追回），
-        // 即使资金终局判给卖家（成交）也不应继续占位——实物已可再售，见 releaseHoldsForReturnReceived
+        // D1：已交付行若退货已确认收货/放弃追索（received_at 非空，货已实际回店主侧/店主放弃追回），
+        // 即使资金终局判给店主（成交）也不应继续占位——实物已可再售，见 releaseHoldsForReturnReceived
         await releaseHoldsForReturnReceived(orderId);
       }
       break;
@@ -1110,7 +1148,7 @@ async function applyEventCore(name, args, meta = {}) {
       break;
     /*
       两级售后（v2）：买家链上 requestRefund → refund_status=requested（资金冻结、超时释放被禁）；
-      卖家 rejectRefund → rejected（解锁 requestDispute 资格）。合约不接受被拒后重复申请
+      店主 rejectRefund → rejected（解锁 requestDispute 资格）。合约不接受被拒后重复申请
       （防「申请→拒绝→再申请」无限冻结循环，见 Escrow.sol requestRefund），本地镜像随之翻转。
 
       ⚠️ 两列分住两张表（`refund_status`/`refund_requested_at` 在 order_chain，`updated_at` 在 orders），
@@ -1162,14 +1200,14 @@ async function applyEventCore(name, args, meta = {}) {
     case 'PartialRefundAccepted': {
       /*
         买家对**具体金额**的部分退款授权（契约 2026-09 新增；契约收紧 approveRefund 之后，
-        卖家要退部分金额，唯一合法取值就是这里被授权的那个数）。
+        店主要退部分金额，唯一合法取值就是这里被授权的那个数）。
 
         本事件**不迁移订单状态**：授权不转移资金、不冻结订单，买家仍可确认收货/发起争议/
         改授权额（重复授权覆盖旧值），所以 status / refund_status 一律不动。
 
         但"授权额真的写入/变化"必须算作 changed > 0 —— 通用尾部（recordEvent 事件史 +
         typeForChainEvent 通知分派）只在 changed > 0 时才跑，若这里恒返回 0，链上授权了、
-        本地订单详情里却查不到任何凭证（而卖家要凭这条金额去调 approveRefund）。
+        本地订单详情里却查不到任何凭证（而店主要凭这条金额去调 approveRefund）。
         幂等：`WHERE ... <> ?` 让同值重扫（重组回退/失败重试）foundRows=0，不重复记账
         （与其它分支"foundRows=0 不写事件史"同口径）。
         重复授权覆盖旧值时被拒的授权不会上链（合约在写映射前 revert），故本列恒等于链上
@@ -1181,14 +1219,14 @@ async function applyEventCore(name, args, meta = {}) {
         "挪"进更晚的窗口，就等于让成交额在两天的报表里各出现一次。本分支只写这一列，别无副作用。
 
         通知：不派发 webhook（`typeForChainEvent` 刻意不给它映射）——这不是店主/买家需要
-        被叫醒的**状态**通知：订单状态没变、钱没动，卖家用不用这个授权额由他自己决定
+        被叫醒的**状态**通知：订单状态没变、钱没动，店主用不用这个授权额由他自己决定
         （面板上读 DTO 即可）。给它加 'order.*' 通知只会让店主在"什么都没发生"时收到告警。
       */
       changed = await applyAcceptedPartialRefund(orderId, args?.refundWei);
       break;
     }
     case 'RefundApproved':
-      // 卖家 approveRefund（申请后同意 / 争议中和解）：合约 2026-09 只接受两种金额 ——
+      // 店主 approveRefund（申请后同意 / 争议中和解）：合约 2026-09 只接受两种金额 ——
       // refundWei == amount（全额认赔，不需要授权）或 refundWei == 买家已精确授权的
       // acceptedPartialRefund[orderId]（部分退款）；其它一律 RefundAmountNotAccepted
       //（旧的 RefundNotFull 已删除），所以本事件只会是这两档之一；能任意比例拆分的
@@ -1203,13 +1241,13 @@ async function applyEventCore(name, args, meta = {}) {
       确认收货后的售后案件（契约 2026-10 第二批）——**两个分支都不迁移 orders.status**。
 
       为什么必须写在这里（而不是调用点各判一次）：`after_sale_status` 是"这一个终局单上有没有
-      在途案件"的**唯一**本地事实，它同时喂着售后陈述门控、退货单窗口、仲裁台队列、卖家徽标与
+      在途案件"的**唯一**本地事实，它同时喂着售后陈述门控、退货单窗口、仲裁台队列、店主徽标与
       保留期保护。事件路径是它的第一来源；/sync 与后台对账（chainReconcile）按链上
       afterSaleOpen/afterSaleOpenedAtBlock 走 afterSale.js 里**同一对**写入口回填，
       所以"漏扫事件"不会让这个状态与链上永久分叉。
 
       `foundRows=0`（本地无此单 / 已是该状态）时不写事件史、不发通知——与其它分支同口径；
-      链上真值核验（meta.chainParams 的买家/卖家/金额比对）在本函数头部统一执行，售后案件事件
+      链上真值核验（meta.chainParams 的买家/店主/金额比对）在本函数头部统一执行，售后案件事件
       同样受它保护（草稿的 orderId 对拿到详情链接的人可见，不核对就等于让别人的假案件驱动本地队列）。
       这两列都住在 order_chain（链上镜像表），写入只落在那一行上（见 afterSale.js）。
     */
@@ -1251,7 +1289,7 @@ async function applyEventCore(name, args, meta = {}) {
       }
       const stakePaid = await stakePaidOf(orderId);
       changed = (await db.run(
-        `UPDATE order_chain SET refunded_amount_wei = ?, claim_paid_wei = ?, stake_paid_wei = ?
+        `UPDATE order_chain SET refunded_amount_wei = ?, claim_paid_wei = ?, stake_paid_wei = COALESCE(?, stake_paid_wei)
           WHERE order_id = ? AND (refunded_amount_wei <> ? OR claim_paid_wei <> ?)`,
         total,
         claimTotal,
@@ -1299,7 +1337,7 @@ async function applyEventCore(name, args, meta = {}) {
       }
       const stakePaid = await stakePaidOf(orderId);
       changed = (await db.run(
-        `UPDATE order_chain SET refunded_amount_wei = ?, stake_paid_wei = ?
+        `UPDATE order_chain SET refunded_amount_wei = ?, stake_paid_wei = COALESCE(?, stake_paid_wei)
           WHERE order_id = ? AND refunded_amount_wei <> ?`,
         total,
         stakePaid,
@@ -1310,7 +1348,7 @@ async function applyEventCore(name, args, meta = {}) {
     }
     case 'Arbitrated':
       // 仲裁裁决（争议可能带着 requested/rejected 镜像进入）：refundWei 同口径拆分结算；
-      // 占位回补（全额退款 = 未交付行口径 / 拆分与判卖家 = D1 退货已回收口径）由 settleByRefundSplit 内部处理
+      // 占位回补（全额退款 = 未交付行口径 / 拆分与判店主 = D1 退货已回收口径）由 settleByRefundSplit 内部处理
       changed = await settleByRefundSplit(db, orderId, args.refundWei);
       break;
     case 'OrderExpiredReleased': {
@@ -1323,7 +1361,7 @@ async function applyEventCore(name, args, meta = {}) {
       // 超卖）；从未交付的 draft/escrowed 归还占位额度（货仍在库可再售）。逐行快照判定
       // 释放粒度，避免以单行状态代表整体漏放/多放。超时即终局：退款镜像复位。
       // from 集对齐 /sync 与对账的口径（源码审计 2026-09）：补 cancelled（草稿被清扫后才
-      // 落定的链上单，卖家真实收款而本地永不停留在非终态 = 流水漏计）、disputed（链上 Created
+      // 落定的链上单，店主真实收款而本地永不停留在非终态 = 流水漏计）、disputed（链上 Created
       // 单不可能超时释放成 Disputed，本地 disputed 必是漏扫/重组残镜像），
       // 以及 **settled**（2026-09 复审补：/sync 与 chainReconcile 现在把"链上已 Settled 但原因未知"
       // 统一收敛为 settled，其中就包含**超时释放后事件被漏扫**这一种——事件随后被重扫出来时，
@@ -1360,7 +1398,7 @@ async function applyEventCore(name, args, meta = {}) {
           .map((r) => r.order_id);
         if (released.length) await releaseHoldsForOrderIds(released);
         // D1：已交付行（shipped/有物流/有交付行）超时释放本不自动回补（货在买家侧钱货两清），
-        // 但若退货已确认收货/放弃追索（received_at 非空）——货已实际回到卖家侧可再售——占位回补
+        // 但若退货已确认收货/放弃追索（received_at 非空）——货已实际回到店主侧可再售——占位回补
         await releaseHoldsForReturnReceived(orderId);
       }
       break;
@@ -1370,7 +1408,7 @@ async function applyEventCore(name, args, meta = {}) {
   }
   if (changed > 0) {
     await recordEvent(orderId, { name, txHash: meta.txHash || null, block: meta.block || null, at: Date.now() });
-    // 卖家通知（P0-3）：状态迁移成功后触发（webhook 内部未配置即零开销）。
+    // 店主通知（P0-3）：状态迁移成功后触发（webhook 内部未配置即零开销）。
     // OrderCreated 已在分支内先行入队（保证 escrowed 早于自动交付的 shipped），此处跳过防双发。
     // 参数据是**对外单号** order_no（接收方按它查单）。
     /*
@@ -1652,8 +1690,8 @@ async function pollOnceWithProvider({ provider, url, head }) {
   /*
     链上真值预取（源码审计 2026-09，防「诱饵单」）：此前只有 OrderCreated 分支核对链上参数，
     攻击者可用他人草稿的 orderId 建 1 wei 单再 releaseExpired，把本地未付款 draft 改成 expired
-    （占位被释放、事件史写入攻击者 txHash、按 INCOME_STATUS 计入卖家流水）。这里对**本批内
-    涉及本地订单的非 OrderCreated 事件**逐个 orderId 取一次 getOrder（买家/卖家/金额自创建起
+    （占位被释放、事件史写入攻击者 txHash、按 INCOME_STATUS 计入店主流水）。这里对**本批内
+    涉及本地订单的非 OrderCreated 事件**逐个 orderId 取一次 getOrder（买家/店主/金额自创建起
     不可变 ⇒ 现取现用恒有效），随 meta.chainParams 传入 applyEvent 逐项比对。
     取不到（RPC 失败）时**不阻断整轮**：该 orderId 记为 unverified，其事件在下面按单条失败处理
     （重试 → 隔离），既不会「无法核对就直接落地」，也不会因一个单拖住整窗扫描。
@@ -1665,7 +1703,7 @@ async function pollOnceWithProvider({ provider, url, head }) {
     const needIds = new Set();
     for (const ev of all) {
       /*
-        OrderCreated 也必须预取：事件本身不带支付资产，只比 orderId/买卖家/金额
+        OrderCreated 也必须预取：事件本身不带支付资产，只比 orderId/买店主/金额
         会让「ERC20 单 + 原生灰尘支付」通过；token 只能从 getOrder/orderToken 现读。
       */
       if (ev.name.startsWith('Claim')) continue;
@@ -1747,7 +1785,7 @@ async function pollOnceWithProvider({ provider, url, head }) {
       const n = await applyEvent(ev.name, ev.args, {
         txHash: ev.txHash,
         block: ev.block,
-        // 链上真值（买家/卖家/金额/验货窗口）：非 OrderCreated 事件据此拒绝「他人对同一 orderId
+        // 链上真值（买家/店主/金额/验货窗口）：非 OrderCreated 事件据此拒绝「他人对同一 orderId
         // 的诱饵单」，见 applyEventCore 头部说明。OrderCreated 自身已用事件字段比对。
         chainParams: prefetched && prefetched.ok ? {
           buyer: prefetched.buyer,

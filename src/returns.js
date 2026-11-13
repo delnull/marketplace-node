@@ -2,16 +2,16 @@
  * 退货单数据层（P0-4，纯本地数据面——链上资金流不变）：
  *
  * 用途：已交付订单（有物流单号或交付行）退款时的线下追回协调——
- * 卖家建退货单（地址/说明）→ 买家回填退回物流单号 → 卖家确认收到/放弃追索 →
+ * 店主建退货单（地址/说明）→ 买家回填退回物流单号 → 店主确认收到/放弃追索 →
  * 该单占位才被回补（防「钱退了货没回，容量却被再售」）。
  *
  * 与释放机制的关系（见 stockHold.js）：
  *  - 未交付的退款单：refunded 终局即自动释放（原语义）；
  *  - 已交付且退货 received_at 非空：refunded 终局自动释放（releaseRefundedEscrow 升级判据）；
- *  - 已交付未确认收货：占位保留；卖家 receive/waive 时若订单已 refunded 则当场释放
+ *  - 已交付未确认收货：占位保留；店主 receive/waive 时若订单已 refunded 则当场释放
  *    （watcher/sync 事件在 receive 之后到达时由 releaseRefundedEscrow 覆盖——released_at 幂等）；
- *  - D1 例外：成交终局态（settled/confirmed/expired——资金判给卖家）但退货已确认收货/放弃追索
- *    （received_at 非空，货已实际回到卖家侧可再售）：终局迁移（watcher/sync）或 receive/waive
+ *  - D1 例外：成交终局态（settled/confirmed/expired——资金判给店主）但退货已确认收货/放弃追索
+ *    （received_at 非空，货已实际回到店主侧可再售）：终局迁移（watcher/sync）或 receive/waive
  *    动作当场由 releaseHoldsForReturnReceived 回补占位（released_at 幂等）。
  *
  * 建单窗口与售后案件的关系（2026-10）：窗口 = 退款协调相关状态（escrowed/shipped/disputed/refunded）
@@ -98,7 +98,7 @@ export async function fetchReturnsByOrderIds(orderIds) {
 }
 
 /**
- * 卖家填写/修改退货地址（买家发起退货申请后）。
+ * 店主填写/修改退货地址（买家发起退货申请后）。
  * 只允许 open 状态；已寄出/已收货再改地址没有意义，反而会让买家按旧地址寄丢。
  */
 export async function setReturnAddress({ returnRow, address }) {
@@ -115,7 +115,7 @@ export async function setReturnAddress({ returnRow, address }) {
 }
 
 /**
- * 买家发起退货申请：仅创建一条 open 的空地址退货单，地址由卖家补。
+ * 买家发起退货申请：仅创建一条 open 的空地址退货单，地址由店主补。
  * 门控复用 createReturn（已交付 + 退款/售后窗口），这里只补买家身份。
  */
 export async function requestReturn({ order, buyer, note, quantity }) {
@@ -139,7 +139,7 @@ export function returnToPublic(r) {
     waived: !!r.waived,
     /*
       本次退货覆盖的件数。多件订单可只退一部分；占位释放按这个数，而不是按整单 hold_qty。
-      对外必须下发：卖家在确认收货前要能核对"退回来的是几件"。
+      对外必须下发：店主在确认收货前要能核对"退回来的是几件"。
     */
     quantity: Number(r.quantity) || 1,
     address: r.address || '',
@@ -149,7 +149,7 @@ export function returnToPublic(r) {
       退回件的承运方名称（买家填，可空）。与订单侧的 `orders.carrier` **同一口径与同一归一实现**
       （src/shipping.js）：只有运单号时查件只能靠单号前缀猜，纯数字号段的快递完全猜不出；
       NULL = 未填（三态：不是空串）。退货这条路与发货那条路必须是同一种形状，否则
-      "同一个运单号，卖家寄出时能查、买家寄回时查不了"。
+      "同一个运单号，店主寄出时能查、买家寄回时查不了"。
     */
     carrier: r.carrier || null,
     receivedAt: r.received_at || null,
@@ -163,12 +163,12 @@ export function returnToPublic(r) {
  * （即退款协调相关阶段）**或有在途售后案件**（确认收货后的售后案件，见下）；未交付单直接走退款即可。
  *
  * 为什么终局单只对"有在途售后案件"开放（**不要顺手放宽成"终局都可建"**）：
- * 退货单在本仓是有资金后果的凭据——卖家 receive/waive 会经 `releaseHoldsForReturnReceived`
- * 回补库存占位（D1 口径：货已实际回到卖家侧/卖家放弃追索，额度才能再售）。对一笔**已钱货两清**
+ * 退货单在本仓是有资金后果的凭据——店主 receive/waive 会经 `releaseHoldsForReturnReceived`
+ * 回补库存占位（D1 口径：货已实际回到店主侧/店主放弃追索，额度才能再售）。对一笔**已钱货两清**
  * 的终局单，唯一能证明"货要寄回、需要留痕"的链上事实就是售后案件（买家在窗口内 openAfterSale）；
  * 没有案件却允许建单，等于凭空给终局单补一条不存在的追索依据，而占位回补会跟着它走。
  * 有案件时反而必须放行：案件主张的正是"货有问题"，货要寄回、流程要留痕（谁寄的、寄到哪、
- * 卖家何时确认收到），否则双方只能在线下口头约定，占位与退货事实都无从对账。
+ * 店主何时确认收到），否则双方只能在线下口头约定，占位与退货事实都无从对账。
  *
  * ⚠️ 与本文件既有纪律一致：这里只**放行建单**，绝不改占位回补语义——已交付单不因建单/结案
  * 自动回补，仍以 `received_at` 为唯一凭据（见 releaseHoldsForReturnReceived）。
@@ -198,7 +198,7 @@ export async function createReturn({ order, address, note, quantity }) {
   /*
     退货件数是**占位释放的计量单位**：多件订单只退回一件时，只能释放一件的 committed，
     否则剩下仍在买家手里的货会立刻变成"可再售"（超卖）。缺省 = 整单全部退回；
-    卖家要部分退货必须显式给 quantity（或后续 PATCH /return/quantity 改小）。
+    店主要部分退货必须显式给 quantity（或后续 PATCH /return/quantity 改小）。
   */
   const qtyRaw = quantity === undefined || quantity === null || quantity === '' ? maxQty : Number(quantity);
   if (!Number.isSafeInteger(qtyRaw) || qtyRaw < 1 || qtyRaw > maxQty) {
@@ -226,9 +226,9 @@ export async function createReturn({ order, address, note, quantity }) {
 }
 
 /**
- * 修改退货件数（仅 open；卖家在确认收到前按实际退回数量修正）。
+ * 修改退货件数（仅 open；店主在确认收到前按实际退回数量修正）。
  *
- * 买家发起退货时默认整单；卖家实际只收到部分时必须在点 receive 之前改小——
+ * 买家发起退货时默认整单；店主实际只收到部分时必须在点 receive 之前改小——
  * `settleReturn` 按这里的数字释放占位，写大了就是把买家仍持有的货变成可再售。
  */
 export async function setReturnQuantity({ order, returnRow, quantity }) {
@@ -254,15 +254,15 @@ export async function setReturnQuantity({ order, returnRow, quantity }) {
  * 不留空串、也不编"其他"——它是"买家有没有告诉我们寄的是哪家"这个事实本身。
  *
  * **必须检查 `foundRows`**（2026-10-14 补齐，与同文件 `settleReturn` 同一形状）：UPDATE 带的
- * `AND status = 'open'` 是竞态守卫，而买家提交单号与卖家「确认收到 / 放弃追索」改的是同一行。
+ * `AND status = 'open'` 是竞态守卫，而买家提交单号与店主「确认收到 / 放弃追索」改的是同一行。
  * 不看 foundRows 就会在写了 0 行的前提下回"已记录退回物流单号"——买家以为寄回凭据已登记，
- * 卖家那边状态早已是 received、单号仍是 NULL，退回件的唯一凭据静默丢失。
+ * 店主那边状态早已是 received、单号仍是 NULL，退回件的唯一凭据静默丢失。
  *
  * @param {{order: object, returnRow: object, buyer: string, trackingNo?: string, carrier?: unknown}} p
  *   order = 读模型行（校验买家身份）；returnRow = order_returns 行（`id` 是退货单自己的内部键）
  */
 export async function setReturnTracking({ order, returnRow, buyer, trackingNo, carrier }) {
-  if (!returnRow) return { error: '退货单不存在（请先联系卖家创建退货单）' };
+  if (!returnRow) return { error: '退货单不存在（请先联系店主创建退货单）' };
   if (String(order.buyer || '').toLowerCase() !== String(buyer || '').toLowerCase()) {
     return { error: '仅买家本人可填写退回物流单号', forbidden: true };
   }
@@ -272,7 +272,7 @@ export async function setReturnTracking({ order, returnRow, buyer, trackingNo, c
   if (returnRow.status !== 'open') return { error: `退货单当前状态(${returnRow.status})不可再填单号（已寄出/已确认）` };
   const moved = (await getDb().run("UPDATE order_returns SET status = 'shipped', tracking_no = ?, carrier = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status = 'open'", no, normalizeCarrier(carrier), returnRow.id)).foundRows;
   if (moved !== 1) {
-    return { error: '退货单状态已变化（可能已被卖家处理），请刷新后重试——单号没有记录，请确认当前状态后再填' };
+    return { error: '退货单状态已变化（可能已被店主处理），请刷新后重试——单号没有记录，请确认当前状态后再填' };
   }
   return { ok: true, data: await fetchReturnByOrder(order.order_id) };
 }

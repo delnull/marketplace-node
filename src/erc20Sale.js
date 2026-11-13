@@ -1,12 +1,12 @@
 /**
- * ERC20 商品：合约识别与交付收据核验（方案 A：卖家转币 + 节点核对 Transfer）。
+ * ERC20 商品：合约识别与交付收据核验（方案 A：店主转币 + 节点核对 Transfer）。
  *
  * BTY 的 EVM 交易会同时存在 Chain33 哈希与 EVM 哈希（浏览器两个哈希都能查到同一笔交易）。
- * 卖家提交任一哈希；这里先查回执，再用交易对象拿到**回执的 canonical 哈希**，
+ * 店主提交任一哈希；这里先查回执，再用交易对象拿到**回执的 canonical 哈希**，
  * 交付记录按 canonical 哈希去重，避免同一笔转账被两个订单各认领一次。
  */
-import { Contract, isAddress } from 'ethers';
-import { getProvider, rpcRequest } from './chain.js';
+import { Interface, isAddress } from 'ethers';
+import { rpcRequest } from './chain.js';
 
 const ERC20_ABI = [
   'function decimals() view returns (uint8)',
@@ -16,39 +16,36 @@ const ERC20_ABI = [
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
-/** 带超时的 Promise（RPC 挂起必须失败，不能把请求线程挂死） */
-function timeout(ms, message) {
-  return new Promise((_, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
-    if (typeof timer.unref === 'function') timer.unref();
-  });
-}
-
 /**
  * 校验商家填的地址是**可识别 ERC20 合约**：有代码，且 decimals/symbol 读得出来。
  * 允许任意 ERC20（不做白名单）；只把"不是合约 / 不是标准 ERC20"挡在上架阶段。
+ *
+ * 读链走 `rpcRequest`（node:http + AbortSignal.timeout）：到点真正中止连接，
+ * 不是外层 race 超时、底层请求还在跑。两个元数据读并行，共用 15 秒单次预算。
  * @returns {Promise<{ok:true, contract:string, decimals:number, symbol:string} | {ok:false, retryable:boolean, reason:string}>}
  */
 export async function checkErc20Contract(address) {
   const contract = String(address || '').trim().toLowerCase();
   if (!isAddress(contract)) return { ok: false, retryable: false, reason: 'ERC20 合约地址非法（需 0x 开头的 40 位十六进制）' };
-  const provider = getProvider();
+  const iface = new Interface(ERC20_ABI);
   let code;
   try {
-    code = await Promise.race([provider.getCode(contract), timeout(8_000, '读取合约代码超时')]);
+    /* 公网 RPC 冷连接/抖动下 8 秒会把「慢但可用」判成读不到；15 秒与链上标准探测同档 */
+    code = await rpcRequest('eth_getCode', [contract, 'latest'], { timeoutMs: 15_000 });
   } catch (e) {
     console.error('[erc20Sale] 读取合约代码失败：', e?.message || e);
     return { ok: false, retryable: true, reason: `读不到合约代码（链上节点读取失败），请核对合约地址与节点配置` };
   }
   if (!code || code === '0x') return { ok: false, retryable: false, reason: '该地址没有合约代码，不是 ERC20 合约' };
-  const token = new Contract(contract, ERC20_ABI, provider);
   let decimals;
   let symbol;
   try {
-    [decimals, symbol] = await Promise.race([
-      Promise.all([token.decimals(), token.symbol()]),
-      timeout(8_000, '读取 ERC20 元数据超时'),
-    ]);
+    const read = async (fn) => {
+      const data = iface.encodeFunctionData(fn, []);
+      const raw = await rpcRequest('eth_call', [{ to: contract, data }, 'latest'], { timeoutMs: 15_000 });
+      return iface.decodeFunctionResult(fn, raw)[0];
+    };
+    [decimals, symbol] = await Promise.all([read('decimals'), read('symbol')]);
   } catch (e) {
     console.error('[erc20Sale] 读取代币元数据失败：', e?.message || e);
     return {
@@ -102,7 +99,7 @@ export async function resolveTxReceipt(txHash) {
 }
 
 /**
- * 核验一笔卖家→买家的 ERC20 Transfer。
+ * 核验一笔店主→买家的 ERC20 Transfer。
  * 返回 `{ok:true, txHash, inputHash, blockNumber, amount}`；amount 为 raw uint256 十进制字符串。
  */
 export async function verifyErc20Transfer(txHash, { token, from, to }) {
@@ -130,7 +127,7 @@ export async function verifyErc20Transfer(txHash, { token, from, to }) {
     return {
       ok: false,
       retryable: false,
-      reason: `收据里没有该 ERC20 从卖家转到买家的转账记录`,
+      reason: `收据里没有该 ERC20 从店主转到买家的转账记录`,
     };
   }
   return {

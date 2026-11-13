@@ -110,7 +110,7 @@ function userMessageLiterals(src) {
 /**
  * 节点运维读数/启动巡检模块：这些 `message` 只给节点运维看（/healthz、启动自检、监听状态），
  * 保留 `MK_*` 环境变量名与合约读法反而更有用（运维要照着改名/对账）。
- * 它们不进入买家/卖家的业务消息；业务消息仍由下面这条通用扫描兜住。
+ * 它们不进入买家/店主的业务消息；业务消息仍由下面这条通用扫描兜住。
  */
 const OPS_READOUT_FILES = new Set([
   'chain.js',

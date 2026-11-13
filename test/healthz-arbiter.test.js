@@ -20,10 +20,11 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
-import { makeCtx, assertOk, shopRef } from './setup.mjs';
+import { makeCtx, assertOk, login, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
-const { app, request } = ctx;
+const { app, request, owner } = ctx;
+const ownerToken = (await login(ctx, owner)).token;
 
 const arbiter = Wallet.createRandom();
 const arbiterOnchain = arbiter.address.toLowerCase();
@@ -50,7 +51,10 @@ after(() => {
 });
 
 const health = async () => {
-  const r = await request(app).get('/healthz').expect(200);
+  const r = await request(app)
+    .get('/healthz?full=1')
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .expect(200);
   assertOk(r);
   return r.body.data;
 };

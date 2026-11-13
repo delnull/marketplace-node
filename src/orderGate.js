@@ -163,7 +163,7 @@ export async function checkOrderGate({
   */
   if (!orderGateEnabled()) return { ok: true };
   /*
-    note（买家给卖家的备注）在签名里被显式接收，但**不入 payload**：白名单在下面，
+    note（买家给店主的备注）在签名里被显式接收，但**不入 payload**：白名单在下面，
     由本模块（唯一实现）决定"发什么"，调用点无法"顺手"把 PII 带出去。
     void 只是把"刻意不用"写明白——将来谁想把它发出去，得先改这里的白名单，而不是改调用点。
   */

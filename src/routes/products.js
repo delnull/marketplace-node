@@ -20,13 +20,13 @@
  *  DELETE /api/products/:slug/tokens/:id   店主/操作员（staff）删除单个未用 tokenId
  *  DELETE /api/products/:slug/tokens       店主清空整个交付池（ownerOnly；?confirm=1；含已交付记录——凭证在交付子表不受影响）
  *
- * 码池模型：数字商品由卖家导入一批兑换码；发货时若未手动填交付内容，
+ * 码池模型：数字商品由店主导入一批兑换码；发货时若未手动填交付内容，
  * orders 发货流程自动分配一个未用码（事务防重）。码池对公开接口完全不可见，
  * 仅 staff（店主/操作员）令牌可读写；订单交付后买家经订单接口按身份可见。
  * `product_codes.order_id` 是**内部外键**（orders.id，NULL = 未分配），下发给店主的是对外订单号（见 GET 的说明）。
  *
  * NFT 交付池模型：NFT 商品（kind='nft'，nft_contract=合约地址、nft_standard=erc721/erc1155）
- * 由卖家导入一批 tokenId 作为交付库存（每行一个：十进制 / 0x hex / a-b 范围展开）；发货由卖家在钱包
+ * 由店主导入一批 tokenId 作为交付库存（每行一个：十进制 / 0x hex / a-b 范围展开）；发货由店主在钱包
  * 把池内 NFT 转给买家后提交 tokenId+txHash，节点按 nft_standard 核验链上转账事件后置 shipped（见 orders.js）：
  * erc721 兼容 ERC721A 的 Transfer 单枚事件；erc1155 支持 TransferSingle 与 TransferBatch（批量一次多枚），
  * 同 tokenId 多份（value>1 或批量重复 id）不支持（每件 = 一个独立 tokenId 恰一份）。
@@ -94,6 +94,7 @@ import { goodsPriceMicroOf, priceOf, priceUnitOf } from '../money.js';
 // 「这一单还占着库存」的唯一谓词（2026-10-14）：改名守卫与 willRestrict 的补记核算共用它，
 // 不再各自拼状态白名单——状态集每加一个终态就会漏一次，而漏的后果是超卖。
 import { stockPromiseSql, uncommittedPromiseSql } from '../stockHold.js';
+import { KIND_CHANGE_BLOCK_IN } from '../orderStatus.js';
 // 商品标签（类目）的键/展示形/归一化 —— **唯一实现**（两个写入入口、列表筛选与标签清单共用，见 src/tags.js 文件头）
 import { assertParsedJsonColumn, cleanLabel, normalizeTags, parseTagsColumn, tagKeyOf } from '../tags.js';
 // 商品参数（键值对）与商品级承诺（受控枚举 + 数字）—— **各自唯一实现**，两个写入入口共用
@@ -188,7 +189,7 @@ const nodeAudit = async (req, action, targetType, targetId, detail) =>
 /**
  * **节点商品处置的唯一内核**：单品与批量都走这里。
  *
- * 一次事务里锁行、判状态、写状态；事务提交后逐件写节点级审计并推卖家 webhook。
+ * 一次事务里锁行、判状态、写状态；事务提交后逐件写节点级审计并推店主 webhook。
  * 这样"单品"与"批量"不可能在状态条件、时间戳清空、审计字段或通知上漂移——
  * 新增第三个入口时只要调用它，就自动具备同一套语义。
  *
@@ -251,6 +252,7 @@ const router = Router();
   一个 IP 就能用并发模糊搜索打满 DB 池；这里给它独立的读预算，并把 cursor 限制在合理范围。
 */
 const publicProductListLimiter = simpleRateLimit({ windowMs: 60_000, max: 120, message: '商品查询过于频繁，请稍后再试' });
+const productReviewsLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message: '评价查询过于频繁，请稍后再试' });
 const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true }); // P1-⑤：商品经营面=店主+店员
 const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true }); // 池清空/敏感资源批量作废=仅店主
 const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true }); // 节点侧强制下架/恢复（节点主∪员工）
@@ -258,14 +260,14 @@ const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true }); // 节
 const hostOnly = makeAuthMiddleware(verifySession, { hostOnly: true });
 
 /**
- * 卖家面按 slug 取商品行 —— **唯一入口**（取行 + 归属校验 + 写动作的"能不能卖"闸一起做）。
+ * 店主面按 slug 取商品行 —— **唯一入口**（取行 + 归属校验 + 写动作的"能不能卖"闸一起做）。
  *
- * 为什么必须收成一处：多店之前"按 slug 取行"就够（一个节点只有一个卖家），多店之后
- * 每个卖家面入口都要回答"这件商品是不是**本店**的"，而把这条判断抄在 10 个调用点上
+ * 为什么必须收成一处：多店之前"按 slug 取行"就够（一个节点只有一个店主），多店之后
+ * 每个店主面入口都要回答"这件商品是不是**本店**的"，而把这条判断抄在 10 个调用点上
  * 必然漏一个——新增一个入口就多一个漏点，且漏掉时的表现是"操作成功了"，没有任何报错。
  *
  * 判据是 `products.shop_code == req.shop.code`（后者由鉴权中间件解析出来：请求头指的那家，
- * 或这个地址唯一经营的那家——单店卖家不必带请求头，多店则必须点名，见 http.js）。
+ * 或这个地址唯一经营的那家——单店店主不必带请求头，多店则必须点名，见 http.js）。
  * 失败时**已经把响应写出去**，调用方只需 `if (!x) return;`。
  * 读不到与不属于本店刻意给**不同**的结论（404 / 403）：前者是标识抄错了，后者是越权——
  * 混成一个会让排查方向错掉。
@@ -293,7 +295,11 @@ async function requireShopProduct(req, res) {
     fail(res, '该商品不属于本店', 403, 403);
     return null;
   }
-  if (req.method !== 'GET' && !requireSellable(req, res)) return null;
+  /*
+    GET 与 DELETE 都不过 sellable：读取是履约/对码动作，删除/清池是**减少**未来销售能力；
+    暂停接单只该拦“新增/改价/上架”这类会产生新销售的动作。
+  */
+  if (req.method !== 'GET' && req.method !== 'DELETE' && !requireSellable(req, res)) return null;
   return row;
 }
 
@@ -763,7 +769,7 @@ async function saveSkus(productId, skus) {
 
     为什么：买家下单的占位（`stockHold`）是 `UPDATE product_skus SET committed = committed + ?`。
     读在事务之外时，一笔占位可以落在「读回旧值」与「DELETE/INSERT」之间，而 INSERT 写的是
-    **读回来的那个旧值** ⇒ 那一件占位被静默抹掉：卖家改一次商品，买家手里的单就少一件占位
+    **读回来的那个旧值** ⇒ 那一件占位被静默抹掉：店主改一次商品，买家手里的单就少一件占位
     （余量虚高 ⇒ 同一件货被再卖一次），或已占位的那一件回来一看变成「已售罄」。
     MySQL 下并发的写事务真的会落在不同连接上（所以这里必须显式成组）。
 
@@ -772,15 +778,24 @@ async function saveSkus(productId, skus) {
     由服务器盖章（应用端时钟错了也写不错）。
   */
   return await withTransaction(async () => {
-    const prev = new Map(
-      (await db.all('SELECT sku_key, committed FROM product_skus WHERE product_id = ?', productId)).map((r) => [r.sku_key, { committed: r.committed }])
-    );
+    const prevRows = await db.all('SELECT sku_key, committed FROM product_skus WHERE product_id = ?', productId);
+    const prev = new Map(prevRows.map((r) => [r.sku_key, { committed: r.committed }]));
+    const newKeys = new Set(skus.map((s) => s.key));
+    /*
+      一对一改名（旧键消失、新键出现）不能把旧键的 committed 丢掉：
+      已成交/已退款未回收的件数仍记在旧键上，丢了它 available 就会凭空变大。
+      旧键到新键没有通用映射，只在“恰好一个旧键、一个新键”时搬运；其余形状由路由层拒绝。
+    */
+    const disappeared = prevRows.filter((r) => !newKeys.has(r.sku_key) && Number(r.committed) > 0);
+    const carryCommitted =
+      disappeared.length === 1 && skus.length === 1 ? Number(disappeared[0].committed) || 0 : 0;
     await db.run('DELETE FROM product_skus WHERE product_id = ?', productId);
     const insSql =
       'INSERT INTO product_skus (product_id, sku_key, specs_json, price_micro, image_url, capacity, committed, active, token_amount) ' +
       'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
     for (const s of skus) {
-      await db.run(insSql, productId, s.key, JSON.stringify(s.specs || {}), s.priceMicro, s.imageUrl || '', s.capacity, prev.get(s.key)?.committed || 0, s.active === false ? 0 : 1, s.tokenAmount ?? null);
+      const inherited = Number(prev.get(s.key)?.committed) || 0;
+      await db.run(insSql, productId, s.key, JSON.stringify(s.specs || {}), s.priceMicro, s.imageUrl || '', s.capacity, inherited + carryCommitted, s.active === false ? 0 : 1, s.tokenAmount ?? null);
     }
   });
 }
@@ -1253,7 +1268,7 @@ function validateProduct(v) {
     autoDeliver = Number(v.autoDeliver);
     if (![-1, 0, 1].includes(autoDeliver)) errors.push('自动发货设置只能是 -1（跟随全局）/ 0（关闭）/ 1（开启）');
   }
-  // 低库存提醒阈值：余量 ≤ 阈值时卖家面板警示；空/0 视为不提醒（列是 NULL = 不提醒，三态不落空串）
+  // 低库存提醒阈值：余量 ≤ 阈值时店主面板警示；空/0 视为不提醒（列是 NULL = 不提醒，三态不落空串）
   let stockAlertAt = null;
   if (v.stockAlertAt !== undefined && v.stockAlertAt !== null && v.stockAlertAt !== '') {
     stockAlertAt = Number(v.stockAlertAt);
@@ -1929,7 +1944,7 @@ router.get('/attributes', listedShopScope, wrap(async (req, res) => {
 /**
  * 「这件商品**还缺什么**」的**唯一判据**（SQL 表达式，别名 `p`）。
  *
- * 为什么是 SQL 而不是 JS：它有两个消费方——卖家列表的筛选（`?incomplete=1`，服务端分页过滤）
+ * 为什么是 SQL 而不是 JS：它有两个消费方——店主列表的筛选（`?incomplete=1`，服务端分页过滤）
  * 与逐行提示。写在 JS 里就只能先把整页取回来再过滤，于是"筛出来的条数"与"翻页"两套语义
  * （返回不满一页但后面还有）。写成一段表达式则两个用途读的是同一份判据，不可能说岔。
  *
@@ -1959,8 +1974,8 @@ export const COMPLETENESS_MISSING_SQL = `TRIM(CONCAT(
 ))`;
 
 /**
- * 店主全量列表（含已下架与草稿，卖家面板管理用；需 owner 登录）—— 必须在 /:slug 之前注册。
- *  额外附池口径统计（poolBuilt/poolUnused，仅 digital/nft）：卖家设的总量承诺 vs
+ * 店主全量列表（含已下架与草稿，店主面板管理用；需 owner 登录）—— 必须在 /:slug 之前注册。
+ *  额外附池口径统计（poolBuilt/poolUnused，仅 digital/nft）：店主设的总量承诺 vs
  *  码池/NFT 交付池实际未用资源——供面板做「口径冲突预警」（池未用 < 可售余量提示补货）。
  *  公开列表/详情不返回该字段（交付池资源是店主持有信息）。
  *
@@ -2022,18 +2037,20 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
          (SELECT COUNT(*) FROM product_codes c WHERE c.product_id = p.id AND c.status = 'unused') AS codes_unused,
          (SELECT COUNT(*) FROM product_nft_tokens t WHERE t.product_id = p.id) AS tokens_built,
          (SELECT COUNT(*) FROM product_nft_tokens t WHERE t.product_id = p.id AND t.status = 'unused') AS tokens_unused
-       FROM products p WHERE ${where.join(' AND ')} ORDER BY p.id ASC LIMIT ?`, ...args, pageSize);
+       FROM products p WHERE ${where.join(' AND ')} ORDER BY p.id ASC LIMIT ?`, ...args, pageSize + 1);
+  const hasMore = rows.length > pageSize;
+  const pageRows = hasMore ? rows.slice(0, pageSize) : rows;
   /*
     在途承诺：一次 GROUP BY 取回本页全部商品（不逐行查 = 不引入 N+1）。
     没结清的单一件都没有 → 该商品不下发这个键之外的空数组（前端拿到 [] 即"改规格无阻碍"）。
   */
   const pendingByProduct = new Map();
-  if (rows.length) {
-    const marks = rows.map(() => '?').join(',');
+  if (pageRows.length) {
+    const marks = pageRows.map(() => '?').join(',');
     const pending = await getDb().all(`SELECT o.product_id AS pid, o.sku_key AS sku_key, COUNT(*) AS orders, COALESCE(SUM(o.quantity), 0) AS units
            FROM orders o
           WHERE o.product_id IN (${marks}) AND ${stockPromiseSql('o')}
-          GROUP BY o.product_id, o.sku_key`, ...rows.map((r) => r.id));
+          GROUP BY o.product_id, o.sku_key`, ...pageRows.map((r) => r.id));
     for (const p of pending) {
       const list = pendingByProduct.get(p.pid) || [];
       // COUNT 是整数、SUM 是 DECIMAL（驱动给字符串）——两个都显式转换，别让 "3" 流到店主的界面上
@@ -2042,7 +2059,7 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
     }
   }
   // 池口径：poolBuilt=已建池资源总数（0=未建池，手动交付型）；poolUnused=未用数（0 且已建池=池空）
-  const withSkuRows = await withSkusBatch(rows);
+  const withSkuRows = await withSkusBatch(pageRows);
   const withSalesRows = await withSalesBatch(withSkuRows);
   const products = await Promise.all(withSalesRows.map(async (r) => {
     const base = await rowToPublic(r);
@@ -2072,8 +2089,8 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
           : { poolBuilt: null, poolUnused: null }),
     };
   }));
-  const last = rows.length ? rows[rows.length - 1].id : null;
-  ok(res, { products, nextCursor: last, rates: null });
+  const last = pageRows.length ? pageRows[pageRows.length - 1].id : null;
+  ok(res, { products, nextCursor: hasMore ? last : null, rates: null });
 }));
 
 /**
@@ -2086,7 +2103,7 @@ router.get('/all', staffOnly, wrap(async (req, res) => {
  *
  * 过滤：`q`（标题/标识/店铺名）、`shop`（店铺编号）、`hidden=1|0`（节点处置状态）、
  * `sort=recent`（按上架倒序；店铺详情看"最近商品"用）。
- * 游标分页与卖家 `/all` 同款：默认 `p.id > cursor` 升序；`sort=recent` 时 `p.id < cursor` 降序。
+ * 游标分页与店主 `/all` 同款：默认 `p.id > cursor` 升序；`sort=recent` 时 `p.id < cursor` 降序。
  */
 router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 30));
@@ -2125,7 +2142,7 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
   if (hidden === '0') where.push('p.node_hidden = 0');
   where.push(deleted === '1' ? 'p.deleted_at IS NOT NULL' : 'p.deleted_at IS NULL');
   if (q) {
-    // 与卖家 /all 同一套 LIKE 转义与大小写口径（库级 as_cs；搜索语义是大小写不敏感）
+    // 与店主 /all 同一套 LIKE 转义与大小写口径（库级 as_cs；搜索语义是大小写不敏感）
     const like = `%${q.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
     where.push(
       "(p.title COLLATE utf8mb4_0900_ai_ci LIKE ? ESCAPE '\\\\'" +
@@ -2185,7 +2202,7 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
  * 公开详情对这几类商品按 404 处理，而节点管理员在处置/复核时必须看得到内容本身
  * （标题、描述、主图、参数、价格与店铺状态）——包括已软删除商品（`deleted=1` 复核）。
  * 否则只能凭商品列表的一行字判断。
- * 本端点只读，不改变任何状态；返回的是公开 DTO（不含码池/收货信息等卖家私域数据）。
+ * 本端点只读，不改变任何状态；返回的是公开 DTO（不含码池/收货信息等店主私域数据）。
  */
 router.get('/admin/:slug', nodeAdmin, wrap(async (req, res) => {
   const slug = String(req.params.slug || '').trim();
@@ -2195,7 +2212,7 @@ router.get('/admin/:slug', nodeAdmin, wrap(async (req, res) => {
   if (!shop) return fail(res, '商品所属店铺不存在', 404, 404);
   ok(res, {
     product: await rowToPublic(row),
-    shop: shopDto(shop, await nodeOwner()),
+    shop: shopDto(shop, await nodeOwner(), { publicView: true }),
   });
 }));
 
@@ -2206,9 +2223,9 @@ router.get('/admin/:slug', nodeAdmin, wrap(async (req, res) => {
  *   · 全部 slug 必须存在（缺一件就整批拒绝，不出现"成功 7 件、失败 3 件"的模糊结果）；
  *   · 已在目标状态的行计入 `unchanged`，不重复写、不重复通知；
  *   · 下架必填原因，恢复清空原因与处置时刻；
- *   · 每个真正变化的商品各留一条节点级审计（批量动作可逐件追溯），并各推一条卖家 webhook。
+ *   · 每个真正变化的商品各留一条节点级审计（批量动作可逐件追溯），并各推一条店主 webhook。
  *
- * 上限 100 与卖家批量接口同口径：超过就明确拒绝，不静默截断。
+ * 上限 100 与店主批量接口同口径：超过就明确拒绝，不静默截断。
  */
 router.patch('/admin/moderation', nodeAdmin, wrap(async (req, res) => {
   const raw = req.body?.slugs;
@@ -2313,7 +2330,7 @@ async function publicProductGate(row, { mine = false } = {}) {
 }
 
 /**
- * 发布前的 NFT 标准预检：只在卖家填写合约后给提示，不作为发布判据
+ * 发布前的 NFT 标准预检：只在店主填写合约后给提示，不作为发布判据
  * （发布/编辑仍走 POST/PATCH 里的同一次检测；交付仍以 Transfer 事件为准）。
  */
 router.get('/nft-standard', staffOnly, wrap(async (req, res) => {
@@ -2368,7 +2385,7 @@ router.get('/:slug', wrap(async (req, res) => {
 }));
 
 /** 商品评价列表（公开；**服务端**筛选 + 排序 + 分页，见 src/reviews.js） */
-router.get('/:slug/reviews', wrap(async (req, res) => {
+router.get('/:slug/reviews', productReviewsLimiter, wrap(async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const pageSize = Math.min(50, Math.max(1, parseInt(req.query.pageSize, 10) || 10));
   const filter = ['all', 'good', 'bad'].includes(String(req.query.filter))
@@ -2473,7 +2490,7 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
   const db = getDb();
   const slugs = [...new Set((req.body?.slugs || []).map((x) => String(x)).filter(Boolean))];
   // 超限显式拒绝而非静默截断与 batch-ship「超限即拒」原则一致——
-  // 静默截断会让卖家误以为跨页全选 >100 件已全部生效）
+  // 静默截断会让店主误以为跨页全选 >100 件已全部生效）
   if (slugs.length > 100) {
     return fail(res, `批量修改单次上限 100 件（实际 ${slugs.length} 件）——请分批操作`);
   }
@@ -2716,7 +2733,7 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
                   `undefined`，而下面那句 `prev.active !== false` 对 undefined 为**真** ⇒
                   未显式提交 active 的组合被当作"要上架"，最终 `saveSkus` 按
                   「`rawSku?.active === undefined ? true : …`」落库 active=1。
-                  触发路径是前端真实操作：卖家单独停售某规格后，点一次商品上下架
+                  触发路径是前端真实操作：店主单独停售某规格后，点一次商品上下架
                   （前端只发 `{active:false}` / `{active:true}`）就把它**静默重新上架**。
                 */
                 active: s.active !== 0,
@@ -2772,10 +2789,24 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
         digital 时永久少一个可卖位）。这是**形状**约束：有在途池需求就不允许改型，而不是
         在触发器里补 kind 条件（那会允许两套计数器并存）。
       */
+      /*
+        判据必须是**所有仍可能被后续事件/恢复路径推进的订单**，而不是只看池计数器：
+        physical 在途单从未加过 `reserved_codes/tokens`，只看计数器会放行 physical→digital；
+        改型后旧单终局时 ④/⑤ 触发器按当前 `p.kind` 扣/加计数器，池账永久漂移。
+        cancelled 也在集合里：支付晚到/事件漏扫时它会被恢复成 escrowed，恢复触发器同样按当前 kind 记账。
+      */
+      const inFlight = await db.get(
+        `SELECT COUNT(*) AS c FROM orders WHERE product_id = ? AND status IN ${KIND_CHANGE_BLOCK_IN}`,
+        row.id
+      );
       const counters = await db.get('SELECT reserved_codes, reserved_tokens FROM products WHERE id = ? FOR UPDATE', row.id);
-      if (Number(counters?.reserved_codes) > 0 || Number(counters?.reserved_tokens) > 0) {
+      if (
+        Number(inFlight?.c) > 0
+        || Number(counters?.reserved_codes) > 0
+        || Number(counters?.reserved_tokens) > 0
+      ) {
         return abortTx({
-          fail: '该商品仍有在途池订单（兑换码/NFT 尚未交付），不可变更类型；请等待这些订单交付或取消后再改',
+          fail: '该商品仍有未终结订单或在途池占位，不可变更类型；请等待这些订单交付/取消/终结，并清空池后再改',
         });
       }
       if (row.kind === 'digital') {
@@ -2851,6 +2882,25 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     */
     {
       const newKeys = new Set(value.skus.map((s) => s.key));
+      const disappearingCommitted = [...prevSkuMap.values()].filter(
+        (s) => !newKeys.has(s.sku_key) && Number(s.committed) > 0
+      );
+      /*
+        旧键的 committed 是已售/仍押着的件数，不随规格改名消失。
+        只有「恰好一个旧键 → 一个新键」能可靠地把它搬到新键（saveSkus 同批搬运）；
+        拆分/合并/退役多种键同时消失时没有可靠映射，只能拒绝，避免 available 凭空变大。
+      */
+      if (disappearingCommitted.length > 1 || (disappearingCommitted.length === 1 && value.skus.length !== 1)) {
+        const detail = disappearingCommitted
+          .map((s) => `「${s.sku_key || '默认'}」${Number(s.committed)} 件`)
+          .join('、');
+        return abortTx({
+          fail:
+            `规格组合将被删除，但这些组合仍记着已售/已占位件数：${detail}。` +
+            '旧键到新键没有可靠映射，直接删除会让可售库存凭空变大（超卖）。' +
+            '请保留原组合名只改价格/库存，或等这些件数结清后再调整；一次只改一个组合名时系统会搬运已售件数。',
+        });
+      }
       /*
         判据 = 「**这一单的库存承诺还没结清**」（`stockHold.stockPromiseSql` 的唯一实现），
         **不是**一串状态白名单。
@@ -3102,7 +3152,7 @@ router.post('/:slug/codes', staffOnly, wrap(async (req, res) => {
   if (raw.length > 500) return fail(res, '单次导入最多 500 条');
   const dedup = [...new Set(raw.map((c) => String(c).trim()).filter(Boolean))];
   if (!dedup.length) return fail(res, '未解析到有效码（去除空白后为空）');
-  // 超长行按既有契约静默跳过并计入 skipped，但成功文案明确数量与行上限（卖家侧审计 ③：
+  // 超长行按既有契约静默跳过并计入 skipped，但成功文案明确数量与行上限（店主侧审计 ③：
   // 不整批拒绝——旧行为被单测锁定；用提示替代行号，seller 可据此排查输入）
   const tooLongCount = dedup.filter((c) => c.length > 200).length;
   const codes = dedup.filter((c) => c.length <= 200);
@@ -3135,7 +3185,13 @@ router.post('/:slug/codes', staffOnly, wrap(async (req, res) => {
       'INSERT INTO product_codes (product_id, code) ' +
       'SELECT ?, ? FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM product_codes WHERE product_id = ? AND code = ?)';
     for (const code of codes) {
-      n += (await db.run(insSql, product.id, code, product.id, code)).foundRows;
+      try {
+        n += (await db.run(insSql, product.id, code, product.id, code)).foundRows;
+      } catch (e) {
+        // 并发导入同一码：唯一键冲突只吞这一种，外键/截断等仍然整批失败。
+        if (e?.code === 'ER_DUP_ENTRY') continue;
+        throw e;
+      }
     }
     return { imported: n, stats: await codeStats(db, product.id) };
   });
@@ -3323,7 +3379,7 @@ router.post('/:slug/tokens', staffOnly, wrap(async (req, res) => {
   if (raw.length > NFT_MAX_IMPORT) return fail(res, `单次导入最多 ${NFT_MAX_IMPORT} 行`);
   const seen = new Set();
   const values = [];
-  // 循环内累计判总展开上限（防先全量展开再判上限的内存峰值——卖家侧审计待确认 b）
+  // 循环内累计判总展开上限（防先全量展开再判上限的内存峰值——店主侧审计待确认 b）
   for (let i = 0; i < raw.length; i++) {
     const r = parseTokenSpec(raw[i]);
     if (!r.ok) return fail(res, `第 ${i + 1} 行：${r.error}`);
@@ -3363,7 +3419,12 @@ router.post('/:slug/tokens', staffOnly, wrap(async (req, res) => {
       'INSERT INTO product_nft_tokens (product_id, token_id) ' +
       'SELECT ?, ? FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM product_nft_tokens WHERE product_id = ? AND token_id = ?)';
     for (const tokenId of values) {
-      n += (await db.run(insSql, product.id, tokenId, product.id, tokenId)).foundRows;
+      try {
+        n += (await db.run(insSql, product.id, tokenId, product.id, tokenId)).foundRows;
+      } catch (e) {
+        if (e?.code === 'ER_DUP_ENTRY') continue;
+        throw e;
+      }
     }
     return { imported: n, stats: await nftStats(db, product.id) };
   });
@@ -3432,9 +3493,8 @@ router.delete('/:slug/tokens/:id', staffOnly, wrap(async (req, res) => {
 
 /**
  * 清空整个 NFT 交付池（仅 owner；需 ?confirm=1 二次确认）。
- * 适用：停售/改型/换合约地址前整批作废。已交付（used）行也可删除——交付凭证已冗余
- * 保存在订单交付子表（order_delivery_items，含 tx_hash），历史订单展示/追溯不受影响。
- * 请确认无「待交付」在途 NFT 单依赖该池（池空时新单已被售罄拦截，在途单需手动交付或退款）。
+ * 适用：停售/改型/换合约地址前整批作废**未用**编号。已交付（used）行保留为墓碑——
+ * 交付凭证另存于订单子表，但“这枚 tokenId 已交付过”必须继续挡住重复导入/二次分配。
  */
 router.delete('/:slug/tokens', ownerOnly, wrap(async (req, res) => {
   if (req.query.confirm !== '1') return fail(res, '清空交付池为整批不可逆操作，需要二次确认');
@@ -3443,9 +3503,22 @@ router.delete('/:slug/tokens', ownerOnly, wrap(async (req, res) => {
   if (!product) return;
   if (product.kind !== 'nft') return fail(res, '仅 NFT 商品有编号交付池');
   const stats = await nftStats(db, product.id);
-  await db.run('DELETE FROM product_nft_tokens WHERE product_id = ?', product.id);
-  await audit(req, 'token.clear', 'product', product.slug, { deleted: stats.total });
-  ok(res, { slug: product.slug, cleared: stats.total }, stats.total ? `已清空交付池（${stats.total} 条，含已交付记录；历史订单凭证不受影响）` : '交付池已为空');
+  /*
+    只删未用行。已交付行是**不可再分配的墓碑**：删掉它，同一个 tokenId 可被重新导入并
+    分配给第二个买家，而第一个买家的交付凭证无法兑现。历史订单快照不依赖这行，但
+    “这枚 tokenId 已经交付过”这个事实必须在池里继续挡重复导入。
+  */
+  const cleared = (await db.run("DELETE FROM product_nft_tokens WHERE product_id = ? AND status = 'unused'", product.id)).foundRows;
+  await audit(req, 'token.clear', 'product', product.slug, { cleared, keptUsed: stats.used });
+  ok(
+    res,
+    { slug: product.slug, cleared, keptUsed: stats.used },
+    cleared
+      ? `已清空未用编号（${cleared} 条）；已交付的 ${stats.used} 条保留，防止同一 tokenId 被再次分配`
+      : stats.used
+        ? `交付池没有未用编号；已交付的 ${stats.used} 条保留，防止同一 tokenId 被再次分配`
+        : '交付池已为空'
+  );
 }));
 
 export default router;

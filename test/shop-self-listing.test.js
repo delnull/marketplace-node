@@ -52,7 +52,7 @@ test('重复操作是 409，不会静默成功', async () => {
 });
 
 /**
- * 卖家面板的店铺行必须读**节点现读**的 `operatedShops`。
+ * 店主面板的店铺行必须读**节点现读**的 `operatedShops`。
  *
  * 暂停店不进公开在售列表，旧前端因此拿登录回执补目录缺口——回执是登录那一刻的快照，
  * 于是歇业后仍显示"经营中"、头像还被拼丢。本用例钉住节点这一侧的事实形状：
@@ -69,7 +69,7 @@ test('GET /api/shops：operatedShops 现读暂停状态与头像，未登录为 
     .expect(200);
   assertOk(asOwner);
   const row = asOwner.body.data.operatedShops.find((s) => s.code === shopRef.value);
-  assert.ok(row, 'operatedShops 必须包含暂停接单的店（否则卖家面板进不了自己的店）');
+  assert.ok(row, 'operatedShops 必须包含暂停接单的店（否则店主面板进不了自己的店）');
   assert.equal(row.listed, false, '回执/目录必须给现读的接单状态');
   assert.match(row.listedReason, /^店主歇业：/, '暂停原因随店铺行下发');
   assert.equal(row.avatarUrl, avatar, '头像等展示字段不能在这个入口丢');

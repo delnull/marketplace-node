@@ -20,9 +20,8 @@
  */
 import { getDb, withTransaction } from './db.js';
 import { auditEntryHash, chainHead } from './auditChain.js';
-// 来源 IP 的唯一入口：clientIp 消费 Express 的 trust proxy 解析结果（见 http.js）。
-// 在这里再读一次 req.ip 就是在同一件事上多出一个判据，它会与限流键/请求日志漂移。
-import { clientIp } from './http.js';
+// 来源 IP 的唯一入口：clientIp 消费 Express 的 trust proxy 解析结果（见 http.js）；审计只落网段。
+import { clientIp, auditIpOf } from './http.js';
 
 /**
  * 撞 `uq_audit_head`（链头刚被别人推进）时的重试上限。5 次足够让"两个写者同时进来"这种
@@ -125,7 +124,7 @@ export async function logAudit({ req, actor, actorRole, action, targetType, targ
             String(targetId || '').slice(0, 120),
             // JSON 列：传 JSON 文本，由服务器解析并规范化（键序/空白由它定，回读得到的就是那一份）
             JSON.stringify(detail || {}),
-            clientIp(req).slice(0, 64),
+            auditIpOf(clientIp(req)).slice(0, 64),
             prevHash
           );
           const id = Number(ins.insertId);

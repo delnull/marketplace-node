@@ -30,7 +30,7 @@ import { removeMediaUrls } from './mediaSweep.js';
 import { INCOME_STATUS as ORDER_INCOME_STATUS } from './orderStatus.js';
 
 /** 可评价（成交）状态：与收款流水 INCOME_STATUS 同口径 */
-export const REVIEWABLE_STATUS = ORDER_INCOME_STATUS; // 与入账口径同源：钱到卖家手里才可评价
+export const REVIEWABLE_STATUS = ORDER_INCOME_STATUS; // 与入账口径同源：钱到店主手里才可评价
 
 /** 一条评价最多几张图（首次评价与追评各自独立计数） */
 export const REVIEW_MAX_IMAGES = 3;
@@ -376,7 +376,7 @@ export async function productReviews(slug, page, pageSize, filter = 'all', sort 
  *
  * 参数三态（与 reputationSummary 同款，理由同款：不给默认值，让"忘了传"不可表达）：
  * `undefined` ⇒ 抛错；`null` ⇒ 该节点全部在售店铺的合计；地址 ⇒ 只算那一家。
- * 过滤走 `orders.seller`（评价行本身没有卖家列，它挂在订单上）——`reviews.product_id`
+ * 过滤走 `orders.seller`（评价行本身没有店主列，它挂在订单上）——`reviews.product_id`
  * 不足以定位店铺：多店之后商品属于店铺，但评价的归属应当与订单一致。
  *
  * 关联两侧都是内部键：`reviews.order_id` → `orders.id`（外键）。比较用 `lower()`：

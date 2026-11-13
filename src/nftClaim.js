@@ -3,7 +3,7 @@
  *
  * ## 这个功能回答什么
  *
- * NFT 商品卖的是"一枚 token"，而实物/服务由卖家**链下兑付**。买家拿走 token 之后，
+ * NFT 商品卖的是"一枚 token"，而实物/服务由店主**链下兑付**。买家拿走 token 之后，
  * 谁有权提货？判据只能是"现在这枚 token 在谁手上"——所以声明的入口是**持有人**，不是原订单买家。
  *
  * ## 判据链（每一环都在本模块唯一实现）
@@ -22,7 +22,7 @@
  * ## A-policy：声明绑定提交人，不随后续转手漂移
  *
  * 声明行记的是**提交那一刻**的持有人。此后 token 若被转走：
- *   · 卖家**发货前**会再查一次链上持有人（`shipClaim`），发现已转手就拒绝发货并提示取消；
+ *   · 店主**发货前**会再查一次链上持有人（`shipClaim`），发现已转手就拒绝发货并提示取消；
  *   · 取消后该行让位（唯一索引只压未完结状态），**新持有人可以重新提一条**；
  *   · 已经 `fulfilled` 的声明不能被第二次兑付（同一枚 token 兑付两次是资金/实物双重损失）。
  *
@@ -135,22 +135,23 @@ export function claimDto(row, { as = 'public' } = {}) {
     nftContract: row.token_contract,
     tokenId: row.token_id,
     tokenRef: tokenRefOf(row.token_contract, row.token_id),
-    orderNo: row.order_no,
-    /** 商品展示名/标准（卖家列表与 CSV 用；公开行也可见） */
+    /** 商品展示名/标准（店主列表与 CSV 用；公开行也可见） */
     productTitle: row.product_title || null,
     nftStandard: row.nft_standard || null,
     /**
      * 交付这枚 NFT 的链上托管单号（`Escrow.getOrder` 的键）。前端在签名
-     * `openClaimDispute` 前必须用它复核订单的卖家/状态，不能只信节点返回的 `args[1]`。
+     * `openClaimDispute` 前必须用它复核订单的店主/状态，不能只信节点返回的 `args[1]`。
      */
     escrowOrderId: row.escrow_order_id ? String(row.escrow_order_id).toLowerCase() : null,
-    /** 交付这枚 NFT 的链上转账哈希（卖家交付时登记；用于持有人独立核对 token 来源） */
+    /** 交付这枚 NFT 的链上转账哈希（店主交付时登记；用于持有人独立核对 token 来源） */
     deliveryTxHash: row.delivery_tx_hash ? String(row.delivery_tx_hash).toLowerCase() : null,
     seller: row.seller,
     claimant: row.claimant,
     status: row.status,
     shipping: null,
     claimId: row.dispute_claim_id || null,
+    /** 链上争议状态：public 行也需要（否则公开面看不到“在途/已结案”，会把发起按钮重新放出来） */
+    disputeState: row.dispute_state || 'none',
     /** 提货类型：提交时的快照 */
     claimType: row.claim_type,
     /**
@@ -158,19 +159,24 @@ export function claimDto(row, { as = 'public' } = {}) {
      * 过期任务同样只认快照，见 expireOverdueClaims。
      */
     claimDeadlineAt: row.claim_deadline_at ? new Date(row.claim_deadline_at).toISOString() : null,
-    note: row.reject_reason || '',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
   if (as === 'public') return base;
   return {
     ...base,
+    /*
+      订单号是**详情页的句柄**：公开行不能给（匿名拿到它就能打开订单详情）。
+      持有人/店主/节点处理者才需要“这一条对应哪张单”，所以只在这三个视角下发。
+      驳回理由同样是店主写给提货人的文本，公开匿名查询不下发。
+    */
+    orderNo: row.order_no,
     shopCode: row.shop_code,
     productSlug: row.product_slug,
     trackingNo: row.tracking_no || null,
-    disputeState: row.dispute_state || 'none',
     disputeOpenedAt: row.dispute_opened_at ?? null,
     disputeClosedAt: row.dispute_closed_at ?? null,
+    note: row.reject_reason || '',
     shipping:
       as === 'seller' || as === 'holder'
         ? {
@@ -208,7 +214,7 @@ export async function deliveredTokenOf(contract, tokenId, { orderId = null } = {
        JOIN products p ON p.id = o.product_id
       WHERE d.kind = 'nft' AND d.value = ? AND p.nft_contract = ?
         /*
-          'expired' 也要收：链上 releaseExpired 把订单结算给卖家（等价 Settled），
+          'expired' 也要收：链上 releaseExpired 把订单结算给店主（等价 Settled），
           而 NFT 是否已交付由链下交付行决定；交付过就必须允许持有人继续提货/开争议。
         */
         AND o.status IN ('confirmed','settled','expired')${orderClause}
@@ -237,10 +243,10 @@ export function claimDeadlineOf({ delivered, now = Date.now() }) {
  * 把**超过提货窗口仍未处理**的声明置为 expired。
  *
  * 为什么需要生产者：`expired` 在枚举与 UI 文案里都有，但此前没有任何写入点——
- * 窗口过后列表仍显示"待卖家处理/已通过"，持有人也看不到自己已经过期。
+ * 窗口过后列表仍显示"待店主处理/已通过"，持有人也看不到自己已经过期。
  * 只处理 `requested/approved`（`shipped` 已在履约中，不能因窗口到期改成过期），
  * 且只认**提交时写入的 `claim_deadline_at` 快照**；旧行（NULL）跳过，不拿当前商品配置重算——
- * 否则卖家改小窗口就能把已提交的声明清掉。已有链上争议（state 非 none / claim id 已写）不标过期。
+ * 否则店主改小窗口就能把已提交的声明清掉。已有链上争议（state 非 none / claim id 已写）不标过期。
  * 由 `claimReconcile` 的 5 分钟周期任务调用；失败不影响链上对账。
  */
 export async function expireOverdueClaims({ limit = 100, now = Date.now() } = {}) {
@@ -306,10 +312,10 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
     };
   }
   if (Number(delivered.claimable) !== 1) {
-    return { ok: false, status: 409, message: '这件商品的卖家没有开启提货兑付' };
+    return { ok: false, status: 409, message: '这件商品的店主没有开启提货兑付' };
   }
   /*
-    实物才强制收货信息；数字/服务（claim_type != physical）由卖家按提货说明交付，
+    实物才强制收货信息；数字/服务（claim_type != physical）由店主按提货说明交付，
     强制填地址+运单号会把这两类提货逼进一条走不通的实物流程。
   */
   if (String(delivered.claim_type || 'physical') === 'physical' && (!name || !phone || !address)) {
@@ -375,16 +381,16 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
       return {
         ok: false,
         status: 409,
-        message: '这枚 NFT 已有一条未完结的提货声明（同一枚 NFT 同时只能有一条）——请等待卖家处理，或先撤回旧声明',
+        message: '这枚 NFT 已有一条未完结的提货声明（同一枚 NFT 同时只能有一条）——请等待店主处理，或先撤回旧声明',
       };
     }
     throw e;
   }
 }
 
-/* ── 状态迁移（卖家动作的唯一实现）──────────────────────────────────── */
+/* ── 状态迁移（店主动作的唯一实现）──────────────────────────────────── */
 
-/** 允许的卖家动作与前置状态（**唯一判据**；路由只做鉴权与参数校验） */
+/** 允许的店主动作与前置状态（**唯一判据**；路由只做鉴权与参数校验） */
 const SELLER_ACTIONS = {
   approve: { from: ['requested'], to: 'approved' },
   ship: { from: ['approved'], to: 'shipped' },
@@ -396,10 +402,10 @@ const SELLER_ACTIONS = {
 export const SELLER_CLAIM_ACTIONS = Object.keys(SELLER_ACTIONS);
 
 /**
- * 卖家推进/终结一条声明（approve / ship / fulfill / reject / cancel）。
+ * 店主推进/终结一条声明（approve / ship / fulfill / reject / cancel）。
  *
  * `ship` 会**再查一次链上持有人**（A-policy 的另一半）：声明绑定的是提交那一刻的持有人，
- * 卖家发货前若 token 已经转手，货不该发给原提交人——拒绝并要求先取消（新持有人会重新提）。
+ * 店主发货前若 token 已经转手，货不该发给原提交人——拒绝并要求先取消（新持有人会重新提）。
  * 读不到链上持有人时同样拒绝（fail-closed）：宁可晚发一天，也不把实物发给一个无法确认的人。
  *
  * @param {{claimNo:string, seller:string, action:string, trackingNo?:string, rejectReason?:string}} input
@@ -464,7 +470,7 @@ export async function holderCancelClaim({ claimNo, claimant } = {}) {
   if (!CLAIM_OPEN_STATUSES.includes(String(row.status))) {
     return { ok: false, status: 409, message: `当前状态（${row.status}）不能撤回` };
   }
-  if (String(row.status) === 'shipped') return { ok: false, status: 409, message: '已发货的声明不能撤回（请与卖家协商）' };
+  if (String(row.status) === 'shipped') return { ok: false, status: 409, message: '已发货的声明不能撤回（请与店主协商）' };
   const changed = (await getDb().run(
     "UPDATE nft_claims SET status = 'cancelled' WHERE id = ? AND status IN ('requested','approved')",
     row.id
@@ -577,8 +583,6 @@ export async function buildClaimDisputeCall({ claimNo, amountWei, deadlineSecond
     ok: true,
     call: {
       fn: 'openClaimDispute',
-      chainId: null, // 由路由补（config.chain.chainId），本模块不读配置以保持纯函数形状
-      escrow: null,
       claimId,
       args: [claimId, String(chainRow.escrow_order_id).toLowerCase(), tokenRef, String(orderRow.seller), String(row.claimant), amount, dl],
       tokenRef,

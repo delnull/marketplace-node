@@ -16,6 +16,7 @@
 import { Contract, isAddress } from 'ethers';
 import { getDb } from './db.js';
 import { assertPublicHttpTarget } from './netguard.js';
+import { getPinned } from './pinnedRequest.js';
 import { redisGetJson, redisSetJson } from './redis.js';
 
 const PRICE_TTL_MS = 30_000;
@@ -160,24 +161,21 @@ async function oracleRate(token) {
   }
   try {
     /*
-      行情源 URL 现在是页面可配的，必须先过 SSRF 闸：内网/回环/云元数据地址不能成为节点
-      出站 GET 的目标。解析与 fetch 的二次解析之间仍有 DNS rebinding 窗口（配置仅节点主可写，
-      风险面已收窄）；彻底闭环需要 GET 版 pinnedRequest，见 netguard 的说明。
+      行情源 URL 现在是页面可配的，必须先过 SSRF 闸，并用校验时解析出的地址**钉住连接**：
+      `fetch(url)` 会在连接阶段再解析一次，留下 DNS rebinding 窗口。GET 版 pinnedRequest
+      把“校验的地址 = 连接的地址”闭死，同时限量读响应体。
     */
     const target = await assertPublicHttpTarget(token.priceUrl);
     if (!target.ok) throw new Error(target.message);
-    const res = await fetch(token.priceUrl, {
+    const res = await getPinned(token.priceUrl, {
+      addresses: target.addresses,
       headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(3_000),
-      /*
-        禁止跟随重定向：3xx 可以把请求引到内网/云元数据（SSRF 校验只看了配置的 URL）。
-        DNS rebinding 窗口仍在（配置仅节点主可写，风险面已收窄）；要彻底闭环需 GET 版
-        pinnedRequest——这里至少不让"校验通过的公网 URL"自己 302 到内网。
-      */
-      redirect: 'error',
+      timeoutMs: 3_000,
+      readBody: true,
+      maxBodyBytes: 64 * 1024,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = await res.json();
+    const body = JSON.parse(res.body || '');
     let v = body?.usdtMicroPerToken;
     if (v == null && body?.usdt != null) {
       const f = Number(body.usdt);
@@ -261,12 +259,16 @@ export async function quotePaymentToken(tokenAddress, totalUsdtMicro) {
  * 链上白名单的唯一的按 token 检查（报价/草稿/公开列表共用）。
  * 读不到就抛错，由调用方按"本次不可支付"处理——不把 RPC 失败折成 false 或 true。
  *
- * 30 秒短缓存 + 2 秒硬超时：`GET /api/shop/payment-methods` 是匿名端点，每请求若对每个
- * 已配置 token 都打一次 RPC，会被用来放大链上读。白名单变更是低频治理动作，30s 的陈旧窗口
- * 不会让买家付出错误资产（真正的收款授权仍由 Escrow 在 `createOrderToken` 时校验）。
+ * 30 秒短缓存 + 8 秒硬超时：`GET /api/shop/payment-methods` 是匿名端点，每请求若对每个
+ * 已配置 token 都打一次 RPC，会被用来放大链上读；但旧值 2 秒比 FallbackProvider 的 stall
+ * 轮换还短（多端点时），慢但可用的端点永远轮不到，匿名买家会看到"这种代币不可支付"。
+ * 8 秒在多端点配置下大于 stall + 一次读；缓存按 token 分桶，RPC 次数仍被 30 秒窗口限制，
+ * 放大面没有变大（放大的是单次等待，不是读次数）。
+ * 白名单变更是低频治理动作，30s 的陈旧窗口不会让买家付出错误资产（真正的收款授权仍由
+ * Escrow 在 `createOrderToken` 时校验）。
  */
 const TOKEN_SUPPORT_TTL_MS = 30_000;
-const TOKEN_SUPPORT_TIMEOUT_MS = 2_000;
+const TOKEN_SUPPORT_TIMEOUT_MS = 8_000;
 
 function withTokenSupportTimeout(promise) {
   return new Promise((resolve, reject) => {
@@ -281,17 +283,28 @@ function withTokenSupportTimeout(promise) {
   });
 }
 
-let _tokenSupportReader = async (tokenAddress) => {
-  const { getEscrow } = await import('./chain.js');
-  return !!(await getEscrow().supportedToken(tokenAddress));
-};
+/**
+ * 读链上 `Escrow.supportedToken`：走 `rpcRequest`（node:http + AbortSignal.timeout），
+ * 超时会真正中止连接；`getEscrow()` 只用来拿 ABI 与合约地址，不再用它的 provider 发请求。
+ */
+async function readSupportedToken(tokenAddress) {
+  const { getEscrow, rpcRequest } = await import('./chain.js');
+  const escrow = getEscrow();
+  const data = escrow.interface.encodeFunctionData('supportedToken', [tokenAddress]);
+  const deadline = Date.now() + TOKEN_SUPPORT_TIMEOUT_MS;
+  const raw = await rpcRequest('eth_call', [{ to: String(escrow.target), data }, 'latest'], {
+    timeoutMs: TOKEN_SUPPORT_TIMEOUT_MS,
+    deadline,
+  });
+  const [supported] = escrow.interface.decodeFunctionResult('supportedToken', raw);
+  return Boolean(supported);
+}
+
+let _tokenSupportReader = readSupportedToken;
 
 /** 测试注入链上白名单读取器（传 null 恢复默认）。 */
 export function setTokenSupportReader(fn) {
-  _tokenSupportReader = fn || (async (tokenAddress) => {
-    const { getEscrow } = await import('./chain.js');
-    return !!(await getEscrow().supportedToken(tokenAddress));
-  });
+  _tokenSupportReader = fn || readSupportedToken;
 }
 
 export async function tokenSupportedOnChain(tokenAddress) {

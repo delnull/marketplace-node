@@ -171,11 +171,11 @@ test('期货不变量：计数器恒等于"在途订单尚未交付的件数"（
   assert.equal(await reservedOf(p.productId), await pendingTruth(p.productId), '计数器与真值必须逐件一致');
 });
 
-test('池未建（一个资源行都没有）时不拦：卖家手动交付那种形态仍然能下单', async () => {
+test('池未建（一个资源行都没有）时不拦：店主手动交付那种形态仍然能下单', async () => {
   const p = await insertPoolProduct({ kind: 'digital', title: '无池数字商品' });
   const buyer = Wallet.createRandom().address.toLowerCase();
   for (let i = 0; i < 3; i++) {
-    assert.equal(await attemptDraft(buyer, p), 'ok', '池未建时不该拦（旧语义：卖家手动交付/自由文本）');
+    assert.equal(await attemptDraft(buyer, p), 'ok', '池未建时不该拦（旧语义：店主手动交付/自由文本）');
   }
   assert.equal(await reservedOf(p.productId), 3, '不拦不等于不记账：这 3 件的需求仍然记在计数器上');
   assert.equal(await reservedOf(p.productId), await pendingTruth(p.productId));

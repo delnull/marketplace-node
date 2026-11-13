@@ -118,6 +118,63 @@ test('驳回开店申请：原因落库、pending 队列清空；买家不能审
   assert.equal(forbidden.status, 403);
 });
 
+test('申请人可删除自己的已驳回申请；待审批的不能被删除', async () => {
+  const applicant = Wallet.createRandom();
+  const applicantToken = (await login(ctx, applicant)).token;
+  const ownerToken = (await login(ctx, owner)).token;
+
+  const submit = async (name) => {
+    const r = await request(app)
+      .post('/api/shops/applications')
+      .set('Authorization', `Bearer ${applicantToken}`)
+      .send({ name })
+      .expect(200);
+    return r.body.data.id;
+  };
+  const rejectedId = await submit('待删除驳回申请');
+  await request(app)
+    .post(`/api/shops/applications/${rejectedId}/review`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({ action: 'reject', reason: '测试驳回' })
+    .expect(200);
+  const pendingId = await submit('待审批申请');
+
+  const del = await request(app)
+    .delete('/api/shops/applications/mine')
+    .set('Authorization', `Bearer ${applicantToken}`)
+    .expect(200);
+  assertOk(del);
+  assert.equal(del.body.data.deleted, 1, '只删已驳回的那条');
+
+  const mine = await request(app)
+    .get('/api/shops/applications/mine?all=1')
+    .set('Authorization', `Bearer ${applicantToken}`)
+    .expect(200);
+  assert.equal(mine.body.data.applications.some((a) => a.id === rejectedId), false);
+  assert.equal(
+    mine.body.data.applications.some((a) => a.id === pendingId && a.status === 'pending'),
+    true,
+    '待审批申请不能被删除'
+  );
+
+  const again = await request(app)
+    .delete('/api/shops/applications/mine')
+    .set('Authorization', `Bearer ${applicantToken}`)
+    .expect(200);
+  assert.equal(again.body.data.deleted, 0, '重复删除幂等');
+
+  // 收尾：把待审批那条也驳回后删除，避免给后续“分页 total”用例留下额外 pending。
+  await request(app)
+    .post(`/api/shops/applications/${pendingId}/review`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .send({ action: 'reject', reason: '收尾' })
+    .expect(200);
+  await request(app)
+    .delete('/api/shops/applications/mine')
+    .set('Authorization', `Bearer ${applicantToken}`)
+    .expect(200);
+});
+
 test('申请队列分页：total / page / pageSize；待审批按先来先审排序', async () => {
   const created = [];
   for (const name of ['分页申请 A', '分页申请 B', '分页申请 C']) {

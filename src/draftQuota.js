@@ -52,6 +52,61 @@ export const MAX_ACTIVE_DRAFTS = 10;
 /** 同一起始人同商品未支付草稿的件数合计上限（件） */
 export const MAX_DRAFT_UNITS_PER_PRODUCT = 99;
 
+/** 两道闸的拒因（唯一实现）：预检与事务内的守卫 UPDATE 必须说同一句话 */
+function draftLimitFail() {
+  return `你的未支付草稿过多（≥${MAX_ACTIVE_DRAFTS}），请先完成支付或取消旧草稿后再下单`;
+}
+function unitLimitFail(held) {
+  return `你对该商品的未支付草稿合计已达 ${held}/${MAX_DRAFT_UNITS_PER_PRODUCT} 件上限——请先完成支付或取消旧草稿后再下单`;
+}
+
+/**
+ * 额度账本的目标表/条件（唯一实现）：自购记买家账，代客记 (店主, 买家) 账。
+ * 模板插值只来自本函数内的固定字符串，不来自请求。
+ */
+function quotaTargetsOf({ buyer, productId, proxySeller = null }) {
+  const proxy = String(proxySeller || '').toLowerCase();
+  const buyerKey = String(buyer || '').toLowerCase();
+  if (!buyerKey) throw new Error('draftQuota 需要 buyer');
+  if (proxy) {
+    return {
+      draftTable: 'seller_proxy_draft_quota',
+      draftWhere: 'seller = ? AND buyer = ?',
+      draftParams: [proxy, buyerKey],
+      productTable: 'seller_proxy_product_quota',
+      productWhere: 'seller = ? AND buyer = ? AND product_id = ?',
+      productParams: [proxy, buyerKey, productId],
+    };
+  }
+  return {
+    draftTable: 'buyer_draft_quota',
+    draftWhere: 'buyer = ?',
+    draftParams: [buyerKey],
+    productTable: 'buyer_product_quota',
+    productWhere: 'buyer = ? AND product_id = ?',
+    productParams: [buyerKey, productId],
+  };
+}
+
+/**
+ * 只读预检：在下单风控/汇率之前，先把**明显已经超限**的请求拒掉。
+ *
+ * 它不是判据——真正的占位仍是事务内的 `reserveDraftQuota`（带守卫 UPDATE，原子）。
+ * 放在这里只是不让一个必然被拒的请求先花掉一次风控外呼（最多 10 秒）。
+ * 并发下预检可能通过而占位失败：以事务内的结果为准。
+ */
+export async function precheckDraftQuota({ buyer, productId, units, proxySeller = null }) {
+  const db = getDb();
+  const qty = Number(units);
+  const t = quotaTargetsOf({ buyer, productId, proxySeller });
+  const drafts = await db.get(`SELECT active_drafts FROM ${t.draftTable} WHERE ${t.draftWhere}`, ...t.draftParams);
+  if (Number(drafts?.active_drafts ?? 0) >= MAX_ACTIVE_DRAFTS) return { fail: draftLimitFail() };
+  const row = await db.get(`SELECT units FROM ${t.productTable} WHERE ${t.productWhere}`, ...t.productParams);
+  const held = Number(row?.units ?? 0);
+  if (held + qty > MAX_DRAFT_UNITS_PER_PRODUCT) return { fail: unitLimitFail(held) };
+  return null;
+}
+
 /**
  * 占一份草稿额度：活跃草稿 +1、同发起人同商品件数 +units。
  *
@@ -67,60 +122,31 @@ export const MAX_DRAFT_UNITS_PER_PRODUCT = 99;
 export async function reserveDraftQuota({ buyer, productId, units, proxySeller = null }) {
   const db = getDb();
   const qty = Number(units);
-  const proxy = String(proxySeller || '').toLowerCase();
-  const buyerKey = String(buyer || '').toLowerCase();
-  if (!buyerKey) throw new Error('reserveDraftQuota 需要 buyer');
-  /*
-    额度键：
-      · 自购（无 proxySeller）：买家一个人一本账；
-      · 代客：**(店主, 被代下单的买家)** 一本账——店主不能拿自己的额度去替所有买家刷，
-        也不能把某个买家的额度占满；同一对 (seller,buyer) 的上限与自购一致。
-    表名只来自本函数内的固定字符串（不来自请求），所以模板插值不构成注入面。
-  */
-  let draftTable;
-  let draftWhere;
-  let draftParams;
-  let productTable;
-  let productWhere;
-  let productInsertParams;
-  if (proxy) {
-    draftTable = 'seller_proxy_draft_quota';
-    draftWhere = 'seller = ? AND buyer = ?';
-    draftParams = [proxy, buyerKey];
-    productTable = 'seller_proxy_product_quota';
-    productWhere = 'seller = ? AND buyer = ? AND product_id = ?';
-    productInsertParams = [proxy, buyerKey, productId];
-  } else {
-    draftTable = 'buyer_draft_quota';
-    draftWhere = 'buyer = ?';
-    draftParams = [buyerKey];
-    productTable = 'buyer_product_quota';
-    productWhere = 'buyer = ? AND product_id = ?';
-    productInsertParams = [buyerKey, productId];
-  }
+  const t = quotaTargetsOf({ buyer, productId, proxySeller });
+  const { draftTable, draftWhere, draftParams, productTable, productWhere, productParams } = t;
   // 建行（无条件、幂等）。理由见文件头"建行必须无条件先做"。
+  const proxy = String(proxySeller || '').toLowerCase();
   if (proxy) {
     await db.run(
       `INSERT INTO ${draftTable} (seller, buyer, active_drafts) VALUES (?, ?, 0)
        ON DUPLICATE KEY UPDATE active_drafts = active_drafts`,
-      proxy,
-      buyerKey
+      ...draftParams
     );
     await db.run(
       `INSERT INTO ${productTable} (seller, buyer, product_id, units) VALUES (?, ?, ?, 0)
        ON DUPLICATE KEY UPDATE units = units`,
-      ...productInsertParams
+      ...productParams
     );
   } else {
     await db.run(
       `INSERT INTO ${draftTable} (buyer, active_drafts) VALUES (?, 0)
        ON DUPLICATE KEY UPDATE active_drafts = active_drafts`,
-      buyerKey
+      ...draftParams
     );
     await db.run(
       `INSERT INTO ${productTable} (buyer, product_id, units) VALUES (?, ?, 0)
        ON DUPLICATE KEY UPDATE units = units`,
-      ...productInsertParams
+      ...productParams
     );
   }
   const drafts = await db.run(
@@ -129,12 +155,12 @@ export async function reserveDraftQuota({ buyer, productId, units, proxySeller =
     MAX_ACTIVE_DRAFTS
   );
   if (drafts.foundRows !== 1) {
-    return { fail: `你的未支付草稿过多（≥${MAX_ACTIVE_DRAFTS}），请先完成支付或取消旧草稿后再下单` };
+    return { fail: draftLimitFail() };
   }
   const unitRoom = await db.run(
     `UPDATE ${productTable} SET units = units + ? WHERE ${productWhere} AND units + ? <= ?`,
     qty,
-    ...productInsertParams,
+    ...productParams,
     qty,
     MAX_DRAFT_UNITS_PER_PRODUCT
   );
@@ -144,11 +170,9 @@ export async function reserveDraftQuota({ buyer, productId, units, proxySeller =
       （同一行的写者被这一行的锁串行化）。读不到（行被并发删掉）时按 0 兜底——拒因只是文案，
       判据是那条 UPDATE 的 `foundRows`。
     */
-    const row = await db.get(`SELECT units FROM ${productTable} WHERE ${productWhere}`, ...productInsertParams);
+    const row = await db.get(`SELECT units FROM ${productTable} WHERE ${productWhere}`, ...productParams);
     const held = Number(row?.units ?? 0);
-    return {
-      fail: `你对该商品的未支付草稿合计已达 ${held}/${MAX_DRAFT_UNITS_PER_PRODUCT} 件上限——请先完成支付或取消旧草稿后再下单`,
-    };
+    return { fail: unitLimitFail(held) };
   }
   return null;
 }

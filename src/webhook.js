@@ -1,8 +1,8 @@
 /**
- * 卖家通知（P0-3）：订单关键事件 webhook（店主自接机器人/IM/邮件网关）。
+ * 店主通知（P0-3）：订单关键事件 webhook（店主自接机器人/IM/邮件网关）。
  *
  * 设计：
- *  - URL/签名密钥为经营参数：存 `shop_webhook`（**一行一店**），卖家面板「店铺设置-通知配置」
+ *  - URL/签名密钥为经营参数：存 `shop_webhook`（**一行一店**），店主面板「店铺设置-通知配置」
  *    网页维护，每次投递前动态读取（即改即生效）；
  *  - payload 最小化：**不含收货地址/交付码/NFT tokenId/买家完整地址**（隐私边界与公开列表一致）；
  *  - 本地状态迁移成功后触发（watcher 事件与本地动作两个挂载点，不推中间态）；
@@ -129,7 +129,47 @@ export function pinnedSender(url, init) {
   return postPinned(url, init);
 }
 
+/**
+ * 出站通知的并发闸：4 条在飞、最多 100 条排队。
+ *
+ * 为什么需要：接收端 URL 是店主可改的经营参数，可以任意慢；没有上限时，慢/恶意 endpoint
+ * 会让节点累积大量出站连接（每次投递还会重试 2 次）。队列满时直接拒绝——重试链会再试，
+ * 最终记一条投递失败留痕；宁可丢一次通知并留痕，也不把节点的连接/内存拖垮。
+ * 测试事件也走同一把闸，设置页看到的"忙/慢"与正式通知一致。
+ */
+const WEBHOOK_MAX_INFLIGHT = 4;
+const WEBHOOK_MAX_QUEUE = 100;
+let webhookInflight = 0;
+const webhookQueue = [];
+
+function acquireDeliverySlot() {
+  if (webhookInflight < WEBHOOK_MAX_INFLIGHT) {
+    webhookInflight += 1;
+    return Promise.resolve();
+  }
+  if (webhookQueue.length >= WEBHOOK_MAX_QUEUE) {
+    return Promise.reject(new Error('通知投递队列已满（接收端过慢），本次通知未发出'));
+  }
+  return new Promise((resolve) => webhookQueue.push(resolve));
+}
+
+function releaseDeliverySlot() {
+  const next = webhookQueue.shift();
+  if (next) next();
+  else webhookInflight -= 1;
+}
+
+/** 所有真实出站投递的唯一入口：先拿并发槽，再走 sendOnceUnbounded */
 async function sendOnce(url, payload, shopCode) {
+  await acquireDeliverySlot();
+  try {
+    return await sendOnceUnbounded(url, payload, shopCode);
+  } finally {
+    releaseDeliverySlot();
+  }
+}
+
+async function sendOnceUnbounded(url, payload, shopCode) {
   const body = JSON.stringify(payload);
   /*
     只投 https：HMAC 能防篡改，但防不了明文链路上的窃听/重放组合；公开 http 端点让
@@ -410,8 +450,8 @@ export async function notifyRaw(type, data = {}) {
 /**
  * 结算类事件（`Arbitrated` / `RefundApproved`）的通知类型：**从退款额与托管额推导**，
  * 与本地终态（`settleByRefundSplit` / `mapChainTerminal`）用同一组语义：
- *   · refundWei == 0                ⇒ 全额判卖家 ⇒ `order.settled`
- *   · 0 < refundWei < amount        ⇒ 拆分结算（买家拿回一部分，余额给卖家）⇒ 本地是 settled，
+ *   · refundWei == 0                ⇒ 全额判店主 ⇒ `order.settled`
+ *   · 0 < refundWei < amount        ⇒ 拆分结算（买家拿回一部分，余额给店主）⇒ 本地是 settled，
  *                                      所以通知也用 `order.settled`（P3-5：旧实现把它映射成
  *                                      `order.refunded`，而 payload 里的 status 是 settled——
  *                                      类型与状态互相矛盾，接收端无法按类型分流）
@@ -454,7 +494,7 @@ export function typeForChainEvent(name, args = {}, { amountWei } = {}) {
     case 'OrderExpiredReleased':
       return 'order.expired';
     /*
-      裁决/卖家同意退款：事件只带退款额，必须结合本单托管额才能分清"全额退款"与"拆分"。
+      裁决/店主同意退款：事件只带退款额，必须结合本单托管额才能分清"全额退款"与"拆分"。
       `0` 与"全额"是两种确证语义，`0 < refund < amount` 是结算向的部分退款（本地 settled）。
     */
     case 'Arbitrated':

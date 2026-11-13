@@ -78,7 +78,7 @@ async function disputedOrderWithCode(title) {
   const paidTxHash = `0x${String(paySeq).padStart(64, 'e')}`;
   await db.run("UPDATE orders SET status = 'escrowed', updated_at = ? WHERE order_no = ?", new Date(), order.id);
   await db.run('UPDATE order_chain SET paid_tx_hash = ? WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.order_no = ?)', paidTxHash, order.id);
-  // 卖家手动交付码后买家发起争议（shipped → disputed，含码的争议单）
+  // 店主手动交付码后买家发起争议（shipped → disputed，含码的争议单）
   const shipRes = await request(app)
     .post(`/api/orders/${order.id}/ship`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
@@ -113,7 +113,7 @@ test('RPC 读不到委员会：仲裁人登录也不开放交付码（安全降�
   assert.equal(arbDetail.status, 'disputed', '公开字段仍可读');
   assert.deepEqual(arbDetail.deliveries, [], '未确证仲裁人身份前不泄露码');
 
-  // 店主兜底不受影响（卖家本来持有码，追索/回收权限不依赖仲裁人判定）
+  // 店主兜底不受影响（店主本来持有码，追索/回收权限不依赖仲裁人判定）
   const ownerDetail = await detailAs(ownerToken, order.id);
   assert.equal(ownerDetail.deliveries[0].value, 'CARD-888', '店主视角不受降级影响');
 });

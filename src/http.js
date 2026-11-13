@@ -3,6 +3,7 @@
  * 错误处理与鉴权中间件。
  */
 import config from './config.js';
+import net from 'node:net';
 import { roleOf, isNodeAdmin, isHost, operatedShopCodes } from './auth.js';
 import { SHOP_HEADER, shopContextOf, shopRowByCode, shopSellable, notSellableReason } from './shops.js';
 import { redisHit } from './redis.js';
@@ -132,6 +133,63 @@ export function bearerToken(req) {
 }
 
 /**
+ * 限流桶的地址归一：IPv4 原样；IPv4-mapped IPv6 还原为 IPv4；IPv6 取 /64 前缀。
+ * 不做这一步，IPv6 用户每次换一个地址就是新桶，限流等于不存在。
+ */
+export function rateLimitKeyOf(ip) {
+  const raw = String(ip || '').trim().toLowerCase();
+  if (!raw) return 'unknown';
+  if (!raw.includes(':')) return raw;
+  if (raw.startsWith('::ffff:') && net.isIP(raw.slice(7)) === 4) return raw.slice(7);
+  if (net.isIP(raw) !== 6) return raw;
+  const [head, tail] = raw.split('::');
+  const left = head ? head.split(':') : [];
+  const right = tail ? tail.split(':') : [];
+  const missing = Math.max(0, 8 - left.length - right.length);
+  const groups = [...left, ...Array(missing).fill('0'), ...right].map((g) => (g || '0').replace(/^0+$/, '0'));
+  return `${groups.slice(0, 4).join(':')}::/64`;
+}
+
+/** 审计只留“足以定位来源、又不足以指向个人”的网段；原始 IP 不再永久落审计表。 */
+export function auditIpOf(ip) {
+  const key = rateLimitKeyOf(ip);
+  if (!key || key === 'unknown') return '';
+  if (key.endsWith('::/64')) return key;
+  const parts = key.split('.');
+  if (parts.length === 4) return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+  return key.slice(0, 64);
+}
+
+/**
+ * 按**登录地址**的额外预算（RPC 放大闸）：IP 可以换，但订单归属地址是稳定的。
+ * 与 `simpleRateLimit` 的分工：IP 桶防匿名脚本，这一层防“登录后换订单号/哈希刷链”。
+ * Redis 故障时**放行**——支付确认/同步不能被限流依赖拖成 503；IP 桶仍会 fail-closed。
+ */
+export function addressRateLimit({ windowMs, max, message = '操作过于频繁，请稍后再试' } = {}) {
+  return (req, res, next) => {
+    const addr = String(req.auth?.address || '').toLowerCase();
+    if (!addr) return next();
+    const shape = req.route?.path ? `${req.baseUrl || ''}${req.route.path}` : (req.baseUrl || req.path || '');
+    const namespace = String(config.db.name || 'node').toLowerCase();
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('地址限流 Redis 超时')), 1_000);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+    Promise.race([redisHit(`rate:addr:${namespace}:${req.method} ${shape}:${addr}`, windowMs), timeout])
+      .then((hit) => {
+        if (hit.count > max) {
+          res.setHeader('Retry-After', String(Math.max(1, Math.ceil(hit.ttlMs / 1000))));
+          return fail(res, message, 429, 429);
+        }
+        return next();
+      })
+      .catch(() => next())
+      .finally(() => clearTimeout(timer));
+  };
+}
+
+/**
  * 限流中间件：**Redis 是唯一计数源**（跨进程固定窗口：INCR+PEXPIRE，按方法+路由+IP）。
  *
  * 为什么不再回退进程内 Map：多实例/多进程时每个进程各算一份，"每 IP 120 次/分"会被实例数
@@ -141,18 +199,29 @@ export function bearerToken(req) {
 export function simpleRateLimit({ windowMs, max, message = '请求过于频繁，请稍后再试' } = {}) {
   return (req, res, next) => {
     const ip = clientIp(req);
+    // IPv6 按 /64 归一：一个用户通常控制整个 /64，按精确地址计数等于每次换地址就重置配额。
+    const bucketIp = rateLimitKeyOf(ip);
     // 键用「方法 + 路由形状」而不是进程内自增 id，也不是实际 URL：多进程自增顺序不保证一致；
     // 而实际 URL 带订单号/参数时，攻击者换一个 id 就是一个新桶，等于绕过限流。
     // `req.route.path` 是 Express 匹配到的路由形状（如 `/:id`）；router.use 级限流没有 route，
     // 用 baseUrl（挂载点）兜底，仍不随参数变化。
     const shape = req.route?.path ? `${req.baseUrl || ''}${req.route.path}` : (req.baseUrl || req.path || '');
     const routeKey = `${req.method} ${shape}`;
+    // 同一 Redis 可能被多个节点/同一次测试的多个库共用：桶键必须带实例（库名），
+    // 否则一个库打满的额度会把另一个库也锁住（测试套件里表现为“单独跑通过、全量跑失败”）。
+    const namespace = String(config.db.name || 'node').toLowerCase();
     let timer;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('限流 Redis 超时')), 500);
+      /*
+        500ms 是旧值：Redis 是**本机/内网**依赖，但一次 GC、网络抖动或慢查询就可能超过 0.5 秒，
+        于是正常请求收到 503「限流服务暂不可用」。1 秒覆盖本地抖动，又不把"Redis 故障期
+        每个请求多挂 2 秒"的堆积放大带回来；超过就 fail-closed，不取消底层命令（命令层
+        没有 abort，靠 redis.js 的连接失败熔断兜住）。
+      */
+      timer = setTimeout(() => reject(new Error('限流 Redis 超时')), 1_000);
       if (typeof timer.unref === 'function') timer.unref();
     });
-    Promise.race([redisHit(`${routeKey}:${ip}`, windowMs), timeout])
+    Promise.race([redisHit(`rate:${namespace}:${routeKey}:${bucketIp}`, windowMs), timeout])
       .then((hit) => {
         if (hit.count > max) {
           res.setHeader('Retry-After', String(Math.max(1, Math.ceil(hit.ttlMs / 1000))));
@@ -265,7 +334,7 @@ function attachShopContext(req, shop) {
  *     建草稿取商品行的 `shop_code`（routes/orders.js），订单动作取订单行的 `shop_code`
  *     （orderScope.js 的 `findOrderInShop`，以及各 handler 传给 `isStaff` 的 `order.shop_code`）。
  *     带了头在这里只是"按这家店看"的提示（列表类端点据此限定范围），不是授权凭证。
- *   · **卖家动作**（`ownerOnly` / `staffOnly`）：这个地址能经营哪几家店是**授权事实**，
+ *   · **店主动作**（`ownerOnly` / `staffOnly`）：这个地址能经营哪几家店是**授权事实**，
  *     由 `shops.seller` ∪ `shop_operators` 回答（`auth.operatedShopCodes`）。
  *     恰好一家 ⇒ 就是它，不必带请求头；**多于一家 ⇒ 必须点名**（缺头 = 400）：
  *     "哪一家"没有合理默认值，给一个默认会让请求方以为自己在动 A 店、实际动了 B 店，
@@ -286,7 +355,7 @@ export function makeAuthMiddleware(
   verify,
   { ownerOnly = false, staffOnly = false, nodeAdmin = false, hostOnly = false } = {}
 ) {
-  // 卖家面的两档必须落在**某一家店**的上下文里：它们的判据是"他在那家店里是什么角色"
+  // 店主面的两档必须落在**某一家店**的上下文里：它们的判据是"他在那家店里是什么角色"
   const sellerScope = ownerOnly || staffOnly;
   // 节点级两档：nodeAdmin（节点主 ∪ 员工）与 hostOnly（仅节点主）——都**不要求**请求头
   const nodeScope = nodeAdmin || hostOnly;
@@ -406,7 +475,7 @@ export function makeAuthMiddleware(
 }
 
 /**
- * 卖家动作在**没有**请求头时的店铺：这个地址恰好经营一家 ⇒ 返回那一行；多于一家 ⇒ 400。
+ * 店主动作在**没有**请求头时的店铺：这个地址恰好经营一家 ⇒ 返回那一行；多于一家 ⇒ 400。
  *
  * 失败时**已经把响应写出去**（与 routes/products.js 的 `requireShopProduct` 同款约定），
  * 调用方只需 `if (!shop) return;`：

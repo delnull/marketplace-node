@@ -3,7 +3,7 @@
  *
  * 判据：
  *   · 与店主 `active` 正交：店主上架也绕不过 `node_hidden`，店主不能改它；
- *   · 公开列表/详情/建单在隐藏后都不可达，卖家 `/all` 仍能看到原因；
+ *   · 公开列表/详情/建单在隐藏后都不可达，店主 `/all` 仍能看到原因；
  *   · 恢复后重新进入公开面；
  *   · 非节点管理员不能调用；动作留节点级审计。
  */
@@ -82,7 +82,7 @@ test('节点强制下架：公开面消失、店主改不动；恢复后重新�
     .set('X-Mk-Shop', code)
     .expect(200);
   const row = sellerAll.body.data.products.find((p) => p.slug === slug);
-  assert.ok(row, '卖家列表仍要能看到这件商品（否则无从整改）');
+  assert.ok(row, '店主列表仍要能看到这件商品（否则无从整改）');
   assert.equal(row.nodeHidden, true);
   assert.equal(row.nodeHiddenReason, '疑似假货，待店主举证', '原因必须让店主看到');
 

@@ -162,7 +162,7 @@ test('unverified 与 disputed 是两件独立的事：丢了 OrderCreated 镜像
 test('计数可独立复算：与"按链上事实手算"的结果逐项相同（分子 ⊆ 分母，比率 ≤ 1）', async () => {
   const b = Wallet.createRandom().address.toLowerCase();
   const at = Date.now() - 60_000;
-  // ① 买家确认收货；② 退款申请后卖家全额退款（无争议）；③ 仲裁拆分（判卖家，退了一部分）；④ 超时释放；⑤ 在途售后案件
+  // ① 买家确认收货；② 退款申请后店主全额退款（无争议）；③ 仲裁拆分（判店主，退了一部分）；④ 超时释放；⑤ 在途售后案件
   await insertOrder({ buyerAddr: b, status: 'confirmed', events: [ev('OrderCreated', at), ev('ReceiptConfirmed', at + 1)] });
   await insertOrder({
     buyerAddr: b,

@@ -18,7 +18,7 @@
  * （三个手动交付入口 + 自动交付），"这个链上单号是不是我这一单"只有 `chainParamsMatch` 一处
  * （交付闸、watcher 事件分支、后台对账共用）——判据落在调用点上就是两个答案层的开始。
  *
- * 本节点没有平台费、没有节点抽成、没有链上店铺登记：订单身份只有 **(orderId, 买家, 卖家, 金额,
+ * 本节点没有平台费、没有节点抽成、没有链上店铺登记：订单身份只有 **(orderId, 买家, 店主, 金额,
  * 验货窗口)** 五项，比对也只比这五项。
  */
 import { fetchOnchainOrder, getEscrow } from './chain.js';
@@ -36,7 +36,7 @@ export function fetchOrderFor(orderIdHex, opts) {
 }
 
 /**
- * 链上真值与本地订单锁定参数逐项比对（买家/卖家/金额/**验货窗口**皆不可变）。
+ * 链上真值与本地订单锁定参数逐项比对（买家/店主/金额/**验货窗口**皆不可变）。
  *
  * 为什么这四项就是订单身份：合约的 `createOrder(orderId, seller, amount, timeoutBlocks)` 只接
  * 这四项，`OrderCreated` 也只带 orderId/buyer/seller/amount。同一 orderId 上的"另一笔单"
@@ -91,7 +91,7 @@ export function chainParamsMatch(local, p) {
 }
 
 /**
- * 一条解码后的 `OrderCreated` 日志是否属于**本单**（orderId + 买家 + 卖家 + 金额）。
+ * 一条解码后的 `OrderCreated` 日志是否属于**本单**（orderId + 买家 + 店主 + 金额）。
  *
  * 为什么不能只靠 `queryFilter` 的 indexed 过滤：那同样是 RPC 的承诺。`/sync` 拿日志补
  * `paid_tx_hash`、`/paid` 拿收据日志确认托管——两处都已核对 `log.address`，但地址只证明
@@ -130,14 +130,14 @@ export function orderCreatedMatches(order, args, escrowOrderId, token) {
  * 那一列是 watcher 以 `head − MK_ESCROW_FINALITY_BLOCKS`（默认 12 块 ≈ 1 分钟）为上界回写的**镜像**，
  * 所以买家在 `createOrder` 之后紧接着 `requestRefund` 的那 12 块里，镜像**必然**还是 `none`。
  * 判据落在镜像上，就等于给了"钱已冻结、货照发"一个结构性窗口：买家手里有货/码，
- * 而托管里的钱被 `refundRequested` 永久挡住超时释放（卖家只能拒绝 → 争议 → 仲裁，双损）。
+ * 而托管里的钱被 `refundRequested` 永久挡住超时释放（店主只能拒绝 → 争议 → 仲裁，双损）。
  * 四个交付入口（三个手动 + 自动）全部经本函数，判据只剩一处。
  *
  * ── 判据与方向 ────────────────────────────────────────────────────────────
  *   · 链上 `status` 必须是 `Created`（钱还在托管里；`Disputed`/`Settled`/`Refunded` 都不该发货）；
- *   · 链上 `refundRequested` 必须为假（真值只在链上；卖家拒绝后它为假 ⇒ 恢复可交付）；
- *   · 链上同单号的买家/卖家/金额/验货窗口与本单不符 ⇒ 拒绝（诱饵单，见 chainParamsMatch）；
- *   · 链上读不到 ⇒ **拒绝**（fail-closed）。代价如实写明：节点 RPC 故障期间卖家发不了货，
+ *   · 链上 `refundRequested` 必须为假（真值只在链上；店主拒绝后它为假 ⇒ 恢复可交付）；
+ *   · 链上同单号的买家/店主/金额/验货窗口与本单不符 ⇒ 拒绝（诱饵单，见 chainParamsMatch）；
+ *   · 链上读不到 ⇒ **拒绝**（fail-closed）。代价如实写明：节点 RPC 故障期间店主发不了货，
  *     而"读不到就放行"恰恰会把上面那个窗口原样还回来。
  *
  * ── 残余窗口（如实写明）────────────────────────────────────────────────────
@@ -173,7 +173,7 @@ export async function deliveryGate(order) {
       ok: false,
       code: 'decoy',
       message:
-        '链上同单号的托管单与本单的买家/卖家/金额/验货窗口不一致——疑似他人对同一单号的诱饵单，已阻止交付，请核对该订单',
+        '链上同单号的托管单与本单的买家/店主/金额/验货窗口不一致——疑似他人对同一单号的诱饵单，已阻止交付，请核对该订单',
     };
   }
   if (String(chain.status) !== 'Created') {
@@ -198,7 +198,7 @@ export async function deliveryGate(order) {
  * **不是**"没有案件"）。
  *
  * 为什么把 getOrder 一起读回来：改本地镜像之前必须确认"这个链上 orderId 确实是本单"
- * （买家/卖家/金额三项，防他人对同一 orderId 的诱饵单）。三次读取在同一个 tick 里发出，
+ * （买家/店主/金额三项，防他人对同一 orderId 的诱饵单）。三次读取在同一个 tick 里发出，
  * ethers v6 会把它们打包成一次 JSON-RPC 请求。
  *
  * `openedAtBlock` 在无案件时链上返回 0 → 归一成 null（0 不是区块号，落库会变成假事实）。
@@ -206,7 +206,7 @@ export async function deliveryGate(order) {
  * 不匹配，此时"有案件"这个结论本身就不可信——抛错让 /sync 与对账都跳过该单（保持本地原值）。
  *
  * @returns {Promise<{open: boolean, openedAtBlock: number|null, status: string,
- *                    buyer: string, seller: string, amount: string}>}
+ *                    buyer: string, seller: string, amount: string, refundedAmount: string}>}
  */
 export async function fetchAfterSaleFor(orderIdHex, { blockTag = 'latest' } = {}) {
   const c = getEscrow();
@@ -231,6 +231,7 @@ export async function fetchAfterSaleFor(orderIdHex, { blockTag = 'latest' } = {}
     buyer: order.buyer,
     seller: order.seller,
     amount: order.amount,
+    refundedAmount: order.refundedAmount,
   };
 }
 

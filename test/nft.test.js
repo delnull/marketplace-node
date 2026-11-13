@@ -591,6 +591,90 @@ test('matchNftTransfers：标准错配（erc721 合约日志按 erc1155 申报�
   assert.match(r.reason, /ERC1155/, '错误信息应指引核对 NFT 标准');
 });
 
+test('清空 NFT 交付池：只删未用，已交付 tokenId 留墓碑挡住重导入', async () => {
+  const created = await request(app)
+    .post('/api/products')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send(nftPayload({ title: '清空交付池商品' }))
+    .expect(200);
+  assertOk(created);
+  const slug = created.body.data.slug;
+
+  const imported = await request(app)
+    .post(`/api/products/${slug}/tokens`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ tokens: ['21', '22', '23'] })
+    .expect(200);
+  assertOk(imported);
+  assert.equal(imported.body.data.stats.unused, 3);
+
+  // 模拟其中一枚已交付：used 行是墓碑，清空池不得删
+  await db.run(
+    "UPDATE product_nft_tokens SET status = 'used' WHERE product_id = (SELECT id FROM products WHERE slug = ?) AND token_id = '22'",
+    slug
+  );
+
+  const noConfirm = await request(app)
+    .delete(`/api/products/${slug}/tokens`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .expect(200);
+  assert.notEqual(noConfirm.body.code, 0, '清空池必须二次确认');
+
+  const cleared = await request(app)
+    .delete(`/api/products/${slug}/tokens?confirm=1`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .expect(200);
+  assertOk(cleared);
+  assert.equal(cleared.body.data.cleared, 2, '只删未用两枚');
+  assert.equal(cleared.body.data.keptUsed, 1, '已交付那枚保留为墓碑');
+
+  const remain = await db.all(
+    'SELECT token_id, status FROM product_nft_tokens WHERE product_id = (SELECT id FROM products WHERE slug = ?)',
+    slug
+  );
+  assert.deepEqual(
+    remain.map((r) => [r.token_id, r.status]),
+    [['22', 'used']]
+  );
+
+  const reimport = await request(app)
+    .post(`/api/products/${slug}/tokens`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ tokens: ['22', '24'] })
+    .expect(200);
+  assertOk(reimport);
+  assert.equal(reimport.body.data.skipped, 1, '已交付的 22 不能重新变成未用');
+  assert.equal(reimport.body.data.stats.unused, 1, '只新增 24');
+});
+
+test('并发导入同一批 tokenId：唯一键兜底，只落一份', async () => {
+  const created = await request(app)
+    .post('/api/products')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send(nftPayload({ title: '并发导入池商品' }))
+    .expect(200);
+  assertOk(created);
+  const slug = created.body.data.slug;
+  const body = { tokens: ['31', '32', '33', '34'] };
+  const [a, b] = await Promise.all([
+    request(app)
+      .post(`/api/products/${slug}/tokens`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+      .send(body),
+    request(app)
+      .post(`/api/products/${slug}/tokens`)
+      .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+      .send(body),
+  ]);
+  assertOk(a);
+  assertOk(b);
+  const rows = await db.all(
+    'SELECT token_id FROM product_nft_tokens WHERE product_id = (SELECT id FROM products WHERE slug = ?) ORDER BY token_id',
+    slug
+  );
+  assert.deepEqual(rows.map((r) => r.token_id), ['31', '32', '33', '34'], '并发导入不得产生重复行');
+});
+
 test('matchNftTransfers：无关事件（Foo 等）与申报集合为空被拒', async () => {
   const { matchNftTransfers } = await lib();
   const iface = new (await import('ethers')).Interface(['event Foo()']);

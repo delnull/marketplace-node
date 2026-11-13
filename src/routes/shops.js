@@ -1,9 +1,14 @@
 /**
  * 店铺目录与开店审批（挂 `/api/shops`）——**店铺完全在节点链下**。
  *
- *  GET  /                    公开：本节点**在售**店铺列表（编号/店名/卖家地址/在售状态）；
+ *  GET  /                    公开：本节点**在售**店铺列表（编号/店名/店主地址/在售状态）；
  *                            带登录令牌时另附 `mine`（这个钱包在本节点的开店状态，含暂停店与待审批申请）
- *                            与 `operatedShops`（这个钱包能经营的店，含暂停店；卖家面板读它）
+ *                            与 `operatedShops`（这个钱包能经营的店，含暂停店；店主面板读它）。
+ *                            可选 `?address=0x…`：附带 `hasOperatedShop`（该地址在本节点是否**能经营**
+ *                            店铺，含歇业；店主、店员、节点员工自营店都算。只给布尔值，不返回
+ *                            店铺/角色详情）。有令牌时以令牌地址为准。
+ *                            前端店主入口靠它判断"要不要显示"——歇业店不在公开列表里，
+ *                            单看公开 `shops` 会把歇业店主当成没有店。
  *  GET  /stats               公开：按编号批量返回店铺评价聚合 + 有效单量（目录页一次取一页，避免 2N 请求）；
  *                            编号用**重复的 `code` 参数**传（`?code=A&code=B`），不能用逗号拼接——
  *                            逗号本身是合法校验位（见 src/shopCode.js）。
@@ -27,12 +32,12 @@
  *
  * ## 没有抽成
  *
- * 零费模型：平台不收、节点也不收，托管结算只有买家/卖家两条腿。申请里没有费率字段，
- * 审批也不设置费率——钱的分配在链上（`Escrow._settle`）只有退款与卖家两笔。
+ * 零费模型：平台不收、节点也不收，托管结算只有买家/店主两条腿。申请里没有费率字段，
+ * 审批也不设置费率——钱的分配在链上（`Escrow._settle`）只有退款与店主两笔。
  */
 import { Router } from 'express';
-import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit, bearerToken } from '../http.js';
-import { verifySession, isHost } from '../auth.js';
+import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit, bearerToken, clientIp } from '../http.js';
+import { verifySession, isHost, operatedShopCodes } from '../auth.js';
 import config from '../config.js';
 import { getDb, withTransaction, abortTx } from '../db.js';
 import { logAudit } from '../audit.js';
@@ -64,6 +69,39 @@ const applicationLimiter = simpleRateLimit({ windowMs: 60_000, max: 60, message:
   避免用一次请求绕过 `/api/shop/reputation` 的单次限额。目录页每节点只会发一批，30 秒 HTTP 缓存也会兜住重复。
 */
 const shopStatsBatchLimiter = simpleRateLimit({ windowMs: 60_000, max: 10, message: '店铺统计批量查询过于频繁，请稍后再试' });
+
+/*
+  匿名地址归属查询的**本地**限流（只挡带 `?address=` 且没有有效令牌的请求）。
+  为什么不用 `simpleRateLimit`：`/api/shops` 是公开目录请求，连接钱包的买家每次目录加载
+  都会带地址来问一遍；若把这条路径绑到 Redis，Redis 一抖整页目录就会 503。
+  这里挡的是"枚举地址"这一类滥用，进程内计数足够；多进程最坏是额度按进程放大，
+  不影响目录可用性。额度按「一次目录加载 = 每个节点一个请求」留足余量。
+  ⚠️ 不能在中间件里按 `Authorization` 头是否存在来放行：伪造一个 Bearer 就能绕过；
+  必须等 `optionalBuyer()` 验完令牌、确认没有有效买家之后再计数。
+  ⚠️ 超预算时**不能让整个请求 429**：前端会把 `/api/shops` 失败当成"这个节点的店铺读不到"，
+  公开目录跟着消失。只跳过归属回答（`hasOperatedShop=false`），公开店铺照常返回。
+*/
+const anonymousShopQueryHits = new Map();
+const SHOP_QUERY_WINDOW_MS = 60_000;
+const SHOP_QUERY_MAX_PER_WINDOW = 600;
+function anonymousShopQueryHasBudget(req) {
+  const now = Date.now();
+  const ip = clientIp(req);
+  const hit = anonymousShopQueryHits.get(ip);
+  if (!hit || hit.resetAt <= now) {
+    if (anonymousShopQueryHits.size > 4096) {
+      for (const [key, value] of anonymousShopQueryHits) {
+        if (value.resetAt <= now) anonymousShopQueryHits.delete(key);
+      }
+      // 仍然超限（大量未过期 IP）：整表清掉也比无界增长安全；限流是防滥用，不是账本。
+      if (anonymousShopQueryHits.size > 4096) anonymousShopQueryHits.clear();
+    }
+    anonymousShopQueryHits.set(ip, { count: 1, resetAt: now + SHOP_QUERY_WINDOW_MS });
+    return true;
+  }
+  hit.count += 1;
+  return hit.count <= SHOP_QUERY_MAX_PER_WINDOW;
+}
 
 /**
  * 可选登录：目录公开可读。带令牌时同时用于两件事——
@@ -103,7 +141,7 @@ const audit = async (req, action, targetType, targetId, detail) =>
 /**
  * **店铺接单状态的唯一写内核**：单品与批量共用。
  *
- * 一次事务里锁行、判状态、写状态；事务提交后逐店写节点级审计并推卖家 webhook。
+ * 一次事务里锁行、判状态、写状态；事务提交后逐店写节点级审计并推店主 webhook。
  * 单品与批量因此在"原因清空、时间戳、审计字段、通知"上不可能漂移。
  *
  * 返回 `{ missing }` = 有编号不存在（**整批不写**）；否则 `{ changed }` 只含真正
@@ -241,8 +279,37 @@ async function mineAtNode(seller, host) {
 
 /** 公开：本节点在售店铺列表（`listed = 0` 的店**不进**这个列表——它已经不接单也不该被聚合） */
 router.get('/', wrap(async (req, res) => {
+  /*
+    响应可能含 `mine` / `operatedShops`（令牌）或 `hasOperatedShop`（地址查询），
+    不能交给共享缓存；地址/令牌换了却命中同一条缓存，就是把别人的店算到当前钱包头上。
+  */
+  res.setHeader('Cache-Control', 'private, no-store');
   const nodeAddr = await nodeOwner();
   const buyer = await optionalBuyer(req);
+  /*
+    可选地址查询：只回答"这个地址在本节点有没有店铺"（含歇业），不返回店铺编号/店名/状态。
+    这里只查 `shops.seller`（店主），**不查 `shop_operators`（店员）**——店员名单是节点本地
+    授权事实，不能因为一个匿名布尔查询就暴露；店员登录后由登录回执显示入口。
+    为什么允许匿名：店主入口必须在登录前判断有没有店；歇业店不在公开列表里，单看 `shops`
+    会把歇业店主当成买家。有令牌时以令牌地址为准，避免拿 A 的令牌查 B 的归属。
+  */
+  const queryAddress = String(req.query.address || '').trim().toLowerCase();
+  if (!buyer && queryAddress && (!isAddress(queryAddress) || isZeroAddress(queryAddress))) {
+    return fail(res, '地址必须是 0x 开头的 40 位地址', 400, 400);
+  }
+  const canAnswerMembership = !buyer && queryAddress ? anonymousShopQueryHasBudget(req) : true;
+  const membershipLimited = !buyer && !!queryAddress && !canAnswerMembership;
+  const inquiry = buyer || queryAddress;
+  /*
+    有令牌时直接复用本请求本来就要读的 `operatedShops`（避免再查一遍 operatedShopCodes）；
+    匿名地址查询则只读 code 集合，不构造店铺 DTO。两者都含歇业店与店员授权。
+  */
+  const operated = buyer ? await operatedShops(buyer, nodeAddr) : null;
+  const hasOperatedShop = operated
+    ? operated.length > 0
+    : canAnswerMembership && inquiry
+      ? (await operatedShopCodes(inquiry)).length > 0
+      : false;
   let rows = await listListedShopRows();
   const totalListed = rows.length;
   if (buyer) {
@@ -251,7 +318,14 @@ router.get('/', wrap(async (req, res) => {
   }
   ok(res, {
     host: nodeAddr || null,
-    shops: rows.map((r) => shopDto(r, nodeAddr)),
+    shops: rows.map((r) => shopDto(r, nodeAddr, { publicView: true })),
+    /**
+     * 该查询地址在本节点**能经营**的店是否存在（含歇业；店主、店员、节点员工自营店都算）。
+     * `address` 缺省且未登录时为 false；匿名查询超过本地额度时也只回 false，不把公开目录打成错误。
+     */
+    hasOperatedShop,
+    /** 本次因为匿名额度用尽而**没有回答**归属；前端可据此提示/重试，而不是当成“没有店” */
+    hasOperatedShopLimited: membershipLimited,
     /** 该买家在本节点设置的屏蔽导致目录隐藏的店铺数（不是全节点统计） */
     hiddenBlocked: totalListed - rows.length,
     /**
@@ -261,10 +335,10 @@ router.get('/', wrap(async (req, res) => {
     mine: buyer ? await mineAtNode(buyer, nodeAddr) : null,
     /**
      * 当前登录钱包在本节点**能经营的店**（含暂停接单），与登录回执的 `shops[]` 同形。
-     * 卖家面板的店名/头像/接单状态/暂停原因只读这一份（**现读**，不是登录时的快照）。
+     * 店主面板的店名/头像/接单状态/暂停原因只读这一份（**现读**，不是登录时的快照）。
      * 没有令牌 = `null`（节点不替匿名请求断言"你有哪些店"）。
      */
-    operatedShops: buyer ? await operatedShops(buyer, nodeAddr) : null,
+    operatedShops: operated,
   });
 }));
 
@@ -438,7 +512,7 @@ router.get('/:code', wrap(async (req, res) => {
   if (!row) {
     return fail(res, '没有这家店', 404, 404);
   }
-  ok(res, shopDto(row, await nodeOwner()));
+  ok(res, shopDto(row, await nodeOwner(), { publicView: true }));
 }));
 
 /**
@@ -593,6 +667,22 @@ router.get('/applications/mine', requireAuth, wrap(async (req, res) => {
     applications: rows.map((row) => applicationDto(row)),
     mine: await mineAtNode(seller, await nodeOwner()),
   });
+}));
+
+/**
+ * 申请人删除自己的**已驳回**申请（清除店名/公告/驳回原因等个人信息）。
+ * pending 不能删（会绕过审批队列）；approved 已经是店铺事实，不能靠删申请抹掉。
+ */
+router.delete('/applications/mine', requireAuth, wrap(async (req, res) => {
+  const seller = String(req.auth?.address || '').toLowerCase();
+  const deleted = (
+    await getDb().run("DELETE FROM shop_applications WHERE seller = ? AND status = 'rejected'", seller)
+  ).foundRows;
+  ok(
+    res,
+    { deleted },
+    deleted ? `已删除 ${deleted} 条已驳回申请（店名/公告/驳回原因已清除）` : '没有可删除的已驳回申请'
+  );
 }));
 
 /**
@@ -773,7 +863,7 @@ router.post('/applications/:id/review', nodeAdmin, wrap(async (req, res) => {
   return ok(
     res,
     { application: fresh, shop: shopDto(shop, await nodeOwner()) },
-    `已开店，编号 ${code}（店主刷新后即可在卖家面板经营）`
+    `已开店，编号 ${code}（店主刷新后即可在店主面板经营）`
   );
 }));
 

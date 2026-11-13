@@ -280,10 +280,10 @@ test('门控函数本身（不经路由）：过期返回业务拒绝形状，�
   assert.match(expired.message, /陈述时限已过/);
   const okRow = evidencePhaseError({ status: 'disputed', updated_at: new Date(now - 1000), after_sale_status: 'none' }, 'arbitration', 'buyer', { now });
   assert.equal(okRow, null);
-  // 仲裁阶段双方都可陈述：未过期时卖家同样放行（时限不改变"谁能在哪个阶段说话"）
+  // 仲裁阶段双方都可陈述：未过期时店主同样放行（时限不改变"谁能在哪个阶段说话"）
   const sellerOk = evidencePhaseError({ status: 'disputed', updated_at: new Date(now - 1000), after_sale_status: 'none' }, 'arbitration', 'seller', { now });
   assert.equal(sellerOk, null);
-  // 过期对双方一视同仁：卖家也一样被拒（举证窗口是**双方**的窗口）
+  // 过期对双方一视同仁：店主也一样被拒（举证窗口是**双方**的窗口）
   const sellerLate = evidencePhaseError({ status: 'disputed', updated_at: new Date(now - 8 * DAY), after_sale_status: 'none' }, 'arbitration', 'seller', { now });
   assert.equal(sellerLate.code, 1);
   assert.match(sellerLate.message, /陈述时限已过/);

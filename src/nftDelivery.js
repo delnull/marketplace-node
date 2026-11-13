@@ -1,12 +1,12 @@
 /**
- * NFT 交付核验（v2 集合语义）：卖家把池内未用 tokenId 转给买家后提交
+ * NFT 交付核验（v2 集合语义）：店主把池内未用 tokenId 转给买家后提交
  * deliveries: [{tokenId, txHash}]——多哈希（一枚一哈希，多次提交）与批量
  * （同 txHash 一次多枚：ERC721 同收据多笔 Transfer / ERC1155 TransferBatch）均支持。
  * 节点按 txHash 分组做一次集合核验：申报 tokenId 集合须 ⊆ 收据中该合约
  * from=店主、to=买家 的转移集合。
  *
  * 安全边界：事件只能由 NFT 合约自身 emit，from/to/tokenId 均为事件参数，
- * 链上无法伪造——核验通过即链上事实（卖家确实把这批 NFT 转给了买家）。
+ * 链上无法伪造——核验通过即链上事实（店主确实把这批 NFT 转给了买家）。
  * BTY 兼容层收据同样适用（logs 结构与标准 EVM 一致；事件解析不依赖 receipt.to）。
  *
  * 标准匹配：按商品快照锁定的 nft_standard 选择事件签名解析（erc721：Transfer，
@@ -164,8 +164,8 @@ export async function verifyNftTransfersTx(txHash, nftContract, expected) {
   }
   /*
     确认深度：图省一次比较就在 latest 落交付，短重组后本地已 shipped、链上 Transfer 却消失，
-    订单随后还能超时结算给卖家——买家钱货两空。与 /paid、watcher 同一个 finality 口径：
-    未达终局不落交付，让卖家等几块再确认（交易若真被重组，会被明确拒绝而不是静默记账）。
+    订单随后还能超时结算给店主——买家钱货两空。与 /paid、watcher 同一个 finality 口径：
+    未达终局不落交付，让店主等几块再确认（交易若真被重组，会被明确拒绝而不是静默记账）。
   */
   const finalized = await finalizedBlockTag().catch(() => null);
   if (typeof finalized === 'number' && Number(receipt.blockNumber) > finalized) {

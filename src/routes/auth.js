@@ -16,7 +16,7 @@
  * 把 `shop` 改成"可选"只会让"登录是否绑店"继续有两种形状，所以整条参数删掉。
  *
  * 登录回执给出 `shops`：这个地址在本节点能经营的店与**各自**的角色（前端据此记逐店角色
- * 与页面门控；卖家面板的店铺行读 `GET /api/shops` 的 `operatedShops`，那是现读）。
+ * 与页面门控；店主面板的店铺行读 `GET /api/shops` 的 `operatedShops`，那是现读）。
  * 这份清单与 `GET /api/shops` 的 `operatedShops`
  * 共用 `operatedShops()` 一个实现，且每次现读——回执不是店铺状态的快照。
  * 回执里**没有** node 级的 `code`/`role`/`isOwner`/`isStaff`：

@@ -19,7 +19,7 @@ import { makeCtx, insertOrder, shopRef } from './setup.mjs';
 const ctx = await makeCtx();
 const { db, buyer, owner } = ctx;
 
-const { pollOnce } = await import('../src/escrowWatcher.js');
+const { pollOnce, replayQuarantinedEvents } = await import('../src/escrowWatcher.js');
 const config = (await import('../src/config.js')).default;
 
 const EVENT_IFACE = new Interface([
@@ -214,4 +214,19 @@ test('追平链头后隔一轮重扫游标块：head 刚可见的日志不会因
   assert.ok(!second.upToDate, '第二轮应重扫游标块（表现为落后 1 块）');
   assert.equal(second.scanned.from, LATEST, '第二轮必须重扫最新块');
   assert.equal(second.scanned.to, LATEST, '第二轮重扫范围只到链头');
+});
+
+test('隔离事件重放：清清单必须同时回退游标，否则清单空了事件仍然永远不会重放', async () => {
+  await db.run(
+    'UPDATE node SET quarantined_events = ?, watcher_block = ?, watcher_hash = ? WHERE id = 1',
+    JSON.stringify({ '42:0:RefundApproved:0xabc': { block: 42, name: 'RefundApproved', tries: 3 } }),
+    100,
+    '0xdeadbeef'
+  );
+  const r = await replayQuarantinedEvents();
+  assert.deepEqual(r, { cleared: 1, rewindTo: 41 });
+  const row = await db.get('SELECT quarantined_events, watcher_block, watcher_hash FROM node WHERE id = 1');
+  assert.equal(row.watcher_block, 41);
+  assert.equal(row.watcher_hash, null, '哈希清空，避免下一次重组比对把回退覆盖掉');
+  assert.deepEqual(row.quarantined_events, {}, '清单已清空');
 });

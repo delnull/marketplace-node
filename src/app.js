@@ -5,7 +5,8 @@
 import express from 'express';
 import cors from 'cors';
 import config from './config.js';
-import { ok, fail, wrap, isProdLike, clientIp, simpleRateLimit } from './http.js';
+import { ok, fail, wrap, isProdLike, clientIp, simpleRateLimit, bearerToken } from './http.js';
+import { verifySession, isNodeAdmin } from './auth.js';
 import { getDb, serverCapabilities } from './db.js';
 import { redisHealth } from './redis.js';
 // 审计哈希链的**只读校验器**（唯一实现，见 auditChain.js）：healthz 只用最近一段窗口，见下方 readAuditChain
@@ -378,7 +379,7 @@ export function createApp() {
       给出的是一屏假话。所以先算同一份读数，再用 HTTP 码表达结论。
       代价：不健康时也要多读一次审计链（30s 缓存）与媒体用量（60s 缓存）。
     */
-    const readings = {
+    const fullReadings = {
       healthy,
       ...(reason ? { reason } : {}),
       name: await nodeNameOf(),
@@ -481,6 +482,45 @@ export function createApp() {
         redis,
       },
     };
+    /*
+      `/healthz` 是公开探活：默认只回“是否健康 + 谁能被联邦发现 + watcher 是否在扫”的读数。
+      watcher 游标/隔离数/最近错误仍公开（连接页与 dev-stack 探活要据此判断“扫到哪、有没有卡住”）；
+      DB 能力、媒体用量、审计链、委员会/绑定读数只给节点主/员工。
+    */
+    const wantsFull = String(req.query.full || '') === '1' || /^Bearer\s+/i.test(String(req.headers.authorization || ''));
+    let full = false;
+    if (wantsFull) {
+      const t = bearerToken(req);
+      if (!t) return fail(res, '读取完整健康读数需要节点主/员工登录', 401, 401);
+      let payload;
+      try {
+        payload = await verifySession(t);
+      } catch {
+        return fail(res, '登录已过期：请重新登录后读取完整健康读数', 401, 401);
+      }
+      try {
+        full = await isNodeAdmin(payload.address);
+      } catch {
+        return fail(res, '节点管理权限暂时无法确认，请稍后再试', 503, 503);
+      }
+      if (!full) return fail(res, '只有节点主/员工可以读取完整健康读数', 403, 403);
+    }
+    const readings = full
+      ? fullReadings
+      : {
+          healthy: fullReadings.healthy,
+          ...(fullReadings.reason ? { reason: fullReadings.reason } : {}),
+          name: fullReadings.name,
+          host: fullReadings.host,
+          shops: fullReadings.shops,
+          version: fullReadings.version,
+          now: fullReadings.now,
+          watcher: fullReadings.watcher,
+          orderTimeout: fullReadings.orderTimeout,
+          /* 托管/保证金地址不是秘密：GET /api/shop 本来就公开它们；探活脚本据此核对节点身份。 */
+          escrowAddress: fullReadings.escrowAddress,
+          stakingAddress: fullReadings.stakingAddress,
+        };
     if (!healthy) {
       res.status(503);
       return fail(res, `节点不健康：${reason}`, 1, 503, readings);
@@ -521,7 +561,7 @@ export function createApp() {
   app.use('/api/orders', evidenceFilesRouter); // 证据附件（P0-2）
   app.use('/api/rates', ratesRouter);
   app.use('/api/arbitration', arbitrationRouter);
-  // NFT 提货声明（持有人提交、卖家处理、节点管理员生成链上争议参数）
+  // NFT 提货声明（持有人提交、店主处理、节点管理员生成链上争议参数）
   app.use('/api/claims', claimsRouter);
 
 /*

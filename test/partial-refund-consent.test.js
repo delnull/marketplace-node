@@ -1,7 +1,7 @@
 /**
  * 买家「精确金额授权」的部分退款（契约 2026-09 新增）在节点侧的全部落地路径。
  *
- * 契约变更（纯增量）：卖家原先能单方面指定部分退款额（`approveRefund(orderId, 1)` 就能让买家
+ * 契约变更（纯增量）：店主原先能单方面指定部分退款额（`approveRefund(orderId, 1)` 就能让买家
  * 只拿 1 wei 且此后无任何链上救济路径）——现在 `approveRefund` 只接受两种金额：
  *   · `refundWei == amount`（全额认赔，不需要授权）；
  *   · `refundWei == acceptedPartialRefund[orderId]`（买家**对具体金额**点头过的那个数）。
@@ -179,7 +179,7 @@ before(async () => {
 });
 
 let seq = 0;
-/** 直接插本地订单行（照 test/order-sync-paths.test.js 的骨架；买家/卖家/金额与链上真值一致） */
+/** 直接插本地订单行（照 test/order-sync-paths.test.js 的骨架；买家/店主/金额与链上真值一致） */
 async function insertOrder({ status = 'escrowed', accepted = null, events = null } = {}) {
   seq += 1;
   const row = await insertOrderRow(db, {
@@ -217,7 +217,7 @@ const chainTruth = (status = 'Created') => ({
 // ── ① ABI 与事件清单：契约侧新增的三项必须在生产 ABI 里，且事件必须挂进轮询清单 ──
 
 test('事件声明/视图/写函数都在生产 ABI 里，且 PartialRefundAccepted 挂进 watcher 的 EVENTS 清单', () => {
-  // 视图与写函数（漏一行：卖家部分退款在节点侧无从知晓，/sync 也读不到授权额）
+  // 视图与写函数（漏一行：店主部分退款在节点侧无从知晓，/sync 也读不到授权额）
   mustFunction('acceptPartialRefund');
   assert.equal(mustFunction('acceptedPartialRefund').outputs.length, 1, '只读视图返回单个 uint256（0 = 未授权）');
   assert.deepEqual(
@@ -252,7 +252,7 @@ test('RefundRejected 必须清掉本地过期授权额（与合约 reject 的 de
     1
   );
   const row = await rowOf(o.orderId);
-  assert.equal(String(row.accepted_partial_refund_wei), '0', '拒绝后卖家不能再按旧授权额调 approveRefund');
+  assert.equal(String(row.accepted_partial_refund_wei), '0', '拒绝后店主不能再按旧授权额调 approveRefund');
   assert.equal(row.refund_status, 'rejected');
 });
 
@@ -263,7 +263,7 @@ test('PartialRefundAccepted：写授权额与事件史、不动 status；同值�
 
   assert.equal(await applyEvent('PartialRefundAccepted', { orderId: o.escrowOrderId, refundWei: ACCEPTED }, meta), 1);
   let row = await rowOf(o.orderId);
-  assert.equal(row.accepted_partial_refund_wei, ACCEPTED, '授权额必须落库（卖家 UI 给出可执行金额的唯一依据）');
+  assert.equal(row.accepted_partial_refund_wei, ACCEPTED, '授权额必须落库（店主 UI 给出可执行金额的唯一依据）');
   assert.equal(row.status, 'escrowed', '授权不迁移订单状态（不转移资金、不冻结订单）');
   assert.equal(row.refund_status, 'none', '授权也不动售后镜像');
   // 时间列是 DATETIME(3) → 读回来是 `Date`：比较"有没有被改写"要按**时刻**比
@@ -446,8 +446,8 @@ test('DTO：订单详情与待仲裁列表都下发 acceptedPartialRefundWei/Dec
 
 // ── ⑥ 回归：全额/部分的分流与仲裁路径不变（本轮没有改本地状态机的判据） ──
 
-test('回归：买家授权额 → 卖家 approveRefund 同额落 settled 并记已退金额；全额落 refunded；仲裁不受授权限制', async () => {
-  // ① 双方谈拢的部分退款：买家授权 → 卖家 approveRefund(授权额) 的链上事件
+test('回归：买家授权额 → 店主 approveRefund 同额落 settled 并记已退金额；全额落 refunded；仲裁不受授权限制', async () => {
+  // ① 双方谈拢的部分退款：买家授权 → 店主 approveRefund(授权额) 的链上事件
   const partial = await insertOrder({ status: 'escrowed' });
   assert.equal(await applyEvent('PartialRefundAccepted', { orderId: partial.escrowOrderId, refundWei: ACCEPTED }), 1);
   assert.equal(await applyEvent('RefundApproved', { orderId: partial.escrowOrderId, refundWei: ACCEPTED }), 1);

@@ -23,7 +23,7 @@
  */
 import config from './config.js';
 import { withRedisLock } from './redis.js';
-import { fetchOrderFor } from './chainOrder.js';
+import { fetchOrderFor, chainParamsMatch } from './chainOrder.js';
 import { finalizedBlockTag } from './chain.js';
 import { getDb, withTransaction } from './db.js';
 import { releaseHoldsForOrderIds } from './stockHold.js';
@@ -31,6 +31,30 @@ import { releaseHoldsForOrderIds } from './stockHold.js';
 const SWEEP_INTERVAL_MS = 60_000; // 每 60s 检查一次
 /** 单轮最多处理多少条：积压时把长事务/长串 RPC 切成多轮，而不是一轮锁住所有草稿。 */
 const SWEEP_BATCH = 50;
+/**
+ * 建单幂等键的保留窗口：映射本身只用于「同一意图失败重试」，草稿 TTL 30 分钟后
+ * 对应订单早已不是活跃 draft。按**数据库时钟**清 90 天前的映射，避免这张表按订单数无限增长。
+ * 不能按「订单离开 draft」删除：那会让"支付后响应丢失再重试"又建出一张新草稿。
+ */
+const IDEM_RETENTION_DAYS = 90;
+const IDEM_CLEANUP_INTERVAL_MS = 60 * 60_000;
+const IDEM_CLEANUP_BATCH = 1000;
+let lastIdemCleanupAt = 0;
+
+async function sweepOldOrderIdempotency() {
+  const now = Date.now();
+  if (now - lastIdemCleanupAt < IDEM_CLEANUP_INTERVAL_MS) return 0;
+  lastIdemCleanupAt = now;  /*
+    保留天数/批量是模块内常量（不来自请求），直接进 SQL 是安全的；用字面量而不是
+    `INTERVAL ? DAY`，避免不同 MySQL 驱动对占位符在 INTERVAL/LIMIT 里的处理差异。
+  */
+  const r = await getDb().run(
+    `DELETE FROM order_idempotency WHERE created_at < DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ${IDEM_RETENTION_DAYS} DAY) LIMIT ${IDEM_CLEANUP_BATCH}`
+  );
+  const removed = Number(r?.affectedRows || 0);
+  if (removed) console.log(`[sweeper] 清理 ${removed} 条超过 ${IDEM_RETENTION_DAYS} 天的建单幂等键`);
+  return removed;
+}
 
 /**
  * 执行一轮清扫，返回本次关闭的草稿数量（测试可直接调用）。
@@ -41,6 +65,14 @@ const SWEEP_BATCH = 50;
  */
 export async function sweepExpiredDrafts() {
   const db = getDb();
+  /*
+    幂等键保留窗口的维护性清理与草稿清扫**互相独立**，必须放在下面的早退之前：
+    绝大多数轮次没有过期草稿（`staleRows.length === 0` 直接 return），放在末尾就永远不跑。
+    失败只留日志，不影响草稿清扫。
+  */
+  await sweepOldOrderIdempotency().catch((e) =>
+    console.error('[sweeper] 清理建单幂等键失败（下轮重试）:', e?.message || e)
+  );
   const ttlMinutes = config.draftTtlMinutes;
   const dueSql = `o.created_at <= DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ? MINUTE)`;
   const paidGuard = 'AND NOT EXISTS (SELECT 1 FROM order_chain c WHERE c.order_id = o.id AND c.paid_tx_hash IS NOT NULL)';
@@ -66,7 +98,18 @@ export async function sweepExpiredDrafts() {
         const r = rows[i];
         try {
           const onchain = await fetchOrderFor(r.escrow_order_id, { blockTag });
-          if (onchain?.status && onchain.status !== 'None') held[i] = true;
+          /*
+            链上“存在”不等于“这是本单的支付”：草稿的 escrowOrderId 对买家本人可见，
+            1 wei 的诱饵单也能让 status 变成 Created/Settled。必须走与 /cancel、watcher、
+            对账同一份身份判据；不匹配就当没付过，让 TTL 清扫照常释放库存。
+          */
+          const exists = !!onchain?.status && onchain.status !== 'None';
+          if (exists && chainParamsMatch(r, onchain)) held[i] = true;
+          else if (exists) {
+            console.warn(
+              `[sweeper] 忽略与本地订单身份不符的链上记录（order=${String(r.order_no).slice(0, 8)}…）：金额/买家/店主/窗口/支付资产不一致，疑似诱饵单；本轮仍按未支付草稿清扫`
+            );
+          }
         } catch {
           // 可能已支付但 watcher 未应用：本轮不取消，避免把真单摘出本地生命周期。
           held[i] = true;
@@ -77,7 +120,8 @@ export async function sweepExpiredDrafts() {
     return rows.filter((_, i) => held[i]).map((r) => r.id);
   };
   const staleRows = await db.all(
-    `SELECT o.id, c.escrow_order_id
+    `SELECT o.id, o.order_no, c.escrow_order_id,
+            o.buyer, o.seller, o.amount_wei, o.timeout_blocks, o.payment_token
        FROM orders o
        JOIN order_chain c ON c.order_id = o.id
       WHERE o.status = 'draft'
@@ -152,6 +196,11 @@ export async function sweepExpiredDrafts() {
     console.log(`[sweeper] 自动关闭 ${foundRows} 个超时未支付的草稿订单（TTL ${ttlMinutes} 分钟）`);
   }
   return foundRows;
+}
+
+/** 仅供测试：清掉「每小时最多扫一次」的节流，避免测试之间互相跳过。 */
+export function __resetIdemCleanupForTest() {
+  lastIdemCleanupAt = 0;
 }
 
 /** 启动周期清扫（server 入口调用；幂等，重复调用仅多一个定时器）。

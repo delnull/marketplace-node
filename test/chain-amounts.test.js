@@ -33,7 +33,7 @@ test('decimalToWei：与 weiToDecimal 互逆（合法入参逐位一致，不丢
   }
 });
 
-test('orderCreatedMatches：orderId/买家/卖家/金额/支付资产全部属于本单才通过', () => {
+test('orderCreatedMatches：orderId/买家/店主/金额/支付资产全部属于本单才通过', () => {
   const zero = '0x0000000000000000000000000000000000000000';
   const order = {
     escrow_order_id: `0x${'aa'.repeat(32)}`,
@@ -84,7 +84,7 @@ test('orderCreatedMatches：orderId/买家/卖家/金额/支付资产全部属�
   assert.equal(orderCreatedMatches(order, args), false, '没有链上 token 读数时必须 fail-closed');
 });
 
-test('chainParamsMatch：买家/卖家/金额/验货窗口/支付资产任一项不符即拒绝', () => {
+test('chainParamsMatch：买家/店主/金额/验货窗口/支付资产任一项不符即拒绝', () => {
   const zero = '0x0000000000000000000000000000000000000000';
   const local = {
     buyer: '0x0000000000000000000000000000000000000002',

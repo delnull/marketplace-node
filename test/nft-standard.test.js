@@ -1,11 +1,13 @@
 /**
  * NFT 发布期的 ERC165 标准检测：
- * 只允许“恰好一个”ERC721/ERC1155 接口；检测值与卖家声明不一致必须拒绝；
+ * 只允许“恰好一个”ERC721/ERC1155 接口；检测值与店主声明不一致必须拒绝；
  * RPC 读不到时 retryable（路由 503），不把“不知道”放行成发布成功。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { ethers } from 'ethers';
+import config from '../src/config.js';
 import {
   checkNftStandard,
   detectNftStandard,
@@ -41,6 +43,43 @@ test('真实 ethers Contract 路径：provider.call 的 supportsInterface 返回
     },
   };
   assert.deepEqual(await detectNftStandard(CONTRACT, { provider }), { ok: true, standard: 'erc1155' });
+});
+
+test('生产路径（不注入 provider/reader）：原始 JSON-RPC 读 getCode + supportsInterface 并解码', async () => {
+  const iface = new ethers.Interface(['function supportsInterface(bytes4 interfaceId) view returns (bool)']);
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      let j = {};
+      try {
+        j = JSON.parse(body || '{}');
+      } catch {}
+      let out;
+      if (j.method === 'eth_getCode') {
+        out = { result: '0x6000' };
+      } else if (j.method === 'eth_call') {
+        const parsed = iface.parseTransaction({ data: String(j.params?.[0]?.data || '') });
+        const id = String(parsed.args[0]).toLowerCase();
+        out = { result: iface.encodeFunctionResult('supportsInterface', [id === ERC1155_INTERFACE_ID]) };
+      } else {
+        out = { error: { code: -32601, message: `unexpected ${j.method}` } };
+      }
+      res.setHeader('content-type', 'application/json');
+      res.setHeader('connection', 'close');
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: j.id ?? 1, ...out }));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const saved = config.chain.rpcUrls;
+  config.chain.rpcUrls = [`http://127.0.0.1:${server.address().port}`];
+  try {
+    assert.deepEqual(await detectNftStandard(CONTRACT), { ok: true, standard: 'erc1155' });
+  } finally {
+    config.chain.rpcUrls = saved;
+    server.close();
+    server.closeAllConnections?.();
+  }
 });
 
 test('标准检测：两个都声明/都不声明/无 ERC165 都不放行', async () => {

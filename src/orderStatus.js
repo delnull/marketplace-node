@@ -32,17 +32,17 @@ export const ORDER_STATUS = Object.freeze([
   'cancelled',
 ]);
 
-/** 在途（资金已上链且未终局）：卖家要发货、买家可确认/退款/争议 */
+/** 在途（资金已上链且未终局）：店主要发货、买家可确认/退款/争议 */
 export const ACTIVE_STATUS = Object.freeze(['escrowed', 'shipped', 'disputed']);
 
-/** 已付款但在途（含卖家尚未发货）——`/paid` 与 watcher 回写允许的来源集 */
+/** 已付款但在途（含店主尚未发货）——`/paid` 与 watcher 回写允许的来源集 */
 export const PRE_PAID_STATUS = Object.freeze(['draft', 'escrowed', 'shipped']);
 
 /**
  * 链上**仍处 `Created`、可被 `releaseExpired` 释放**的本地镜像（托管超时读数用）。
  *
  * 为什么是这两个：`escrowed`（已托管未发货）与 `shipped`（已发货买家未确认）在链上都还停在
- * `Created`——钱仍在托管里，超时窗口一到，**任何人**都能调 `releaseExpired` 把钱判给卖家。
+ * `Created`——钱仍在托管里，超时窗口一到，**任何人**都能调 `releaseExpired` 把钱判给店主。
  * 刻意排除另外两个易混状态：
  *  · `draft`    —— 本地草稿，链上根本没有单（无从谈释放）；
  *  · `disputed` —— 合约 `releaseExpired` 明确要求 `status == Created`，争议单只能走 `voteSettlement` 票决。
@@ -54,13 +54,30 @@ export const ESCROW_RELEASABLE_STATUS = Object.freeze(['escrowed', 'shipped']);
 /** 草稿 + 在途：商品维度的"在途需求"核算、库存占位计数用 */
 export const DRAFT_OR_ACTIVE_STATUS = Object.freeze(['draft', 'escrowed', 'shipped', 'disputed']);
 
-/** 入账口径（钱已到卖家手里）：看板 GMV / 流水 / 趋势 / CSV 的钱流窗口 */
+/**
+ * 商品类型变更的闸门集合：任何仍可能被后续链上事件/恢复路径推进的订单都算。
+ * `cancelled` 必须包含：支付晚到/OrderCreated 漏扫时 watcher 会把 cancelled 恢复为 escrowed，
+ * 恢复触发器按**当时的商品 kind** 记池占位；改型后这条旧单就会把计数记到错误的池上。
+ */
+export const KIND_CHANGE_BLOCK_STATUS = Object.freeze([...DRAFT_OR_ACTIVE_STATUS, 'cancelled']);
+
+/** 入账口径（钱已到店主手里）：看板 GMV / 流水 / 趋势 / CSV 的钱流窗口 */
 export const INCOME_STATUS = Object.freeze(['confirmed', 'settled', 'expired']);
+
+/**
+ * 允许回填 `order_chain.refunded_amount_wei` 的本地终态。
+ *
+ * 为什么含 `confirmed`：买家确认收货后店主仍可在留存货款里退款（SellerRefunded），
+ * 本地状态刻意停在 confirmed（不是 settled）；只按“目标状态”匹配会让这笔退款永远补不进去。
+ * 为什么不含 `expired`：超时释放是另一条终局路径，链上 Settled 的退款额不能借回填去
+ * 重盖它的 updated_at/入账窗口（见 orders.js 的 Settled 分支注释）。
+ */
+export const REFUND_BACKFILL_STATUS = Object.freeze(['confirmed', 'settled', 'refunded']);
 
 /** 可擦除个人信息的状态（资金流已终结）；与 PII_PROTECTED_STATUS 互斥且并集 = ORDER_STATUS */
 export const PII_ERASABLE_STATUS = Object.freeze(['confirmed', 'settled', 'refunded', 'expired', 'cancelled']);
 
-/** 禁止擦除的状态（在途，卖家要按地址发货） */
+/** 禁止擦除的状态（在途，店主要按地址发货） */
 export const PII_PROTECTED_STATUS = Object.freeze(['draft', 'escrowed', 'shipped', 'disputed']);
 
 /**
@@ -76,4 +93,6 @@ export const ACTIVE_IN = sqlIn(ACTIVE_STATUS);
 export const PRE_PAID_IN = sqlIn(PRE_PAID_STATUS);
 export const DRAFT_OR_ACTIVE_IN = sqlIn(DRAFT_OR_ACTIVE_STATUS);
 export const INCOME_IN = sqlIn(INCOME_STATUS);
+export const REFUND_BACKFILL_IN = sqlIn(REFUND_BACKFILL_STATUS);
+export const KIND_CHANGE_BLOCK_IN = sqlIn(KIND_CHANGE_BLOCK_STATUS);
 export const ESCROW_RELEASABLE_IN = sqlIn(ESCROW_RELEASABLE_STATUS);

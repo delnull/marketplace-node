@@ -427,3 +427,119 @@ test('回归：SKU 单价被改成超过安全整数上限的脏数据时，下�
   // 用例的前提成立：这条脏价格 ×99 确实越过了安全整数，而不是在防一个不存在的情况
   assert.equal(Number.isSafeInteger(1_000_000_000_000_000 * 99), false);
 });
+
+test('建单幂等键：同一键重试返回同一张草稿，只落一行、不重复占草稿额度', async () => {
+  const p = await listProduct(productPayload({ title: '幂等键商品' }));
+  /* 独立买家：本文件的共享 buyer 可能已被其它用例占着草稿额度，配额断言要一个干净的账本 */
+  const idemBuyer = Wallet.createRandom();
+  const idemToken = (await login(ctx, idemBuyer)).token;
+  assert.ok(idemToken);
+  const key = `test-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const post = (idemKey = key) =>
+    request(app)
+      .post('/api/orders')
+      .set('Authorization', `Bearer ${idemToken}`).set('X-Mk-Shop', shopRef.value)
+      .send({ productSlug: p.slug, quantity: 1, buyer: idemBuyer.address, idempotencyKey: idemKey });
+
+  const first = await post();
+  const second = await post();
+  assertOk(first);
+  assertOk(second);
+  assert.equal(second.body.data.id, first.body.data.id, '同一幂等键必须回放同一张草稿');
+  assert.notEqual(first.body.data.replayed, true, '新建响应不带回放标记');
+  assert.equal(second.body.data.replayed, true, '回放响应必须带 replayed=true，前端据此决定是否核对旧快照');
+  assert.equal(
+    (await db.get('SELECT COUNT(*) AS c FROM orders WHERE product_slug = ?', p.slug)).c,
+    1,
+    '重试不得落第二行'
+  );
+  /* 同一键拿去建另一件商品：是客户端复用错误，明确 409，不回放错单 */
+  const other = await listProduct(productPayload({ title: '幂等键另一商品' }));
+  const cross = await request(app)
+    .post('/api/orders')
+    .set('Authorization', `Bearer ${idemToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ productSlug: other.slug, quantity: 1, buyer: idemBuyer.address, idempotencyKey: key });
+  assert.equal(cross.status, 409);
+  assert.match(String(cross.body.message), /另一笔商品/);
+  /* 额度只占一次：再来 9 张不同键的草稿正好到 10，第 11 张被拒 */
+  for (let i = 0; i < 9; i += 1) {
+    assertOk(await post(`${key}-${i}`));
+  }
+  const over = await post(`${key}-over`);
+  assert.match(blocked(over), /未支付草稿过多/);
+  assert.equal(openTransactions(), 0);
+
+  /* 非法格式：明确 400，不静默忽略 */
+  const badFormat = await post('bad key!');
+  assert.equal(badFormat.status, 400);
+  assert.match(String(badFormat.body.message), /幂等键格式非法/);
+});
+
+test('建单幂等键回放：规格与支付资产也属于购买意图，不能被回放错单', async () => {
+  const token = '0x2222222222222222222222222222222222222222';
+  await seedPaymentToken(token);
+  try {
+    const p = await listProduct(
+      productPayload({
+        title: '幂等规格资产商品',
+        specs: [{ name: '颜色', options: ['红', '蓝'] }],
+        skus: [
+          { key: '红', priceMicro: 88_000_000, capacity: null },
+          { key: '蓝', priceMicro: 88_000_000, capacity: null },
+        ],
+      })
+    );
+    const idemBuyer = Wallet.createRandom();
+    const idemToken = (await login(ctx, idemBuyer)).token;
+    const key = `spec-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const post = (body) =>
+      request(app)
+        .post('/api/orders')
+        .set('Authorization', `Bearer ${idemToken}`).set('X-Mk-Shop', shopRef.value)
+        .send({ productSlug: p.slug, quantity: 1, buyer: idemBuyer.address, idempotencyKey: key, ...body });
+
+    const first = await post({ skuKey: '红', paymentToken: token });
+    const second = await post({ skuKey: '红', paymentToken: token });
+    assertOk(first);
+    assertOk(second);
+    assert.equal(second.body.data.id, first.body.data.id, '同规格同支付资产必须回放同一张草稿');
+
+    const otherSku = await post({ skuKey: '蓝', paymentToken: token });
+    assert.equal(otherSku.status, 409, '同键换规格不得回放旧草稿');
+    assert.match(String(otherSku.body.message), /另一笔购买意图/);
+
+    const otherPay = await post({ skuKey: '红' });
+    assert.equal(otherPay.status, 409, '同键换支付资产不得回放旧草稿');
+    assert.match(String(otherPay.body.message), /另一笔购买意图/);
+  } finally {
+    await clearPaymentToken(token);
+  }
+});
+
+test('建单幂等键：并发同键只落一张，另一张回放同一张草稿', async () => {
+  const p = await listProduct(productPayload({ title: '幂等并发商品' }));
+  const idemBuyer = Wallet.createRandom();
+  const idemToken = (await login(ctx, idemBuyer)).token;
+  const key = `conc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const send = () =>
+    request(app)
+      .post('/api/orders')
+      .set('Authorization', `Bearer ${idemToken}`).set('X-Mk-Shop', shopRef.value)
+      .send({ productSlug: p.slug, quantity: 1, buyer: idemBuyer.address, idempotencyKey: key });
+
+  const [a, b] = await Promise.all([send(), send()]);
+  assertOk(a);
+  assertOk(b);
+  assert.equal(a.body.data.id, b.body.data.id, '两个并发请求必须收敛到同一张草稿');
+  assert.equal(
+    [a, b].filter((r) => r.body.data.replayed === true).length,
+    1,
+    '并发重复里恰好一笔是回放（另一笔是真正建单），前端据此只对回放核对旧快照'
+  );
+  assert.equal(
+    (await db.get('SELECT COUNT(*) AS c FROM orders WHERE product_slug = ?', p.slug)).c,
+    1,
+    '并发重复不得落第二行'
+  );
+  assert.equal(openTransactions(), 0);
+});

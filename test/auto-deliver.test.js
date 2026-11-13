@@ -1,6 +1,6 @@
 /**
  * 卡密自动交付（autoDeliver）：数字商品（卡密/兑换码）订单进入 escrowed 后
- * 自动从码池分配未用码置 shipped——无需卖家手动发货。
+ * 自动从码池分配未用码置 shipped——无需店主手动发货。
  *
  * 覆盖两条触发路径：
  *  - watcher 权威路径：await applyEvent('OrderCreated') 回写 escrowed 后自动发码（异步）；
@@ -194,13 +194,13 @@ test('watcher 路径：链上已申请退款（本地镜像尚未落地）不得
   assert.equal(await waitStatus(draft.id, 'shipped', 120), false, '链上已冻结：不得置 shipped');
   setChainOrderFetcher(chainSaysOpen);
 
-  assert.equal((await rowOf(draft.id)).status, 'escrowed', '链上已申请退款 ⇒ 不得发码，保留 escrowed 等卖家处置');
+  assert.equal((await rowOf(draft.id)).status, 'escrowed', '链上已申请退款 ⇒ 不得发码，保留 escrowed 等店主处置');
   assert.deepEqual(await itemsOf(draft.id), [], '不得写入任何交付行');
   const stillUnused = await db.get("SELECT status FROM product_codes WHERE code = 'FROZEN-KEY-1'");
   assert.equal(stillUnused.status, 'unused', '码必须留在池里');
 });
 
-test('watcher 路径：链上真值读不到时**不发码**（fail-safe，宁可留给卖家手动交付）', async () => {
+test('watcher 路径：链上真值读不到时**不发码**（fail-safe，宁可留给店主手动交付）', async () => {
   const { ownerToken, slug } = await listDigital({ title: 'watcher 读不到链商品' });
   await importCodes(ownerToken, slug, ['NORPC-KEY-1']);
 
@@ -265,7 +265,7 @@ test('paid 快路径：链上已申请退款而本地镜像尚未落地时，不
     setChainOrderFetcher(chainSaysOpen);
   }
 
-  assert.equal((await rowOf(order.id)).status, 'escrowed', '订单保持 escrowed 等卖家处置');
+  assert.equal((await rowOf(order.id)).status, 'escrowed', '订单保持 escrowed 等店主处置');
   assert.deepEqual(await itemsOf(order.id), [], '不得写入任何交付行');
   assert.equal(
     (await db.get("SELECT status FROM product_codes WHERE code = 'PAID-FROZEN-1'")).status,
@@ -274,7 +274,7 @@ test('paid 快路径：链上已申请退款而本地镜像尚未落地时，不
   );
 });
 
-test('paid 快路径：链上真值读不到时不发码（fail-safe，宁可留给卖家手动交付）', async () => {
+test('paid 快路径：链上真值读不到时不发码（fail-safe，宁可留给店主手动交付）', async () => {
   const { ownerToken, slug } = await listDigital({ title: 'paid 读不到链商品' });
   await importCodes(ownerToken, slug, ['PAID-NORPC-1']);
   const order = await escrowedOrder(slug);
@@ -304,15 +304,15 @@ test('审计 P1-1：退款冻结期（refund_status=requested）不自动交付�
   // 链上真值同步（申请待决 ⇒ refundRequested=true）：交付判据在链上，桩必须说同一件事
   setChainOrderFetcher(() => ({ status: 'Created', refundRequested: true, refundRejected: false, refundedAmount: '0' }));
 
-  // paid 钩子路径：冻结期不得自动发码（此前卖家 approveRefund = 钱退+码送出双损）
+  // paid 钩子路径：冻结期不得自动发码（此前店主 approveRefund = 钱退+码送出双损）
   assert.equal(await deliveryOnPaid(order), false, '冻结期自动交付应被拦截');
-  assert.equal((await rowOf(order.id)).status, 'escrowed', '冻结期订单保持 escrowed 等待卖家决策');
+  assert.equal((await rowOf(order.id)).status, 'escrowed', '冻结期订单保持 escrowed 等待店主决策');
 
   // 码池补货补跑路径同守卫（tryAutoDeliverPendingForProduct 遍历同样走 tryAutoDeliverOrder）
   const { tryAutoDeliverPendingForProduct } = await import('../src/autoDeliver.js');
   assert.equal(await tryAutoDeliverPendingForProduct(fr.product_id), 0, '补跑不得向冻结期订单发码');
 
-  // 卖家拒绝退款（rejected，解锁争议资格）后恢复可自动交付（与 /ship 门控一致：
+  // 店主拒绝退款（rejected，解锁争议资格）后恢复可自动交付（与 /ship 门控一致：
   // 仅 requested 冻结期拒发；rejected 后订单重回可发货态）
   await applyEvent('RefundRejected', { orderId: order.escrowOrderId });
   assert.equal((await rowOf(order.id)).refund_status, 'rejected');
@@ -321,14 +321,14 @@ test('审计 P1-1：退款冻结期（refund_status=requested）不自动交付�
   assert.equal((await rowOf(order.id)).status, 'shipped');
 });
 
-test('无码池数字商品：保持 escrowed 等待卖家手动交付（交付表单兜底）', async () => {
+test('无码池数字商品：保持 escrowed 等待店主手动交付（交付表单兜底）', async () => {
   const { slug } = await listDigital(); // 未导入任何码
   const order = await escrowedOrder(slug);
   assert.equal(await deliveryOnPaid(order), false);
   assert.equal((await rowOf(order.id)).status, 'escrowed', '无码池不得自动发货');
 });
 
-test('实物商品：永不自动交付（需卖家后台填物流发货）', async () => {
+test('实物商品：永不自动交付（需店主后台填物流发货）', async () => {
   const { slug } = await listDigital({ kind: 'physical', priceMicro: 88_000_000 });
   const order = await escrowedOrder(slug);
   assert.equal(await deliveryOnPaid(order), false);
@@ -485,7 +485,7 @@ test('码池补货自动补发：池空滞留的 escrowed 订单在导入码后�
   // 同上：`product_codes.order_id` 是内部主键，接口给的 `order.id` 是订单号
   assert.equal(used.order_id, await orderIdOf(db, order.id));
 
-  // 行级关闭（autoDeliver=0）的商品：补货不自动补发（保持 escrowed 由卖家手动交付）
+  // 行级关闭（autoDeliver=0）的商品：补货不自动补发（保持 escrowed 由店主手动交付）
   const off = await listDigital({ title: '补货不自动补发商品' });
   await patchProduct(off.ownerToken, off.slug, { autoDeliver: 0 });
   const offOrder = await escrowedOrder(off.slug);
@@ -503,7 +503,7 @@ test('码池补货自动补发：池空滞留的 escrowed 订单在导入码后�
 /**
  * 源码评审 2026-09（P1）：补货补跑曾经只看**本地镜像**（`refund_status === 'requested'`），
  * 而镜像有 15s 轮询 + 12 块确认深度的滞后窗口。买家已在链上申请退款、watcher 还没落地的这段时间里，
- * 店主一导入码就会把码发给一个即将退款的买家（卖家随后 approveRefund ⇒ 钱退+码送出，双损）。
+ * 店主一导入码就会把码发给一个即将退款的买家（店主随后 approveRefund ⇒ 钱退+码送出，双损）。
  * 本用例把"链上说已申请退款、本地镜像仍说 none"这个**真实窗口**造出来：
  * 不带链上复核的实现会在这里发出码（autoDelivered=1），修好后必须是 0。
  */
@@ -522,7 +522,7 @@ test('码池补货补跑：链上已申请退款（镜像尚未落地）不得�
       .expect(200);
     assertOk(res);
     assert.equal(res.body.data.autoDelivered, 0, '链上已申请退款 ⇒ 不得补发');
-    assert.equal((await rowOf(order.id)).status, 'escrowed', '订单保持 escrowed，等卖家决策');
+    assert.equal((await rowOf(order.id)).status, 'escrowed', '订单保持 escrowed，等店主决策');
     const code = await db.get('SELECT status FROM product_codes WHERE code = ?', 'LATE-REFUND-1');
     assert.equal(code.status, 'unused', '码不能被占用（否则退款后买家白拿码）');
   } finally {

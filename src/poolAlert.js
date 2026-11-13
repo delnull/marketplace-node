@@ -3,12 +3,12 @@
  *
  * 问题：数字商品（码池 product_codes）与 NFT 商品（tokenId 池 product_nft_tokens）是
  * **下单不占位**的池式交付（无限量、下单时只锁价不锁资源），池子可能在「买家建草稿」与
- * 「链上托管落定」之间被别的订单掏空。此时买家已经付了钱、链上也已 OrderCreated，而卖家
- * 无从自动交付——此前只有卖家面板里的 `poolEmpty` 字段标着，**卖家不去看就不会知道**，
+ * 「链上托管落定」之间被别的订单掏空。此时买家已经付了钱、链上也已 OrderCreated，而店主
+ * 无从自动交付——此前只有店主面板里的 `poolEmpty` 字段标着，**店主不去看就不会知道**，
  * 而买家那边钱已经出去了。本模块在订单进入 escrowed 的那一刻主动推店主 webhook。
  *
  * 为什么要有这个模块而不是在 orders.js 里就地判断：
- *  - 判定口径（哪些商品算池式、需求量怎么算、池里可用量怎么读）必须与卖家面板的
+ *  - 判定口径（哪些商品算池式、需求量怎么算、池里可用量怎么读）必须与店主面板的
  *    `poolEmpty` **完全一致**（见 poolShortfallOf），否则会出现"面板显示缺货但没告警"或反之；
  *  - 两条触发路径（paid 快路径与 watcher 事件回写）都要告警，只能有一份实现。
  *
@@ -19,7 +19,7 @@
  * payload 只含订单号/链上单号/原因——不含收货信息、买家地址（与 webhook.js 的隐私边界一致）。
  *
  * 快照读不到时**不当作"没有池"**（2026-10 修复）：订单快照 `orders.product_snapshot` 解析失败
- * 原先被折成 `{}` ⇒ `poolBacked=false` ⇒ 缺货告警与卖家面板 `poolEmpty` 一起静默消失
+ * 原先被折成 `{}` ⇒ `poolBacked=false` ⇒ 缺货告警与店主面板 `poolEmpty` 一起静默消失
  * （买家钱已上链、货交不出，却没有任何人被告知）。现在走"读不到池快照"的分支：
  * console.warn 指明哪张快照/哪一单/什么错，且在 escrowed（钱已锁）时照样**至少告警一次**
  * （reason 如实说"读不到快照、无法确认可交付"，**不编**缺货数量）。见 poolShortfallOf。
@@ -45,7 +45,7 @@ import { notifyRaw } from './webhook.js';
 import { alertOnceDelivered } from './alertAck.js';
 
 /**
- * 池式交付的缺口核算（**唯一实现**；卖家面板 poolEmpty 与主动告警共用）。
+ * 池式交付的缺口核算（**唯一实现**；店主面板 poolEmpty 与主动告警共用）。
  * @param {object} order `v_orders` 行（需 order_id / order_no / status / quantity / product_id / product_snapshot）
  * @returns {{poolBacked:boolean|null, kind:'digital'|'nft'|null, need:number, available:number, short:boolean}}
  *  need：digital 一次性需 quantity 个；nft 按剩余需求 = quantity − 已交付行数（支持分批交付）。
@@ -55,7 +55,7 @@ import { alertOnceDelivered } from './alertAck.js';
  *   · `false` 快照可读但确证不是池式商品，或订单不在 escrowed（未托管/已交付/已终局）——
  *     此时**没有缺口语义**（钱没锁，或本来就没有池）；
  *   · `null`  **读不到快照**（JSON 解析失败 / 不是 JSON 对象）。
- *     旧实现把这一种折成 `{}` ⇒ `poolBacked=false` ⇒ 缺货告警与卖家面板 `poolEmpty`
+ *     旧实现把这一种折成 `{}` ⇒ `poolBacked=false` ⇒ 缺货告警与店主面板 `poolEmpty`
  *     **一起静默消失**：买家钱已上链、货交不出，却没有任何人被告知（本模块存在的唯一理由）。
  *     所以这里不再兜：读不到就报读不到（console.warn 说明是哪张快照、什么错），
  *     并在 escrowed（钱已锁）时把 short 置 true——"无法确认可交付"必须有人处理，不沉默。
@@ -120,7 +120,7 @@ export async function poolShortfallOf(order, preloaded = null) {
 }
 
 /**
- * 卖家面板/买家详情的 `poolEmpty` 字段（布尔，**无法表达三态**）。
+ * 店主面板/买家详情的 `poolEmpty` 字段（布尔，**无法表达三态**）。
  * 判据只有一处（上面的 poolShortfallOf），这里只是取它的结果：
  * 确证缺货 → true；读不到快照且已 escrowed → 也 true（否则就是"钱已付、货可能交不出却没人被告知"）。
  * 代价（如实写）：这一格是布尔，读不到快照时界面文案说的是"交付资源用尽/正在补货"——
@@ -132,8 +132,8 @@ export async function isPoolEmpty(order, preloaded = null) {
 }
 
 /**
- * 批量预取卖家列表的池缺口上下文：可用量按 kind 一次读、NFT 已交付数一次读。
- * 没有这一层时卖家列表每行 1–2 次查询，100 行就是 100+ 次。
+ * 批量预取店主列表的池缺口上下文：可用量按 kind 一次读、NFT 已交付数一次读。
+ * 没有这一层时店主列表每行 1–2 次查询，100 行就是 100+ 次。
  */
 export async function loadPoolContext(orders) {
   const list = (orders || []).filter(Boolean);

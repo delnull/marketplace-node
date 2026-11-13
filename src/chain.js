@@ -8,7 +8,7 @@
  *  - 地址/金额工具（checksum、wei ↔ 小数）。
  *
  * 节点不读取任何 Registry：Registry 只做目录展示，不是本节点的运行依赖。
- * 每个节点部署自己的 Escrow（带委员会）与 Staking（卖家保证金），用
+ * 每个节点部署自己的 Escrow（带委员会）与 Staking（店主保证金），用
  * `MK_ESCROW_ADDRESS` / `MK_STAKING_ADDRESS` 接线。**没有平台费、没有节点抽成、
  * 没有店铺链上登记、没有地址黑名单**——店铺/商品/订单明细/费用全在节点自己的库里。
  * 支付资产：原生 BTY + 节点配置并已在 Escrow 白名单开启的 ERC20（见 paymentTokens.js）。
@@ -17,29 +17,31 @@
  * 可显式传入 network 参数避免未知网络校验。
  */
 import { ethers } from 'ethers';
+import http from 'node:http';
+import https from 'node:https';
 import config from './config.js';
 import { redisGetJson, redisSetJson } from './redis.js';
 
 // ── Escrow 合约 ABI（与 contracts/src/Escrow.sol 对齐；只含本节点需要的部分）──
 export const ESCROW_ABI = [
   // 事件（watcher 依赖，topic 与链上一致）。OrderCreated **不再带 host**：
-  // 订单只属于本节点这一份 Escrow，店铺与卖家是节点链下的事实。
+  // 订单只属于本节点这一份 Escrow，店铺与店主是节点链下的事实。
   'event OrderCreated(bytes32 indexed orderId, address indexed buyer, address indexed seller, uint256 amount)',
   'event ReceiptConfirmed(bytes32 indexed orderId)',
   'event DisputeRequested(bytes32 indexed orderId)',
-  // refundWei：裁给买家的金额（0=全额判卖家，=amount=全额退买家，中间值=拆分结算）
+  // refundWei：裁给买家的金额（0=全额判店主，=amount=全额退买家，中间值=拆分结算）
   'event Arbitrated(bytes32 indexed orderId, uint256 refundWei)',
   'event OrderExpiredReleased(bytes32 indexed orderId)',
   'event RefundRequested(bytes32 indexed orderId)',
   'event RefundRejected(bytes32 indexed orderId)',
-  // refundWei：卖家同意的退款金额。合约只接受两种金额：
+  // refundWei：店主同意的退款金额。合约只接受两种金额：
   //   · refundWei == amount                        → 全额认赔（不需要任何授权）
   //   · refundWei == acceptedPartialRefund[orderId] → 买家已**精确授权**过的那个数
   'event RefundApproved(bytes32 indexed orderId, uint256 refundWei)',
   // 买家对**具体金额**的部分退款授权（= 让"双方已谈拢的部分退款"不必绕道仲裁人）。
   'event PartialRefundAccepted(bytes32 indexed orderId, uint256 refundWei)',
   // 确认收货后的**售后案件**（本地镜像的唯一判据见 src/afterSale.js）：
-  // 它只影响售后裁决；赔款只从 Staking 的卖家保证金出（BTY），不在留存货款里扣。
+  // 它只影响售后裁决；赔款只从 Staking 的店主保证金出（BTY），不在留存货款里扣。
   'event AfterSaleOpened(bytes32 indexed orderId, address indexed buyer, address indexed seller)',
   'event AfterSaleClosed(bytes32 indexed orderId, address indexed by, string note)',
   'event SellerPendingAccrued(bytes32 indexed orderId, address indexed seller, uint256 amount, uint64 unlockBlock)',
@@ -113,17 +115,17 @@ export const ESCROW_ABI = [
   'function settledAtBlock(bytes32 orderId) view returns (uint64)',
   'function afterSaleWindowBlocksOf(bytes32 orderId) view returns (uint64)',
   /*
-    该卖家当前的**在途售后敞口**（wei）= Σ 在途单（退款申请待决 + 争议中）的 amount。
+    该店主当前的**在途售后敞口**（wei）= Σ 在途单（退款申请待决 + 争议中）的 amount。
     它是 `Staking.payoutFloors` 的唯一读数来源 ⇒ 缺这个读法时四条出金路径整体 revert。
   */
   'function sellerOpenExposure(address seller) view returns (uint256)',
   'function totalOpenExposure() view returns (uint256)',
-  /// 判给卖家时的**实收净额**（零费模型下 = amount − refundedAmount）——Staking 罚没上限基准
+  /// 判给店主时的**实收净额**（零费模型下 = amount − refundedAmount）——Staking 罚没上限基准
   'function sellerNetAtSettle(bytes32 orderId) view returns (uint256)',
   /*
     托管超时的**链上阈值**（前端 utils/escrowCountdown 同判据）：
     释放允许当且仅当 `latestBlock > releaseNotBeforeBlock(orderId)`。刻意不自己用
-    `createdAtBlock + timeoutBlocks` 算一遍——合约在这之上还叠了"卖家拒绝退款后的释放静置期"。
+    `createdAtBlock + timeoutBlocks` 算一遍——合约在这之上还叠了"店主拒绝退款后的释放静置期"。
     ⚠️ 若 `refundRequested` 仍为真，释放被**永久**禁止，此时本函数返回的 T 没有意义。
   */
   'function releaseNotBeforeBlock(bytes32 orderId) view returns (uint64)',
@@ -139,7 +141,7 @@ export const ESCROW_ABI = [
     提货争议读法：
       · `claimCase(claimId)` = (orderId, tokenRef, seller, claimant, amount, deadline, openedAt, closed)
         8 个字段，按位置解码；
-      · `sellerClaimExposure(seller)` = 卖家在途提货争议敞口（开案锁定、结案释放）；
+      · `sellerClaimExposure(seller)` = 店主在途提货争议敞口（开案锁定、结案释放）；
       · `claimTallyOf(claimId, amountWei)` = 该金额的已投票数。
   */
   'function claimCase(bytes32 claimId) view returns (bytes32 orderId, bytes32 tokenRef, address seller, address claimant, uint256 amount, uint64 deadline, uint64 openedAt, bool closed)',
@@ -233,19 +235,51 @@ function zeroArgsFor(kind) {
  * nonce≈6e18），ethers v6 的 getBlock 解析会因 nonce 溢出崩溃——凡涉及区块对象的读取
  * 一律走原始 JSON-RPC。端点列表见 config.chain.rpcUrls；前面的失败才轮到后面的。
  *
- * 每次尝试 15 秒超时：RPC 挂起（TCP 黑洞/节点无响应）时若无超时，轮询器会永久卡住。
+ * 为什么用 `node:http(s)` 而不是 `globalThis.fetch`：
+ *   ① 测试/运行期可能替换 globalThis.fetch（本仓测试套件就把它禁掉，防止外呼行情），
+ *      链上读不该被那把"外部网络总开关"误伤；
+ *   ② 与 ethers 在 Node 下的实现同一条路（node:http），行为/代理/证书语义一致；
+ *   ③ 用 `AbortSignal.timeout` 交给 http.request，超时**真正中止连接**。
  */
 async function rpcAt(url, method, params, { timeoutMs = 15_000 } = {}) {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-    signal: AbortSignal.timeout(timeoutMs),
+  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+  const target = new URL(url);
+  const mod = target.protocol === 'https:' ? https : http;
+  const json = await new Promise((resolve, reject) => {
+    const req = mod.request(
+      target,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+        signal: AbortSignal.timeout(timeoutMs),
+      },
+      (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        /* 响应中途 RST/连接被掐：不监听这两个事件就只能等 AbortSignal.timeout 到点 */
+        res.on('error', reject);
+        res.on('aborted', () => reject(new Error('响应被中止')));
+        res.on('data', (chunk) => {
+          raw += chunk;
+        });
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`HTTP ${res.statusCode}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(raw));
+          } catch (e) {
+            reject(new Error(`响应不是 JSON：${e?.message || e}`));
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.end(body);
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const j = await res.json();
-  if (j.error) throw new Error(`${method}: ${j.error?.message || JSON.stringify(j.error)}`);
-  return j.result;
+  if (json.error) throw new Error(`${method}: ${json.error?.message || JSON.stringify(json.error)}`);
+  return json.result;
 }
 
 /** 错误信息里只留 host：RPC URL 可能含 API key，日志不该把它带出去。 */
@@ -260,12 +294,25 @@ function rpcHostOf(url) {
 /**
  * 按配置顺序尝试所有 RPC 端点；全部失败才抛错（错误里带每个端点的 host + 原因）。
  * 返回第一个成功端点的结果。
+ *
+ * `deadline`（绝对时间戳，毫秒）是**整轮**的总预算：给了它，单次尝试只拿
+ * `min(timeoutMs, 剩余)`，到点不再尝试下一条。`rpcAt` 用 `AbortSignal.timeout`
+ * 真正中止 fetch——不是"外层 race 超时、底层请求还在跑"。
  */
-export async function rpcRequest(method, params, { timeoutMs = 15_000, urls = config.chain.rpcUrls } = {}) {
+export async function rpcRequest(
+  method,
+  params,
+  { timeoutMs = 15_000, urls = config.chain.rpcUrls, deadline = 0 } = {}
+) {
   const errors = [];
   for (const url of urls) {
+    const remaining = deadline ? deadline - Date.now() : timeoutMs;
+    if (remaining <= 0) {
+      errors.push('总预算已用尽');
+      break;
+    }
     try {
-      return await rpcAt(url, method, params, { timeoutMs });
+      return await rpcAt(url, method, params, { timeoutMs: Math.min(timeoutMs, remaining) });
     } catch (e) {
       errors.push(`${rpcHostOf(url)}：${String(e?.message || e).slice(0, 160)}`);
     }
@@ -287,7 +334,7 @@ export async function assertChainId() {
   for (const url of urls) {
     let got;
     try {
-      got = Number(await rpcAt(url, 'eth_chainId', [], { timeoutMs: 5_000 }));
+      got = Number(await rpcAt(url, 'eth_chainId', [], { timeoutMs: 10_000 }));
     } catch (e) {
       unreachable.push(`${rpcHostOf(url)}：${String(e?.message || e).slice(0, 120)}`);
       continue;
@@ -460,7 +507,7 @@ export function markPinnedProviderFailure(url) {
   if (url) pinnedFailures.set(String(url), Date.now());
 }
 
-export async function getPinnedProvider({ timeoutMs = 5_000 } = {}) {
+export async function getPinnedProvider({ timeoutMs = 10_000 } = {}) {
   assertNoChainIdDrift();
   const network = new ethers.Network('bityuan', config.chain.chainId);
   const urls = pinnedUrlOrder();
@@ -567,9 +614,20 @@ const ERC1271_IFACE = new ethers.Interface([
 const ERC1271_MAGIC = '0x1626ba7e';
 const SAFE_LEGACY_MAGIC = '0x20c13b0b';
 
-/** `eth_getCode` 短缓存 + 单次超时：1271 验签不能被一次挂死的 RPC 拖住整个请求。 */
+/**
+ * `eth_getCode` 短缓存 + 单次超时：1271 验签不能被一次挂死的 RPC 拖住整个请求。
+ *
+ * **1.2 秒是"本机 RPC"的预算，不是公网的**：FallbackProvider 的 stall 轮换本身要 2 秒，
+ * 外层 1.2 秒会先到点——慢但活着的端点永远轮不到，结果是把"这次没读到"折成
+ * "这个地址不是合约 / 签名无效"（fail-closed 变成"假否定"）。单次 8 秒（多端点时
+ * 大于 stall + 一次读），但**一次验签另有 10 秒总预算**（getCode + 两条 1271 重载是串行的）：
+ * 否则 3 × 8 = 24 秒会顶到前端登录的 30 秒默认超时。Redis 缓存段另有 1 秒上限（缓存是增强，
+ * 不能把登录挂在一个慢 Redis 上）。
+ */
 const CODE_CACHE_TTL_MS = 60_000;
-const CODE_CALL_TIMEOUT_MS = 1_200;
+const CODE_CALL_TIMEOUT_MS = 8_000;
+const VERIFY_TOTAL_BUDGET_MS = 10_000;
+const CODE_CACHE_TIMEOUT_MS = 1_000;
 
 function withTimeout(promise, ms) {
   return new Promise((resolve, reject) => {
@@ -581,14 +639,20 @@ function withTimeout(promise, ms) {
   });
 }
 
-async function codeAt(address, provider) {
+async function codeAt(address, deadline) {
   const key = String(address).toLowerCase();
   // code 在地址生命周期内基本不变；Redis 让同一节点的多个进程共享一次 eth_getCode，
-  // 不再各自维护一个 60s 的进程内 Map。
-  const cached = await redisGetJson(`chain-code:${key}`);
+  // 不再各自维护一个 60s 的进程内 Map。缓存读/写都是**增强**：慢/挂时按未命中处理。
+  const cached = await withTimeout(redisGetJson(`chain-code:${key}`), CODE_CACHE_TIMEOUT_MS).catch(() => null);
   if (typeof cached === 'string' && cached.startsWith('0x')) return cached;
-  const code = await withTimeout(provider.getCode(key), CODE_CALL_TIMEOUT_MS);
-  await redisSetJson(`chain-code:${key}`, code, CODE_CACHE_TTL_MS);
+  const remaining = deadline ? Math.max(1, deadline - Date.now()) : CODE_CALL_TIMEOUT_MS;
+  const code = String(
+    (await rpcRequest('eth_getCode', [key, 'latest'], {
+      timeoutMs: Math.min(CODE_CALL_TIMEOUT_MS, remaining),
+      deadline,
+    })) || '0x'
+  );
+  await withTimeout(redisSetJson(`chain-code:${key}`, code, CODE_CACHE_TTL_MS), CODE_CACHE_TIMEOUT_MS).catch(() => undefined);
   return code;
 }
 
@@ -599,8 +663,12 @@ function asBytes(value) {
   return s.startsWith('0x') ? ethers.getBytes(s) : ethers.toUtf8Bytes(s);
 }
 
-async function call1271(provider, signer, data) {
-  const ret = await withTimeout(provider.call({ to: String(signer).toLowerCase(), data }), CODE_CALL_TIMEOUT_MS);
+async function call1271(signer, data, deadline) {
+  const remaining = deadline ? Math.max(1, deadline - Date.now()) : CODE_CALL_TIMEOUT_MS;
+  const ret = await rpcRequest('eth_call', [{ to: String(signer).toLowerCase(), data }, 'latest'], {
+    timeoutMs: Math.min(CODE_CALL_TIMEOUT_MS, remaining),
+    deadline,
+  });
   return String(ret || '0x');
 }
 
@@ -612,12 +680,16 @@ async function call1271(provider, signer, data) {
  * 签的是 Safe EIP-712 的 `SafeMessage(inner)`，标准路径永远不中，它对应 legacy bytes 重载
  * （`0x20c13b0b`，必须传 inner 原始字节）。两次调用都是 fail-closed。
  */
-export async function isValidContractSignature(signer, inner, digest, signature, provider = null) {
+export async function isValidContractSignature(signer, inner, digest, signature) {
   if (!isAddress(signer)) return false;
-  let p;
+  /*
+    整次验签的总预算：getCode + 标准 1271 + Safe legacy 只能落在 10 秒内。
+    三次读都走 `rpcRequest`（`AbortSignal.timeout`）——到点会**真正中止** fetch，
+    不是外层 race 超时、底层 eth_call 还在跑。
+  */
+  const deadline = Date.now() + VERIFY_TOTAL_BUDGET_MS;
   try {
-    p = provider || getProvider();
-    const code = await codeAt(signer, p);
+    const code = await codeAt(signer, deadline);
     if (code === '0x') return false;
   } catch {
     return false;
@@ -628,7 +700,7 @@ export async function isValidContractSignature(signer, inner, digest, signature,
       String(digest),
       String(signature),
     ]);
-    const ret = await call1271(p, signer, data);
+    const ret = await call1271(signer, data, deadline);
     const decoded = ERC1271_IFACE.decodeFunctionResult('isValidSignature(bytes32,bytes)', ret);
     if (String(decoded[0]).toLowerCase() === ERC1271_MAGIC) return true;
   } catch {
@@ -640,7 +712,7 @@ export async function isValidContractSignature(signer, inner, digest, signature,
       asBytes(inner),
       String(signature),
     ]);
-    const ret = await call1271(p, signer, data);
+    const ret = await call1271(signer, data, deadline);
     const decoded = ERC1271_IFACE.decodeFunctionResult('isValidSignature(bytes,bytes)', ret);
     const magic = String(decoded[0]).toLowerCase();
     return magic === SAFE_LEGACY_MAGIC || magic === ERC1271_MAGIC;
@@ -872,8 +944,17 @@ let _committeeLastAttempt = null;
 let _committeeInflight = null;
 const COMMITTEE_TTL_MS = 60_000;
 const COMMITTEE_ERROR_TTL_MS = 5_000;
-/** 单次委员会链上读的硬超时（公开详情页会 force 读，不能无限挂起） */
-const COMMITTEE_RPC_TIMEOUT_MS = 2_000;
+/**
+ * 单次委员会链上读的硬超时（公开详情页会 force 读，不能无限挂起）。
+ *
+ * 2 秒是旧值：它比 FallbackProvider 的 2 秒 stall 轮换还短，慢但可用的端点还没轮到就被
+ * 判成"读不到委员会"，随后 `getCommittee` 返回 null（fail-closed）——界面于是说"名单没读到"，
+ * 仲裁/售后入口暂时不可用。单次 8 秒，但**整次加载另有 10 秒总预算**（核心 3 读 + ≤20 个
+ * 撤销读都要落在里面）：否则 force 路径的 8s + 8s = 16s 会让公开详情页挂太久。
+ * 代价：RPC 真黑洞时，这一页最多多等 10 秒（之后按"读不到"处理，不会折成空名单）。
+ */
+const COMMITTEE_RPC_TIMEOUT_MS = 8_000;
+const COMMITTEE_TOTAL_BUDGET_MS = 10_000;
 /*
   委员会缓存**只有当前名单一份**：订单/提货案不再快照届次，`committeeForOrder` 与
   `getCommittee` 是同一个读数。缓存失效由 CommitteeUpdated/ArbiterRevoked 事件触发。
@@ -934,18 +1015,30 @@ async function eligibleCommitteeMembers(members, revokedOf) {
   const list = Array.isArray(members) ? members.map((m) => String(m).toLowerCase()) : [];
   const keep = await Promise.all(list.map(async (m) => {
     /*
-      每个 revokedArbiter 读都加超时：委员会最多 20 人，公开详情页（争议/售后单）会对
-      每个成员发一次读；RPC 卡住时不能让一个匿名请求把整条事件循环挂在这里。
+      每个 revokedArbiter 读都走同一次加载的 `rpcRequest`（带 deadline，超时真中止）：
+      委员会最多 20 人，公开详情页（争议/售后单）会对每个成员发一次读；
+      RPC 卡住时不能让一个匿名请求把整条事件循环挂在这里。
       超时/失败 ⇒ null ⇒ 该成员被排除（fail-closed）。
     */
     const revoked = revokedOf
-      ? await withTimeout(Promise.resolve(revokedOf(m)), COMMITTEE_RPC_TIMEOUT_MS)
+      ? await Promise.resolve(revokedOf(m))
           .then((v) => v === true)
           .catch(() => null)
       : false;
     return revoked === false;
   }));
   return list.filter((_, i) => keep[i]);
+}
+
+/** 委员会读：走原始 JSON-RPC（node:http + deadline），不再用 provider 的 race */
+async function readEscrowCall(escrow, fn, args, deadline) {
+  const data = escrow.interface.encodeFunctionData(fn, args);
+  const raw = await rpcRequest('eth_call', [{ to: String(escrow.target), data }, 'latest'], {
+    timeoutMs: COMMITTEE_RPC_TIMEOUT_MS,
+    deadline,
+  });
+  const res = escrow.interface.decodeFunctionResult(fn, raw);
+  return res.length === 1 ? res[0] : res;
 }
 
 async function _loadCommittee({ force = false } = {}) {
@@ -955,12 +1048,14 @@ async function _loadCommittee({ force = false } = {}) {
     return { ...c, arbiters: await eligibleCommitteeMembers(c.arbiters, null) };
   }
   const escrow = getEscrow();
+  const deadline = Date.now() + COMMITTEE_TOTAL_BUDGET_MS;
+  const read = (fn, args = []) => readEscrowCall(escrow, fn, args, deadline);
   const [members, threshold, epoch] = await Promise.all([
-    withTimeout(escrow.arbiters(), COMMITTEE_RPC_TIMEOUT_MS),
-    withTimeout(escrow.arbiterThreshold(), COMMITTEE_RPC_TIMEOUT_MS),
-    withTimeout(escrow.committeeEpoch(), COMMITTEE_RPC_TIMEOUT_MS),
+    read('arbiters'),
+    read('arbiterThreshold'),
+    read('committeeEpoch'),
   ]);
-  const eligible = await eligibleCommitteeMembers(members, (m) => escrow.revokedArbiter(m));
+  const eligible = await eligibleCommitteeMembers(members, async (m) => Boolean(await read('revokedArbiter', [m])));
   return committeeShape({ arbiters: eligible, threshold, epoch });
 }
 

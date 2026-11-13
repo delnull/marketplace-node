@@ -47,7 +47,7 @@ const orderRow = async (id) =>
 
 const ageDraft = async (id, ms) => await ageDrafts(db, id, ms);
 
-const { sweepExpiredDrafts } = await import('../src/orderSweeper.js');
+const { sweepExpiredDrafts, __resetIdemCleanupForTest } = await import('../src/orderSweeper.js');
 const { setChainOrderFetcher } = await import('../src/chainOrder.js');
 // 每个 sweeper 用例自己决定链上结果；默认按"链上没有该单"构造，避免依赖其它用例的全局桩。
 setChainOrderFetcher(async () => ({ status: 'None' }));
@@ -93,8 +93,29 @@ test('超时草稿已有支付凭证：sweeper 不得把它当未支付草稿取
   assert.equal((await orderRow(d.id)).status, 'draft');
 });
 
-test('超时草稿自动关闭为 cancelled，未超时草稿保留', async () => {
-  const stale = await createDraft();
+test('1 wei 诱饵单不阻止草稿 TTL 清扫：链上存在但身份不符不算已支付', async () => {
+  const d = await createDraft({ capacity: 1 });
+  assert.equal(await availOf(d.productSlug), 0, '草稿占住限量 1 件');
+  await ageDraft(d.id, 2 * 3600_000);
+  // 链上有同 orderId 的单，但金额只有 1 wei（买家/店主即使相同也不属于本单）。
+  setChainOrderFetcher(async () => ({
+    status: 'Settled',
+    buyer: buyer.address,
+    seller: owner.address,
+    amount: '1',
+    timeoutBlocks: 120960,
+    token: '0x0000000000000000000000000000000000000000',
+  }));
+  try {
+    assert.equal(await sweepExpiredDrafts(), 1, '诱饵单不能被当成真实支付');
+    assert.equal((await orderRow(d.id)).status, 'cancelled');
+    assert.equal(await availOf(d.productSlug), 1, '取消后库存占位必须回补');
+  } finally {
+    setChainOrderFetcher(async () => ({ status: 'None' }));
+  }
+});
+
+test('超时草稿自动关闭为 cancelled，未超时草稿保留', async () => {  const stale = await createDraft();
   await ageDraft(stale.id, 2 * 3600_000); // 做旧 2 小时（超过默认 TTL 30 分钟）
 
   const fresh = await createDraft();
@@ -174,4 +195,40 @@ test('created_at 落在"未来"的草稿不会被提前清扫；拨回 TTL 之�
   assert.ok(closed >= 1, 'DB 里确实过了 TTL 之后必须清扫');
   assert.equal((await orderRow(o.id)).status, 'cancelled');
   assert.equal(await availOf(o.productSlug), 1, '占位已回补');
+});
+
+test('幂等键保留窗口：90 天前的映射被清，近期映射保留', async () => {
+  __resetIdemCleanupForTest();
+  await db.run('DELETE FROM order_idempotency');
+  const initiator = buyer.address.toLowerCase();
+  /* order_no 只是这张映射表的唯一键（无外键指向 orders）；B + 20 位 = CHAR(21) */
+  const oldNo = `B${'1'.repeat(20)}`;
+  const newNo = `B${'2'.repeat(20)}`;
+  await db.run(
+    `INSERT INTO order_idempotency (initiator, idem_key, order_no, created_at)
+     VALUES (?, ?, ?, DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL 91 DAY))`,
+    initiator,
+    'retention-old-key',
+    oldNo
+  );
+  await db.run(
+    `INSERT INTO order_idempotency (initiator, idem_key, order_no)
+     VALUES (?, ?, ?)`,
+    initiator,
+    'retention-new-key',
+    newNo
+  );
+
+  await sweepExpiredDrafts();
+
+  assert.equal(
+    await db.get(`SELECT order_no FROM order_idempotency WHERE idem_key = 'retention-old-key'`),
+    undefined,
+    '超过 90 天的映射必须被清'
+  );
+  assert.ok(
+    await db.get(`SELECT order_no FROM order_idempotency WHERE idem_key = 'retention-new-key'`),
+    '近期映射不得被清（支付后响应丢失的重试还要靠它回放）'
+  );
+  __resetIdemCleanupForTest();
 });

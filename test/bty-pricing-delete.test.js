@@ -206,7 +206,7 @@ test('BTY 退款微单位向下取整：不足 1 微 BTY 的 wei 不进入统计
   assert.equal(refundPriceMicroOfRow({ price_currency: 'BTY', refunded_amount_wei: '1999999999999' }), 1n);
 });
 
-test('订单软删除：只允许已取消/已超时；卖家列表移除而买家记录与详情保留', async () => {
+test('订单软删除：只允许已取消/已超时；店主列表移除而买家记录与详情保留', async () => {
   const p = await createProduct({ title: '订单删除', skus: [{ key: '', priceMicro: 1_000_000 }] });
   const draft = await createDraft(p.slug);
 
@@ -284,7 +284,7 @@ test('订单从终局恢复时清除双方软删除标记，恢复后的订单�
     'SELECT seller_deleted_at, buyer_deleted_at FROM orders WHERE order_no = ?',
     draft.id
   );
-  assert.ok(deleted.seller_deleted_at, '卖家删除标记应写入');
+  assert.ok(deleted.seller_deleted_at, '店主删除标记应写入');
   assert.ok(deleted.buyer_deleted_at, '买家删除标记应写入');
 
   // watcher / 对账 / sync 都会走同一条直接 UPDATE：状态离开终局时触发器必须清标记
@@ -298,9 +298,25 @@ test('订单从终局恢复时清除双方软删除标记，恢复后的订单�
   assert.equal(revived.buyer_deleted_at, null);
 
   const sellerList = await asOwner(request(app).get('/api/orders/seller?status=escrowed&pageSize=100')).expect(200);
-  assert.ok(sellerList.body.data.orders.some((o) => o.id === draft.id), '恢复后的订单必须回到卖家列表');
+  assert.ok(sellerList.body.data.orders.some((o) => o.id === draft.id), '恢复后的订单必须回到店主列表');
   const buyerList = await request(app).get(`/api/orders?address=${buyer.address.toLowerCase()}&pageSize=100`).expect(200);
   assert.ok(buyerList.body.data.orders.some((o) => o.id === draft.id), '恢复后的订单必须回到买家列表');
+});
+
+test('暂停接单的店仍可删除商品：目录不展示不等于管理面锁死', async () => {
+  const p = await createProduct({ title: '暂停店待删商品', skus: [{ key: '', priceMicro: 1_000_000 }] });
+
+  const paused = await asOwner(request(app).patch('/api/shop/listing')).send({ listed: false, reason: '盘点' }).expect(200);
+  assertOk(paused);
+  assert.equal(paused.body.data.listed, false);
+
+  const pub = await asOwner(request(app).get(`/api/products/${p.slug}`)).expect(200);
+  assertOk(pub, '暂停店店主仍应读得到自己的商品（否则无法管理）');
+
+  const del = await asOwner(request(app).delete(`/api/products/${p.slug}?confirm=1`)).expect(200);
+  assertOk(del);
+  const row = await db.get('SELECT deleted_at FROM products WHERE slug = ?', p.slug);
+  assert.ok(row?.deleted_at, '暂停店删除必须落软删除标记');
 });
 
 test('订单软删除：在途订单不能删（不提供删除入口）', async () => {

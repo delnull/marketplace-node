@@ -4,8 +4,8 @@
  *  GET  /nft?contract=&tokenId=  公开状态：这枚 token 的提货行（**不含收货信息**）
  *  GET  /nft/mine               我作为提货人提交过的行（需登录）
  *  POST /nft                    提交提货声明 {nftContract, tokenId, shipping:{name,phone,address}}
- *  GET  /nft/seller             我作为卖家（本节点）的提货行（需登录）
- *  POST /nft/:id/seller         卖家动作 {action:'approve'|'ship'|'fulfill'|'reject', trackingNo?, note?}
+ *  GET  /nft/seller             我作为店主（本节点）的提货行（需登录）
+ *  POST /nft/:id/seller         店主动作 {action:'approve'|'ship'|'fulfill'|'reject', trackingNo?, note?}
  *  POST /nft/:id/cancel         提货人撤回自己的声明（未发货前）
  *  POST /nft/:id/dispute        节点管理员生成链上 `openClaimDispute` 参数（不签交易、不广播）
  *
@@ -16,7 +16,7 @@
  * NFT 可以转手。谁有权提货只能由**链上当前持有人**回答（`ownerOf` / `balanceOf`），
  * 所以提交入口是"持有人"，而"这枚 token 确实在本节点被交付过"是前置事实
  * （见 src/nftClaim.js 的判据链）。声明一旦提交就绑定提交人（A-policy）：
- * 卖家发货前会再查一次持有人，转手了就拒绝发货并提示取消，新持有人可以重新提。
+ * 店主发货前会再查一次持有人，转手了就拒绝发货并提示取消，新持有人可以重新提。
  *
  * ## 节点不持私钥
  *
@@ -26,7 +26,8 @@
 import { Router } from 'express';
 import config from '../config.js';
 import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
-import { verifySession, roleOf, isHost } from '../auth.js';
+import { verifySession, roleOf, isHost, isNodeStaffOf } from '../auth.js';
+import { nodeOwner } from '../shops.js';
 import { getDb } from '../db.js';
 import { logAudit } from '../audit.js';
 import { sendCsv } from '../csv.js';
@@ -49,19 +50,31 @@ const exportLimiter = simpleRateLimit({ windowMs: 60_000, max: 10, message: '导
 
 const CLAIM_STATUSES = ['requested', 'approved', 'shipped', 'fulfilled', 'rejected', 'cancelled', 'expired'];
 
-/** 卖家/店员作用域：与 POST /nft/:id/seller 同一判据（seller 本人或本店店员） */
+/** 店主/店员作用域：与 POST /nft/:id/seller 同一判据（seller 本人或本店店员） */
 async function sellerScopeOf(address) {
   const staffShops = (
     await getDb().all('SELECT shop_code FROM shop_operators WHERE address = ?', address)
   ).map((r) => String(r.shop_code));
-  const scope = staffShops.length
-    ? `(n.seller = ? OR n.shop_code IN (${staffShops.map(() => '?').join(',')}))`
-    : 'n.seller = ?';
-  return { scope, params: [address, ...staffShops] };
+  /*
+    与 roleOf 对齐：节点员工在本节点**自营店**（seller == node.owner）也按 staff 处理；
+    列表若不带上这个分支，员工能操作却看不到，正是 P2-SEC-11。
+  */
+  const nodeStaffOwner = (await isNodeStaffOf(address)) ? await nodeOwner() : '';
+  const parts = ['n.seller = ?'];
+  const params = [address];
+  if (staffShops.length) {
+    parts.push(`n.shop_code IN (${staffShops.map(() => '?').join(',')})`);
+    params.push(...staffShops);
+  }
+  if (nodeStaffOwner) {
+    parts.push('n.seller = ?');
+    params.push(nodeStaffOwner);
+  }
+  return { scope: `(${parts.join(' OR ')})`, params };
 }
 
 /**
- * 卖家提货筛选（列表与 CSV 共用；两处口径必须逐字一致）。
+ * 店主提货筛选（列表与 CSV 共用；两处口径必须逐字一致）。
  * q 搜提货单/订单/tokenId/提货人/运单/合约；status=todo 表示三个待办态。
  */
 function claimFilterOf(req) {
@@ -133,6 +146,7 @@ router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
     contract.toLowerCase(),
     tokenId
   );
+  res.set('Cache-Control', 'private, no-store');
   ok(res, { claims: rows.map((r) => claimDto(r, { as: 'public' })) });
 }));
 
@@ -151,7 +165,7 @@ router.get('/nft/mine', requireAuth, wrap(async (req, res) => {
   ok(res, { claims: rows.map((r) => claimDto(r, { as: 'holder' })) });
 }));
 
-/** 卖家提货 CSV（当前筛选的全量，不分页；含收货信息，属卖家私域） */
+/** 店主提货 CSV（当前筛选的全量，不分页；含收货信息，属店主私域） */
 router.get('/nft/seller.csv', requireAuth, exportLimiter, wrap(async (req, res) => {
   const filter = claimFilterOf(req);
   if (filter.error) return fail(res, filter.error);
@@ -189,8 +203,8 @@ router.get('/nft/seller.csv', requireAuth, exportLimiter, wrap(async (req, res) 
     导出审计**逐店落行**，一行一家店（`shop_code` 由被导出的行自己回答）。
 
     为什么不是一行节点级（旧形状 `shopCode: null` + `actorRole: 'staff'`）：
-      · 角色是假的——卖家本人导出自己的提货单，旧实现恒写 staff；
-      · 归属是假的——一份 CSV 可能横跨同一位卖家/店员可经营的几家店，而它读的是店铺私域数据
+      · 角色是假的——店主本人导出自己的提货单，旧实现恒写 staff；
+      · 归属是假的——一份 CSV 可能横跨同一位店主/店员可经营的几家店，而它读的是店铺私域数据
         （含收货信息）。写成节点级之后**只有节点主看得见**，真正该监督这次导出的店主反而看不到；
         而且节点主看到的是租户的动作，方向反了。
     逐店落行之后，每家店主在自己的审计列表里都能看到"谁在什么时候导出了我这家店的提货单"，
@@ -226,7 +240,7 @@ router.get('/nft/seller.csv', requireAuth, exportLimiter, wrap(async (req, res) 
 }));
 
 /**
- * 我作为卖家/本店店员（本节点）的提货行（需登录；支持搜索/日期/状态/分页）。
+ * 我作为店主/本店店员（本节点）的提货行（需登录；支持搜索/日期/状态/分页）。
  *
  * 列表的授权面必须与 `POST /nft/:id/seller` 完全一致：动作允许该行的 seller **或本店店员**，
  * 而旧列表只按 `seller = ?` 过滤——店员能处理却看不到，只能靠猜 claim id。
@@ -271,7 +285,7 @@ router.post('/nft', requireAuth, wrap(async (req, res) => {
     note,
   });
   if (!r.ok) return fail(res, r.message);
-  ok(res, r.claim, '提货声明已提交；卖家会复核持有人并安排发货');
+  ok(res, r.claim, '提货声明已提交；店主会复核持有人并安排发货');
 }));
 
 /** 提货人撤回自己的声明（仅未发货前） */
@@ -282,9 +296,9 @@ router.post('/nft/:id/cancel', requireAuth, wrap(async (req, res) => {
 }));
 
 /**
- * 卖家推进/终结声明（approve / ship（需 trackingNo）/ fulfill / reject）。
+ * 店主推进/终结声明（approve / ship（需 trackingNo）/ fulfill / reject）。
  *
- * 鉴权 = 该行的 `seller`（订单卖家）**或** 那家店的店员（`roleOf`）；
+ * 鉴权 = 该行的 `seller`（订单店主）**或** 那家店的店员（`roleOf`）；
  * `ship` 会在唯一实现里再查一次链上持有人（A-policy：转手了就拒绝发货，要求先取消）。
  */
 router.post('/nft/:id/seller', requireAuth, wrap(async (req, res) => {
@@ -292,7 +306,7 @@ router.post('/nft/:id/seller', requireAuth, wrap(async (req, res) => {
   if (!row) return fail(res, '声明不存在', 404, 404);
   const mine = String(row.seller) === String(req.auth.address);
   const staff = mine ? true : (await roleOf(req.auth.address, String(row.shop_code))) === 'staff';
-  if (!mine && !staff) return fail(res, '只有该订单的卖家/本店店员可以处理这条提货声明', 403, 403);
+  if (!mine && !staff) return fail(res, '只有该订单的店主/本店店员可以处理这条提货声明', 403, 403);
   const { action, trackingNo, note } = req.body || {};
   const r = await sellerClaimAction({
     claimNo: req.params.id,
@@ -311,7 +325,7 @@ router.post('/nft/:id/seller', requireAuth, wrap(async (req, res) => {
     targetType: 'nft_claim',
     targetId: r.claim.id,
     /*
-      审计只记**状态与是否存在**：运单号可反查收件人，卖家驳回原因可能含买家个人信息。
+      审计只记**状态与是否存在**：运单号可反查收件人，店主驳回原因可能含买家个人信息。
       这两类内容住在 nft_claims，会随 PII 擦除清空；audit_logs 是 append-only（触发器拒绝
       UPDATE/DELETE），一旦抄进来就永远删不掉。不要把 detail 当调试日志用。
     */

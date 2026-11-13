@@ -4,7 +4,7 @@
  * ## 为什么必须是一个共用的判据
  *
  * 一个节点上有多家店，而订单行里的 `shop_code` 是**唯一**能把订单与店绑起来的东西
- * （`seller` 只是链上收款地址，`req.shop` 只是"这次请求被解析到哪家店"）。卖家面的每一个
+ * （`seller` 只是链上收款地址，`req.shop` 只是"这次请求被解析到哪家店"）。店主面的每一个
  * 订单动作（发货、批量发货、NFT 交付、退货、擦 PII、导出）都必须先回答这一问，
  * 而"在每个 handler 里各写一次比较"的形态必然漏——漏掉的那一处，凭据属于 A 店的店主
  * 可以对 B 店的订单动手，且**所有写操作都成功、没有任何报错**（实测：`/:id/ship` 只校验
@@ -14,7 +14,7 @@
  * 所以判据只此一处，**调用点是"取订单"这个动作本身**（`findOrderInShop`），而不是
  * "取到之后再判一次"——后者只要有人忘了判就漏，前者忘不了。
  *
- * ⚠️ 它**只服务卖家面**：买家动作的店铺上下文就是订单自己（handler 直接读 `order.shop_code`
+ * ⚠️ 它**只服务店主面**：买家动作的店铺上下文就是订单自己（handler 直接读 `order.shop_code`
  * 去问 `isStaff`），所以买家不需要、也没有任何理由带 `X-Mk-Shop`（见 http.js 的中间件说明）。
  *
  * ## 判据为什么是 `shop_code` 相等
@@ -33,7 +33,7 @@
  */
 import { getDb } from './db.js';
 
-/** 该订单是否属于这家店（`shopCode` 取 `req.shop.code`，卖家面恒非空） */
+/** 该订单是否属于这家店（`shopCode` 取 `req.shop.code`，店主面恒非空） */
 export function orderBelongsToShop(order, shopCode) {
   const want = String(shopCode ?? '');
   return !!want && String(order?.shop_code ?? '') === want;

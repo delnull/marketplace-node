@@ -246,23 +246,31 @@ test('force：跳过新鲜度检查重新拉一次，但**不绕过单飞**（�
   }
 });
 
-test('上游挂但有实时旧值：保留旧值 + stale=true + error 记明来源（绝不假装是实时价）', async () => {
+test('上游挂但有实时旧值：先返回旧值（stale）+ 后台刷新失败后 error 记明来源（绝不假装是实时价）', async () => {
   const net = installFetch();
   const restoreCfg = isolate(); // TTL = 0：每一轮都要真的去打上游，才能看到"这一轮失败了"
   try {
-    const { getRates } = await freshRates();
+    const { getRates, refreshRates } = await freshRates();
     const good = await getRates();
     assert.equal(good.stale, false);
     assert.equal(net.calls.ticker, 1);
 
     net.restore();
     const dead = installFetch(true);
+    /*
+      stale-while-revalidate：有旧值时请求路径**不等上游**，先给旧值并标 stale；
+      后台刷新（single-flight）负责去撞这次失败。这里 join 那一轮再断言错误。
+    */
     const r = await getRates();
-    assert.equal(dead.calls.ticker, 1, 'TTL=0 → 这一轮确实去打上游了，也确实失败了');
     assert.equal(r.btyUsdt, good.btyUsdt, '失败不丢旧值：上一轮的实时值仍比"没有价格"强');
-    assert.equal(r.stale, true);
-    assert.match(r.error, /BTY-USDT/, '错误必须指出是哪条腿——这是运维唯一的线索');
-    assert.ok(r.updatedAt >= good.updatedAt, '失败的这一轮也要更新"上次尝试时刻"');
+    assert.equal(r.stale, true, '旧值必须在返回时就被标成 stale，不能等后台失败才知道');
+    await refreshRates(true); // join 在飞的那一轮（或再发一轮），让失败落进 cache
+    assert.equal(dead.calls.ticker, 1, 'TTL=0 → 这一轮确实去打上游了，也确实失败了');
+    const after = await getRates();
+    assert.equal(after.btyUsdt, good.btyUsdt);
+    assert.equal(after.stale, true);
+    assert.match(after.error, /BTY-USDT/, '错误必须指出是哪条腿——这是运维唯一的线索');
+    assert.ok(after.updatedAt >= good.updatedAt, '失败的这一轮也要更新"上次尝试时刻"');
     dead.restore();
   } finally {
     restoreCfg(); net.restore();

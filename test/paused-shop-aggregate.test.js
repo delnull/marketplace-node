@@ -75,5 +75,6 @@ test('挂起店铺的聚合端点被拒（409 + 唯一拒因）；无头仍可�
   assertOk(shopInfo);
   assert.equal(shopInfo.body.data.shop.code, shopRef.value);
   assert.equal(shopInfo.body.data.shop.listed, false);
-  assert.match(String(shopInfo.body.data.shop.listedReason), /测试暂停/);
+  assert.equal(shopInfo.body.data.shop.listedReason, '', '公开单店行不泄露内部暂停原因');
+  assert.equal(shopInfo.body.data.shop.listedAt, null, '公开单店行不泄露处置时间');
 });

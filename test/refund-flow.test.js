@@ -119,9 +119,9 @@ const blocked = (res) => {
   return res.body.message || '';
 };
 
-// ── 两级售后端到端（限量实物商品：占位 → 申请 → 理由/回复 → 拒绝 → 争议 → 卖家和解退款）──
+// ── 两级售后端到端（限量实物商品：占位 → 申请 → 理由/回复 → 拒绝 → 争议 → 店主和解退款）──
 
-test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争议陈述→卖家同意退款（占位回补）', async () => {
+test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争议陈述→店主同意退款（占位回补）', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '两级售后实物', capacity: 5, priceMicro: 88_000_000 }));
   const order = await createDraft(p.slug, 2);
   assert.equal(
@@ -135,7 +135,7 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
 
   // ── 阶段门控：未链上申请前提交退款理由被拒 ──
   const early = await postEvidence(oid, { phase: 'refund_request', content: '还没申请就想退' }, buyerToken);
-  assert.match(blocked(early), /仅当退款申请待卖家处理/);
+  assert.match(blocked(early), /仅当退款申请待店主处理/);
 
   // 买家链上 requestRefund（watcher 回写）
   assert.equal(await applyEvent('RefundRequested', { orderId: eid }), 1);
@@ -143,7 +143,7 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   assert.equal(afterReq.refundStatus, 'requested');
   // 时间字段在 DTO 里是 **ISO-8601 字符串**（库里 DATETIME(3) → `Date` → JSON）：比时刻先 parse
   assert.ok(Number.isFinite(Date.parse(afterReq.refundRequestedAt)), '详情携带申请时刻');
-  assert.equal(afterReq.status, 'escrowed', '资金仍冻结在托管，等待卖家决策');
+  assert.equal(afterReq.status, 'escrowed', '资金仍冻结在托管，等待店主决策');
 
   // ── 陈述时间线：买家理由（可追加）→ 店主回复；角色/阶段严格校验 ──
   const r1 = await postEvidence(oid, { phase: 'refund_request', content: '收到实物与描述不符，申请退款' }, buyerToken);
@@ -156,10 +156,10 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   // 陌生人：不可提交（非当事人）
   const byStranger = await postEvidence(oid, { phase: 'refund_reply', content: '路人甲' }, strangerToken);
   assert.equal(blocked(byStranger), '仅本单买家或店主/操作员可提交陈述');
-  // 买家不可替卖家回复；卖家不可提退款理由
-  const buyerReply = await postEvidence(oid, { phase: 'refund_reply', content: '替卖家回复' }, buyerToken);
+  // 买家不可替店主回复；店主不可提退款理由
+  const buyerReply = await postEvidence(oid, { phase: 'refund_reply', content: '替店主回复' }, buyerToken);
   assert.match(blocked(buyerReply), /仅店主可提交/);
-  const ownerAsk = await postEvidence(oid, { phase: 'refund_request', content: '卖家申请退款？' }, ownerToken);
+  const ownerAsk = await postEvidence(oid, { phase: 'refund_request', content: '店主申请退款？' }, ownerToken);
   assert.match(blocked(ownerAsk), /仅买家可提交/);
   // content 边界
   const emptyC = await postEvidence(oid, { phase: 'refund_reply', content: '   ' }, ownerToken);
@@ -175,13 +175,13 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   const strangerDetail = await getDetail(oid, strangerToken);
   assert.ok(!('evidence' in strangerDetail), '第三人不可见陈述');
 
-  // ── 卖家拒绝（链上 rejectRefund）：解锁争议入口；申请阶段的陈述不再受理 ──
+  // ── 店主拒绝（链上 rejectRefund）：解锁争议入口；申请阶段的陈述不再受理 ──
   assert.equal(await applyEvent('RefundRejected', { orderId: eid }), 1);
   const afterRej = await getDetail(oid, ownerToken);
   assert.equal(afterRej.refundStatus, 'rejected');
   assert.ok(afterRej.refundRejectedAt >= afterReq.refundRequestedAt);
   const postReject = await postEvidence(oid, { phase: 'refund_request', content: '被拒后补理由' }, buyerToken);
-  assert.match(blocked(postReject), /待卖家处理/);
+  assert.match(blocked(postReject), /待店主处理/);
   const arbEarly = await postEvidence(oid, { phase: 'arbitration', content: '先仲裁为敬' }, buyerToken);
   assert.match(blocked(arbEarly), /争议中/);
 
@@ -219,7 +219,7 @@ test('两级售后端到端：申请冻结→双方陈述→拒绝解锁→争�
   assert.equal(arbDetail.evidence[3].phase, 'arbitration');
   assert.equal(arbDetail.evidence[4].phase, 'arbitration');
 
-  // 争议中卖家链上 approveRefund 和解（资金退买家）
+  // 争议中店主链上 approveRefund 和解（资金退买家）
   assert.equal(await applyEvent('RefundApproved', { orderId: eid, refundWei: order.amountWei }), 1);
   const done = await getDetail(oid, buyerToken);
   assert.equal(done.status, 'refunded');
@@ -247,7 +247,7 @@ test('退款申请待决期间拒绝发货（ship 门控）：先链上拒绝申
   await escrowed(order);
   const eid = order.escrowOrderId;
 
-  // 买家链上申请退款（watcher 回写 requested）→ 卖家发货被拒
+  // 买家链上申请退款（watcher 回写 requested）→ 店主发货被拒
   assert.equal(await applyEvent('RefundRequested', { orderId: eid }), 1);
   const ship = await request(app)
     .post(`/api/orders/${order.id}/ship`)
@@ -262,7 +262,7 @@ test('退款申请待决期间拒绝发货（ship 门控）：先链上拒绝申
     '冻结期发货被拒，状态不变'
   );
 
-  // 卖家链上拒绝退款（rejectRefund）→ 恢复可发货
+  // 店主链上拒绝退款（rejectRefund）→ 恢复可发货
   assert.equal(await applyEvent('RefundRejected', { orderId: eid }), 1);
   const ok = await request(app)
     .post(`/api/orders/${order.id}/ship`)
@@ -284,7 +284,7 @@ test('已交付（shipped 有物流单号）后退款：不自动回补占位（
     '下单占位 1 件'
   );
 
-  // 卖家发货（物流单号=交付证据）→ 买家申请退款 → 卖家同意退款（链上 RefundApproved）
+  // 店主发货（物流单号=交付证据）→ 买家申请退款 → 店主同意退款（链上 RefundApproved）
   const ship = await request(app)
     .post(`/api/orders/${order.id}/ship`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
@@ -334,7 +334,7 @@ test('applyRefundFlags：sync 反查按链上 getOrder 标记回填/清除 refun
   // 幂等：重复同步不重复迁移
   assert.equal(await applyRefundFlags(eid, { refundRequested: true, refundRejected: false }), 0);
 
-  // 链上翻转（卖家拒绝）→ rejected
+  // 链上翻转（店主拒绝）→ rejected
   assert.equal(await applyRefundFlags(eid, { refundRequested: false, refundRejected: true }), 1);
   row = await db.get('SELECT refund_status, refund_rejected_at FROM v_orders WHERE order_no = ?', orderNo);
   assert.equal(row.refund_status, 'rejected');

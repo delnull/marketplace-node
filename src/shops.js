@@ -5,7 +5,7 @@
  *
  * 在它之前，"这家店是谁"由 `config.shop.owner` 一个全局常量回答。于是"一节点一店"
  * 被写死在四个地方：鉴权（`ownerOnly`/`staffOnly` 比同一个常量）、商品归属（`products`
- * 表连卖家列都没有）、订单卖家（`orders.seller` 恒等于那个常量）、以及全部统计口径。
+ * 表连店主列都没有）、订单店主（`orders.seller` 恒等于那个常量）、以及全部统计口径。
  * 多店之后这四件事必须由**同一行数据**回答，否则每一处都要自己再判一次，而"新增一个
  * 调用点就多一个漏点"——本仓把这种形状叫"判据挂错了层"。
  *
@@ -39,7 +39,7 @@
  *
  * `listed = 0` 只意味着**不能接单 + 不进前端聚合**（节点主/员工暂停）。
  * 它**不是**"店下线"：该店的发货、同意/拒绝退款、售后案件、个人信息擦除、自有资料维护
- * **全部照常可用**。把 listed=0 做成"拒绝一切卖家面请求"会让店主在被暂停之后连已托管的单子
+ * **全部照常可用**。把 listed=0 做成"拒绝一切店主面请求"会让店主在被暂停之后连已托管的单子
  * 都没法处理。落实方式：只有**影响未来销售**的动作（上架/改价/码池与 token 池导入、建单）
  * 检查 `assertSellable`，履约类动作一律不检查。
  */
@@ -50,7 +50,7 @@ import { tanxinAddressOf } from './tanxin.js';
 import { isShopCodeShape } from './shopCode.js';
 import { storedMediaKindOf, storedMediaNameOf } from './mediaKinds.js';
 
-/** 店铺句柄的请求头（卖家面的**范围提示**：带了必须指得中；不带则取唯一经营的那家，多店时必须点名——见 http.js） */
+/** 店铺句柄的请求头（店主面的**范围提示**：带了必须指得中；不带则取唯一经营的那家，多店时必须点名——见 http.js） */
 export const SHOP_HEADER = 'x-mk-shop';
 
 /**
@@ -177,12 +177,12 @@ export async function setNodeAvatar(url) {
 }
 
 /**
- * 一行 shops → 对外形状（**唯一一份**：公开列表、店铺详情、卖家面板共用）。
+ * 一行 shops → 对外形状（**唯一一份**：公开列表、店铺详情、店主面板共用）。
  *
  * `nodeAddr` = 节点主地址（`hostOperator()` 或 `await nodeOwner()`）。它是"这家店挂在哪台机器下"
  * 的答案（一库一节点，所有店铺同值），联邦目录靠它把店铺与节点对上——店铺自己不再存一份。
  */
-export function shopDto(row, nodeAddr) {
+export function shopDto(row, nodeAddr, { publicView = false } = {}) {
   if (!row) return null;
   const node = String(nodeAddr || '').trim().toLowerCase();
   return {
@@ -194,13 +194,10 @@ export function shopDto(row, nodeAddr) {
     avatarUrl: avatarUrlOf(row),
     tanxinAddress: tanxinAddressOf(row),
     listed: Number(row.listed) === 1,
-    /** 暂停原因（`''` = 当前没有暂停）；店主在设置页读它，节点管理面在店铺行读它 */
-    listedReason: String(row.listed_reason || ''),
-    /**
-     * 最近一次切换接单状态的时刻：**只在暂停时下发**（在售店的公开行不暴露内部处置时间；
-     * 暂停店本来就不进公开聚合面，只有店主与节点管理员读得到）。
-     */
-    listedAt: Number(row.listed) === 1 ? null : (row.listed_at ?? null),
+    /** 暂停原因只给店主/节点管理员；公开行不暴露内部处置文本 */
+    listedReason: publicView ? '' : String(row.listed_reason || ''),
+    /** 最近一次切换接单状态的时刻同样只给内部管理面 */
+    listedAt: publicView || Number(row.listed) === 1 ? null : (row.listed_at ?? null),
   };
 }
 

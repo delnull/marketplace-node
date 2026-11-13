@@ -1,7 +1,7 @@
 /**
  * 退货闭环（P0-4）：已交付订单退款前的退货单协调 + 占位释放时机
  *  - 未交付退款单：refunded 终局自动释放（原语义，回归）；
- *  - 已交付退款单：refunded 后占位保留 → 卖家 receive/waive 确认后才回补；
+ *  - 已交付退款单：refunded 后占位保留 → 店主 receive/waive 确认后才回补；
  *  - receive 早于链上退款终局时挂起等待，watcher RefundApproved 迁移后自动释放（released_at 幂等）；
  *  - 同单一退货单（幂等创建）；退货信息按当事人视角可见。
  */
@@ -64,14 +64,14 @@ async function shipPhysical(orderId, trackingNo) {
   assertOk(res);
 }
 
-test('已交付退款单：refunded 后占位保留 → 卖家收到退货后才回补（watcher 路径）', async () => {
+test('已交付退款单：refunded 后占位保留 → 店主收到退货后才回补（watcher 路径）', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '退货主流程', capacity: 5 }));
   const order = await createDraft(p.slug);
   await escrowed(order);
   await shipPhysical(order.id, 'SF-RET-1');
   assert.equal(await commOf(p.slug), 1);
 
-  // 买家申请退款 → 卖家建退货单（地址/说明）
+  // 买家申请退款 → 店主建退货单（地址/说明）
   assert.equal(await applyEvent('RefundRequested', { orderId: order.escrowOrderId }), 1);
   const cr = await request(app)
     .post(`/api/orders/${order.id}/return`)
@@ -100,7 +100,7 @@ test('已交付退款单：refunded 后占位保留 → 卖家收到退货后才
   assertOk(tk);
   assert.equal(tk.body.data.status, 'shipped');
 
-  // 链上退款终局（卖家 approveRefund，watcher 回写 refunded）：received 未确认 → 占位仍保留
+  // 链上退款终局（店主 approveRefund，watcher 回写 refunded）：received 未确认 → 占位仍保留
   assert.equal(await applyEvent('RefundApproved', { orderId: order.escrowOrderId, refundWei: order.amountWei }), 1);
   assert.equal(
     (await db.get('SELECT status FROM v_orders WHERE order_no = ?', order.id)).status,
@@ -108,7 +108,7 @@ test('已交付退款单：refunded 后占位保留 → 卖家收到退货后才
   );
   assert.equal(await commOf(p.slug), 1, '已交付且退货未确认 → 退款后占位保留');
 
-  // 卖家确认收到退货 → 占位回补
+  // 店主确认收到退货 → 占位回补
   const rc = await request(app)
     .post(`/api/orders/${order.id}/return/receive`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
@@ -119,11 +119,11 @@ test('已交付退款单：refunded 后占位保留 → 卖家收到退货后才
   assert.equal(await commOf(p.slug), 0, '确认收到退货后回补占位（可再次销售）');
 });
 
-test('退回单号回填的并发竞态：卖家已确认收到时，买家那次回填必须**报错**而不是假装成功', async () => {
+test('退回单号回填的并发竞态：店主已确认收到时，买家那次回填必须**报错**而不是假装成功', async () => {
   /*
     回归（2026-10-15）：`setReturnTracking` 的 UPDATE 带 `AND status = 'open'` 守卫，
-    而"买家提交单号"与"卖家确认收到/放弃追索"改的是同一行。旧实现不看 `changes`，
-    写了 0 行仍回「已记录退回物流单号」——买家以为寄回凭据已登记，卖家那边状态早已是
+    而"买家提交单号"与"店主确认收到/放弃追索"改的是同一行。旧实现不看 `changes`，
+    写了 0 行仍回「已记录退回物流单号」——买家以为寄回凭据已登记，店主那边状态早已是
     received、单号仍是 NULL，退回件的唯一凭据静默丢失（同文件 settleReturn 早就修过这一类）。
     这里直接喂一个**过期的退货单快照**（status 还是 open，库里已 received），复现那个竞态。
   */
@@ -147,7 +147,7 @@ test('退回单号回填的并发竞态：卖家已确认收到时，买家那�
   const stale = await fetchReturnByOrder(orderRow.order_id); // 买家手里的那一份（status='open'）
   assert.equal(stale.status, 'open', '前置：快照是 open');
 
-  // 卖家并发确认收到（库里变成 received）
+  // 店主并发确认收到（库里变成 received）
   const rc = await request(app)
     .post(`/api/orders/${order.id}/return/receive`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
@@ -169,7 +169,7 @@ test('receive 早于链上退款终局：挂起等待，watcher RefundApproved �
   await shipPhysical(order.id, 'SF-RET-2');
   assert.equal(await applyEvent('RefundRequested', { orderId: order.escrowOrderId }), 1);
 
-  // 卖家先收货（订单仍 escrowed/refund_status=requested）
+  // 店主先收货（订单仍 escrowed/refund_status=requested）
   await request(app)
     .post(`/api/orders/${order.id}/return`)
     .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
@@ -288,7 +288,7 @@ async function returnToReceived(orderId, trackingNo, { waive = false } = {}) {
   assert.ok(!Number.isNaN(Date.parse(rc.body.data.receivedAt)), '收货时刻是 ISO-8601 时刻');
 }
 
-test('D1：仲裁判卖家成交（Arbitrated=false → settled）——已收货退货的占位回补', async () => {
+test('D1：仲裁判店主成交（Arbitrated=false → settled）——已收货退货的占位回补', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: 'D1仲裁判付回补', capacity: 5 }));
   const order = await createDraft(p.slug);
   await escrowed(order);
@@ -297,11 +297,11 @@ test('D1：仲裁判卖家成交（Arbitrated=false → settled）——已收�
   await returnToReceived(order.id, 'SF-D1-A-BACK');
   assert.equal(await commOf(p.slug), 1, '退款未终局：收货后仍挂起（资金未定）');
 
-  // 争议 → 仲裁判卖家（成交终局）：货已实际回库（received_at 已落）→ 占位回补
+  // 争议 → 仲裁判店主（成交终局）：货已实际回库（received_at 已落）→ 占位回补
   assert.equal(await applyEvent('DisputeRequested', { orderId: order.escrowOrderId }), 1);
   assert.equal(await applyEvent('Arbitrated', { orderId: order.escrowOrderId, refundWei: 0n }), 1);
   assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', order.id)).status, 'settled');
-  assert.equal(await commOf(p.slug), 0, '判卖家成交 + 已确认收货退货 → 回补（货可再售）');
+  assert.equal(await commOf(p.slug), 0, '判店主成交 + 已确认收货退货 → 回补（货可再售）');
   assert.ok((await db.get('SELECT released_at FROM v_orders WHERE order_no = ?', order.id)).released_at, '置释放幂等标记');
 
   // 幂等：重复触发不再二次扣减
@@ -326,7 +326,7 @@ test('D1：超时释放（OrderExpiredReleased → expired）——已交付行�
 
 test('D1：确认收货终局（ReceiptConfirmed → confirmed）+ 已收货退货 → 回补；未收货退货不误释放', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: 'D1确认终局回补', capacity: 5 }));
-  // 场景一：退货已确认收货 → 买家确认收货（资金终局判卖家）→ 回补
+  // 场景一：退货已确认收货 → 买家确认收货（资金终局判店主）→ 回补
   const o1 = await createDraft(p.slug);
   await escrowed(o1);
   await shipPhysical(o1.id, 'SF-D1-C1');
@@ -352,7 +352,7 @@ test('D1：确认收货终局（ReceiptConfirmed → confirmed）+ 已收货退�
   assert.equal((await db.get('SELECT status FROM v_orders WHERE order_no = ?', o2.id)).status, 'confirmed');
   assert.equal(await commOf(p.slug), 1, '退货未确认收货：confirmed 不释放（占位保留）');
 
-  // 场景三：终局后才确认收货（watcher 事件先到、卖家 receive 后到）→ receive 动作当场回补
+  // 场景三：终局后才确认收货（watcher 事件先到、店主 receive 后到）→ receive 动作当场回补
   const o3 = await createDraft(p.slug);
   await escrowed(o3);
   await shipPhysical(o3.id, 'SF-D1-C3');

@@ -57,7 +57,7 @@ const isJustCreated = (row, now = Date.now()) => row?.created_at instanceof Date
 /** 店主创建退货单 */
 /**
  * 买家发起退货申请：只创建 open 的空地址退货单，seller 补地址后买家再填回寄单号。
- * 这是退货的**发起权**归买家；卖家仍可用下面 `POST /return` 直接建单（历史路径）。
+ * 这是退货的**发起权**归买家；店主仍可用下面 `POST /return` 直接建单（历史路径）。
  */
 router.post('/:orderNo/return/request', requireAuth, wrap(async (req, res) => {
   const order = await findOrderForBuyer(req.params.orderNo);
@@ -75,7 +75,7 @@ router.post('/:orderNo/return/request', requireAuth, wrap(async (req, res) => {
     过滤直接 return，**永远不会落库**，而 ACTION_LABEL 里也没有这个动作。留着它等于让下一个人
     以为"买家退货申请有审计可查"。买家的申请事实由 `order_returns` 行本身承担。
   */
-  ok(res, returnToPublic(r.data), '退货申请已提交，等待卖家填写退货地址');
+  ok(res, returnToPublic(r.data), '退货申请已提交，等待店主填写退货地址');
 }));
 
 router.post('/:orderNo/return', staffOnly, wrap(async (req, res) => {
@@ -88,7 +88,7 @@ router.post('/:orderNo/return', staffOnly, wrap(async (req, res) => {
   ok(res, returnToPublic(r.data), created ? '退货单已创建' : '退货单已存在');
 }));
 
-/** 卖家修改退货件数（仅 open；确认收到前按实际退回数量修正，占位按这个数释放）。 */
+/** 店主修改退货件数（仅 open；确认收到前按实际退回数量修正，占位按这个数释放）。 */
 router.patch('/:orderNo/return/quantity', staffOnly, wrap(async (req, res) => {
   const order = await findOrderInShop(req.params.orderNo, req.shop.code);
   if (!order) return fail(res, '订单不存在', 404, 404);
@@ -100,7 +100,7 @@ router.patch('/:orderNo/return/quantity', staffOnly, wrap(async (req, res) => {
 }));
 
 /** 买家回填退回物流单号（可带承运方名称；归一与上限见 src/returns.js → src/shipping.js） */
-/** 卖家填写/修改退货地址（买家发起申请后；只允许 open）。 */
+/** 店主填写/修改退货地址（买家发起申请后；只允许 open）。 */
 router.patch('/:orderNo/return/address', staffOnly, wrap(async (req, res) => {
   const order = await findOrderInShop(req.params.orderNo, req.shop.code);
   if (!order) return fail(res, '订单不存在', 404, 404);
@@ -144,7 +144,7 @@ router.post('/:orderNo/return/waive', staffOnly, wrap(async (req, res) => {
   let returnRow = await getDb().get('SELECT * FROM order_returns WHERE order_id = ?', order.order_id);
   if (!returnRow) {
     // 无既有退货单：先建（门控：已交付 + 状态窗口），再置放弃
-    const created = await createReturn({ order, address: req.body?.address ?? '', note: req.body?.note ?? '卖家放弃追索' });
+    const created = await createReturn({ order, address: req.body?.address ?? '', note: req.body?.note ?? '店主放弃追索' });
     if (created.error) return fail(res, created.error, created.notFound ? 404 : 1, created.notFound ? 404 : 200);
     returnRow = created.data;
   }

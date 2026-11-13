@@ -1,6 +1,6 @@
 /**
  * 店铺履约画像端点（/api/shop/reputation，链下信誉索引）：
- *  - 集成：造 9 单覆盖全部终局（确认/超时/判买家/判卖家/未决争议 + 500 天前老单），
+ *  - 集成：造 9 单覆盖全部终局（确认/超时/判买家/判店主/未决争议 + 500 天前老单），
  *    断言四时间窗事件计数、比率（4 位小数）、发货中位数与样本阈值（争议 5 ≥ 5 正常出率）；
  *  - 单元：computeReputation 纯函数喂小样本（争议 <5）断言争议相关率置 null + sampleTooSmall，
  *    并验证中位数（偶数均值）与 0 争议/空库边界。
@@ -82,12 +82,12 @@ before(async () => {
   const t1 = await createOrder(buyerAddrs[0]); await ev(t1, 'OrderCreated'); await ev(t1, 'ReceiptConfirmed'); // 买家确认
   const t2 = await createOrder(buyerAddrs[1]); await ev(t2, 'OrderCreated'); await ship(t2); await ev(t2, 'ReceiptConfirmed'); // 已交付后确认（发货样本）
   const t3 = await createOrder(buyerAddrs[2]); await ev(t3, 'OrderCreated'); await ev(t3, 'DisputeRequested'); await ev(t3, 'Arbitrated', { refundWei: t3.amountWei }); // 判买家
-  const t4 = await createOrder(buyerAddrs[3]); await ev(t4, 'OrderCreated'); await ship(t4); await ev(t4, 'DisputeRequested'); await ev(t4, 'Arbitrated', { refundWei: 0n }); // 判卖家（样本）
+  const t4 = await createOrder(buyerAddrs[3]); await ev(t4, 'OrderCreated'); await ship(t4); await ev(t4, 'DisputeRequested'); await ev(t4, 'Arbitrated', { refundWei: 0n }); // 判店主（样本）
   const t5 = await createOrder(buyerAddrs[4]); await ev(t5, 'OrderCreated'); await ev(t5, 'OrderExpiredReleased'); // 超时释放
   const t6 = await createOrder(buyerAddrs[5]); await ev(t6, 'OrderCreated'); await ev(t6, 'DisputeRequested'); // 未裁决争议
   const t7 = await createOrder(buyerAddrs[6]); await ev(t7, 'OrderCreated'); await ev(t7, 'ReceiptConfirmed'); await backdate(t7, 500); // 老单：仅进 all
   const t8 = await createOrder(buyerAddrs[7]); await ev(t8, 'OrderCreated'); await ev(t8, 'DisputeRequested'); await ev(t8, 'Arbitrated', { refundWei: t8.amountWei }); // 判买家 #2
-  const t9 = await createOrder(buyerAddrs[8]); await ev(t9, 'OrderCreated'); await ship(t9); await ev(t9, 'DisputeRequested'); await ev(t9, 'Arbitrated', { refundWei: 0n }); // 判卖家 #2（样本）
+  const t9 = await createOrder(buyerAddrs[8]); await ev(t9, 'OrderCreated'); await ship(t9); await ev(t9, 'DisputeRequested'); await ev(t9, 'Arbitrated', { refundWei: 0n }); // 判店主 #2（样本）
   void t1; void t2; void t5; void t6; void t7; void t8; void t9;
 });
 
@@ -101,18 +101,18 @@ test('履约画像：近窗事件计数与比率全对（5 争议 ≥ 样本阈�
   const r = await reputation();
   const w = r.windows.d30;
 
-  // 近窗 8 单：确认 2、超时 1、争议 5（判买家 2 / 判卖家 2 / 未决 1）
+  // 近窗 8 单：确认 2、超时 1、争议 5（判买家 2 / 判店主 2 / 未决 1）
   assert.equal(w.escrowOrders, 8);
   assert.equal(w.confirmed, 2);
   assert.equal(w.timeouts, 1);
   assert.equal(w.disputes, 5);
-  assert.equal(w.settledToSeller, 2, '判卖家 2（终局 settled 反推）');
+  assert.equal(w.settledToSeller, 2, '判店主 2（终局 settled 反推）');
   assert.equal(w.refundedToBuyer, 2, '判买家 2（终局 refunded 反推）');
   assert.equal(w.sampleTooSmall, false, '5 争议达样本阈值');
   assert.equal(w.escrowConfirmRate, 0.25);
   assert.equal(w.escrowTimeoutRate, 0.125);
   assert.equal(w.escrowDisputeRate, 0.625, '5/8');
-  assert.equal(w.refundedToBuyerShare, 0.4, '判买家 2/5（卖家过错近似）');
+  assert.equal(w.refundedToBuyerShare, 0.4, '判买家 2/5（店主过错近似）');
 
   // d30/d90/d365 口径一致（老单 500 天前只进 all）
   assert.equal(r.windows.d90.escrowOrders, 8);

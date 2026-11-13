@@ -1,5 +1,5 @@
 /**
- * 运营指标（`GET /api/shop/metrics`）与卖家 SLA 的**链上可达**路径。
+ * 运营指标（`GET /api/shop/metrics`）与店主 SLA 的**链上可达**路径。
  *
  * 本文件起一个本地假 JSON-RPC（按生产 `ESCROW_ABI` 的 selector 分发，与
  * test/order-sync-paths.test.js / after-sale.test.js 同款），专门覆盖"读得到"的那些读数：

@@ -43,13 +43,13 @@ const BACKTICK = String.fromCharCode(96);
  * （模板字面量的真实右界），中间出现的任何反引号都是**内容里的裸反引号** ⇒ 直接报出来。
  * 这样"有裸反引号"与"右界找不到"是两条**互斥且都响亮**的结论，不再互相掩盖。
  */
-function readDdl() {
+function readTemplate(prefix, label) {
   const src = fs.readFileSync(DB_JS, 'utf8');
   const lines = src.split('\n');
-  const head = lines.findIndex((l) => l.startsWith('const SCHEMA_DDL = '));
-  assert.ok(head >= 0, '找不到 `const SCHEMA_DDL = ` ——它在 db.js 里的形状变了？');
+  const head = lines.findIndex((l) => l.startsWith(prefix));
+  assert.ok(head >= 0, `找不到 \`${prefix}\` ——它在 db.js 里的形状变了？`);
   const openTick = lines[head].indexOf(BACKTICK);
-  assert.ok(openTick >= 0, `第 ${head + 1} 行的 SCHEMA_DDL 不是以反引号开头的模板字面量`);
+  assert.ok(openTick >= 0, `第 ${head + 1} 行的 ${label} 不是以反引号开头的模板字面量`);
   const bare = [];
   for (let i = head; i < lines.length; i++) {
     const from = i === head ? openTick + 1 : 0;
@@ -58,15 +58,26 @@ function readDdl() {
     // 右界 = 反引号之后只剩 `;`（模板字面量的收尾）
     if (lines[i].slice(at + 1).trim() === ';') {
       const body = [lines[head].slice(openTick + 1), ...lines.slice(head + 1, i), lines[i].slice(0, at)].join('\n');
-      assert.ok(bare.length === 0, `SCHEMA_DDL 的**内容**里有裸反引号（模板字面量会在那里被截断）：\n  ${bare.join('\n  ')}`);
+      assert.ok(bare.length === 0, `${label} 的**内容**里有裸反引号（模板字面量会在那里被截断）：\n  ${bare.join('\n  ')}`);
       return body;
     }
     bare.push(`${i + 1}: ${lines[i].trim().slice(0, 100)}`);
   }
   assert.fail(
-    `找不到 SCHEMA_DDL 的收尾（一行以反引号 + 分号结束）——它多半被内容里的反引号截断了。\n` +
+    `找不到 ${label} 的收尾（一行以反引号 + 分号结束）——它多半被内容里的反引号截断了。\n` +
       `  可疑行：\n  ${bare.join('\n  ') || '（一行都没扫到，模板字面量可能被整体改写）'}`
   );
+}
+
+/*
+  `order_idempotency` 的表定义放在独立常量里（迁移脚本也要用同一份），
+  在 SCHEMA_DDL 里是 `${ORDER_IDEMPOTENCY_DDL}` 插值。文本守卫若只扫 SCHEMA_DDL，
+  会**看不见这张表**；这里把插值替换成常量的真实内容，表清单与注释扫描才覆盖到它。
+*/
+function readDdl() {
+  const schema = readTemplate('const SCHEMA_DDL = ', 'SCHEMA_DDL');
+  const idem = readTemplate('export const ORDER_IDEMPOTENCY_DDL = ', 'ORDER_IDEMPOTENCY_DDL');
+  return schema.replace('${ORDER_IDEMPOTENCY_DDL}', idem);
 }
 
 /** 某个下标是否落在 `/* … *​/` 注释内部。 */
@@ -131,7 +142,7 @@ test('表与视图清单被钉住：少建一张或多建一张都要当场现�
   const expected = [
     'audit_logs', 'buyer_blocks', 'buyer_draft_quota', 'buyer_favorites', 'buyer_product_quota', 'dispute_evidence',
     'evidence_files', 'nft_claims', 'node', 'node_staff', 'order_alerts', 'order_chain',
-    'order_delivery_claims', 'order_delivery_items', 'order_returns', 'order_shipping',
+    'order_delivery_claims', 'order_delivery_items', 'order_idempotency', 'order_returns', 'order_shipping',
     'order_token_deliveries',
     'orders', 'payment_tokens', 'pii_pending_media', 'product_codes', 'product_nft_tokens', 'product_skus', 'products', 'proxy_drafts',
     'reviews', 'seller_proxy_draft_quota', 'seller_proxy_product_quota', 'shop_applications',

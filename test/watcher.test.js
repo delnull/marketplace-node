@@ -14,7 +14,7 @@ process.env.MK_WEBHOOK_RETRY_MS = '20';
 
 const ctx = await makeCtx();
 const { db } = ctx;
-const { applyEvent } = await import('../src/escrowWatcher.js');
+const { applyEvent, setStakePaidReaderForTest } = await import('../src/escrowWatcher.js');
 // 通知配置的写入走唯一入口（键的形状只在 src/webhook.js 里出现）
 const { setWebhookConfig } = await import('../src/webhook.js');
 
@@ -23,7 +23,7 @@ let seq = 0;
 /**
  * 插入一条订单（链上单号每单唯一），返回 `{ orderId, orderNo, escrowOrderId }`。
  *
- * 买家/卖家取本文件防伪用例锁定的那两个固定地址（见下方 createdArgs），金额同为 1e18 wei。
+ * 买家/店主取本文件防伪用例锁定的那两个固定地址（见下方 createdArgs），金额同为 1e18 wei。
  * 行形状交给 setup.mjs 的 insertOrder（链上单号住在 order_chain，见 src/db.js 的三表拆分）。
  */
 async function insertOrder(status = 'draft') {
@@ -63,7 +63,7 @@ test('ReceiptConfirmed：escrowed/shipped → confirmed（买家确认收货释�
   await applyEvent('ReceiptConfirmed', { orderId: b.escrowOrderId });
   assert.equal(await statusOf(b.orderId), 'confirmed');
 
-  // v2+：Escrow.confirmReceipt 扩 Disputed 态（仲裁/卖家失能时买家撤诉放款出口）
+  // v2+：Escrow.confirmReceipt 扩 Disputed 态（仲裁/店主失能时买家撤诉放款出口）
   const d = await insertOrder('disputed');
   assert.equal(await applyEvent('ReceiptConfirmed', { orderId: d.escrowOrderId }), 1);
   assert.equal(await statusOf(d.orderId), 'confirmed', '争议中买家撤诉 → confirmed 终局');
@@ -77,7 +77,7 @@ test('DisputeRequested：escrowed/shipped → disputed（买家发起争议冻�
   assert.equal(await statusOf(a.orderId), 'disputed');
 });
 
-test('Arbitrated：disputed → refunded（判买家）/ settled（判卖家）', async () => {
+test('Arbitrated：disputed → refunded（判买家）/ settled（判店主）', async () => {
   const a = await insertOrder('disputed');
   assert.equal(await applyEvent('Arbitrated', { orderId: a.escrowOrderId, refundWei: FULL_REFUND }), 1);
   assert.equal(await statusOf(a.orderId), 'refunded');
@@ -93,11 +93,11 @@ async function refundRowOf(id) {
   return await db.get('SELECT status, refund_status, refund_requested_at, refund_rejected_at FROM v_orders WHERE order_id = ?', id);
 }
 
-test('RefundRequested：escrowed/shipped → 同状态 + refund_status=requested（资金冻结等待卖家）', async () => {
+test('RefundRequested：escrowed/shipped → 同状态 + refund_status=requested（资金冻结等待店主）', async () => {
   const a = await insertOrder('escrowed');
   assert.equal(await applyEvent('RefundRequested', { orderId: a.escrowOrderId }), 1);
   const row = await refundRowOf(a.orderId);
-  assert.equal(row.status, 'escrowed', '状态不变：钱仍在托管，等待卖家 approve/reject');
+  assert.equal(row.status, 'escrowed', '状态不变：钱仍在托管，等待店主 approve/reject');
   assert.equal(row.refund_status, 'requested');
   assert.ok(row.refund_requested_at > 0, '落申请时刻');
 
@@ -126,7 +126,7 @@ test('RefundRejected：requested → rejected（解锁争议资格；合约不�
 });
 
 test('RefundApproved：escrowed/shipped/disputed → refunded 终态（售后标记复位）', async () => {
-  // 申请后卖家同意退款
+  // 申请后店主同意退款
   const a = await insertOrder('shipped');
   await applyEvent('RefundRequested', { orderId: a.escrowOrderId });
   assert.equal(await applyEvent('RefundApproved', { orderId: a.escrowOrderId, refundWei: FULL_REFUND }), 1);
@@ -134,7 +134,7 @@ test('RefundApproved：escrowed/shipped/disputed → refunded 终态（售后标
   assert.equal(rowA.status, 'refunded');
   assert.equal(rowA.refund_status, 'none', '终态后售后标记复位（结果由订单状态表达）');
 
-  // 争议中卖家主动和解退款（disputed → refunded，链上 RefundApproved 同事件）
+  // 争议中店主主动和解退款（disputed → refunded，链上 RefundApproved 同事件）
   const b = await insertOrder('disputed');
   assert.equal(await applyEvent('RefundApproved', { orderId: b.escrowOrderId, refundWei: FULL_REFUND }), 1);
   assert.equal(await statusOf(b.orderId), 'refunded');
@@ -152,7 +152,7 @@ test('RefundApproved：escrowed/shipped/disputed → refunded 终态（售后标
   assert.deepEqual(events.map((e) => e.name), ['RefundRequested', 'RefundApproved']);
 });
 
-test('OrderExpiredReleased：draft/escrowed/shipped → expired（超时释放给卖家）', async () => {
+test('OrderExpiredReleased：draft/escrowed/shipped → expired（超时释放给店主）', async () => {
   const a = await insertOrder('escrowed');
   assert.equal(await applyEvent('OrderExpiredReleased', { orderId: a.escrowOrderId }), 1);
   assert.equal(await statusOf(a.orderId), 'expired');
@@ -241,9 +241,9 @@ test('事件史：迁移成功记录 {name,txHash,block,at}，失败/无凭证�
   assert.equal(ev0.block, null);
 });
 
-// ── 防伪托管：OrderCreated 事件金额/卖家/买家必须与本地订单锁定一致 ──
+// ── 防伪托管：OrderCreated 事件金额/店主/买家必须与本地订单锁定一致 ──
 // （insertOrder 默认行：buyer=0x…aa、seller=0x…bb、amount_wei=1e18；Escrow 仅原生 BTY 入金后事件
-//   不再表达支付代币，0 金额/错误卖家/他人买家直调 createOrder 均不得推进状态）
+//   不再表达支付代币，0 金额/错误店主/他人买家直调 createOrder 均不得推进状态）
 const GOOD_BUYER = '0x00000000000000000000000000000000000000aa';
 const GOOD_SELLER = '0x00000000000000000000000000000000000000bb';
 const GOOD_AMOUNT = 1000000000000000000n;
@@ -267,7 +267,7 @@ test('防伪：金额不符的托管事件不推进（0 金额/少付均拒）',
   );
 });
 
-test('防伪：卖家不符的托管事件不推进', async () => {
+test('防伪：店主不符的托管事件不推进', async () => {
   const a = await insertOrder('draft');
   assert.equal(await applyEvent('OrderCreated', createdArgs(a.escrowOrderId, { seller: '0x' + '2'.repeat(40) })), 0);
   assert.equal(
@@ -277,7 +277,7 @@ test('防伪：卖家不符的托管事件不推进', async () => {
 });
 
 
-test('防伪：金额/卖家全部匹配的真实托管事件正常推进', async () => {
+test('防伪：金额/店主全部匹配的真实托管事件正常推进', async () => {
   const a = await insertOrder('draft');
   assert.equal(await applyEvent('OrderCreated', createdArgs(a.escrowOrderId), { txHash: '0x' + 'd'.repeat(64), block: 9 }), 1);
   const row = await db.get('SELECT status, onchain_events, paid_tx_hash FROM v_orders WHERE order_id = ?', a.orderId);
@@ -320,7 +320,7 @@ test('cancelled 行不匹配事件不复活（金额/买家不符的伪造事件
 });
 
 // ── 按退款额拆分结算（2026-09：能给出部分金额的有两条出口——仲裁人的 `voteSettlement(orderId, refundWei)`
-//    （任意比例、无需授权）与卖家 `approveRefund(orderId, refundWei)` 且 refundWei **恰好等于买家
+//    （任意比例、无需授权）与店主 `approveRefund(orderId, refundWei)` 且 refundWei **恰好等于买家
 //    `acceptPartialRefund` 授权过的那个数**；其它金额一律 RefundAmountNotAccepted，旧的 RefundNotFull 已删除。
 //    本文件只钉"按额分流"本身，买家授权链路的端到端见 test/partial-refund-consent.test.js）──
 
@@ -379,6 +379,28 @@ test('SellerRefunded：结算后退款按累计总额落库，重放不重复加
     (await db.get('SELECT refunded_amount_wei FROM v_orders WHERE order_id = ?', a.orderId)).refunded_amount_wei,
     '300000000000000000'
   );
+});
+
+test('保证金赔付读数不可用：退款额/提货赔付仍落账，只保留 stake_paid_wei 旧值', async () => {
+  const a = await insertOrder('settled');
+  setStakePaidReaderForTest(async () => {
+    throw new Error('MK_STAKING_ADDRESS 缺失（测试）');
+  });
+  try {
+    assert.equal(
+      await applyEvent(
+        'SellerRefunded',
+        { orderId: a.escrowOrderId, amount: '250000000000000000', refundedTotal: '250000000000000000' },
+        { txHash: '0x' + '7'.repeat(64), block: 75 }
+      ),
+      1,
+      '保证金派生读数失败不能阻断链上退款事实'
+    );
+    const row = await db.get('SELECT refunded_amount_wei FROM v_orders WHERE order_id = ?', a.orderId);
+    assert.equal(row.refunded_amount_wei, '250000000000000000');
+  } finally {
+    setStakePaidReaderForTest(async () => '0');
+  }
 });
 
 test('ClaimPaid：提货赔付与买家退款分开落库，重放不重复加', async () => {
@@ -448,7 +470,7 @@ test('ClaimPaid 同时终结本地 claim：ClaimClosed 漏扫也不会让 token 
   assert.equal(String(row.claim_amount_wei), amount);
 });
 
-test('拆分结算：refundWei = amount 落 refunded（全额退款），0 落 settled（全额判卖家）', async () => {
+test('拆分结算：refundWei = amount 落 refunded（全额退款），0 落 settled（全额判店主）', async () => {
   const full = await insertOrder('disputed');
   await applyEvent('Arbitrated', { orderId: full.escrowOrderId, refundWei: '1000000000000000000' });
   assert.equal(await statusOf(full.orderId), 'refunded');
@@ -467,12 +489,12 @@ test('拆分结算：refundWei = amount 落 refunded（全额退款），0 落 s
 });
 
 /**
- * 事件字段容错（**不是**在说"卖家可以随便填金额"）：合约侧 approveRefund 的合法取值只有
+ * 事件字段容错（**不是**在说"店主可以随便填金额"）：合约侧 approveRefund 的合法取值只有
  * 「全额」与「买家已精确授权的那个数」（其它 RefundAmountNotAccepted，旧 RefundNotFull 已删除）；
  * 这里直调 applyEvent 是为了钉住 settleByRefundSplit 对 `refundWei` 的判定与 Arbitrated 完全一致
  * （ABI 漂移/历史事件/对账兜底都不会出现"同一笔钱两条事件路径两种终态"）。
  * 真实链上同样会产生部分金额的出口见上一条（arbitrate）与 test/partial-refund-consent.test.js
- * （买家 acceptPartialRefund 授权后卖家 approveRefund 同额）。
+ * （买家 acceptPartialRefund 授权后店主 approveRefund 同额）。
  */
 test('按额判定：RefundApproved 带部分金额（历史/ABI 容错）同样落 settled + 已退金额', async () => {
   const a = await insertOrder('shipped');
@@ -488,8 +510,8 @@ test('按额判定：RefundApproved 带部分金额（历史/ABI 容错）同样
 // 攻击者可对任意**未付款草稿**的 orderId 用 1 wei + timeoutBlocks=1 建一笔自己的链上单，
 // 再调 releaseExpired 触发 OrderExpiredReleased。修复前该事件只按 orderId + 本地状态落地，
 // 会把受害者的 draft 改成 expired（占位被释放、事件史写入攻击者 txHash、按 INCOME_STATUS
-// 计入卖家流水），且买家随后真实支付因 OrderExists 永久 revert。
-// 修复：非 OrderCreated 事件同样必须与链上 getOrder 真值（买家/卖家/金额）逐项一致。
+// 计入店主流水），且买家随后真实支付因 OrderExists 永久 revert。
+// 修复：非 OrderCreated 事件同样必须与链上 getOrder 真值（买家/店主/金额）逐项一致。
 
 const OTHER_BUYER = '0x' + '3'.repeat(40);
 
@@ -549,9 +571,9 @@ test('防伪（仲裁/退款类事件）：链上金额不符的 Arbitrated 不�
 
 // ── 源码审计 2026-09：终局事件的 from 集与 /sync 口径对齐（防流水漏计） ──
 
-test('终局 from 集对齐 /sync：cancelled 残镜像收到超时释放/仲裁/退款事件后收敛（卖家流水不再漏计）', async () => {
+test('终局 from 集对齐 /sync：cancelled 残镜像收到超时释放/仲裁/退款事件后收敛（店主流水不再漏计）', async () => {
   // 草稿被清扫（cancelled）后链上才落定并终局——此前这些行永远停在 cancelled，
-  // INCOME_STATUS 计不到，卖家实际收到的钱不出现在账本里（/sync 早已支持该口径）
+  // INCOME_STATUS 计不到，店主实际收到的钱不出现在账本里（/sync 早已支持该口径）
   const a = await insertOrder('cancelled');
   assert.equal(await applyEvent('OrderExpiredReleased', { orderId: a.escrowOrderId }), 1, 'cancelled → expired');
   assert.equal(await statusOf(a.orderId), 'expired');

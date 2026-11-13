@@ -7,12 +7,12 @@
  *    watcher 对 Escrow 链上事件的**本地位移镜像**（每事件含 txHash/块号，可链上对账），
  *    节点虚报统计可被第三方重算戳穿；`at` 为节点落库时刻（近似事件时刻，诚实标注）。
  *  - 仲裁判向不在事件史字段内（Arbitrated 参数未落库），以订单**终局状态**反推：
- *    refunded = 判买家 / settled = 判卖家（只统计**含 Arbitrated 事件**的行）。
- *    注意 refunded/settled 两态**也可由 `RefundApproved` 产生**（卖家同意退款 / 争议中和解，
+ *    refunded = 判买家 / settled = 判店主（只统计**含 Arbitrated 事件**的行）。
+ *    注意 refunded/settled 两态**也可由 `RefundApproved` 产生**（店主同意退款 / 争议中和解，
  *    含部分退款——那类单没有 Arbitrated 事件，因此不计入判向统计）；拆分裁决按 settled
- *    计入判卖家侧（要区分"拆分"需另读 refundedAmountWei）；
+ *    计入判店主侧（要区分"拆分"需另读 refundedAmountWei）；
  *  - 发货耗时中位数/P90 = delivered_at − OrderCreated.at，本地账 ⚠ 节点自述（可交叉抽样）；
- *    减法的唯一实现在 shipLatencySpan（卖家 SLA 读数复用同一批样本与同一基准，见 opsMetrics.js）；
+ *    减法的唯一实现在 shipLatencySpan（店主 SLA 读数复用同一批样本与同一基准，见 opsMetrics.js）；
  *  - 样本阈值：窗口内争议 < 5 笔时争议率/判买家率置 null（sampleTooSmall 标记），防小样本误导；
  *  - **重复交易对占比**（`sybil`，2026-10 新增）：同一 buyer↔seller 交易对在窗口内的第 2 笔及以后
  *    的成交占该窗总成交的比例 = (总成交 − 不同交易对数) / 总成交。它是**可疑信号，不是结论**：
@@ -142,7 +142,7 @@ export function escrowedAtOf(events) {
 
 /**
  * 发货耗时样本（毫秒）= 交付时刻 − 托管入账近似时刻；任一缺失返回 null（读不到就不报数）。
- * **唯一判据**：履约画像与卖家 SLA 读数共用同一个减法——两处各写一遍必然漂移，
+ * **唯一判据**：履约画像与店主 SLA 读数共用同一个减法——两处各写一遍必然漂移，
  * 而"这家店发货要多久"出现两个数就是两个真相。
  *
  * 入参是**毫秒数**（调用方用 `timeMs(列)` / `escrowedAtOf(事件史)` 先折算好）。
@@ -165,7 +165,7 @@ export function percentile(list, q) {
   return s[idx];
 }
 
-/** 交易对的稳定键（buyer↔seller；卖家在本仓是一家店，但键里带上它才是"交易对"的诚实口径） */
+/** 交易对的稳定键（buyer↔seller；店主在本仓是一家店，但键里带上它才是"交易对"的诚实口径） */
 const pairKeyOf = (row) => `${String(row.buyer || '').toLowerCase()}|${String(row.seller || '').toLowerCase()}`;
 
 /** 纯统计函数（行：读模型 `v_orders` 的 status/onchain_events/delivered_at/buyer/seller 列；nowMs 供测试注入） */
@@ -214,7 +214,7 @@ export function computeReputation(rows, nowMs = Date.now()) {
       没有事件时下面各计数自然是 0（分子不受影响），单量与非空凭证同源。
     */
 
-    // 交付时刻（本地账：卖家发货写入）——列是 DATETIME(3)（Date）或 NULL，算术在毫秒域做
+    // 交付时刻（本地账：店主发货写入）——列是 DATETIME(3)（Date）或 NULL，算术在毫秒域做
     const deliveredAt = timeMs(row.delivered_at);
     // OrderCreated 落库时刻（托管入账近似）——唯一判据见 escrowedAtOf
     const escrowedAt = escrowedAtOf(events);
@@ -279,7 +279,7 @@ export function computeReputation(rows, nowMs = Date.now()) {
       } else if (ev.name === 'OrderExpiredReleased') {
         for (const w of orderWindows) win[w.key].timeouts += 1;
       } else if (ev.name === 'Arbitrated') {
-        // 判向以终局状态反推（refunded=买家 / settled=卖家）；异常终局不计入判向
+        // 判向以终局状态反推（refunded=买家 / settled=店主）；异常终局不计入判向
         if (row.status === 'refunded') {
           for (const w of orderWindows) win[w.key].refundedToBuyer += 1;
         } else if (row.status === 'settled') {
@@ -289,7 +289,7 @@ export function computeReputation(rows, nowMs = Date.now()) {
     }
 
     // 发货耗时样本：按订单创建归属窗口（与事件计数同源；有交付记录且能取到托管时刻）。
-    // 减法只有一处实现（shipLatencySpan）：履约画像与卖家 SLA 读数必须给出同一个"发货多久"。
+    // 减法只有一处实现（shipLatencySpan）：履约画像与店主 SLA 读数必须给出同一个"发货多久"。
     const span = shipLatencySpan({ deliveredAt, escrowedAt });
     if (span !== null) for (const w of orderWindows) win[w.key].deliveries.push(span);
   }
@@ -396,7 +396,7 @@ export function computeReputation(rows, nowMs = Date.now()) {
  * buyer/seller 两列是**重复交易对信号**的分组键（见文件头；两者都是 OrderCreated 事件的
  * indexed 字段 ⇒ 口径可由第三方扫链复算）。
  *
- * **必须按卖家地址过滤**（2026-10-15 修 D6，2026-10 多店改造改为显式传参）：
+ * **必须按店主地址过滤**（2026-10-15 修 D6，2026-10 多店改造改为显式传参）：
  * `orders.seller` 是**逐行**写入的（= 该单所属店铺的 `shops.seller`），而本函数此前不带任何
  * WHERE —— 于是换过店主地址（店铺转手 / 换绑钱包）、或一台节点上有多家店时，会把**别家店**
  * 的订单算进这一家的公开画像（单量、确认率、发货耗时全被稀释/抬高），而这份画像是买家

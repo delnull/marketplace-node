@@ -56,8 +56,19 @@ function pinnedLookup(addresses) {
  */
 export function postPinned(
   url,
-  { headers = {}, body = '', addresses = [], timeoutMs = 5000, signal, readBody = false, maxBodyBytes = 64 * 1024 } = {}
+  /*
+    超时预算**没有默认值**：调用方必须显式给（webhook 与 orderGate 各用自己的配置）。
+    留一个默认值就是第二份真相——某天调用方漏传时会静默拿到一个没人review过的数。
+  */
+  { headers = {}, body = '', addresses = [], timeoutMs, signal, readBody = false, maxBodyBytes = 64 * 1024, method = 'POST' } = {}
 ) {
+  const verb = String(method).toUpperCase();
+  if (verb !== 'POST' && verb !== 'GET') {
+    return Promise.reject(new Error(`pinnedRequest: 不支持的 method=${method}`));
+  }
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return Promise.reject(new Error('postPinned: 调用方必须显式给 timeoutMs（毫秒，>0）'));
+  }
   return new Promise((resolve, reject) => {
     let u;
     try {
@@ -80,7 +91,7 @@ export function postPinned(
     const isHttps = u.protocol === 'https:';
     const isIpHost = net.isIP(hostname) !== 0;
     const options = {
-      method: 'POST',
+      method: verb,
       hostname,
       port: u.port ? Number(u.port) : isHttps ? 443 : 80,
       path: `${u.pathname}${u.search}`,
@@ -148,6 +159,11 @@ export function postPinned(
       }
       signal.addEventListener('abort', onAbort, { once: true });
     }
-    req.end(body);
+    req.end(verb === 'GET' ? '' : body);
   });
+}
+
+/** 钉住地址的 GET（行情源等只读 JSON；语义与 postPinned 相同：不重定向、限量读、超时必给） */
+export function getPinned(url, opts = {}) {
+  return postPinned(url, { ...opts, method: 'GET', body: '' });
 }

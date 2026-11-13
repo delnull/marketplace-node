@@ -9,7 +9,7 @@
  * 保留：escrowed / shipped / disputed / confirmed / settled / expired 等已付款订单；
  * 部分退款（settled + refunded_amount_wei > 0）仍算一笔已支付订单/件数。
  *
- * 只用在**公开销量/单量**；卖家看板的成交/净额仍走 `INCOME_STATUS`。
+ * 只用在**公开销量/单量**；店主看板的成交/净额仍走 `INCOME_STATUS`。
  */
 export const PAID_SALES_WHERE =
   "TRIM(COALESCE(o.paid_tx_hash, '')) <> '' AND o.status NOT IN ('refunded', 'cancelled') AND o.buyer <> o.seller";

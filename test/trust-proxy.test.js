@@ -16,13 +16,17 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { makeCtx, assertOk } from './setup.mjs';
+import { makeCtx, assertOk, login } from './setup.mjs';
 
 const ctx = await makeCtx();
-const { app, request } = ctx;
+const { app, request, owner } = ctx;
+const ownerToken = (await login(ctx, owner)).token;
 
 test('/healthz 暴露生效的反代信任边界（capabilities.trustProxy）', async () => {
-  const res = await request(app).get('/healthz').expect(200);
+  const res = await request(app)
+    .get('/healthz?full=1')
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .expect(200);
   assertOk(res);
   assert.equal(res.body.data.capabilities?.trustProxy, 'loopback', '运维必须能读到本进程实际信任哪些代理跳');
 });

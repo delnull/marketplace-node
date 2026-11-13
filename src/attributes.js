@@ -11,7 +11,7 @@
  *
  * ── 为什么必须有这一层（而不是让店主继续写进商品说明）──────────────────
  * 商品说明是**自由文本**：能写"全新未拆封"，但仲裁人只能把整段话读一遍，
- * 而"卖家到底承诺了哪一条"没有边界。参数是 `{name, value}` 的键值对，
+ * 而"店主到底承诺了哪一条"没有边界。参数是 `{name, value}` 的键值对，
  * 仲裁台可以逐条对照"买家说他买的是全新，快照里的参数写的是什么"。
  * 它服务的是最常见的争议类型：货不对板。
  *
@@ -104,10 +104,14 @@ export function normalizeAttributes(input) {
     if (len(value) > ATTR_VALUE_MAX_LEN) {
       throw new Error(`参数「${name}」的值超过 ${ATTR_VALUE_MAX_LEN} 字上限（本项 ${len(value)} 字）——更长的说明请写进商品说明`);
     }
-    const key = tagKeyOf(name);
-    if (seen.has(key)) continue; // 同一个键只留先出现的写法（与标签同一条去重口径）
+    /*
+      去重键必须含值：同名多值（接口 USB-C / HDMI）是合法商品参数，按 name 去重会把第二条
+      静默丢掉，与分面按 (name,value) 聚合的口径矛盾。同一个 (name,value) 只留先出现的写法。
+    */
+    const key = `${tagKeyOf(name)}\u0000${tagKeyOf(value)}`;
+    if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ name, value, pair: attrPairOf(key, tagKeyOf(value)) });
+    out.push({ name, value, pair: attrPairOf(tagKeyOf(name), tagKeyOf(value)) });
   }
   if (out.length > ATTR_MAX) {
     throw new Error(`最多 ${ATTR_MAX} 条商品参数（去重后当前 ${out.length} 条）——请删掉次要的几条`);

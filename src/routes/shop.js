@@ -2,7 +2,7 @@
  * 店铺信息与管理路由（经营参数全部网页化：**店名/公告是 `shops` 的列**，店员/通知各有自己的表）。
  *
  * 配置文件只保留"身份与接线"（节点主钱包/escrow/staking/端口等）；节点不读取任何 Registry。
- * 店名/公告/店员名单/通知 webhook 均在卖家面板「店铺设置」维护（即改即生效，无需重启）。
+ * 店名/公告/店员名单/通知 webhook 均在店主面板「店铺设置」维护（即改即生效，无需重启）。
  * 节点自己的对外资料（名称/公告）是 `node` **单例行**的两列——它不是"某家店的名字"。
  *
  *  GET  /                节点信息（+ 带 X-Mk-Shop 时附该店信息）——买家页面与下单核验用
@@ -19,9 +19,9 @@
  *  GET  /reviews/stats   店铺买家评价聚合（公开只读）
  *  GET  /buyer-signal    买家履约信号（ownerOnly；**本店视角**，口径见 src/buyerSignal.js）
  *  GET  /metrics         运营指标（ownerOnly；待办/超时/挂账/对账读数，口径见 src/opsMetrics.js）
- *  GET  /sla             卖家 SLA 读数（ownerOnly；三份待办清单 + 发货时长分布，同上）
+ *  GET  /sla             店主 SLA 读数（ownerOnly；三份待办清单 + 发货时长分布，同上）
  *
- * **卖家面的店铺上下文由鉴权中间件解析**（见 http.js）：带 `X-Mk-Shop` 就按它（必须指得中），
+ * **店主面的店铺上下文由鉴权中间件解析**（见 http.js）：带 `X-Mk-Shop` 就按它（必须指得中），
  * 不带就取"这个地址在本节点唯一经营的那家店"；经营多家时必须点名（缺头 = 400，没有合理默认值）。
  */
 import { Router } from 'express';
@@ -80,7 +80,7 @@ import {
   setNodeAvatar,
 } from '../shops.js';
 // 节点级运营读数（nodeAdmin）：只出"这台机器有没有在干活"，不出任何店铺经营明细
-import { escrowWatcherStatus } from '../escrowWatcher.js';
+import { escrowWatcherStatus, replayQuarantinedEvents } from '../escrowWatcher.js';
 import { chainReconcileStatus } from '../chainReconcile.js';
 import { reputationSummary } from '../reputation.js';
 import { shopReviewStats } from '../reviews.js';
@@ -270,8 +270,8 @@ router.get('/', optionalShop, wrap(async (req, res) => {
     escrowAddress: config.chain.escrowAddress || null,
     stakingAddress: config.chain.stakingAddress || null,
     timeoutBlocks: config.escrow.timeoutBlocks,
-    shops: listed.map((r) => shopDto(r, owner)),
-    ...(shop ? { shop: shopDto(shop, owner) } : {}),
+    shops: listed.map((r) => shopDto(r, owner, { publicView: true })),
+    ...(shop ? { shop: shopDto(shop, owner, { publicView: true }) } : {}),
     version: config.version,
   });
 }));
@@ -337,9 +337,12 @@ router.get('/payment-methods', paymentMethodsLimiter, wrap(async (req, res) => {
       tokens: [],
     });
   }
-  const rates = await getRates();
+  /*
+    行情与支付方式互不依赖：并行取，避免"慢行情 + 慢 token 读"串成两倍等待
+    （两者各自有预算，合起来仍要落在前端 30s 读超时之内）。
+  */
+  const [rates, tokens] = await Promise.all([getRates(), listPaymentMethods(total)]);
   const nativeAmount = total ? usdtMicroToPayWei(total, rates) : null;
-  const tokens = await listPaymentMethods(total);
   /*
     公开支付方式必须与链上 `supportedToken` 一致：只列环境变量里“配置了”的 token，
     买家会先建草稿、占库存，到签名前才被 Escrow 拒绝。supported=false 直接剔除；
@@ -534,14 +537,33 @@ router.put('/node-staff', hostOnly, wrap(async (req, res) => {
   if (!isAddress(address) || isZeroAddress(address)) return fail(res, '地址必须是 0x 开头的以太坊地址（零地址不可加入）');
   const owner = await nodeOwner();
   if (owner && address === owner) return fail(res, '节点主无需加入员工名单（节点主权限恒高于员工）');
+  let removed = false;
   if (action === 'add') {
     await addNodeStaff(address);
   } else {
-    await removeNodeStaff(address);
+    removed = await removeNodeStaff(address);
   }
   const next = await nodeStaffList();
   await audit(req, 'node.staff.' + action, 'node', address, { staff: next.length }, null);
-  ok(res, { staff: next }, action === 'add' ? '已加入节点员工名单（节点级动作可用）' : '已移出节点员工名单（下一次请求即失效）');
+  ok(res, { staff: next }, action === 'add' ? '已加入节点员工名单（节点级动作可用）' : removed ? '已移出节点员工名单（下一次请求即失效）' : '该地址本来就不在节点员工名单里');
+}));
+
+/**
+ * 人工重放被隔离的链上事件（hostOnly）。
+ * 隔离不是“这一单已处理完”，而是“这轮没应用成功、游标已越过它”；清清单必须同时回退游标，
+ * 否则清单空了、事件仍然永远不会重放。与 watcher 共用单飞锁，正在扫描时返回 409。
+ */
+router.post('/node/quarantine/replay', hostOnly, wrap(async (req, res) => {
+  const r = await replayQuarantinedEvents();
+  if (r.busy) return fail(res, '链上事件扫描正在进行，请稍后重试', 409, 409);
+  await audit(req, 'node.quarantine.replay', 'node', null, { cleared: r.cleared, rewindTo: r.rewindTo }, null);
+  ok(
+    res,
+    r,
+    r.cleared
+      ? `已清空 ${r.cleared} 条隔离记录，并把游标回退到块 ${r.rewindTo}；下一轮扫描会重放这些事件`
+      : '隔离清单为空，没有需要重放的事件'
+  );
 }));
 
 /**
@@ -978,7 +1000,7 @@ router.get('/metrics', ownerOnly, metricsLimiter, wrap(async (req, res) => {
 }));
 
 /**
- * 卖家 SLA 读数（ownerOnly 只读）：未发货超期清单（最久的 N 条）、待店主回复的退款申请、
+ * 店主 SLA 读数（ownerOnly 只读）：未发货超期清单（最久的 N 条）、待店主回复的退款申请、
  * 在途售后案件，以及发货时长中位数/P90（样本不足置 null 并说明）。
  * "超期"以链上 `releaseNotBeforeBlock` 被当前块高跨过为准，不是本地按块时间估算（见 opsMetrics）。
  */
@@ -1014,7 +1036,11 @@ router.get('/stats/products', ownerOnly, wrap(async (req, res) => {
   if (days === null) return fail(res, '天数无效（需 0 或正整数；0=全量；上限 366 天）');
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
-  ok(res, await productStats(days, String(req.query.sort || 'gmv'), page, pageSize, req.shop.seller));
+  const sort = String(req.query.sort || 'gmv');
+  if (!['gmv', 'incomeOrders', 'refund'].includes(sort)) {
+    return fail(res, '排序方式无效：只支持按成交额、入账单量或退款额排序', 1, 400);
+  }
+  ok(res, await productStats(days, sort, page, pageSize, req.shop.seller));
 }));
 
 export default router;

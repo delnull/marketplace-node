@@ -46,7 +46,7 @@ function assertUserMessage(res, label) {
 
 test('运行时：未登录的 401 文案是中文，且不含机器标识符', async () => {
   const seller = await request(app).get('/api/orders/seller').expect(401);
-  assertUserMessage(seller, '卖家列表未登录');
+  assertUserMessage(seller, '店主列表未登录');
   const product = await request(app).post('/api/products').send({}).expect(401);
   assertUserMessage(product, '上架未登录');
 });

@@ -1511,6 +1511,16 @@ if true; then
     fi
   fi
 
+  # 升级时先跑**加性** schema 迁移（新表/新索引），再换容器：
+  # 新镜像启动时的结构门禁会拒绝缺表的库；迁移失败则旧容器还在服务。
+  # 只在 update 跑：全新安装的库/表由节点首次启动的 schema 自检建出来，那时 DB 可能还不存在。
+  if [ "$MODE" = update ]; then
+    step "⑤b 数据库迁移（建单幂等表/索引）"
+    dk run --rm --network "$NETWORK" --env-file "$ENV_FILE" --entrypoint node "$IMAGE" \
+      scripts/migrate-order-idempotency.mjs || die "数据库迁移失败（旧容器没有被动过，节点仍在服务）"
+    ok "数据库迁移完成"
+  fi
+
   step "⑥ 启动节点容器（$CONTAINER）"
   if dk ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     if [ "$FORCE" != 1 ] && [ "$MODE" != update ]; then

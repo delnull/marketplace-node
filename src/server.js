@@ -213,6 +213,15 @@ if (config.chain.escrowAddress) {
           );
         }
         console.log('[marketplace-node] Escrow/Staking owner 与双向接线一致');
+        /*
+          配置漏写 MK_STAKING_ADDRESS、但 Escrow 已经接线 Staking 时，不能“启动了但
+          watcher 每次读保证金都失败”：链上地址是事实，配置只做校验。这里把链上读数
+          采纳为运行时读取源；显式配置仍优先用于不一致校验。
+        */
+        if (!config.chain.stakingAddress) {
+          config.chain.stakingAddress = stakingAddr;
+          console.log(`[marketplace-node] MK_STAKING_ADDRESS 未配置，已采纳链上 Escrow.staking()=${stakingAddr}`);
+        }
       }
     } catch (e) {
       console.error(

@@ -1,5 +1,5 @@
 /**
- * 卖家运营读数（**唯一实现**）：待办队列（计数 + 最久等待）、托管超时、链上挂账余额、
+ * 店主运营读数（**唯一实现**）：待办队列（计数 + 最久等待）、托管超时、链上挂账余额、
  * 对账读数、SLA 清单与发货时长。
  *
  * 为什么单列一个模块，而不是在路由里各写一遍 SQL：
@@ -136,7 +136,7 @@ export function shopWhere(seller, prefix = 'o.') {
 }
 
 /**
- * 店主待办计数（**唯一实现**：卖家面板徽标 `GET /api/orders/seller/status-counts` 与
+ * 店主待办计数（**唯一实现**：店主面板徽标 `GET /api/orders/seller/status-counts` 与
  * `GET /api/shop/metrics` 共用）。单表聚合毫秒级。
  * @param {string|null|undefined} seller 见 shopWhere
  */
@@ -166,13 +166,13 @@ export async function sellerTodoCounts(seller) {
     店主会一直以为这单已经了结。判据与仲裁队列/退货门控同一处（afterSale.js）。
   */
   const pendingAfterSale = (await db.get(`SELECT COUNT(*) AS c ${fromJoined} WHERE ${AFTER_SALE_OPEN_SQL}${orderScope}`, ...orderScopeParams)).c;
-  // P 评审扩展（卖家待办聚合）：退货回收 / 待回复评价 / 低库存
+  // P 评审扩展（店主待办聚合）：退货回收 / 待回复评价 / 低库存
   // 退货单与评价都挂在订单上，两处都**必须 join orders 再按店铺限定**——
   // 少了这一层，A 店店主的徽标会把 B 店待回收的退货算成自己的。
   const pendingReturns = (await db.get(`SELECT COUNT(*) AS c FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE r.status IN ('open','shipped')${orderScope}`, ...orderScopeParams)).c;
   const returnsToConfirm = (await db.get(`SELECT COUNT(*) AS c FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE r.status = 'shipped'${orderScope}`, ...orderScopeParams)).c;
   const pendingReviewReply = (await db.get(`SELECT COUNT(*) AS c FROM reviews r JOIN orders o ON o.id = r.order_id WHERE r.reply_content = '' AND o.status IN ${INCOME_IN}${orderScope}`, ...orderScopeParams)).c;
-  // 低库存按「商品」计数：任一组合余量 ≤ 商品级阈值即计入（卖家务必要一并看那些组合）
+  // 低库存按「商品」计数：任一组合余量 ≤ 商品级阈值即计入（店主务必要一并看那些组合）
   /*
     商品表的店铺维度读法是 `products.shop_code`，而本模块的入参是 seller
     （理由见 shopWhere：seller 是链上可复算的那个键）。两者之间**显式 join shops 换算**，
@@ -266,11 +266,11 @@ const MAX_THRESHOLD_READS = 100;
 const chainErrText = (e) => String(e?.message || e).slice(0, 160);
 
 /**
- * 「托管中 / 已超时」读数（链上判据，**唯一实现**：运营读数与卖家 SLA 清单共用）。
+ * 「托管中 / 已超时」读数（链上判据，**唯一实现**：运营读数与店主 SLA 清单共用）。
  *
  * 判据是**合约自己**的 `releaseNotBeforeBlock(orderId)`：`latestBlock > 该阈值` 时，
- * 任何人都能调 `releaseExpired` 把钱判给卖家。刻意不自己用 `createdAtBlock + timeoutBlocks`
- * 算——合约在那之上还叠了"卖家拒绝退款后的释放静置期"（加固 A），自算会把静置期内的单
+ * 任何人都能调 `releaseExpired` 把钱判给店主。刻意不自己用 `createdAtBlock + timeoutBlocks`
+ * 算——合约在那之上还叠了"店主拒绝退款后的释放静置期"（加固 A），自算会把静置期内的单
  * 误报成"已超时"（店主被叫去抢救一笔其实还有窗口的单）。
  * 同样刻意不自己估块时间（BTY ≈5s/块只是经验值）：估出来的"超时"没有链上事实对应。
  *
@@ -416,7 +416,7 @@ const accruedSlot = (reason = null) => ({ available: false, reason, address: nul
  * 挂账余额（`Escrow.accruedPayouts`）：`_settle` 派发失败时钱会记在收款方名下，
  * 由其自行 `withdrawPayout()` 领走——**挂在链上、没人提醒**，所以要有读数。
  *
- * 零费模型下**只有卖家这一条腿**（没有平台费/节点抽成可挂）：主体就是该店店主地址，
+ * 零费模型下**只有店主这一条腿**（没有平台费/节点抽成可挂）：主体就是该店店主地址，
  * 读不到时给 available:false 而不用 0 冒充"没有挂账"。
  */
 export async function accruedReading(seller) {
@@ -534,7 +534,7 @@ export async function opsMetrics({ now = Date.now(), reconcile, seller } = {}) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
-   组装：卖家 SLA 读数
+   组装：店主 SLA 读数
    ══════════════════════════════════════════════════════════════════════ */
 
 /** SLA 清单的单次条数上限（面板一屏够用；要全量请走各业务列表端点） */
@@ -672,7 +672,7 @@ function slaItem(orderId, ageMs, extra = {}) {
 }
 
 /**
- * 卖家 SLA 读数（`GET /api/shop/sla`，ownerOnly 只读）：三份待办清单 + 发货时长分布。
+ * 店主 SLA 读数（`GET /api/shop/sla`，ownerOnly 只读）：三份待办清单 + 发货时长分布。
  *
  * 三份清单的判据都**不是**新写的：未发货超期走 escrowOverdueReading（与 metrics 同一个读数）、
  * 待回复退款走 PENDING_REFUND_SQL、在途案件走 AFTER_SALE_OPEN_SQL。
@@ -705,8 +705,14 @@ export async function slaReading({ limit = SLA_LIMIT_DEFAULT, now = Date.now(), 
          FROM orders o LEFT JOIN order_chain c ON c.order_id = o.id
         WHERE ${PENDING_REFUND_SQL}${s.where} ORDER BY c.refund_requested_at ASC LIMIT ?`, ...s.params, n),
     // 店主已提交的"退款回复"条数：一次聚合取回，避免逐行 COUNT（详情时间线的老坑：N+1）。
-    // 键是内部 order_id（子表外键指向它），与上面的 SELECT 对齐。
-    db.all("SELECT order_id, COUNT(*) AS c FROM dispute_evidence WHERE role = 'seller' AND phase = 'refund_reply' GROUP BY order_id"),
+    // 键是内部 order_id（子表外键指向它），与上面的 SELECT 对齐；必须带店铺范围，不能跨店聚合。
+    db.all(
+      `SELECT de.order_id, COUNT(*) AS c
+         FROM dispute_evidence de JOIN orders o ON o.id = de.order_id
+        WHERE de.role = 'seller' AND de.phase = 'refund_reply'${s.where}
+        GROUP BY de.order_id`,
+      ...s.params
+    ),
     queueWait({ where: PENDING_REFUND_SQL, timeCol: 'refund_requested_at', seller }),
     // 在途售后案件：判据 after_sale_status='open'；排序锚点是**开案时刻**（案件不动 updated_at）
     db.all(`SELECT o.id AS order_id, o.order_no, c.after_sale_opened_at

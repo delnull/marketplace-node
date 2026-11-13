@@ -45,7 +45,7 @@ export async function blockedShopCodes(buyer) {
   return new Set(rows.map((r) => String(r.target_value)));
 }
 
-/** 当前买家在本节点屏蔽的卖家地址集合（seller 目标 + shop 目标所属店主）。 */
+/** 当前买家在本节点屏蔽的店主地址集合（seller 目标 + shop 目标所属店主）。 */
 export async function blockedSellers(buyer) {
   const addr = String(buyer || '').toLowerCase();
   if (!ADDRESS_RE.test(addr)) return new Set();
@@ -82,7 +82,7 @@ export async function addBuyerBlock({ buyer, targetType, target, reason } = {}) 
     shopCode = value;
   } else {
     value = raw.toLowerCase();
-    if (!ADDRESS_RE.test(value)) return { error: '卖家地址非法' };
+    if (!ADDRESS_RE.test(value)) return { error: '店主地址非法' };
   }
 
   await getDb().run(

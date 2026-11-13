@@ -1,6 +1,6 @@
 /**
  * 池式商品「已收款但无货可交」主动告警（order.pool_empty）单测：
- *  - 判定口径与卖家面板 poolEmpty **同一实现**（poolShortfallOf/isPoolEmpty）；
+ *  - 判定口径与店主面板 poolEmpty **同一实现**（poolShortfallOf/isPoolEmpty）；
  *  - 托管落定（watcher 的 OrderCreated 分支；paid 快路径调同一函数）后池内资源不足 → 推店主；
  *  - 每单至多一次（order_alerts 里的一行）；池子够 / 非池式 / 已交付的行不告警；
  *  - payload 无 PII（只有订单号/链上单号/原因）；
@@ -126,7 +126,7 @@ async function importTokens(slug, tokens) {
   assertOk(res);
 }
 
-test('poolShortfallOf/isPoolEmpty：与卖家面板 poolEmpty 同口径（数字按 quantity、NFT 扣已交付、实物与非托管态不成立）', async () => {
+test('poolShortfallOf/isPoolEmpty：与店主面板 poolEmpty 同口径（数字按 quantity、NFT 扣已交付、实物与非托管态不成立）', async () => {
   // autoDeliver=0：本用例只验判定口径，不被"补货即自动补发"改变订单状态
   const p = await listProduct(productPayload({ title: '缺货告警数字商品', autoDeliver: 0 }));
   const d = await createDraft(p.slug);
@@ -238,7 +238,7 @@ test('watcher 路径：OrderCreated 回写为 escrowed 时池内不足 → 自�
   */
   assert.ok(await waitUntil(async () => await alertDelivered(order.id)), '投递应结算完成');
   const alerts = sent.filter((s) => s.body.type === 'order.pool_empty');
-  assert.equal(alerts.length, 1, '托管落定即告警（无需卖家去看面板）');
+  assert.equal(alerts.length, 1, '托管落定即告警（无需店主去看面板）');
   assert.equal(alerts[0].body.orderId, order.id);
 
   // 幂等重放（事件重扫 changed=0）：不得再次推送。
@@ -252,7 +252,7 @@ test('watcher 路径：OrderCreated 回写为 escrowed 时池内不足 → 自�
 /**
  * 投递失败不得把幂等标记写死（2026-09 修复）。
  * 旧实现是「先写 kv 里的 ackKey 再 notifyRaw(...)」：URL 写错 / 被 SSRF 拦下 / 店主服务器 5xx /
- * 超时，标记都已写死 ⇒ **永远不会**重试，而这条告警是"买家钱已上链、卖家却无货可交"。
+ * 超时，标记都已写死 ⇒ **永远不会**重试，而这条告警是"买家钱已上链、店主却无货可交"。
  * 现在幂等标记是 order_alerts 的一行（主键 (order_id, kind) 去重，见 src/alertAck.js），
  * 只在投递成功后写：失败 ⇒ 行被删掉 ⇒ 下一轮复查仍会投（at-least-once）。
  */

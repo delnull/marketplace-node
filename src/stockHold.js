@@ -8,7 +8,7 @@
  *   → quantity，不限量/池式商品 → 0。随订单行存续，是释放/恢复的唯一记账依据——
  *   商品任意切换限量/不限量都不会产生账目漂移：
  *   - 从未占位（hold_qty=0）的订单取消/退款 → 释放扣 0，不误扣 committed；
- *   - 限量期下单（hold_qty>0）后卖家改不限量 → 释放照常回补（卖家放开的是承诺上限，不是已占位）；
+ *   - 限量期下单（hold_qty>0）后店主改不限量 → 释放照常回补（店主放开的是承诺上限，不是已占位）；
  *   - 取消后恢复（sync/watcher 自动复活）→ restockOrder 按 hold_qty 条件重新占位。
  * - orders.released_at（DATETIME(3) NULL）= 释放幂等标记（非空即已释放）：释放 = 置 released_at
  *   + 回补 committed，重复触发不再二次扣减（同一订单只能被释放一次，即使状态迁移被两条路径竞争触发）。
@@ -38,8 +38,8 @@
  * 与 shipped → expired 不释放同口径防超卖）——见 releaseRefundedEscrow。
  *
  * D1 例外（releaseHoldsForReturnReceived）：终局「成交向」状态（confirmed/settled/expired）里，
- * 货**不在买家手里**的两种情形（从未交付 / 退货已确认收到或卖家放弃追索）都回补占位。
- * 覆盖 watcher 三条终局事件（ReceiptConfirmed / Arbitrated 判卖家 / OrderExpiredReleased）
+ * 货**不在买家手里**的两种情形（从未交付 / 退货已确认收到或店主放弃追索）都回补占位。
+ * 覆盖 watcher 三条终局事件（ReceiptConfirmed / Arbitrated 判店主 / OrderExpiredReleased）
  * 与 sync Settled 兜底、receive/waive 晚于终局迁移的动作路径（settleReturn）。
  *
  * 原子性说明：写事务由 `withTransaction` 界定作用域（回调即事务）。**2026-10-16 起没有全局写锁了**
@@ -105,7 +105,7 @@ function hasOutstandingHoldSql(alias = 'o') {
  *  - `released_at` 只在**整单释放完成**时置位，保留"整单释放时刻"的审计读数；
  *    部分释放的行 `released_at` 仍为 NULL，靠 `released_qty < hold_qty` 表达"还有占位"。
  *  状态白名单由各调用方按其业务语义提供——常规释放集为 cancelled/refunded/expired，
- *  D1 例外（货已回卖家侧的成交终局）另行传入 settled/confirmed（见 releaseHoldsForReturnReceived），
+ *  D1 例外（货已回店主侧的成交终局）另行传入 settled/confirmed（见 releaseHoldsForReturnReceived），
  *  防止误把仍占用/成交中的行释放。
  *  刻意**不动 `updated_at`**：释放是账目动作，不是订单状态迁移——`updated_at` 是入账窗口与
  *  列表排序的锚点，把它挪动等于让同一笔成交额在两个窗口里各出现一次。 */
@@ -218,22 +218,16 @@ export function isDelivered(row) {
 }
 
 /**
- * 「**这一单的库存承诺还没结清**」的 SQL 谓词（**唯一实现**；2026-10-14 审计新增）。
+ * 「**这一单还欠货**」的 SQL 谓词（**唯一实现**；2026-10-14 审计新增，2026-11 修正终态口径）。
  *
- * 判据是两个出口的**并集**，两个方向都故意取安全侧：
+ * 判据：
  *   · `o.status IN (在途集合)` —— 订单生命还没走完（草稿/托管中/已发货/争议中）；
- *   · 或者 `(o.hold_qty > o.released_qty AND 退货未把剩余件数全部收回)` ——
- *     生命走完了但**占位还押着**，且货没回到店主手里。
+ *   · 或者 `refunded` 且 `o.hold_qty > o.released_qty` 且退货未把剩余件数全部收回
+ *     —— 生命走完了但占位还押着，货没回到店主手里。
  *
- * 第二个出口就是本次修的那个洞：**已交付后退款**（`status = 'refunded'`）的单
- * `releaseRefundedEscrow` **刻意不释放**（货在买家手里，需线下回收）。旧的状态白名单
- * `status IN DRAFT_OR_ACTIVE_IN` 看不见它们——于是店主把规格选项名从「红」改成「深红」时，
- * `saveSkus` 按**同 key** 继承 `committed` 继承不到，那一行的已占位数静默归零，
- * 同一件实物可被再卖一次（**超卖**，受害方是下一个买家，且无任何错误码或审计痕迹）。
- *
- * 为什么要并上"在途集合"（而不是只留第二个出口）：在途但**曾释放过占位**的行
- * （`released_qty` 已推进，例如取消后又恢复的单）同样是未结清的承诺，必须继续挡住改名。
- * 方向是安全的：多算 ⇒ 更容易拒绝这次规格变更，而不是把 `committed` 记成偏小（那才会超卖）。
+ * **不再包含 confirmed/settled/expired**：这些终态单的 `hold_qty` 是已售历史账，
+ * 不代表还要交付；把它们算进来会让有成交记录的限量 SKU 永久无法改名/退役。
+ * 在途集合仍必须并上：在途但曾释放过占位的行同样是未结清承诺。
  *
  * 用法：`WHERE ${stockPromiseSql('o')}`。
  * ⚠️ 别名必须落在 **`orders` 表**上（本谓词用 `${alias}.id` 关联 `order_returns.order_id`，
@@ -241,7 +235,13 @@ export function isDelivered(row) {
  * "Unknown column"——这是刻意的，见文件头。
  */
 export function stockPromiseSql(alias = 'o') {
-  return `(${alias}.status IN ${DRAFT_OR_ACTIVE_IN} OR ${hasOutstandingHoldSql(alias)})`;
+  /*
+    已成交/已超时的终局单不再“欠货”：它们的 `hold_qty` 是**已售库存的历史账**，
+    不是尚未结清的承诺。此前把 `hasOutstandingHoldSql` 无条件并进来，导致有成交记录的
+    限量 SKU 永远无法改名/退役（错误文案还说“等订单走完”，但 confirmed/settled 永远不会再释放）。
+    仍欠货的只有：在途状态，或已退款但货未回收（refunded + 占位仍在册）。
+  */
+  return `(${alias}.status IN ${DRAFT_OR_ACTIVE_IN} OR (${alias}.status = 'refunded' AND ${hasOutstandingHoldSql(alias)}))`;
 }
 
 /**
@@ -275,18 +275,18 @@ export function releaseHoldsForOrderIds(orderIds) {
 }
 
 /**
- * 终局「成交向」订单的占位回补：**仅当货已实际回到卖家侧**（原 D1 口径，2026-10-13 复核后保留）。
+ * 终局「成交向」订单的占位回补：**仅当货已实际回到店主侧**（原 D1 口径，2026-10-13 复核后保留）。
  *
- * 场景：订单已交付 → 退货协调中卖家已确认收到退货（`order_returns.received_at` 非空，含放弃追索
- * waived）→ 链上终局却是非退款路径（ReceiptConfirmed→confirmed / Arbitrated 判卖家→settled /
+ * 场景：订单已交付 → 退货协调中店主已确认收到退货（`order_returns.received_at` 非空，含放弃追索
+ * waived）→ 链上终局却是非退款路径（ReceiptConfirmed→confirmed / Arbitrated 判店主→settled /
  * OrderExpiredReleased→expired）——实物可再售，占位不再有"防超卖"意义，应当回补。
  *
  * **为什么"从未交付的成交向单"刻意不在这里自动释放**（2026-10-13 评估结论，推翻当天早些时候的改动）：
  * 本地唯一能回答"货在不在买家手里"的证据就是交付记录，而**没有交付记录 ≠ 没交付**——
- * 线下交付/自提/卖家漏记都会产生"已成交且无任何交付痕迹"的行；而 `confirmed` 恰恰是**买家自己**
+ * 线下交付/自提/店主漏记都会产生"已成交且无任何交付痕迹"的行；而 `confirmed` 恰恰是**买家自己**
  * 说"我收到了"。在这种行上自动回补，等于把一个**不可判定**的事实当成"货没出去"，
  * 后果是把已经交到买家手里的货重新变成可售 ⇒ 超卖（比占位滞留贵得多：买家拿不到货 + 争议 + 赔付）。
- * 代价是：一笔"真没发货、却被仲裁判了卖家"的单会把 `committed` 永久钉住一件——这是**账目**
+ * 代价是：一笔"真没发货、却被仲裁判了店主"的单会把 `committed` 永久钉住一件——这是**账目**
  * 问题，店主可经商品编辑扩容解决，且方向安全。**要真正消除它，正确做法是把这种行暴露给店主**
  * （谁发货谁最清楚），而不是让节点替他在两个方向里猜一个。
  *
@@ -326,7 +326,7 @@ export async function releaseReturnedUnits(orderId, quantity, returnId = null) {
   const qty = Number(quantity);
   if (!Number.isSafeInteger(qty) || qty <= 0) return 0;
   /*
-    **一次性认领**：watcher 的终局回填与卖家 receive 动作都会走这里；没有 return 级标记时，
+    **一次性认领**：watcher 的终局回填与店主 receive 动作都会走这里；没有 return 级标记时，
     多件订单会被退一次却回补两次（released_qty 只防"整单重复"，防不了两条路径各释放同一个
     return.quantity）。标记与释放同一事务：释放失败（容量不足）时标记回滚，下次还能重试。
   */
@@ -356,12 +356,12 @@ export async function releaseReturnedUnits(orderId, quantity, returnId = null) {
 
 /**
  * 退款终局（refunded）的占位回补：释放集 = 「从未交付」的行 ∪ 「已交付但退货已确认收到
- * （order_returns.received_at 非空，含卖家放弃追索 waived）」的行。
+ * （order_returns.received_at 非空，含店主放弃追索 waived）」的行。
  * 「已交付事实」= `shipped_at`（发货标记，含自提/线下交付等空物流单号形态）∨ tracking_no ∨
  * 交付行存在——此前仅以 tracking_no/交付行判已交付，空单号发货（自提当面交付）被
  * 误判为从未交付而自动回补，货在买家侧即额度释放 → 超卖；且退货单无法创建（hasDelivered
  * 同漏）。已交付且退货未确认收到 → 不释放（货在买家侧，防同一批实物/资源被再次承诺；等待
- * 卖家 receive/waive 后由动作路径释放——released_at 幂等记账保证只回补一次）。
+ * 店主 receive/waive 后由动作路径释放——released_at 幂等记账保证只回补一次）。
  * 码/NFT/ERC20 交付行本身不回池复用（买家可能已用），receive/waive 只解锁限量容量的占位。
  *
  * 链上单号在 `order_chain` 那一行上（1:1，随订单级联删除），所以这里是 JOIN 而不是同表谓词。
@@ -432,7 +432,7 @@ export async function restockOrder(orderId) {
     if (!p) return false; // 组合已不存在：不能静默当成“没库存可占”
     if (hold <= 0) {
       /*
-        从未占位（下单时该组合不限量）→ 取消/恢复期间卖家把它改成了限量。
+        从未占位（下单时该组合不限量）→ 取消/恢复期间店主把它改成了限量。
         此刻必须按**当前**容量补占位；否则 committed 少记，后续同组合还能再卖，形成超卖。
         池式商品（码/NFT）的 capacity 恒 NULL，走下面的“不限量”分支，不在这里占。
       */

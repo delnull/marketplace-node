@@ -170,7 +170,7 @@ test('镜像滞后而链上已冻结时：自动交付同样不发码（同一�
 test('镜像停在 requested 而链上已解冻：/ship 必须放行（不许拿镜像挡合法交付）', async () => {
   const { orderId, orderNo } = await insertOrder({ slug: 'dg-phys-9', kind: 'physical', refundStatus: 'requested' });
   assert.equal((await rowOf(orderId)).refund_status, 'requested', '前置：镜像停在"待处理"');
-  chainSays({ refundRequested: false, refundRejected: true }); // 卖家已链上拒绝
+  chainSays({ refundRequested: false, refundRejected: true }); // 店主已链上拒绝
 
   const res = await ship(orderNo);
   assert.equal(res.body.code, 0, `链上没冻结就该能发货，实际：${JSON.stringify(res.body)}`);
@@ -234,7 +234,7 @@ test('链上已不在托管中（Settled/Disputed/Refunded）⇒ 拒绝交付', 
   }
 });
 
-test('链上同单号的买家/卖家/金额与本单不符（诱饵单）⇒ 拒绝交付', async () => {
+test('链上同单号的买家/店主/金额与本单不符（诱饵单）⇒ 拒绝交付', async () => {
   const { orderId, orderNo } = await insertOrder({ slug: 'dg-phys-5', kind: 'physical' });
   chainSays({ amount: '1' }); // 1 wei 的假单
   const res = await ship(orderNo);
@@ -272,7 +272,7 @@ test('链上 Created 且未申请退款 ⇒ 正常发货（闸不拦正常路径
   assert.equal((await rowOf(orderId)).status, 'shipped');
 });
 
-test('卖家已拒绝退款（refundRejected=true 而 refundRequested=false）⇒ 恢复可交付', async () => {
+test('店主已拒绝退款（refundRejected=true 而 refundRequested=false）⇒ 恢复可交付', async () => {
   const { orderId, orderNo } = await insertOrder({ slug: 'dg-phys-8', kind: 'physical', refundStatus: 'rejected' });
   chainSays({ refundRequested: false, refundRejected: true });
   const res = await ship(orderNo);

@@ -1,5 +1,5 @@
 /**
- * 卖家收款流水：已入账订单（confirmed 买家确认 / settled 仲裁判付 / expired 超时释放）的
+ * 店主收款流水：已入账订单（confirmed 买家确认 / settled 仲裁判付 / expired 超时释放）的
  * 汇总与列表；refunded 等未入账状态不计入。
  *
  * 零费模型：净额 = 毛额 − 已退买家（没有平台费/节点抽成两条腿）。
@@ -60,7 +60,7 @@ test('买家确认收货后计入流水（confirmed）', async () => {
   const o = await settledEscrow(productSlug, buyers[0].address);
   createdWei.push(o.amountWei);
 
-  // 卖家发货（数字：手动交付内容）
+  // 店主发货（数字：手动交付内容）
   const ship = await request(app)
     .post(`/api/orders/${o.id}/ship`)
     .set('Authorization', `Bearer ${ownerLogin.token}`).set('X-Mk-Shop', shopRef.value)
@@ -142,9 +142,9 @@ test('超时释放计入流水（expired），退款订单不计入', async () =
   assert.equal(summary.byStatus.expired.amountWei, o2.amountWei);
 });
 
-test('仲裁判卖家计入流水（settled），分页返回按入账时间倒序', async () => {
+test('仲裁判店主计入流水（settled），分页返回按入账时间倒序', async () => {
   const ownerLogin = await login(ctx, owner);
-  // 第四单：escrowed → ship → disputed → 仲裁判卖家（模拟 watcher Arbitrated）
+  // 第四单：escrowed → ship → disputed → 仲裁判店主（模拟 watcher Arbitrated）
   const o4 = await settledEscrow(productSlug, buyers[3].address);
   await request(app)
     .post(`/api/orders/${o4.id}/ship`)

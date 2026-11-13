@@ -255,7 +255,7 @@ test('买家订单：shipped 后凭登录令牌可见码，refunded 后码隐藏
     .expect(200);
   assert.equal(confirmed.body.data.deliveries[0].value, mine.deliveries[0].value);
 
-  // 退款后码对买家隐藏（码已随交付发放，业务上由卖家自行追索/作废）
+  // 退款后码对买家隐藏（码已随交付发放，业务上由店主自行追索/作废）
   await db.run("UPDATE orders SET status = 'refunded', updated_at = ? WHERE order_no = ?", new Date(new Date()), poolOrderId);
   const refunded = await request(app)
     .get(`/api/orders/${poolOrderId}`)

@@ -11,9 +11,15 @@
  */
 import { Router } from 'express';
 import { getRates } from '../rates.js';
-import { ok, wrap } from '../http.js';
+import { ok, simpleRateLimit, wrap } from '../http.js';
 
 const router = Router();
+
+/*
+  汇率是匿名只读端点，且上游慢时一次请求会等满 15 秒。没有限流时它就是一个可被用来
+  占连接的公开入口（每 IP 每分钟 120 次与公开商品列表同档，正常首页/商品页远低于它）。
+*/
+const ratesLimiter = simpleRateLimit({ windowMs: 60_000, max: 120, message: '汇率查询过于频繁，请稍后再试' });
 
 /** 完全不可用时的应答（键集合与可用时一致，只是没有数）。导出是为了让测试钉住"两分支同形状" */
 export const UNAVAILABLE = {
@@ -26,7 +32,7 @@ export const UNAVAILABLE = {
   updatedAt: null,
 };
 
-router.get('/', wrap(async (req, res) => {
+router.get('/', ratesLimiter, wrap(async (req, res) => {
   const rates = await getRates();
   if (!rates) {
     ok(res, UNAVAILABLE);

@@ -4,7 +4,7 @@
  * 订单状态是 `draft / escrowed / shipped / confirmed / disputed / settled / refunded / expired / cancelled`。
  * 这里钉住四条最容易在状态门控上漂移的动作：
  *   · 买家取消：只有 draft（历史异常 escrowed 无凭证另有出口，但本矩阵用有凭证的单，不能取消）；
- *   · 卖家发货：只有 escrowed 且链上仍在托管；
+ *   · 店主发货：只有 escrowed 且链上仍在托管；
  *   · 买家评价：confirmed / settled / expired（入账终局）；
  *   · 买家改收货信息：只有 escrowed 实物单。
  *
@@ -158,7 +158,7 @@ test('状态计数与 PII 可擦标记覆盖全部 9 个状态', async () => {
   const erasable = new Set(['confirmed', 'settled', 'refunded', 'expired', 'cancelled']);
   for (const { status, o } of rows) {
     const got = byNo.get(o.orderNo);
-    assert.ok(got, `卖家列表缺少 ${status} 的订单 ${o.orderNo}`);
+    assert.ok(got, `店主列表缺少 ${status} 的订单 ${o.orderNo}`);
     assert.equal(got.status, status, `${status} 读回状态`);
     assert.equal(got.piiErasable, erasable.has(status), `${status} 的 piiErasable`);
   }

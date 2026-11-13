@@ -265,7 +265,7 @@ router.get('/orders.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     写死在 SQL 文本里，`shop_code = ?` 就不可能"顺手"丢。
   */
   /*
-    与卖家订单列表共用同一份筛选谓词：页面按退款/售后/检索筛出的范围，
+    与店主订单列表共用同一份筛选谓词：页面按退款/售后/检索筛出的范围，
     导出必须拿到同一个范围；否则“按当前筛选条件导出”是一句假话。
     时间区间是导出独有的，追加在共用谓词之后。
 
@@ -447,7 +447,7 @@ router.get('/codes.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
     ...params
   );
   await auditExport(req, 'export.codes', slug, { rows: rows.length, status: req.query.status || 'all' });
-  // 码值也按公式前缀防护：CSV 会被 Excel 直接打开，卖家导入的码同样可能以 = + - @ 开头。
+  // 码值也按公式前缀防护：CSV 会被 Excel 直接打开，店主导入的码同样可能以 = + - @ 开头。
   // 代价是这类码在表格里会多一个前导撇号；安全优先，避免打开文件就执行公式。
   sendCsv(res, `${slug}-codes.csv`, ['兑换码', '状态', '订单号', '创建时间', '使用时间'],
     rows.map((r) => [r.code, enumText('codeStatus', r.status), r.order_no || '', fmtTime(r.created_at), fmtTime(r.used_at)]));

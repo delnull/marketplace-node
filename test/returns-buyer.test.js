@@ -1,6 +1,6 @@
 /**
- * 买家发起退货 → 卖家填退货地址 → 买家回填回寄单号。
- * 与卖家直接建退货单共用同一张 order_returns；发起权归买家，地址仍由卖家给。
+ * 买家发起退货 → 店主填退货地址 → 买家回填回寄单号。
+ * 与店主直接建退货单共用同一张 order_returns；发起权归买家，地址仍由店主给。
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
@@ -34,14 +34,14 @@ before(async () => {
   );
 });
 
-test('买家发起退货申请 → 卖家填地址 → 买家填回寄单号', async () => {
+test('买家发起退货申请 → 店主填地址 → 买家填回寄单号', async () => {
   const req = await request(app)
     .post(`/api/orders/${orderNo}/return/request`)
     .set('Authorization', `Bearer ${buyerToken}`)
     .send({ note: '尺码不合适' })
     .expect(200);
   assertOk(req);
-  assert.equal(req.body.data.address, '', '买家申请时不应自带卖家仓库地址');
+  assert.equal(req.body.data.address, '', '买家申请时不应自带店主仓库地址');
 
   const addr = await request(app)
     .patch(`/api/orders/${orderNo}/return/address`)

@@ -1,5 +1,5 @@
 /**
- * 卖家通知（P0-3）：
+ * 店主通知（P0-3）：
  *  - watcher 状态迁移/本地动作成功后触发 webhook（注入 sender 捕获）；
  *  - payload 不含隐私字段；配置 secret 时带 X-MK-Signature；
  *  - 失败重试（retryBaseMs 调小）后成功；最终失败不再重试；
@@ -515,7 +515,7 @@ test('投递日志记实际状态码；结算类事件类型与状态一致（0/
   assert.equal((await webhookStatus(shopRef.value)).last.status, 202);
   setWebhookSender(makeSender());
 
-  // 类型推导：0 = 全额判卖家；等于 amount = 全额退款；0 < x < amount = 部分退款（本地 settled）
+  // 类型推导：0 = 全额判店主；等于 amount = 全额退款；0 < x < amount = 部分退款（本地 settled）
   const AMOUNT = '1000000000000000000';
   assert.equal(typeForChainEvent('ReceiptConfirmed', {}), 'order.confirmed');
   assert.equal(typeForChainEvent('Arbitrated', { refundWei: 0n }, { amountWei: AMOUNT }), 'order.settled');

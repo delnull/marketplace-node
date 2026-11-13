@@ -146,7 +146,7 @@ test('erase-pii：在途单拒绝；终局擦除（含附件行与磁盘文件�
   assert.equal(beforeRow.shipping_name, '张三');
   assert.equal(beforeRow.note, '请放门口，到达前电话联系');
 
-  // ── 在途（escrowed）：拒绝擦除——卖家还得靠收货信息发货 ──
+  // ── 在途（escrowed）：拒绝擦除——店主还得靠收货信息发货 ──
   const inflight = await eraseViaApi(order.id);
   assert.notEqual(inflight.body.code, 0);
   assert.match(inflight.body.message, /资金流尚未终结/);
@@ -355,7 +355,7 @@ test('保留期：终局且静置超过阈值才擦；在途与未到期一律�
   const fresh = await createDraft(p.slug, { shipping: { name: '赵六', phone: '13600000000', address: '深圳市某路 4 号' }, note: '新单' });
   await escrowed(fresh);
   assert.equal(await applyEvent('ReceiptConfirmed', { orderId: fresh.escrowOrderId }, { txHash: payHash(), block: 10 }), 1);
-  // ③ 在途（escrowed）且极旧：不擦（卖家要按地址发货）
+  // ③ 在途（escrowed）且极旧：不擦（店主要按地址发货）
   const inflight = await createDraft(p.slug, { shipping: { name: '钱七', phone: '13500000000', address: '杭州市某路 5 号' }, note: '在途单' });
   await escrowed(inflight);
   await ageOrder(inflight.id, 400);
@@ -811,28 +811,28 @@ test('删盘失败：响应必须说"没删净"、锚点不得前移，且重试
 /*
   ── 2026-10-14：擦除入口的**可见性判据**必须在出参里（前端不许自己按状态猜）──────────
   背景：节点早有 ownerOnly 的擦除端点，但店主面板上**没有入口**（前端全仓 0 处引用 erase-pii），
-  而使用指南却写着"店主可在卖家面板执行擦除"——把读者支到一个不存在的按钮上。
+  而使用指南却写着"店主可在店主面板执行擦除"——把读者支到一个不存在的按钮上。
   修法不是在前端补一个 `status === 'confirmed' || …` 数组：可擦状态集合的唯一出处在
   `src/orderStatus.js`（`PII_ERASABLE_STATUS`），前端再抄一份，集合一改就是**静默漂移**
   （多出一个必败按钮，或少一个本该存在的入口）。所以由节点算好 `piiErasable` 下发，
   这里守两件事：① 它确实是"状态能否擦"的忠实映射（逐状态对拍同一份集合）；
-  ② 它在**卖家列表出参**里真的带着（前端拿的就是这个列表）。
+  ② 它在**店主列表出参**里真的带着（前端拿的就是这个列表）。
   权限（ownerOnly）不在这里表达——那是登录角色的事，前端另行门控（见 utils/piiEraseAction）。
 */
-test('订单出参带 piiErasable：与可擦状态集合逐状态一致，且在卖家列表里真实下发', async () => {
+test('订单出参带 piiErasable：与可擦状态集合逐状态一致，且在店主列表里真实下发', async () => {
   const p = await listProduct(productPayload({ kind: 'physical', title: '可擦判据商品' }));
   const o = await createDraft(p.slug, {
     shipping: { name: '判据甲', phone: '13700000001', address: '判据地址-1' },
   });
   await escrowed(o);
 
-  /** 把这一单改成某状态后，从**卖家列表**（前端唯一取数入口）读回它的可擦判据 */
+  /** 把这一单改成某状态后，从**店主列表**（前端唯一取数入口）读回它的可擦判据 */
   const erasableViaSellerList = async (status) => {
     await db.run('UPDATE orders SET status = ? WHERE order_no = ?', status, o.id);
     const r = await request(app).get('/api/orders/seller?pageSize=100').set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value).expect(200);
     assertOk(r);
     const row = r.body.data.orders.find((x) => x.id === o.id);
-    assert.ok(row, `订单应出现在卖家列表里（status=${status}）`);
+    assert.ok(row, `订单应出现在店主列表里（status=${status}）`);
     return row.piiErasable;
   };
 

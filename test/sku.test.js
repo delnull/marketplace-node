@@ -304,7 +304,7 @@ test('编辑规格：改选项名（换 sku_key）时若仍有在途单占着旧
 /**
  * **未显式提交 per-SKU `active` 的 PATCH 不得把「已停售组合」重新上架**（源码审计 2026-09 复审，P1）。
  * 前端的下架/上架按钮只发 `{active:false}` / `{active:true}`，而部分更新的 base 与整体更新
- * 都曾丢掉 per-sku 的 active ⇒ 卖家"单独停售某规格"的决策被一次上下架静默撤销。
+ * 都曾丢掉 per-sku 的 active ⇒ 店主"单独停售某规格"的决策被一次上下架静默撤销。
  */
 test('编辑商品：整体上下架不得把已停售的单个组合重新上架', async () => {
   const p = (await post(productPayload({ title: '停售保持', specs: SPECS, skus: SKUS }))).body.data;

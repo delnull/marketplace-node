@@ -13,10 +13,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCtx, assertOk, TEST_SHOP_CODE } from './setup.mjs';
+import { makeCtx, assertOk, login, TEST_SHOP_CODE } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner } = ctx;
+const ownerToken = (await login(ctx, owner)).token;
 
 const { logAudit } = await import('../src/audit.js');
 const { auditEntryHash } = await import('../src/auditChain.js');
@@ -81,7 +82,10 @@ async function appendHashedRows(n) {
 }
 
 async function healthAuditChain() {
-  const res = await request(app).get('/healthz').expect(200);
+  const res = await request(app)
+    .get('/healthz?full=1')
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .expect(200);
   assertOk(res);
   const cap = res.body.data.capabilities?.auditChain;
   assert.ok(cap, 'healthz.capabilities 必须有 auditChain 读数（否则"链还完整吗"仍然只能靠人记得跑体检）');

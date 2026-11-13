@@ -323,6 +323,37 @@ test('签名：配置 secret 才有 x-mk-signature，且为 timestamp.body 的 H
   process.env.MK_ORDER_GATE_URL = '';
 });
 
+// ── (g) 事务内 freshSku.capacity（P1） ──
+
+test('窗口内把不限量改成限量：事务内 freshSku.capacity 必须生效，不能按旧值放行', async () => {
+  process.env.MK_ORDER_GATE_URL = GATE_URL;
+  process.env.MK_ORDER_GATE_SECRET = 'gate-test-secret';
+  calls.length = 0;
+  const p = await listProduct(productPayload({ kind: 'physical', title: '窗口改容量商品', capacity: null }));
+  const pid = (await db.get('SELECT id FROM products WHERE slug = ?', p.slug)).id;
+  responder = async () => {
+    await db.run('UPDATE product_skus SET capacity = 1 WHERE product_id = ?', pid);
+    return { status: 200, json: async () => ({ allow: true }) };
+  };
+  try {
+    const res = await request(app)
+      .post('/api/orders')
+      .set('Authorization', `Bearer ${buyerToken}`).set('X-Mk-Shop', shopRef.value)
+      .send({ productSlug: p.slug, quantity: 3 })
+      .expect(200);
+    assert.notEqual(res.body.code, 0, '事务内看到容量 1，3 件必须被拒');
+    assert.match(res.body.message, /售罄/);
+    assert.equal((await skuInv(db, p.slug)).committed, 0, '不能留下没有 hold_qty 的草稿');
+    assert.equal(await orderCount(p.slug), 0, '不能按事务外的旧 capacity 建单');
+  } finally {
+    process.env.MK_ORDER_GATE_URL = '';
+    delete process.env.MK_ORDER_GATE_SECRET;
+    resetOrderGate();
+    setOrderGateSender(recordingSender);
+    responder = async () => ({ status: 200, json: async () => ({ allow: true }) });
+  }
+});
+
 // ── (g) SSRF（复用 netguard，每次校验） ──
 
 test('SSRF：内网字面量与「解析到内网」都拒单且不外呼（URL 运行期可改，故每次重校验）', async () => {

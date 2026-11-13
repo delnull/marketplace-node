@@ -108,7 +108,7 @@ before(async () => {
   await escrowed(d4);
   await escrowed(d5);
 
-  // 已交付两单：卖家先发货再争议（shipped → disputed）
+  // 已交付两单：店主先发货再争议（shipped → disputed）
   await ship(d1, { trackingNo: 'SF-1001' });
   await ship(d2, { deliveryCode: 'CARD-777' });
   // 对照：已交付但未争议（shipped 在途正常单，买家已拿到码）
@@ -294,7 +294,7 @@ test('未交付争议单对仲裁人同样开放全字段（含 tracking 证据�
 });
 
 test('仲裁裁决回写后待仲裁列表收敛（disputed → settled/refunded 出列）', async () => {
-  // 判付卖家：d1 出列
+  // 判付店主：d1 出列
   assert.equal(await applyEvent('Arbitrated', { orderId: d1.escrowOrderId, refundWei: 0n }), 1);
   // 判退款买家：d3 出列
   assert.equal(await applyEvent('Arbitrated', { orderId: d3.escrowOrderId, refundWei: d3.amountWei }), 1);

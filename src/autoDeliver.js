@@ -1,13 +1,13 @@
 /**
  * 卡密自动交付：数字商品订单进入 escrowed（买家托管成功，链上 OrderCreated）
- * 后自动从码池分配一个未用码并置 shipped——卡密/兑换码类无需卖家手动发货。
+ * 后自动从码池分配一个未用码并置 shipped——卡密/兑换码类无需店主手动发货。
  *
  * 触发路径（**三条，全部经 `tryAutoDeliverByEscrowOrder`**——交付的输入一律是链上单号）：
  *  - `escrowWatcher` 轮询到 `OrderCreated` 回写之后（权威路径）；
  *  - `POST /:id/paid` 即时确认之后（快路径）；
  *  - 码池补货后的补跑 / 追赶回放收尾的冲刷（`tryAutoDeliverPendingForProduct`、`flushAutoDeliverPending`）。
  * 幂等（仅 escrowed 状态可交付，码分配走条件 UPDATE 防并发）。
- * 自动交付不覆盖的场景保持 escrowed 等卖家手动交付：
+ * 自动交付不覆盖的场景保持 escrowed 等店主手动交付：
  *  - 实物商品（无码池语义，需物流单号）；
  *  - 数字商品但码池为空 / 未建池（MK_AUTO_DELIVER='0' 时全局关闭）。
  *
@@ -76,7 +76,7 @@ export async function deliverDigitalFromPool(order) {
     订单退回 escrowed），而调用方只看到 500。提交之后再通知，失败最多是"少一条 webhook"。
     参数是**对外单号** order_no（webhook 的接收方按它去查/对账），不是内部键。
   */
-  notify('order.shipped', order.order_no); // 卖家通知（P0-3）：自动交付完成
+  notify('order.shipped', order.order_no); // 店主通知（P0-3）：自动交付完成
   return result;
 }
 
@@ -100,7 +100,7 @@ export async function autoDeliverEnabledForProduct(productId) {
  * 唯一调用方 `tryAutoDeliverByEscrowOrder` 已经在调它之前过了 `chainOrder.deliveryGate`
  * （链上 `status == Created` 且 `refundRequested == false`，读不到就拒绝）。
  * 这里原本还留着一句 `if (order.refund_status === 'requested') return false;`——
- * 那是**按本地镜像**再判一次，而镜像按 finality 深度滞后：卖家 `rejectRefund` 之后、
+ * 那是**按本地镜像**再判一次，而镜像按 finality 深度滞后：店主 `rejectRefund` 之后、
  * 或 `RefundRejected` 事件漏扫/被隔离时，镜像会长期停在 `requested`，
  * 于是同一时刻"自动交付拒绝、手动 /ship 放行"，同一个问题又有了两个答案层。
  * 行筛选（escrowed + 有凭证）仍在调用方，与本模块的分工不变。
@@ -121,7 +121,7 @@ export async function tryAutoDeliverOrder(order) {
     return true;
   }
   if (r.error === 'pool_empty') {
-    console.log(`[autoDeliver] 订单 ${String(order.order_no).slice(0, 8)}… 码池无未用码（需 ${order.quantity || 1} 个），等待卖家手动交付`);
+    console.log(`[autoDeliver] 订单 ${String(order.order_no).slice(0, 8)}… 码池无未用码（需 ${order.quantity || 1} 个），等待店主手动交付`);
   }
   return false;
 }
@@ -134,12 +134,12 @@ export async function tryAutoDeliverOrder(order) {
  * `head − finalityBlocks`（默认 12 块 ≈ 1 分钟），所以当它第一次看到 `OrderCreated(N)` 时，
  * 买家紧接着在 `N+1…N+12` 发出的 `requestRefund` **不在本批**、也不在"追赶抑制"的判定范围里
  * （`behind=false`）⇒ 码照发。结果是买家拿着全套兑换码、钱还冻在托管里（`refundRequested`
- * 让 `releaseExpired` 一直 revert），卖家只能拒绝 → 争议 → 仲裁——正是本文件
+ * 让 `releaseExpired` 一直 revert），店主只能拒绝 → 争议 → 仲裁——正是本文件
  * `tryAutoDeliverPendingForProduct` 注释里写的"双损"。
  *
  * 判据只有一条，且**只有一处实现**：`chainOrder.deliveryGate` —— 链上 `getOrder` 说
  * `status == Created(1)` 且 `refundRequested == false` 才发；读不到（RPC 不可达/无此单）**不发**
- * ——自动交付是"锦上添花"，宁可留给卖家面板手动交付，也不要在看不清链上状态时把码发出去。
+ * ——自动交付是"锦上添花"，宁可留给店主面板手动交付，也不要在看不清链上状态时把码发出去。
  * 三个手动交付入口（`/ship`、`/seller/batch-ship`、`/:id/nft-deliveries`）走的是**同一个**闸
  * （2026-10-14 收口）：此前它们只看本地镜像，于是同一个"该不该交付"的问题有两个答案层，
  * 而两个答案在 finality 窗口里必然相反。
@@ -191,7 +191,7 @@ export async function tryAutoDeliverByEscrowOrder(orderIdHex) {
  * watcher 还没落地的这段时间里，店主一导入码就会把码发给一个**即将退款**的买家
  *（钱退回去、货也送出去）。复核由 `tryAutoDeliverByEscrowOrder` 一处承担（2026-10-14 起；
  * 此前它与 `flushAutoDeliverPending` 各自内联了一份同样的判据）。
- * 复核失败（RPC 读不到）时**不发**：自动交付是"锦上添花"，宁可留给卖家面板手动交付，
+ * 复核失败（RPC 读不到）时**不发**：自动交付是"锦上添花"，宁可留给店主面板手动交付，
  * 也不要在看不清链上状态时把码发出去。
  */
 export async function tryAutoDeliverPendingForProduct(productId) {

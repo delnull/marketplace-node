@@ -15,10 +15,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
-import { makeCtx, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
+import { makeCtx, login, shopRef, insertOrder as insertOrderRow } from './setup.mjs';
 
 const ctx = await makeCtx();
-const { app, request } = ctx;
+const { app, request, owner } = ctx;
+const ownerToken = (await login(ctx, owner)).token;
 const { createApp, appErrorHandler } = await import('../src/app.js');
 const { isProdLike, wrap, asyncMiddleware } = await import('../src/http.js');
 // 进程内的 watcher 状态对象（**故意导出**：`/healthz` 的健康判据就建在它上面，
@@ -76,6 +77,16 @@ test('匿名可读的仲裁待办列表带 private, no-store；公开只读端�
   */
   const health = await request(app).get('/healthz').expect(200);
   assert.equal(health.headers['cache-control'], 'no-store', '健康检查不允许被中间层缓存');
+  assert.equal(
+    health.body.data.escrowAddress,
+    '0x2222222222222222222222222222222222222222',
+    '公开探活必须保留托管地址：dev-stack / 主网验收脚本用它核对节点身份'
+  );
+  assert.equal(
+    health.body.data.stakingAddress,
+    '0x3333333333333333333333333333333333333333',
+    '公开探活必须保留保证金地址：探活脚本据此确认节点接的是哪个 Staking'
+  );
 
   // 反例：公开只读端点（不含隐私字段）不应被一起禁掉——否则联邦首页 N 家店 × 3~4 请求全打回源
   const rates = await request(app).get('/api/rates').expect(200);
@@ -214,7 +225,10 @@ test('/healthz 健康判据：集群未起过 ⇒ 200；停滞 ⇒ 503（且 cod
     await db.run('UPDATE node SET quarantined_events = ? WHERE id = 1', JSON.stringify({
       '0:1:OrderCreated': { attempts: 5, name: 'OrderCreated', at: Date.now(), err: '测试注入' },
     }));
-    const quarantined = await request(app).get('/healthz').expect(503);
+    const quarantined = await request(app)
+      .get('/healthz?full=1')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(503);
     assert.match(String(quarantined.body.data.reason), /隔离/, '要说清是隔离事件，而不是含糊的"不健康"');
     assert.equal(quarantined.body.data.watcher.quarantined, 1, '隔离条数取自库里的 node.quarantined_events');
     assert.equal(quarantined.body.data.node.quarantinedEvents, 1, 'healthz 的 node 读数也要给对象条数，不能恒 null');

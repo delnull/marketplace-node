@@ -192,11 +192,14 @@ test('提交 → 公开状态（无 PII）→ 我的提货行 → 一枚 token �
   const row = pub.body.data.claims[0];
   assert.equal(row.id, claimId);
   assert.equal(row.shipping, null, '公开面绝不下发收货信息');
+  assert.equal(row.orderNo, undefined, '公开面不下发订单号（详情页句柄）');
+  assert.equal(row.note, undefined, '公开面不下发店主驳回理由');
   assert.equal(row.status, 'requested');
 
-  // 我的提货行（含自己填的收货信息）
+  // 我的提货行（含自己填的收货信息；订单号/备注只在持有人视角）
   const mine = await request(app).get('/api/claims/nft/mine').set('Authorization', `Bearer ${buyerToken}`).expect(200);
   assert.equal(mine.body.data.claims.length, 1);
+  assert.equal(mine.body.data.claims[0].orderNo, order.id);
   assert.deepEqual(mine.body.data.claims[0].shipping, { name: '张三', phone: '13800000000', address: '北京市朝阳区 1 号' });
 
   // 同一枚 token 再来一条 ⇒ 409（库里的函数唯一索引兜底，并发下也拦得住）
@@ -205,7 +208,7 @@ test('提交 → 公开状态（无 PII）→ 我的提货行 → 一枚 token �
   assert.match(dup.body.message, /未完结的提货声明/);
 });
 
-test('卖家动作：approve → ship（发货前复核持有人）→ fulfill；转手则拒绝发货并允许取消', async () => {
+test('店主动作：approve → ship（发货前复核持有人）→ fulfill；转手则拒绝发货并允许取消', async () => {
   const approve = await request(app)
     .post(`/api/claims/nft/${claimId}/seller`)
     .set('Authorization', `Bearer ${ownerToken}`)
@@ -224,7 +227,7 @@ test('卖家动作：approve → ship（发货前复核持有人）→ fulfill�
   assert.notEqual(moved.body.code, 0);
   assert.match(moved.body.message, /已不在提交人名下/);
 
-  // 卖家取消 ⇒ 让位给新持有人
+  // 店主取消 ⇒ 让位给新持有人
   const cancel = await request(app)
     .post(`/api/claims/nft/${claimId}/seller`)
     .set('Authorization', `Bearer ${ownerToken}`)
@@ -365,10 +368,10 @@ test('提货争议关闭后不能重新生成参数；ClaimClosed 回写实际�
   const row = await db.get('SELECT claim_amount_wei, dispute_state, status FROM nft_claims WHERE claim_no = ?', c.body.data.id);
   assert.equal(row.dispute_state, 'closed');
   assert.equal(row.status, 'fulfilled', '有赔付的争议必须占住 fulfilled 槽位，防二次兑付');
-  assert.equal(String(row.claim_amount_wei), '55', '卖家看到的应是实际赔付额，不是开案请求额');
+  assert.equal(String(row.claim_amount_wei), '55', '店主看到的应是实际赔付额，不是开案请求额');
 });
 
-test('提货卖家列表包含本店店员（与处理动作同一授权面）', async () => {
+test('提货店主列表包含本店店员（与处理动作同一授权面）', async () => {
   const staff = Wallet.createRandom();
   const add = await request(app)
     .put('/api/shop/staff')
@@ -464,7 +467,7 @@ test('零赔付结案/撤销争议必须释放声明占位，不能把 token 永
   assert.equal(cancelled.claim_amount_wei, null);
 });
 
-test('卖家提货列表分页/搜索与 CSV 导出（含公式防护）', async () => {
+test('店主提货列表分页/搜索与 CSV 导出（含公式防护）', async () => {
   const p = await createNftProduct();
   await request(app)
     .post(`/api/products/${p.slug}/tokens`)
@@ -501,13 +504,13 @@ test('卖家提货列表分页/搜索与 CSV 导出（含公式防护）', async
   assert.ok(csv.text.includes("'=1+1"), '收货人公式前缀已加');
   /*
     导出审计：**逐店归属 + 真实角色**（2026-11-04 修）。
-    旧实现写 `shopCode: null` + `actorRole: 'staff'`：卖家本人导出自己的提货单被记成店员，
+    旧实现写 `shopCode: null` + `actorRole: 'staff'`：店主本人导出自己的提货单被记成店员，
     而节点级行只有节点主看得见——真正该监督这次导出的店主反而看不到。
   */
   const exp = await db.get("SELECT * FROM audit_logs WHERE action = 'claim.export' ORDER BY id DESC LIMIT 1");
   assert.ok(exp, '导出必须留一行审计');
   assert.equal(exp.shop_code, shopRef.value, '导出按被导出的行逐店归属（不是节点级）');
-  assert.equal(exp.actor_role, 'owner', '卖家本人导出自己的提货单是店主，不是店员');
+  assert.equal(exp.actor_role, 'owner', '店主本人导出自己的提货单是店主，不是店员');
   assert.equal(exp.target_type, 'nft_claim_export');
   assert.equal(
     Number((await db.get("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'claim.export' AND shop_code IS NULL")).c),

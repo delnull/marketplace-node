@@ -196,7 +196,7 @@ test('镜像停在 requested 而链上已解冻：NFT 交付照常成功（事�
   /*
     回归：交付判据只在进事务前由 `deliveryGate` 按**链上真值**判一次。
     旧实现在事务内的 UPDATE 上还挂着 `AND refund_status != 'requested'`——镜像滞后
-    （卖家 `rejectRefund` 之后、或 `RefundRejected` 事件漏扫）时它会把一次合法交付挡回去，
+    （店主 `rejectRefund` 之后、或 `RefundRejected` 事件漏扫）时它会把一次合法交付挡回去，
     并给出一个与链上相反的理由（"退款申请已在核验期间落地"）。2026-10-15 评审实测到过。
   */
   const id = await nftOrderInEscrow();

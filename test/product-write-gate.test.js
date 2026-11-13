@@ -12,7 +12,7 @@
  *     （商品级价与库存都是各组合的只读汇总），本仓对这种失败的口径是"绝不静默"。
  *     这里同时验**反例不会扩大**：认识的键照常通过（否则这道门会变成"什么都存不进去"）。
  *
- *  3. **卖家列表搜索 `q` 与在途承诺读数**（`GET /api/products/all`）：
+ *  3. **店主列表搜索 `q` 与在途承诺读数**（`GET /api/products/all`）：
  *     搜索在**服务端**（面板分页拉，前端过滤只能搜到已加载的几页）；`%`/`_` 按字面量处理。
  *     `pendingPromises` = 各组合上"库存承诺还没结清"的读数（判据是 `stockHold.stockPromiseSql`
  *     的唯一实现），用途是商品编辑表单在改规格选项名之前先提醒店主——所以这里钉住
@@ -205,7 +205,7 @@ test('未知字段被拒绝：上架 / 编辑 / 批量三个入口，错误里�
   assert.match(String(badBatch.body.message), /tags/);
 });
 
-test('卖家列表搜索 q：标题/标识/描述/参数/承诺都命中；% 按字面量；仅 staff', async () => {
+test('店主列表搜索 q：标题/标识/描述/参数/承诺都命中；% 按字面量；仅 staff', async () => {
   const a = await create(productPayload({ title: '专测甲：USB 数据线' }));
   const b = await create(productPayload({ title: '专测乙：话费卡 100% 通用券' }));
   /*

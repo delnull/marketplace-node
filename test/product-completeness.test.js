@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { makeCtx, login, assertOk, productPayload, shopRef } from './setup.mjs';
 
 /**
- * 卖家列表的「资料是否齐全」：筛选（`?incomplete=1`）与逐行 `missing` 必须**同源**。
+ * 店主列表的「资料是否齐全」：筛选（`?incomplete=1`）与逐行 `missing` 必须**同源**。
  *
  * 判据只有一处（`routes/products.js` 的 `COMPLETENESS_MISSING_SQL`）。这个文件钉的是：
  *  1. 缺什么就报什么（主图 / 说明 / 参数 / 实物承诺发货时效），齐全时是空数组；
@@ -83,4 +83,22 @@ test('与上架与否无关：草稿照样能被检查出来（补资料队列�
   const rows = await all('?incomplete=1&pageSize=100');
   assert.ok(rows.some((r) => r.slug === draft.slug), '草稿也应出现在资料不全的队列里');
   assert.equal((await all()).find((p) => p.slug === draft.slug).active, false, '它仍然是未上架');
+});
+
+test('/all 的分页游标：非末页非空，末页为 null（不再靠空请求试探）', async () => {
+  const one = await request(app)
+    .get('/api/products/all?pageSize=1')
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('X-Mk-Shop', shopRef.value)
+    .expect(200);
+  assertOk(one);
+  assert.notEqual(one.body.data.nextCursor, null, '还有下一页 → 游标非空');
+
+  const last = await request(app)
+    .get('/api/products/all?pageSize=100')
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .set('X-Mk-Shop', shopRef.value)
+    .expect(200);
+  assertOk(last);
+  assert.equal(last.body.data.nextCursor, null, '本页已到底 → 直接 null');
 });

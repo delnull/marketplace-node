@@ -292,7 +292,7 @@ test('托管成功（模拟 watcher 回写）后店主可发货，买家可见 s
   assertOk(ship);
   assert.equal(ship.body.data.status, 'shipped');
   assert.equal(ship.body.data.deliveries.length, 1, '数字商品交付内容应写入交付行');
-  assert.equal(ship.body.data.deliveries[0].value, 'SF1234567890', '交付行内容为卖家填写内容');
+  assert.equal(ship.body.data.deliveries[0].value, 'SF1234567890', '交付行内容为店主填写内容');
   assert.equal(ship.body.data.trackingNo, null, '数字商品不写物流单号');
 
   // 买家列表带登录令牌可见交付码；未登录则隐藏（防未登录探码）

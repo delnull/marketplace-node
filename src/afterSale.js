@@ -2,7 +2,7 @@
  * 确认收货后的**售后案件**（契约 2026-10 第二批）——本地镜像的**唯一判据层**。
  *
  * 链上语义（事实源 `contracts/src/Escrow.sol`，只读参考）：
- *  - 买家在**订单终局（链上 Settled = 钱全额判给卖家）之后**、窗口内（开案窗口取该单**结算时的快照**，
+ *  - 买家在**订单终局（链上 Settled = 钱全额判给店主）之后**、窗口内（开案窗口取该单**结算时的快照**，
  *    自 `settledAtBlock` 起算，生产默认 180 天、上限 360 天）调 `openAfterSale(orderId)` 开案；
  *    入口形状（2026-10-13 收紧）：`status == Settled && buyerConfirmed && refundedAmount < amount`
  *    —— 已全额退款不能再开案；部分退款仍可开案，剩余额度由订单级受偿上限收敛；
@@ -10,11 +10,11 @@
  *    `AfterSaleAlreadyOpen`）；**结案是终态**（`afterSaleClosedAtBlock` 不可清除，再开 revert
  *    `AfterSaleCaseClosed`），所以本地 `closed` 不能被任何事件/回填改回 `open`；
  *  - 买家撤诉走 `closeAfterSale(orderId, note)`；仲裁人结案走委员会票决
- *    `voteAfterSale(orderId, penaltyWei)`（`penaltyWei` 可以大于 0；赔款只从 Staking 的卖家
+ *    `voteAfterSale(orderId, penaltyWei)`（`penaltyWei` 可以大于 0；赔款只从 Staking 的店主
  *    保证金出——原生单付 BTY、代币单也付 BTY；票决事件不带文本）；
- *  - 确认收货后卖家货款先进入 Escrow 的**7 天**留存期（不超过本单窗口）；案件在途时
+ *  - 确认收货后店主货款先进入 Escrow 的**7 天**留存期（不超过本单窗口）；案件在途时
  *    `releaseSellerFunds` 被 `PendingCaseOpen` 挡住，钱重新冻结到结案（或 90 天强制结案）为止，
- *    之后到点即可释放。案件仍不计入 `sellerOpenExposure`，因此**不阻塞卖家在 Staking 里的出金**；
+ *    之后到点即可释放。案件仍不计入 `sellerOpenExposure`，因此**不阻塞店主在 Staking 里的出金**；
  *    但留存货款本身在案件在途时不能动。
  *
  * ## 案件的列住在 `order_chain` 那一行（链上镜像表，watcher 独占写）
@@ -27,7 +27,7 @@
  * 链上 `Escrow.Order.status` 在售后案件全程都停在 `Settled` —— 案件是**叠加在终局之上的第二层**。
  * 本地 `orders.status` 是"这笔钱现在到哪一步"的口径，它同时喂着收款流水/看板 GMV 窗口
  * （`INCOME_STATUS`）、库存占位释放（`stockHold`）、发货与退款闸、（`/api/arbitration/pending` 的）
- * 争议队列。把有案件的单改写成 `disputed` 就等于把一笔**已经结算给卖家**的货款重新拉回在途：
+ * 争议队列。把有案件的单改写成 `disputed` 就等于把一笔**已经结算给店主**的货款重新拉回在途：
  * 金额会在两个窗口里各记一次、占位/流水/徽标全部跟着错位，而且链上根本没有对应的 `DisputeRequested`
  * 事件可以自证。所以售后案件只写本模块管的这几列，`orders.status` 一个字节都不动——
  * 同理也**不碰 `orders.updated_at`**（它是入账窗口与列表排序的锚点）。旧形状下这两条靠纪律，
@@ -63,7 +63,7 @@ export const AFTER_SALE_STATUS = Object.freeze(['none', 'open', 'closed']);
  * 链上开案判据（`Escrow.openAfterSale`，2026-10-13 收紧）：
  *   `status == Settled && buyerConfirmed && refundedAmount < amount && settledAtBlock != 0`。
  * 本地与之对应的：
- *   · `confirmed` —— 买家确认收货（或卖家执行买家授权的部分退款）的事件镜像，正常载体；
+ *   · `confirmed` —— 买家确认收货（或店主执行买家授权的部分退款）的事件镜像，正常载体；
  *   · `settled`   —— 事件漏扫、经 `/sync` 落 settled 的单，链上仍可能 buyerConfirmed=true 且尚有余额；
  *   · `expired`   —— `releaseExpired` 的单链上 **buyerConfirmed=false**，实际**不可能**有案件。
  * 把 expired 留在候选面是刻意的**扫描超集**：最终由链上 `afterSaleOpen` 回答（读不到就跳过），

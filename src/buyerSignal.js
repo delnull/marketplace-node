@@ -6,7 +6,7 @@
  *
  * 三条边界，写在这里免得被"顺手扩展"改掉：
  *  1. **只做本店视角**：节点只数自己镜像的订单，绝不拿一个地址去联邦其它节点查询。
- *     别人的顾客数据不在本店的数据面上；"替卖家打听这个人在别家怎么样"正是隐私面。
+ *     别人的顾客数据不在本店的数据面上；"替店主打听这个人在别家怎么样"正是隐私面。
  *     所以响应里给的是 `scope: 'this_shop_only'`，note 里也把这句话说给店主听。
  *  2. **口径必须可独立复算**：每个计数都对应一个**链上事实**，第三方扫链即可复算——
  *     `settledToSeller` ← `getOrder.status ∈ Settled`（本地 confirmed/settled/expired）；
@@ -98,7 +98,7 @@ export function computeBuyerSignal(rows, { address, seller = null, minSamples = 
     if (!r?.paid_tx_hash) continue; // 未付款（草稿/已取消）：没有履约可谈，不进样本
     sample += 1;
     const status = String(r?.status || '');
-    // ① 钱判给店主（链上 Settled）：确认收货 / 仲裁判卖家 / 超时释放 / 双方和解
+    // ① 钱判给店主（链上 Settled）：确认收货 / 仲裁判店主 / 超时释放 / 双方和解
     if (INCOME_STATUS.includes(status)) settledToSeller += 1;
     // ② 钱退给买家（链上 refundedAmount > 0，含部分退款与拆分裁决）
     if (hasRefundedToBuyer(r)) refundedBuyer += 1;
@@ -214,7 +214,7 @@ export function computeBuyerSignal(rows, { address, seller = null, minSamples = 
 /**
  * 端点用入口：读该买家在**指定店铺**的订单行 → 纯函数（无链上读取、无跨店查询）。
  *
- * **必须按卖家地址限定"本店"**（2026-10-15 修 D6；2026-10 多店改造改为显式传参）：
+ * **必须按店主地址限定"本店"**（2026-10-15 修 D6；2026-10 多店改造改为显式传参）：
  * `orders.seller` 是逐行写入的（= 该单所属店铺的 `shops.seller`），而这个读数的 `scope`
  * 自称 `this_shop_only` —— 不带这个过滤，多店之下会把**别家店**与该买家的往来算进
  * "他在本店的表现"（`localOrders`/`sample` 一起被抬高，店主据此误判风险）。

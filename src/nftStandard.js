@@ -6,7 +6,7 @@
  *   · ERC1155 = 0xd9b67a26
  *
  * 为什么不能只信商品表单里的下拉框：标准决定交付时按哪套 Transfer 事件核验。
- * 卖家把 ERC1155 选成 ERC721 时，商品仍能上架、买家仍能付款，直到交付核验
+ * 店主把 ERC1155 选成 ERC721 时，商品仍能上架、买家仍能付款，直到交付核验
  * 找不到对应事件才失败——那时资金已经在托管里。发布时先拒绝这个错配。
  *
  * 失败语义：
@@ -16,13 +16,21 @@
  * “发布期尽早发现错配”，不是替代交付核验。
  */
 import { ethers } from 'ethers';
-import { getProvider } from './chain.js';
+import { rpcRequest } from './chain.js';
 
 export const ERC721_INTERFACE_ID = '0x80ac58cd';
 export const ERC1155_INTERFACE_ID = '0xd9b67a26';
 const ERC165_INTERFACE_ID = '0x01ffc9a7';
 const SUPPORTS_ABI = ['function supportsInterface(bytes4 interfaceId) view returns (bool)'];
-const RPC_TIMEOUT_MS = 8_000;
+/*
+  链上标准探测的读预算（getCode + up to 3 次 supportsInterface）。
+  8 秒是旧值：发布/预检要连读 4 次，公网 RPC 抖动时最后一次先超时，用户看到的是
+  「链上节点暂时不可用」而合约其实正常。单次 15 秒，但**整次探测另有 30 秒总预算**：
+  4 × 15 = 60 秒会撞上前端更新/预检的 60 秒超时；30 秒给发布（90 秒）和更新（60 秒）
+  都留出 DB/事务的余量。
+*/
+const RPC_TIMEOUT_MS = 15_000;
+const DETECT_TOTAL_BUDGET_MS = 30_000;
 const PROBE_WINDOW_MS = 60_000;
 const PROBE_MAX_PER_WINDOW = 20;
 const PREVIEW_MAX_PER_WINDOW = 10;
@@ -98,20 +106,21 @@ export async function detectNftStandard(contract, { reader = null, provider = nu
   if (!/^0x[0-9a-f]{40}$/.test(c) || /^0x0{40}$/.test(c)) {
     return { ok: false, retryable: false, reason: 'NFT 商品需填写合法的合约地址（0x + 40 位十六进制，且不能为全零）' };
   }
+  /* 整次探测的总预算：后续每次读只能拿 min(单次预算, 剩余) */
+  const deadline = Date.now() + DETECT_TOTAL_BUDGET_MS;
+  const budget = () => Math.max(1, deadline - Date.now());
 
   let supports;
   if (typeof reader === 'function') {
     supports = reader;
-  } else {
-    let p;
+  } else if (provider) {
+    /*
+      注入的 provider 是**测试缝**（nft-standard 单测用它模拟 ethers 的 getCode/call），
+      不是生产路径：生产走下面的原始 JSON-RPC，超时才会真正中止连接。
+    */
+    let p = provider;
     try {
-      p = provider || getProvider();
-    } catch (e) {
-      console.error('[nftStandard] 读取链上节点失败：', messageOf(e) || e);
-      return { ok: false, retryable: true, reason: '读取 NFT 合约标准失败（链上节点暂时不可用，请稍后重试）' };
-    }
-    try {
-      const code = await withTimeout(p.getCode(c), RPC_TIMEOUT_MS);
+      const code = await withTimeout(p.getCode(c), Math.min(RPC_TIMEOUT_MS, budget()));
       if (!code || code === '0x') {
         return { ok: false, retryable: false, reason: `NFT 合约地址 ${c} 在当前链上没有代码——请核对地址与网络` };
       }
@@ -120,31 +129,54 @@ export async function detectNftStandard(contract, { reader = null, provider = nu
       return { ok: false, retryable: true, reason: '读取 NFT 合约代码失败（链上节点暂时不可用，请稍后重试）' };
     }
     const contractReader = new ethers.Contract(c, SUPPORTS_ABI, p);
-    supports = (interfaceId) => withTimeout(contractReader.supportsInterface(interfaceId), RPC_TIMEOUT_MS);
+    supports = (interfaceId) => withTimeout(contractReader.supportsInterface(interfaceId), Math.min(RPC_TIMEOUT_MS, budget()));
+  } else {
+    /*
+      生产：原始 JSON-RPC。`rpcRequest` 的每次尝试都带 `AbortSignal.timeout`，整次探测
+      共用一个 deadline——到点会真正中止 http 请求，而不是外层 race 超时、底层还在跑。
+    */
+    try {
+      const code = await rpcRequest('eth_getCode', [c, 'latest'], { timeoutMs: RPC_TIMEOUT_MS, deadline });
+      if (!code || code === '0x') {
+        return { ok: false, retryable: false, reason: `NFT 合约地址 ${c} 在当前链上没有代码——请核对地址与网络` };
+      }
+    } catch (e) {
+      console.error('[nftStandard] 读取合约代码失败：', messageOf(e) || e);
+      return { ok: false, retryable: true, reason: '读取 NFT 合约代码失败（链上节点暂时不可用，请稍后重试）' };
+    }
+    const iface = new ethers.Interface(SUPPORTS_ABI);
+    supports = async (interfaceId) => {
+      const data = iface.encodeFunctionData('supportsInterface', [interfaceId]);
+      const raw = await rpcRequest('eth_call', [{ to: c, data }, 'latest'], {
+        timeoutMs: RPC_TIMEOUT_MS,
+        deadline,
+      });
+      const [ok] = iface.decodeFunctionResult('supportsInterface', raw);
+      return Boolean(ok);
+    };
   }
 
   let is165 = null;
   let is721 = false;
   let is1155 = false;
   let supportError = null;
-  try {
-    is165 = !!(await supports(ERC165_INTERFACE_ID));
-  } catch (e) {
-    supportError = e;
-    // 不实现 ERC165 的合约在这里就会 revert；先不立刻下结论，下面仍尝试两个标准接口
-  }
-  try {
-    is721 = !!(await supports(ERC721_INTERFACE_ID));
-  } catch (e) {
-    supportError = supportError || e;
-    is721 = false;
-  }
-  try {
-    is1155 = !!(await supports(ERC1155_INTERFACE_ID));
-  } catch (e) {
-    supportError = supportError || e;
-    is1155 = false;
-  }
+  /*
+    三次 supportsInterface 互不依赖，**并行**读：串行时最坏 3×15s，并行后只受整次
+    30s 总预算约束（每次仍拿 min(单次预算, 剩余)）。失败归因顺序保持 165 → 721 → 1155，
+    与原实现的 `supportError = supportError || e` 优先级一致。
+  */
+  const supportsSettled = await Promise.allSettled([
+    supports(ERC165_INTERFACE_ID),
+    supports(ERC721_INTERFACE_ID),
+    supports(ERC1155_INTERFACE_ID),
+  ]);
+  const [r165, r721, r1155] = supportsSettled;
+  if (r165.status === 'fulfilled') is165 = !!r165.value;
+  else supportError = r165.reason;
+  if (r721.status === 'fulfilled') is721 = !!r721.value;
+  else supportError = supportError || r721.reason;
+  if (r1155.status === 'fulfilled') is1155 = !!r1155.value;
+  else supportError = supportError || r1155.reason;
 
   if (is721 && is1155) {
     return { ok: false, retryable: false, reason: '该合约同时声明 ERC721 与 ERC1155 接口，无法唯一判定；请换用标准明确的合约' };
@@ -170,7 +202,7 @@ export async function detectNftStandard(contract, { reader = null, provider = nu
 }
 
 /**
- * 检测并核对卖家声明。`declared` 非法时也明确拒绝，不把“声明错”交给后面的
+ * 检测并核对店主声明。`declared` 非法时也明确拒绝，不把“声明错”交给后面的
  * 交付核验才暴露。
  */
 export async function checkNftStandard(contract, declared, opts = {}) {
@@ -198,7 +230,7 @@ export async function checkNftStandard(contract, declared, opts = {}) {
   return finishCheck(detected, d);
 }
 
-/** 把“实际标准”与卖家声明对齐；检测缓存命中时也走同一处，避免两条判据。 */
+/** 把“实际标准”与店主声明对齐；检测缓存命中时也走同一处，避免两条判据。 */
 function finishCheck(detected, declared) {
   if (!detected.ok) return detected;
   if (detected.standard !== declared) {

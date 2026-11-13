@@ -282,7 +282,7 @@ test('陈述条数上限：仲裁阶段每角色 20 条，超出拒绝；对方�
   assert.equal(await evidenceCount(o.orderId), ARB_CAP, '超限的那条没有落库');
 
   // 店主不受买家额度影响（额度按 (单, 角色, 阶段) 计）
-  const seller = await postEvidence(o.orderNo, { phase: 'arbitration', content: '卖家陈述：不同意仅退款' }, ownerToken);
+  const seller = await postEvidence(o.orderNo, { phase: 'arbitration', content: '店主陈述：不同意仅退款' }, ownerToken);
   assertOk(seller);
   assert.equal(await evidenceCount(o.orderId), ARB_CAP + 1);
   // 买家仍受自己额度约束
