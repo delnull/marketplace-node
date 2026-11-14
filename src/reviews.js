@@ -23,6 +23,7 @@
  *    代价如实写：这是刻意选的（金额宁可响亮地失败），代价落在每一个消费聚合的调用点。
  */
 import { getDb } from './db.js';
+import { normalizeId } from './ids.js';
 import config from './config.js';
 import { findMedia } from './productMedia.js';
 import { storedMediaNameOf } from './mediaKinds.js';
@@ -324,7 +325,7 @@ export async function productReviewSummary(productId) {
  */
 export async function productReviews(slug, page, pageSize, filter = 'all', sort = 'new') {
   const db = getDb();
-  const product = await db.get('SELECT id FROM products WHERE slug = ? AND deleted_at IS NULL', String(slug || ''));
+  const product = await db.get('SELECT id FROM products WHERE slug = ? AND deleted_at IS NULL', normalizeId(slug));
   if (!product) return null;
 
   // 白名单拼 SQL（不把用户输入带进语句；只有这三个片段可能出现在 WHERE 里）

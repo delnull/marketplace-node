@@ -35,7 +35,7 @@
 import { ethers } from 'ethers';
 import { getDb, withTransaction } from './db.js';
 import { getProvider, isAddress } from './chain.js';
-import { newClaimNo } from './ids.js';
+import { newClaimNo, normalizeId } from './ids.js';
 
 /** 仍占着"这枚 token 的提货权"的状态：seller 可操作、新声明不能插队 */
 export const CLAIM_OPEN_STATUSES = ['requested', 'approved', 'shipped'];
@@ -103,9 +103,9 @@ export async function nftOwnedBy({ contract, tokenId, claimant }) {
 
 /* ── 行读取与 DTO ───────────────────────────────────────────────────── */
 
-/** 按对外声明号读一行（读不到返回 undefined） */
+/** 按对外声明号读一行（读不到返回 undefined）。声明号先过 `normalizeId`：抄来的小写/`O` 不该变成"不存在"。 */
 export async function claimRowByNo(claimNo) {
-  const v = String(claimNo ?? '').trim();
+  const v = normalizeId(claimNo);
   if (!v) return undefined;
   return await getDb().get(
     `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
@@ -347,10 +347,12 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
     窗口已过 / 被驳回 / 被取消的旧行不占位（唯一索引只压 requested/approved/shipped/fulfilled）；
     但"过期"只在提交这一刻惰性判定——没有后台扫描也能让新持有人接手。
   */
+  let claimNo = newClaimNo();
   try {
-    const claimNo = newClaimNo();
     await withTransaction(async () => {
-      const ins = await db.run(
+      let ins;
+      for (let attempt = 1; !ins; attempt += 1) {
+        ins = await db.run(
         `INSERT INTO nft_claims
            (claim_no, shop_code, product_id, product_slug, order_id, order_no, seller,
             token_contract, token_id, claimant, status, shipping_name, shipping_phone, shipping_address, note,
@@ -372,12 +374,29 @@ export async function submitClaim({ contract, tokenId, claimant, shipping, note 
         noteText,
         deadline, /* 提交时的窗口快照；null = 不限期 */
         String(delivered.claim_type || 'physical')
-      );
+        ).catch((e) => {
+          /*
+            要区分两个唯一键：`uq_claims_no`（声明号 50 bit 随机，本循环换号重试）与
+            `uq_claims_active_token`（同一枚 token 已有未完结声明，交给外层 409）。
+            连续 5 次声明号冲突则抛出，不能被外层误报成后者。
+          */
+          if (e?.code !== 'ER_DUP_ENTRY' || !/uq_claims_no/.test(String(e?.sqlMessage || e?.message || ''))) throw e;
+          if (attempt >= 5) throw new Error('提货声明号连续冲突（5 次）：请重试');
+          claimNo = newClaimNo();
+        });
+      }
       return ins;
     });
     return { ok: true, claim: claimDto(await claimRowByNo(claimNo), { as: 'holder' }) };
   } catch (e) {
-    if (e?.code === 'ER_DUP_ENTRY' || Number(e?.errno) === 1062) {
+    /*
+      只有 active-token 唯一索引才是"这枚 NFT 已有未完结声明"；声明号冲突已在上面换号重试，
+      其它重复键（以及任何非重复键错误）原样上抛——不要把未知错误冒充成这条业务原因。
+    */
+    if (
+      (e?.code === 'ER_DUP_ENTRY' || Number(e?.errno) === 1062) &&
+      /uq_claims_active_token/.test(String(e?.sqlMessage || e?.message || ''))
+    ) {
       return {
         ok: false,
         status: 409,

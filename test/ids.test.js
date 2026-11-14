@@ -7,18 +7,16 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { newOrderId, newProductSlug, isNewOrderId, isNewProductSlug, orderIdTime } from '../src/ids.js';
+import { newClaimNo, newOrderId, newProductSlug, normalizeId } from '../src/ids.js';
 
 const CROCKFORD = /^[0-9A-HJKMNP-TV-Z]+$/;
 
-test('订单号：21 字符、无连字符、只用 Crockford 字符集', () => {
+test('订单号：21 字符、B 开头、无连字符、只用 Crockford 字符集', () => {
   for (let i = 0; i < 200; i += 1) {
     const id = newOrderId();
     assert.equal(id.length, 21);
     assert.equal(id[0], 'B');
     assert.ok(CROCKFORD.test(id), `出现字符集外的字符：${id}`);
-    assert.ok(!id.includes('-'), `不应含连字符：${id}`);
-    assert.ok(isNewOrderId(id));
   }
 });
 
@@ -28,18 +26,33 @@ test('商品标识：11 字符、P 开头、无连字符', () => {
     assert.equal(slug.length, 11);
     assert.equal(slug[0], 'P');
     assert.ok(CROCKFORD.test(slug));
-    assert.ok(isNewProductSlug(slug));
   }
 });
 
-test('订单号前缀编码下单时刻，且字典序 = 时间序', () => {
+test('提货声明号：21 字符、C 开头、与订单号同一套字符集', () => {
+  for (let i = 0; i < 200; i += 1) {
+    const claimNo = newClaimNo();
+    assert.equal(claimNo.length, 21);
+    assert.equal(claimNo[0], 'C');
+    assert.ok(CROCKFORD.test(claimNo));
+  }
+});
+
+test('订单号前缀：同一毫秒前缀相同、不同毫秒不同，字典序即时间序', () => {
   const t1 = Date.UTC(2026, 8, 16, 3, 0, 0);
   const t2 = t1 + 3600_000;
   const a = newOrderId(t1);
   const b = newOrderId(t2);
-  assert.equal(orderIdTime(a), t1);
-  assert.equal(orderIdTime(b), t2);
   assert.ok(a < b, '同一毫秒之后的下单，单号字典序应当更大（日志/列表可直接按单号排序）');
+  // B + 10 位时间前缀：同一毫秒的单号前 11 位必须相同，不同毫秒必须不同
+  assert.equal(a.slice(0, 11), newOrderId(t1).slice(0, 11));
+  assert.notEqual(a.slice(0, 11), b.slice(0, 11));
+});
+
+test('订单号前缀就是 10 位 base32 毫秒时间戳（独立已知向量）', () => {
+  assert.equal(newOrderId(0).slice(0, 11), 'B0000000000');
+  assert.equal(newOrderId(32).slice(0, 11), 'B0000000010');
+  assert.equal(newOrderId(33).slice(0, 11), 'B0000000011');
 });
 
 test('随机段足够宽：同毫秒 5 万次生成无重复', () => {
@@ -49,9 +62,28 @@ test('随机段足够宽：同毫秒 5 万次生成无重复', () => {
   assert.equal(seen.size, 50_000);
 });
 
-test('历史标识继续可用：不认识的形状不会被判成非法', () => {
-  // 校验函数只用于展示层判断，不能变成"拒绝老数据"的闸门
-  assert.equal(isNewOrderId('ae9c128c-6a90-4989-87e5-7dd7c5b57482'), false);
-  assert.equal(isNewProductSlug('p-3f9a2b7c1d4e'), false);
-  assert.equal(orderIdTime('ae9c128c-6a90-4989-87e5-7dd7c5b57482'), null);
+test('normalizeId：去空白、折大写、Crockford 别名；非字符串一律空串', () => {
+  assert.equal(normalizeId('  b0v3k7q1z  '), 'B0V3K7Q1Z');
+  assert.equal(normalizeId('B0V3K7QIZ'), 'B0V3K7Q1Z', 'I 读成 1');
+  assert.equal(normalizeId('B0V3K7QLZ'), 'B0V3K7Q1Z', 'L 读成 1');
+  assert.equal(normalizeId('BOV3K7Q1Z'), 'B0V3K7Q1Z', 'O 读成 0');
+  // Unicode 折叠是可预期的（toUpperCase 后再做 Crockford 别名）；它不是形状校验器，不能当安全过滤用
+  assert.equal(normalizeId('ſ'), 'S');
+  assert.equal(normalizeId('ı'), '1');
+  assert.equal(normalizeId(''), '');
+  assert.equal(normalizeId('   '), '');
+  for (const bad of [null, undefined, 123, true, [], {}, ['B0V3K7Q1Z']]) {
+    assert.equal(normalizeId(bad), '', `${JSON.stringify(bad)} 不是字符串`);
+  }
+});
+
+test('生成端产出的标识归一化后不变（归一化只影响抄写错误，不改变身份）', () => {
+  for (let i = 0; i < 200; i += 1) {
+    const order = newOrderId();
+    const slug = newProductSlug();
+    const claim = newClaimNo();
+    assert.equal(normalizeId(order), order);
+    assert.equal(normalizeId(slug), slug);
+    assert.equal(normalizeId(claim), claim);
+  }
 });

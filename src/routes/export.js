@@ -18,6 +18,7 @@
  */
 import { Router } from 'express';
 import { getDb } from '../db.js';
+import { normalizeId } from '../ids.js';
 import { verifySession, roleOf } from '../auth.js';
 import { fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
 import { refundPriceMicroOfRow } from '../stats.js';
@@ -424,7 +425,7 @@ router.get('/products.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
 
 router.get('/codes.csv', ownerOnly, exportLimiter, wrap(async (req, res) => {
   const db = getDb();
-  const slug = String(req.query.slug || '');
+  const slug = normalizeId(req.query.slug);
   const product = await db.get('SELECT id FROM products WHERE slug = ? AND kind = ? AND shop_code = ?', slug, 'digital', String(req.shop.code));
   if (!product) return fail(res, '数字商品不存在', 404, 404);
   const where = ['c.product_id = ?'];

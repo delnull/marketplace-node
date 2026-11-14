@@ -14,6 +14,7 @@ import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js'
 import { verifySession } from '../auth.js';
 import { getDb, withTransaction } from '../db.js';
 import { isShopCodeShape, shopDisplayName } from '../shops.js';
+import { normalizeId } from '../ids.js';
 import { priceOf } from '../money.js';
 
 const router = Router();
@@ -32,7 +33,11 @@ function normAddress(raw) {
 function shapeOf(body) {
   const kind = body?.kind === 'shop' ? 'shop' : body?.kind === 'product' ? 'product' : '';
   const code = String(body?.code ?? '').trim().toUpperCase();
-  const slug = String(body?.slug ?? '').trim();
+  /*
+    商品标识走**唯一归一化**（trim + 大写 + Crockford 别名）：读、写、幂等比较三处都拿这个规范值，
+    否则用小写 slug 收藏会 404，或者写进一行大小写混排的收藏（GET 的 JOIN 按库内值匹配）。
+  */
+  const slug = normalizeId(body?.slug);
   if (!kind) return { error: '收藏类型只能是店铺或商品' };
   if (!isShopCodeShape(code)) return { error: '店铺编号形状不对' };
   if (kind === 'shop') {

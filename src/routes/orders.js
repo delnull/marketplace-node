@@ -147,7 +147,9 @@ import { precheckDraftQuota, reserveDraftQuota } from '../draftQuota.js';
 // 池式商品占位的**加量**唯一实现（减量同样在触发器里）
 import { reservePoolUnits, poolAvailability } from '../poolQuota.js';
 import { verifyNftTransfersTx } from '../nftDelivery.js';
-import { newOrderId } from '../ids.js';
+import { newOrderId, normalizeId } from '../ids.js';
+// 商品标识的读入口唯一实现（归一化 + 按 slug 取行）：下单入口也走它，不自己拼 WHERE slug
+import { productRowBySlug } from '../productLookup.js';
 import { loadSkus, snapshotObject } from './products.js';
 import { ok, fail, wrap, bearerToken, makeAuthMiddleware, simpleRateLimit, addressRateLimit } from '../http.js';
 // 金额展示口径的唯一实现（priceOf / goodsPriceMicroOf）——不要再手写 (micro/1e6).toFixed(2)
@@ -187,9 +189,9 @@ import { normalizeCarrier } from '../shipping.js';
 // 店主待办计数（**唯一实现**）：本文件的徽标端点与 /api/shop/metrics 读同一份谓词与 SQL
 import { sellerTodoCounts } from '../opsMetrics.js';
 // 店铺判据（"能不能卖"的唯一实现）：下单闸与商品闸共用同一份文案
-import { sellableError, shopRowByCode, shopRowsByCodes, productSellableSql } from '../shops.js';
+import { sellableError, shopRowByCode, shopRowsByCodes } from '../shops.js';
 import { blockedShopCodes, blockedSellers } from '../blocks.js';
-import { findOrderInShop } from '../orderScope.js';
+import { findOrderByNo, findOrderInShop } from '../orderScope.js';
 import { sellerOrderFilters } from '../sellerOrderFilters.js';
 
 const router = Router();
@@ -319,7 +321,7 @@ async function optionalAuth(req) {
 
 /** 按**订单号**读整单：走读模型视图 v_orders（订单事实 + 个人信息 + 链上镜像一次读全）。 */
 async function findOrder(orderNo) {
-  return await getDb().get('SELECT * FROM v_orders WHERE order_no = ?', String(orderNo || ''));
+  return await findOrderByNo(orderNo);
 }
 
 // poolEmpty 提示（列表/详情字段）口径见 src/poolAlert.js：与托管落定后的 order.pool_empty
@@ -1185,7 +1187,7 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
     return fail(res, '幂等键格式非法（8..64 位字母/数字/下划线/连字符）', 400, 400);
   }
   /* 幂等键只回放**同一购买意图**：同一键被拿去建另一件商品的单，是客户端复用错误，明确拒绝 */
-  const requestedSlug = String(productSlug || '');
+  const requestedSlug = normalizeId(productSlug);
   const requestedQty = quantity === undefined || quantity === null ? 1 : Number(quantity);
   const requestedSku = String(bodySkuKey ?? '');
   const paymentKeyOf = (v) => (/^0x0{40}$/i.test(String(v || '')) ? '' : String(v || '').toLowerCase());
@@ -1278,10 +1280,7 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
   if (!shippingInfo.name && !shippingInfo.phone && !shippingInfo.address) {
     shippingInfo = { name: '', phone: '', address: '' };
   }
-  const product = await getDb().get(
-    `SELECT * FROM products WHERE slug = ? AND ${productSellableSql()}`,
-    String(productSlug || '')
-  );
+  const product = await productRowBySlug(productSlug, { sellableOnly: true });
   if (!product) return fail(res, '商品不存在或已下架', 404, 404);
   /*
     **店铺 = 商品所属的那一家**：`products.shop_code` 有外键指向 `shops(code)`，
@@ -1470,12 +1469,19 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
     拿单号能看到收货信息，所以不能用顺序号。
     注意：它同时被当作**草稿随机盐**参与下面的 orderId 哈希，随机性要求不变。
   */
-  const id = newOrderId(now);
+  /*
+    编号在事务里可能因**唯一键撞车**换号重试（最多 5 次尝试，见下面 INSERT 的重试）：`id` 与
+    由它派生的 `orderIdHex` 因此是 let——两者必须始终同源，改一个不改另一个会把"本地单号"与
+    "链上单号"拆成两笔。
+  */
+  let id = newOrderId(now);
+  const orderIdOf = (orderNo) =>
+    ethers.solidityPackedKeccak256(
+      ['bytes32', 'address', 'address', 'string'],
+      [product.snapshot_hash, owner, target, orderNo]
+    );
   // 草稿 UUID 纳入 orderId 哈希（随机化防链上预占；同买家同商品可反复购买）
-  const orderIdHex = ethers.solidityPackedKeccak256(
-    ['bytes32', 'address', 'address', 'string'],
-    [product.snapshot_hash, owner, target, id]
-  );
+  let orderIdHex = orderIdOf(id);
   /*
     订单锁定的商品快照必须与商品级快照**同源同形**：snapshotObject 的 skus 取自「行上的 skus 数组」，
     而 `SELECT * FROM products` 出来的行没有该属性 → 快照里的 skus 会变成 []。
@@ -1628,7 +1634,9 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
           它是 paid_tx_hash / refund_status / after_sale_* / events 的宿主，晚建一步，
           后面每一条链上回写都得先判"这一行在不在"。
     */
-    const ins = await db.run(`INSERT INTO orders
+    let ins;
+    for (let attempt = 1; !ins; attempt += 1) {
+      ins = await db.run(`INSERT INTO orders
         (order_no, product_id, product_slug, product_snapshot, snapshot_hash, sku_key, sku_specs, buyer, seller, shop_code,
          quantity, hold_qty, amount_wei, payment_token, payment_symbol, payment_decimals,
          token_usdt_micro_per_token, payment_rate_source, payment_rate_stale, price_currency, price_micro,
@@ -1646,7 +1654,29 @@ router.post('/', requireAuth, draftLimiter, wrap(async (req, res) => {
       config.escrow.timeoutBlocks,
       product.age_restricted && ageAckAsserted ? 1 : 0,
       // "要不要开票"是订单事实，住 orders —— 它**不随个人信息擦除消失**（擦除删的是 order_shipping 行）
-      invoiceInfo.needed ? 1 : 0);
+      invoiceInfo.needed ? 1 : 0
+      ).catch(async (e) => {
+        /*
+          唯一可能撞的是 `uq_orders_no`（单号 50 bit 随机，概率极低但必须处理）：换一个单号重试。
+          `orderIdHex` 是由单号派生的**链上标识**，必须跟着重算；幂等映射在同一事务里已落了行，
+          也要同步改成新单号——三者不一致会把"本地单号 / 链上单号 / 幂等键"拆成三笔。
+          非唯一键错误原样上抛；连续 5 次仍撞则失败整笔回滚（不留下半行）。
+        */
+        if (e?.code !== 'ER_DUP_ENTRY' || !/uq_orders_no/.test(String(e?.sqlMessage || e?.message || '')) || attempt >= 5) throw e;
+        id = newOrderId(now);
+        orderIdHex = orderIdOf(id);
+        if (idemKey) {
+          const moved = await db.run(
+            'UPDATE order_idempotency SET order_no = ? WHERE initiator = ? AND idem_key = ?',
+            id,
+            me,
+            idemKey
+          );
+          // 同一事务里刚插入的映射不可能 0 行命中；真为 0 说明映射已经指向一张不存在的单，必须响亮失败
+          if (moved.foundRows !== 1) throw new Error('订单号撞车后幂等映射未更新：请重试');
+        }
+      });
+    }
     /*
       `insertId` = 这条 INSERT 分配到的 `orders.id`：下面两张 1:1 子表的外键就是它。
       刻意**不**用 `SELECT … ORDER BY id DESC LIMIT 1` 去回查（那靠"同一连接、中间没有别的
@@ -1752,7 +1782,21 @@ router.get('/seller/status-counts', staffOnly, wrap(async (req, res) => {
  *  `ids` 是**订单号**（公开标识），返回的 shipped/failed 也是订单号。 */
 router.post('/seller/batch-ship', staffOnly, wrap(async (req, res) => {
   const db = getDb();
-  const ids = [...new Set((req.body?.ids || []).map((x) => String(x)).filter(Boolean))];
+  /*
+    订单号先归一化再查（`normalizeId`），`failed` 回报调用方原样给的那串（前端要按发送行回对）；
+    `shipped`/审计/通知一律用库里的规范单号。
+  */
+  const rawIds = req.body?.ids;
+  if (!Array.isArray(rawIds)) return fail(res, '订单号列表必须是 1 到 50 个', 400, 400);
+  if (rawIds.some((x) => typeof x !== 'string')) return fail(res, '订单号必须是字符串', 400, 400);
+  const labels = new Map();
+  for (const raw of rawIds) {
+    const text = String(raw ?? '');
+    if (!text.trim()) continue;
+    const key = normalizeId(text);
+    if (key && !labels.has(key)) labels.set(key, text);
+  }
+  const ids = [...labels.keys()];
   if (!ids.length) return fail(res, '订单号列表必须是 1 到 50 个');
   // 超限直接拒绝而非静默截断——跨页勾选 >50 时截断会让店主误以为全部已发（店主侧审计 ①）
   if (ids.length > 50) return fail(res, `单次批量发货最多 50 单（当前勾选 ${ids.length} 单）：请减少勾选后分批提交`);
@@ -1792,7 +1836,7 @@ router.post('/seller/batch-ship', staffOnly, wrap(async (req, res) => {
   for (const id of ids) {
     const o = byId.get(id);
     if (!o) {
-      failed.push({ id, reason: '订单不存在' });
+      failed.push({ id: labels.get(id) ?? id, reason: '订单不存在' });
       continue;
     }
     let snap = {};
@@ -1801,15 +1845,15 @@ router.post('/seller/batch-ship', staffOnly, wrap(async (req, res) => {
     } catch {
       snap = {};
     }
-    if (snap.kind !== 'physical') failed.push({ id, reason: '非实物商品不支持批量发货' });
-    else if (o.status !== 'escrowed') failed.push({ id, reason: `状态(${o.status})非待发货` });
-    else if (!o.paid_tx_hash) failed.push({ id, reason: '缺少链上支付凭证，请先同步或取消' });
+    if (snap.kind !== 'physical') failed.push({ id: labels.get(o.order_no) ?? o.order_no, reason: '非实物商品不支持批量发货' });
+    else if (o.status !== 'escrowed') failed.push({ id: labels.get(o.order_no) ?? o.order_no, reason: `状态(${o.status})非待发货` });
+    else if (!o.paid_tx_hash) failed.push({ id: labels.get(o.order_no) ?? o.order_no, reason: '缺少链上支付凭证，请先同步或取消' });
     else candidates.push(o);
   }
   const gates = await Promise.all(candidates.map((o) => deliveryGate(o)));
   candidates.forEach((o, i) => {
     const gate = gates[i];
-    if (!gate.ok) failed.push({ id: o.order_no, reason: gate.message });
+    if (!gate.ok) failed.push({ id: labels.get(o.order_no) ?? o.order_no, reason: gate.message });
     else okIds.push(o.order_no);
   });
   /*
@@ -1845,7 +1889,7 @@ router.post('/seller/batch-ship', staffOnly, wrap(async (req, res) => {
     for (const no of okIds) {
       if (won.includes(no)) continue;
       failed.push({
-        id: no,
+        id: labels.get(no) ?? no,
         reason: '该单在批量校验后被并发修改（已被发货/取消/退款冻结，或支付凭证已不存在），本次未认领',
       });
     }

@@ -15,7 +15,7 @@ import { verifySession, roleOf } from '../auth.js';
 import { ok, fail, wrap, makeAuthMiddleware } from '../http.js';
 import { logAudit } from '../audit.js';
 import { createReturn, requestReturn, setReturnAddress, setReturnQuantity, setReturnTracking, settleReturn, returnToPublic } from '../returns.js';
-import { findOrderInShop } from '../orderScope.js';
+import { findOrderByNo, findOrderInShop } from '../orderScope.js';
 
 const router = Router();
 const requireAuth = makeAuthMiddleware(verifySession);
@@ -28,7 +28,7 @@ const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true });
  * 买家面那条（`/tracking`）按买家身份门控，不需要店铺作用域（身份判据在 `setReturnTracking` 里，
  * 它比对的就是订单行自己的 `buyer`），所以它按订单号读整张订单即可。
  */
-const findOrderForBuyer = async (orderNo) => await getDb().get('SELECT * FROM v_orders WHERE order_no = ?', String(orderNo || ''));
+const findOrderForBuyer = async (orderNo) => await findOrderByNo(orderNo);
 
 /**
  * 管理审计便捷包装（仅 staff 记录；角色按**本店**算，漏传店铺编号会让审计行静默消失）。

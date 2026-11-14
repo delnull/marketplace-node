@@ -36,6 +36,7 @@ import { enumText, fmtTime } from '../userText.js';
 import {
   submitClaim,
   claimDto,
+  claimRowByNo,
   sellerClaimAction,
   holderCancelClaim,
   buildClaimDisputeCall,
@@ -115,7 +116,14 @@ function claimWhereOf(scope, filter) {
     params.push(filter.status);
   }
   if (filter.q) {
-    parts.push(`(n.claim_no LIKE ? OR n.order_no LIKE ? OR n.token_id LIKE ? OR n.claimant LIKE ? OR n.tracking_no LIKE ? OR n.token_contract LIKE ?)`);
+    /*
+      编号两列显式用 ai_ci 比较：表排序规则是 as_cs，粘进来的小写声明号/订单号本来会 0 命中。
+      其余列（token_id/tracking_no/地址）保持原排序规则，避免把大小写敏感的单号搜索放宽。
+    */
+    parts.push(
+      `(n.claim_no COLLATE utf8mb4_0900_ai_ci LIKE ? OR n.order_no COLLATE utf8mb4_0900_ai_ci LIKE ?` +
+        ` OR n.token_id LIKE ? OR n.claimant LIKE ? OR n.tracking_no LIKE ? OR n.token_contract LIKE ?)`
+    );
     const like = `%${filter.q}%`;
     params.push(like, like, like, like, like, like);
   }
@@ -302,7 +310,7 @@ router.post('/nft/:id/cancel', requireAuth, wrap(async (req, res) => {
  * `ship` 会在唯一实现里再查一次链上持有人（A-policy：转手了就拒绝发货，要求先取消）。
  */
 router.post('/nft/:id/seller', requireAuth, wrap(async (req, res) => {
-  const row = await getDb().get('SELECT seller, shop_code FROM nft_claims WHERE claim_no = ?', String(req.params.id || ''));
+  const row = await claimRowByNo(req.params.id);
   if (!row) return fail(res, '声明不存在', 404, 404);
   const mine = String(row.seller) === String(req.auth.address);
   const staff = mine ? true : (await roleOf(req.auth.address, String(row.shop_code))) === 'staff';
@@ -348,7 +356,8 @@ router.post('/nft/:id/dispute', nodeAdmin, wrap(async (req, res) => {
   const { amountWei, deadline } = req.body || {};
   const r = await buildClaimDisputeCall({ claimNo: String(req.params.id), amountWei, deadlineSeconds: deadline });
   if (!r.ok) return fail(res, r.message, r.status, r.status);
-  const claimRow = await getDb().get('SELECT shop_code FROM nft_claims WHERE claim_no = ?', String(req.params.id || ''));
+  const claimRow = await claimRowByNo(req.params.id);
+  if (!claimRow) return fail(res, '声明不存在', 404, 404);
   const host = await isHost(req.auth.address, { force: true });
   await logAudit({
     req,
@@ -357,12 +366,12 @@ router.post('/nft/:id/dispute', nodeAdmin, wrap(async (req, res) => {
     shopCode: null,
     action: 'claim.dispute.prepare',
     targetType: 'nft_claim',
-    targetId: String(req.params.id),
+    targetId: claimRow.claim_no,
     /*
       `shopCode` 是**这家店的治理记录**赖以找到这一行的归属（节点级行的 shop_code 恒为 NULL，
       见 audit.js 的 auditWhere）。没有它，节点主在店铺详情里看不到"这家店的提货争议参数是谁生成的"。
     */
-    detail: { claimId: r.call.claimId, amountWei: r.call.args[5], shopCode: claimRow?.shop_code ?? null },
+    detail: { claimId: r.call.claimId, amountWei: r.call.args[5], shopCode: claimRow.shop_code ?? null },
   });
   ok(
     res,

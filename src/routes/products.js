@@ -85,7 +85,9 @@ import {
   isShopCodeShape,
   productPublicSql,
 } from '../shops.js';
-import { newProductSlug } from '../ids.js';
+import { newProductSlug, normalizeId } from '../ids.js';
+// 商品标识的读入口唯一实现（归一化 + 按 slug 取行）：所有按 slug 读商品的地方都走它
+import { productRowBySlug } from '../productLookup.js';
 import { auditChanges, boundAuditValue, sameAuditValue } from '../auditDiff.js';
 import { normalizeBlocks, deriveDescription, parseBlocks } from '../describeBlocks.js';
 import { tryAutoDeliverPendingForProduct } from '../autoDeliver.js';
@@ -198,8 +200,19 @@ const nodeAudit = async (req, action, targetType, targetId, detail) =>
  */
 async function moderateNodeProducts({ req, slugs, hidden, reason, batch = false }) {
   const db = getDb();
+  /*
+    批量与单品共用这一处：slug 先归一化（trim + 大写 + Crockford 别名），SQL / 审计 / webhook
+    一律用库里的规范值；`missing` 回调用方原样给的那串（前端要对回它发出去的清单）。
+  */
+  const labels = new Map();
+  for (const raw of slugs) {
+    const key = normalizeId(raw);
+    if (key && !labels.has(key)) labels.set(key, raw);
+  }
+  const keys = [...labels.keys()];
+  if (!keys.length) return { missing: [...slugs] };
   const out = await withTransaction(async () => {
-    const marks = slugs.map(() => '?').join(',');
+    const marks = keys.map(() => '?').join(',');
     /*
       行锁把"读现有状态 → 判断要不要写"锁在同一事务里：两个节点管理员同时点批量下架时，
       后到的那一批看到的是已下架状态，只会记 unchanged，不会写出第二条审计/通知。
@@ -207,10 +220,10 @@ async function moderateNodeProducts({ req, slugs, hidden, reason, batch = false 
     const rows = await db.all(
       `SELECT id, slug, title, shop_code, node_hidden, node_hidden_reason, node_hidden_at
          FROM products WHERE slug IN (${marks}) AND deleted_at IS NULL FOR UPDATE`,
-      ...slugs
+      ...keys
     );
     const found = new Set(rows.map((r) => String(r.slug)));
-    const missing = slugs.filter((s) => !found.has(s));
+    const missing = [...labels].filter(([key]) => !found.has(key)).map(([, raw]) => raw);
     if (missing.length) return { missing };
     const changed = rows.filter((r) => (Number(r.node_hidden) === 1) !== hidden);
     for (const r of changed) {
@@ -282,7 +295,7 @@ const hostOnly = makeAuthMiddleware(verifySession, { hostOnly: true });
  * `listed = 0` 只是暂停接单，不是店下线（见 shops.js 的说明）。
  */
 async function requireShopProduct(req, res) {
-  const row = await getDb().get('SELECT * FROM products WHERE slug = ?', String(req.params.slug || ''));
+  const row = await productRowBySlug(req.params.slug);
   /*
     已软删除的商品对店主面也是"不存在"：删除是终局（不提供恢复入口），
     历史订单靠快照独立成立，不需要商品行继续可读。
@@ -2205,8 +2218,8 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
  * 本端点只读，不改变任何状态；返回的是公开 DTO（不含码池/收货信息等店主私域数据）。
  */
 router.get('/admin/:slug', nodeAdmin, wrap(async (req, res) => {
-  const slug = String(req.params.slug || '').trim();
-  const row = await getDb().get('SELECT * FROM products WHERE slug = ?', slug);
+  const slug = normalizeId(req.params.slug);
+  const row = await productRowBySlug(slug);
   if (!row) return fail(res, '商品不存在', 404, 404);
   const shop = await shopRowByCode(row.shop_code);
   if (!shop) return fail(res, '商品所属店铺不存在', 404, 404);
@@ -2230,7 +2243,7 @@ router.get('/admin/:slug', nodeAdmin, wrap(async (req, res) => {
 router.patch('/admin/moderation', nodeAdmin, wrap(async (req, res) => {
   const raw = req.body?.slugs;
   if (!Array.isArray(raw)) return fail(res, '商品标识列表必须是 1 到 100 个', 400, 400);
-  const slugs = [...new Set(raw.map((s) => String(s ?? '').trim()).filter(Boolean))];
+  const slugs = [...new Set(raw.map((s) => normalizeId(s)).filter(Boolean))];
   if (!slugs.length) return fail(res, '商品标识列表不能为空（1 到 100 个）', 400, 400);
   if (slugs.length > 100) return fail(res, `批量处置单次上限 100 件（实际 ${slugs.length} 件）——请分批操作`, 400, 400);
   const hidden = req.body?.hidden;
@@ -2269,7 +2282,7 @@ router.patch('/admin/moderation', nodeAdmin, wrap(async (req, res) => {
  * 两个判据正交，公开可见性由 `productSellableSql()` 同时要求两者，谁都不能单独绕过。
  */
 router.patch('/admin/:slug/moderation', nodeAdmin, wrap(async (req, res) => {
-  const slug = String(req.params.slug || '').trim();
+  const slug = normalizeId(req.params.slug);
   const hidden = req.body?.hidden;
   if (typeof hidden !== 'boolean') return fail(res, '强制下架状态必须是布尔值（是=强制下架，否=恢复展示）', 400, 400);
   const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
@@ -2277,7 +2290,7 @@ router.patch('/admin/:slug/moderation', nodeAdmin, wrap(async (req, res) => {
 
   const out = await moderateNodeProducts({ req, slugs: [slug], hidden, reason });
   if (out.missing) return fail(res, '商品不存在', 404, 404);
-  const fresh = await getDb().get('SELECT * FROM products WHERE slug = ?', slug);
+  const fresh = await productRowBySlug(slug);
   const shop = await shopRowByCode(fresh.shop_code);
   if (!out.changed.length) {
     return ok(
@@ -2367,7 +2380,7 @@ router.get('/token-meta', staffOnly, wrap(async (req, res) => {
  *     要能知道"这家店暂时不接单了"，而不是以为链接坏了或商品没了。
  */
 router.get('/:slug', wrap(async (req, res) => {
-  const row = await getDb().get('SELECT * FROM products WHERE slug = ?', String(req.params.slug || ''));
+  const row = await productRowBySlug(req.params.slug);
   if (!row) return fail(res, '商品不存在', 404, 404);
   let authed = null;
   try {
@@ -2402,7 +2415,7 @@ router.get('/:slug/reviews', productReviewsLimiter, wrap(async (req, res) => {
       · 店铺**暂停接单**（`status:200`）⇒ 详情页本来就按"可读原因"展示这件商品，
         评价随详情一起保持可见（隐藏它反而与详情页自相矛盾，也不是本判据要挡的泄露面）。
   */
-  const row = await getDb().get('SELECT * FROM products WHERE slug = ?', String(req.params.slug || ''));
+  const row = await productRowBySlug(req.params.slug);
   if (!row) return fail(res, '商品不存在', 404, 404);
   const gate = await publicProductGate(row);
   if (gate && gate.status === 404) return fail(res, gate.message, 404, 404);
@@ -2444,7 +2457,7 @@ router.post('/', staffOnly, wrap(async (req, res) => {
        · 只用不容易念错的字符集（无 I/L/O/U）。
     旧形状里存在过的 `p-<12hex>` 之类的标识不必再兼容：本库没有历史数据，slug 一律由这里生成。
   */
-  const slug = newProductSlug();
+  let slug = newProductSlug();
   /*
     商品行与它的 SKU 行**同一次提交**：分开写时任何一步失败都留下"有商品行、没有 SKU 行"的半成品——
     它在列表里看得见、点进去却下不了单（没有可选组合），而错只出现在那一次响应里。
@@ -2455,7 +2468,9 @@ router.post('/', staffOnly, wrap(async (req, res) => {
     也是 `shops(code)` 的外键。
   */
   await withTransaction(async () => {
-    const ins = await db.run(
+    let ins;
+    for (let attempt = 1; !ins; attempt += 1) {
+      ins = await db.run(
       'INSERT INTO products (slug, shop_code, title, description, description_blocks, media, kind, ' +
         'price_currency, shipping_fee_micro, age_restricted, nft_contract, nft_standard, token_contract, token_decimals, token_symbol, claimable, claim_type, claim_window_days, claim_instructions, specs, attributes, terms, tags, ' +
         `snapshot_hash, auto_deliver, stock_alert_at, active, published_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${PUBLISHED_AT_FIRST})`,
@@ -2471,14 +2486,22 @@ router.post('/', staffOnly, wrap(async (req, res) => {
       SNAPSHOT_HASH_UNSET, value.autoDeliver, value.stockAlertAt, value.active,
       // 首次上架时刻只在这两种情况下写：建单时就是"在售"（→ 服务器盖章），或建单时是草稿（→ NULL，等第一次上架再写）
       value.active
-    );
+      ).catch((e) => {
+        /*
+          唯一可能撞的是 `uq_products_slug`（50 bit 随机，概率极低但必须处理）：换一个标识重试。
+          非唯一键错误原样上抛；连续 5 次仍撞则整笔回滚，不留下"有商品没 SKU 行"的半成品。
+        */
+        if (e?.code !== 'ER_DUP_ENTRY' || !/uq_products_slug/.test(String(e?.sqlMessage || e?.message || '')) || attempt >= 5) throw e;
+        slug = newProductSlug();
+      });
+    }
     await saveSkus(ins.insertId, value.skus);
     await refreshSnapshotHash(ins.insertId);
   });
   await audit(req, 'product.create', 'product', slug, { kind: value.kind, priceCurrency: value.priceCurrency, skuCount: value.skus.length, specs: value.specs.map((s) => s.name), tags: value.tags.map((t) => t.display), shippingFeeMicro: value.shippingFeeMicro, ageRestricted: value.ageRestricted, active: value.active });
   ok(
     res,
-    await rowToPublic(await db.get('SELECT * FROM products WHERE slug = ?', slug)),
+    await rowToPublic(await productRowBySlug(slug)),
     value.active ? '上架成功' : '已存为草稿（买家看不到；在商品列表里点「上架」后才会出现在聚合首页）'
   );
 }));
@@ -2488,7 +2511,7 @@ router.post('/', staffOnly, wrap(async (req, res) => {
 router.patch('/batch', staffOnly, wrap(async (req, res) => {
   if (!requireSellable(req, res)) return;
   const db = getDb();
-  const slugs = [...new Set((req.body?.slugs || []).map((x) => String(x)).filter(Boolean))];
+  const slugs = [...new Set((req.body?.slugs || []).map((x) => normalizeId(x)).filter(Boolean))];
   // 超限显式拒绝而非静默截断与 batch-ship「超限即拒」原则一致——
   // 静默截断会让店主误以为跨页全选 >100 件已全部生效）
   if (slugs.length > 100) {
@@ -2540,7 +2563,7 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
       「商品内容已被修改」，而店主只是点了批量改价。判据挂在事务上，不挂在调用点记得先读。
     */
     const r = await withTransaction(async () => {
-      const row = await db.get('SELECT * FROM products WHERE slug = ?', slug);
+      const row = await productRowBySlug(slug);
       if (!row) return { failed: '商品不存在' };
       /*
         归属校验**逐件**做（同一处判据：`products.shop_code == req.shop.code`）：
@@ -3085,11 +3108,11 @@ router.delete('/:slug', staffOnly, wrap(async (req, res) => {
  * 原因写给店主看（与 node_hidden_reason 同一条纪律），删除后商品对任何人都不再公开可见。
  */
 router.delete('/admin/:slug', hostOnly, wrap(async (req, res) => {
-  const slug = String(req.params.slug || '').trim();
+  const slug = normalizeId(req.params.slug);
   const reason = String(req.body?.reason ?? '').trim().slice(0, 200);
   if (!reason) return fail(res, '强制删除必须填写原因（≤200 字，店主可在审计记录中看到）', 400, 400);
   const db = getDb();
-  const row = await db.get('SELECT * FROM products WHERE slug = ?', slug);
+  const row = await productRowBySlug(slug);
   if (!row || row.deleted_at != null) return fail(res, '商品不存在或已被删除', 404, 404);
   const upd = await db.run(
     'UPDATE products SET deleted_at = CURRENT_TIMESTAMP(3), deleted_reason = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND deleted_at IS NULL',

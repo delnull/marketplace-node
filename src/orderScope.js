@@ -29,14 +29,26 @@
  *
  * URL / 通知里流通的是 `orders.order_no`（CHAR(21)）；内部键是 `orders.id`（BIGINT），
  * 读模型 `v_orders` 里叫 `order_id`。路由传进来的一律是前者，所以这里 `WHERE order_no = ?`——
- * 全仓只有这一处负责"把 URL 里的单号换成订单行"，写错键的形状会当场查不到（而不是命中另一单）。
+ * 本函数负责"单号 + 店铺作用域 → 订单行"（店主面与退货/售后的作用域读）；公开详情那种
+ * 不要求店铺作用域的裸读在 `routes/orders.js` 的 `findOrder`，两边用同一个 `normalizeId`。
  */
 import { getDb } from './db.js';
+import { normalizeId } from './ids.js';
 
 /** 该订单是否属于这家店（`shopCode` 取 `req.shop.code`，店主面恒非空） */
 export function orderBelongsToShop(order, shopCode) {
   const want = String(shopCode ?? '');
   return !!want && String(order?.shop_code ?? '') === want;
+}
+
+/**
+ * 按对外单号**裸读**整单（不要求店铺作用域）：公开详情、退货买家面、证据门控共用这一份。
+ * 单号先过 `normalizeId`；读不到返回 undefined。
+ */
+export async function findOrderByNo(orderNo) {
+  const key = normalizeId(orderNo);
+  if (!key) return undefined;
+  return await getDb().get('SELECT * FROM v_orders WHERE order_no = ?', key);
 }
 
 /**
@@ -50,11 +62,14 @@ export function orderBelongsToShop(order, shopCode) {
  * 链上镜像在 `escrow_order_id` / `refund_*` / `after_sale_*` 名下。**这一行没有 `id`**——
  * 旧写法 `order.id` 拿到 undefined，会在绑定参数或写入处立刻抛错，而不是静默写错一张表。
  *
+ * 单号先过 `normalizeId`（trim + 大写 + Crockford 的 `I/L→1`、`O→0`）：库里存的是大写，
+ * 从聊天里抄来的小写或手打的 `O` 不该变成"没有这一单"。
+ *
  * @param {string} orderNo 对外订单号（`orders.order_no`，CHAR(21)）
  * @param {string} shopCode 这次请求作用于的店铺编号（`req.shop.code`）
  * @returns {Promise<object|null>}
  */
 export async function findOrderInShop(orderNo, shopCode) {
-  const row = await getDb().get('SELECT * FROM v_orders WHERE order_no = ?', String(orderNo ?? ''));
+  const row = await findOrderByNo(orderNo);
   return row && orderBelongsToShop(row, shopCode) ? row : null;
 }

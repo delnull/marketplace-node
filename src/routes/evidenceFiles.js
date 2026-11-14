@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import express from 'express';
 import { Router } from 'express';
 import { getDb } from '../db.js';
+import { findOrderByNo } from '../orderScope.js';
 import { verifySession, roleOf, isStaff } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { ok, fail, wrap, asyncMiddleware, bearerToken, makeAuthMiddleware, simpleRateLimit, isProdLike, clientIp } from '../http.js';
@@ -35,7 +36,7 @@ const uploadLimiter = simpleRateLimit({ windowMs: 60_000, max: 30, message: '附
 const downloadLimiter = simpleRateLimit({ windowMs: 60_000, max: 600, message: '附件下载过于频繁，请稍后再试' });
 
 /** 按对外单号读整张订单（**读模型视图**：事实/收货/链上镜像三表各一份，见 db.js） */
-const findOrder = async (orderNo) => await getDb().get('SELECT * FROM v_orders WHERE order_no = ?', String(orderNo || ''));
+const findOrder = async (orderNo) => await findOrderByNo(orderNo);
 const findEvidence = async (id) => await getDb().get('SELECT * FROM dispute_evidence WHERE id = ?', Number(id) || 0);
 
 /**
