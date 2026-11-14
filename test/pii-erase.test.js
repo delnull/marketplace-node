@@ -43,11 +43,11 @@ let operatorToken;
 
 /**
  * 第二家店的编号：用来拿一个"只经营自己那家店、但不是节点主"的店主（见 retention/run 那条用例）。
- * ⚠️ 必须落在 `node/src/shopCode.js` 的字母表里（`0-9 A-Z` 去掉易混的 `I/L/O/U`）——
- * 写成含 `O` 的编号会被 `isShopCodeShape` 拒掉，请求头因此解析不到（404），
+ * ⚠️ 必须是**合法编号**（落在 Crockford 字母表、且过 `verifyShopCode`）——
+ * 写成含 `O` 的编号会被形状判据拒掉，请求头因此解析不到（404），
  * 于是一条本该 403 的越权用例会以 404 通过，看起来还挺像"挡住了"。
  */
-const NON_HOST_SHOP_CODE = '0000NTHST';
+const NON_HOST_SHOP_CODE = '0000NTHBW';
 
 before(async () => {
   ownerToken = (await login(ctx, owner)).token;

@@ -26,7 +26,7 @@ const { verifyAuditChain } = await import('../src/auditChain.js');
 const { logAudit, queryAudit } = await import('../src/audit.js');
 
 /** 第二家店（本节点上的另一个**独立**店主）：一个钱包在本节点只能开一家店，所以必须是新钱包 */
-const OTHER_SHOP_CODE = '0000TEST2';
+const OTHER_SHOP_CODE = '0000TE274';
 const otherOwner = Wallet.createRandom();
 await db.run(
   `INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, '', '', 1)

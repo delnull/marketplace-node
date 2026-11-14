@@ -23,7 +23,7 @@
  *   · 商品是公开可枚举的资源，不需要时间前缀（那反而会泄露"何时上架"的弱信息给无关的人）；
  *   · 10 位随机 ≈ 1e15 组合，跨店全局唯一足够。
  *
- * 店铺编号 = 8 位随机数据 + 1 位**加权校验** = **9 字符**（`newShopCode`）：
+ * 店铺编号 = 7 位随机数据 + 2 位**加权校验** = **9 字符**（`newShopCode`）：
  *   · 店铺是**节点链下**的事实（平台目录只登记节点），编号由本节点铸造、写入 `shops.code`；
  *   · 校验位的形状契约在 `./shopCode.js`（前端在解析 `/shop/<code>` 前用它校验，
  *     单测 `test/shopCode.test.js` 会拿本函数生成的编号去过那份实现）。本文件只负责**铸造**，
@@ -34,7 +34,7 @@
  * 读路径不得假设"标识一定是这个形状"（形状校验只在这些生成器的输出上成立）。
  */
 import crypto from 'node:crypto';
-import { SHOP_CODE_ALPHABET, encodeShopCodeFromData } from './shopCode.js';
+import { SHOP_CODE_ALPHABET, SHOP_CODE_DATA_LEN, encodeShopCodeFromData } from './shopCode.js';
 
 /** Crockford Base32（无 I L O U，避免与 1 0 看混） */
 const ALPHABET = SHOP_CODE_ALPHABET;
@@ -84,14 +84,14 @@ export function newClaimNo(now = Date.now()) {
 }
 
 /**
- * 新店铺编号：8 位随机数据 + 1 位**加权校验**（`Σ 值×位权(1..8) mod 37`）。
+ * 新店铺编号：7 位随机数据 + 2 位**加权校验**（`Σ 值×位权(1..7)`，写成两位 base32，不取模）。
  *
  * 店铺是节点链下的事实，编号由本节点铸造（平台 Registry 不认识"店"）。校验位的算法契约见
  * `./shopCode.js`：前端解析 `/shop/<code>` 前要过它，所以本函数**必须产出能通过那份校验**
  * 的编号——`test/shopCode.test.js` 拿它生成的编号过 `verifyShopCode` 守住这条。
  */
 export function newShopCode() {
-  return encodeShopCodeFromData(randomChars(8));
+  return encodeShopCodeFromData(randomChars(SHOP_CODE_DATA_LEN));
 }
 
 /** 是否新式订单号（仅用于展示层"这是新格式"的判断，不用于校验/拒绝） */

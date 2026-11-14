@@ -92,7 +92,7 @@ test('非法/不存在的目标被拒绝；只能删自己的', async () => {
   const missing = await request(app)
     .post('/api/me/blocks')
     .set('Authorization', `Bearer ${token}`)
-    .send({ targetType: 'shop', target: 'ZZZZZZZZ~' });
+    .send({ targetType: 'shop', target: 'ZZZZZZZV4' });
   assert.equal(missing.status, 404);
 
   const seller = await request(app)

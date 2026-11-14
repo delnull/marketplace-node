@@ -21,7 +21,7 @@ const tenantOwner = Wallet.createRandom();
 const buyer = Wallet.createRandom();
 const stranger = Wallet.createRandom();
 const secondStaff = Wallet.createRandom();
-const TENANT_SHOP = '0000TEN01';
+const TENANT_SHOP = '0000TENB9';
 
 const ctx = await makeCtx();
 const { app, request, db, owner } = ctx;

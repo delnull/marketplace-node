@@ -518,8 +518,8 @@ test('窗口单量：escrowOrders 是全部有凭证订单；effectiveOrders 剔
 test('seller 过滤：只算指定那家店的单；单量按店铺编号计数', async () => {
   const A = '0x' + 'a1'.repeat(20);
   const B = '0x' + 'b2'.repeat(20);
-  const codeA = '0000AAA01';
-  const codeB = '0000BBB01';
+  const codeA = '0000AAA5M';
+  const codeB = '0000BBB66';
   await db.run('INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, ?, ?, 1)', codeA, A, 'A 店', '');
   await db.run('INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, ?, ?, 1)', codeB, B, 'B 店', '');
   const at = Date.now() - 1000;

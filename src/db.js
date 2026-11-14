@@ -1480,7 +1480,7 @@ const SCHEMA_DDL = `
      去掉 host 列：一库一节点，节点主就在 node 表那一行里，店铺行再存一遍是第二份真相。
      店名/公告也回到这里（旧形状把它们放在 kv，那是"配置极简"时代的形状，不是数据模型）。 */
   CREATE TABLE IF NOT EXISTS shops (
-    code          CHAR(9) NOT NULL,                     -- 本节点铸造：8 位数据 + 1 位加权校验
+    code          CHAR(9) NOT NULL,                     -- 本节点铸造：7 位数据 + 2 位加权校验
     seller        CHAR(42) NOT NULL,                    -- 店主钱包（小写）= 订单的 seller
     name          VARCHAR(60) NOT NULL DEFAULT '',
     /*

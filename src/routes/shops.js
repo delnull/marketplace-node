@@ -10,8 +10,7 @@
  *                            前端店主入口靠它判断"要不要显示"——歇业店不在公开列表里，
  *                            单看公开 `shops` 会把歇业店主当成没有店。
  *  GET  /stats               公开：按编号批量返回店铺评价聚合 + 有效单量（目录页一次取一页，避免 2N 请求）；
- *                            编号用**重复的 `code` 参数**传（`?code=A&code=B`），不能用逗号拼接——
- *                            逗号本身是合法校验位（见 src/shopCode.js）。
+ *                            编号用**重复的 `code` 参数**传（`?code=A&code=B`），一个编号一个参数。
  *  GET  /admin/all           节点管理员：本节点**全部**店铺（含暂停接单，用于节点主恢复）
  *  PATCH /admin/listing       节点管理员：批量暂停/恢复接单 {codes, listed, reason}
  *  PATCH /admin/:code/listing 节点管理员：暂停/恢复一家店的接单（原因必填）
@@ -446,9 +445,7 @@ router.patch('/admin/:code/listing', nodeAdmin, wrap(async (req, res) => {
  * 只返回**在售**且属于本节点的编号；未知/暂停/非法编号不出现在结果里（前端按未知处理，不印 0）。
  * 单店的评价或有效单量读取失败时该字段为 null，不带垮同一批其他店。
  *
- * 为什么用重复 `code` 而不是 `codes=A,B`：店铺编号的**校验位可以是逗号**（`src/shopCode.js`
- * 的扩展符号 `-._~,`），逗号分隔会把一个合法编号拆成两个非法片段。重复参数由 Express
- * 原样解析，编号里的逗号不需要转义协议。
+ * 按 `code` 重复参数取一页：一个编号一个参数，协议层不需要再定分隔符。
  */
 router.get('/stats', shopStatsBatchLimiter, wrap(async (req, res) => {
   const raw = req.query.code;
@@ -503,12 +500,11 @@ router.get('/stats', shopStatsBatchLimiter, wrap(async (req, res) => {
  * 必须能读到“这家店暂停接单”而不是把链接当成坏链。返回的只是店铺身份，不返回商品；
  * 商品/聚合端点仍由 `listedShopScope` 对暂停店返回 409。
  *
- * 两次查找**都必须 await**：`shopRowByCode(...) || resolveShopRef(...)` 里的 `||` 作用在
- * Promise 上时左侧恒真（哪怕店铺不存在），于是"没有这家店"这条 404 永远不会走到。
+ * 句柄解析只走唯一实现 `resolveShopRef`（形状 + 存在性）：形状不对与查不到都走同一条 404。
  */
 router.get('/:code', wrap(async (req, res) => {
   const ref = String(req.params.code || '');
-  const row = (await shopRowByCode(ref.toUpperCase())) || (await resolveShopRef(ref));
+  const row = await resolveShopRef(ref);
   if (!row) {
     return fail(res, '没有这家店', 404, 404);
   }
@@ -773,7 +769,7 @@ async function reviewApplications({ req, ids, action, reason, batch = false }) {
     for (const app of ordered) {
       const seller = String(app.seller).toLowerCase();
       /*
-        编号冲突（同一毫秒随机撞车，概率极低但必须处理）：唯一键拒绝后换一个编号重试。
+        编号冲突（随机撞车，概率极低但必须处理）：唯一键拒绝后换一个编号重试。
         重试放在**同一事务**里：任一次成功即建店，全部失败则整笔回滚（不会留下半行）。
         撞的若是 `uq_shops_seller`（同一钱包已有店），换编号不会成功：整批回滚并如实返回。
       */

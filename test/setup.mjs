@@ -88,7 +88,7 @@ export const shopRef = { value: '' };
  * 而 `shopRef.value` 还停在旧值上，卖家面请求就会一路 404（"这家店不存在"），
  * 而现象看起来像鉴权坏了。要用别的编号的用例请**同时**改 `shopRef.value`。
  */
-export const TEST_SHOP_CODE = '0000TEST5';
+export const TEST_SHOP_CODE = '0000TESC5';
 
 export async function makeCtx() {
   const owner = Wallet.createRandom();

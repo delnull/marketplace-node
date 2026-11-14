@@ -13,7 +13,7 @@ import { makeCtx, login, assertOk, shopRef } from './setup.mjs';
 
 const ctx = await makeCtx();
 const { app, request, db, owner, buyer } = ctx;
-const secondCode = '0000TEST2';
+const secondCode = '0000TE274';
 const batchPath = '/api/shops/admin/listing';
 
 test('批量暂停/恢复：缺一家整批拒绝；全批存在时一次改完并同步公开目录', async () => {
@@ -27,7 +27,7 @@ test('批量暂停/恢复：缺一家整批拒绝；全批存在时一次改完�
     '',
     1
   );
-  const accentCode = '0000TEST3';
+  const accentCode = '0000TE37B';
   await db.run(
     `INSERT INTO shops (code, seller, name, notice, listed)
      VALUES (?, ?, ?, ?, 1)`,
@@ -49,7 +49,7 @@ test('批量暂停/恢复：缺一家整批拒绝；全批存在时一次改完�
   const missing = await request(app)
     .patch(batchPath)
     .set(auth)
-    .send({ codes: [shopRef.value, 'ZZZZZZZZZ'], listed: false, reason: '批量测试' });
+    .send({ codes: [shopRef.value, 'ZZZZZZZV4'], listed: false, reason: '批量测试' });
   assert.equal(missing.status, 404, '缺一家应整批拒绝');
   const stillListed = await request(app)
     .get('/api/shops/admin/all')
@@ -93,7 +93,7 @@ test('批量暂停/恢复：缺一家整批拒绝；全批存在时一次改完�
     'q 按店名过滤；不能因搜索把别的店带回来'
   );
   const searchedByCode = await request(app)
-    .get('/api/shops/admin/all?q=0000test2')
+    .get('/api/shops/admin/all?q=0000te27')
     .set(auth)
     .expect(200);
   assert.deepEqual(searchedByCode.body.data.shops.map((s) => s.code), [secondCode], 'q 按编号不区分大小写');

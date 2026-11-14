@@ -12,7 +12,7 @@ import { makeCtx, login, assertOk, TEST_SHOP_CODE, insertProduct, insertOrder } 
 const ctx = await makeCtx();
 const { app, request, owner, db } = ctx;
 
-const SHOP_B = '0000SHB22';
+const SHOP_B = '0000SHB9G';
 const sellerB = `0x${String(9000).padStart(40, '0')}`;
 const buyerOf = (n) => `0x${String(n).padStart(40, '0')}`;
 

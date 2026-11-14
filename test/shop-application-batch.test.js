@@ -12,6 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet } from 'ethers';
 import { makeCtx, login, assertOk } from './setup.mjs';
+import { verifyShopCode } from '../src/shopCode.js';
 
 const ctx = await makeCtx();
 const { app, request, owner } = ctx;
@@ -48,7 +49,7 @@ test('批量通过：每条各建一家店、编号唯一、申请人立即可�
   assert.deepEqual(res.body.data.rejected, []);
   const codes = res.body.data.approved.map((x) => x.code);
   assert.equal(new Set(codes).size, 2, '同一批里两条申请必须拿到不同编号');
-  for (const code of codes) assert.match(code, /^[0-9A-HJKMNP-TV-Z.\-_~,]{9}$/i);
+  for (const code of codes) assert.equal(verifyShopCode(code), code, `审批开出的编号必须过完整校验：${code}`);
 
   for (const [wallet, code] of [
     [a, codes[0]],
@@ -178,7 +179,7 @@ test('批量审批是整批的：一条不满足就整批不写；非 nodeAdmin 
   const appC = await submitApplication(c, '已有店铺');
   await ctx.db.run(
     'INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, ?, ?, 1)',
-    '0000EXST1',
+    '0000EXSD3',
     c.address.toLowerCase(),
     '既有店铺',
     ''

@@ -217,20 +217,20 @@ test('节点商品列表可按店铺筛选；非法店铺编号 400', async () =
   const seller = Wallet.createRandom().address.toLowerCase();
   await db.run(
     'INSERT INTO shops (code, seller, name, notice, listed) VALUES (?, ?, ?, ?, 1)',
-    '0000SHP02',
+    '0000SHPBX',
     seller,
     '第二家店',
     ''
   );
-  const { slug } = await insertProduct(db, { shopCode: '0000SHP02', title: '第二家店的商品' });
+  const { slug } = await insertProduct(db, { shopCode: '0000SHPBX', title: '第二家店的商品' });
 
   const filtered = await request(app)
-    .get('/api/products/admin/all?shop=0000SHP02&pageSize=100')
+    .get('/api/products/admin/all?shop=0000SHPBX&pageSize=100')
     .set(auth)
     .expect(200);
   assert.ok(filtered.body.data.products.some((p) => p.slug === slug));
   assert.equal(
-    filtered.body.data.products.every((p) => p.shopCode === '0000SHP02'),
+    filtered.body.data.products.every((p) => p.shopCode === '0000SHPBX'),
     true,
     '按店铺筛选不能混进别家的商品'
   );
@@ -240,9 +240,9 @@ test('节点商品列表可按店铺筛选；非法店铺编号 400', async () =
     '没有主图的商品 thumb 必须是 null，不能编一个占位图'
   );
 
-  const second = await insertProduct(db, { shopCode: '0000SHP02', title: '第二家店的商品 2' });
+  const second = await insertProduct(db, { shopCode: '0000SHPBX', title: '第二家店的商品 2' });
   const recent = await request(app)
-    .get('/api/products/admin/all?shop=0000SHP02&sort=recent&pageSize=2')
+    .get('/api/products/admin/all?shop=0000SHPBX&sort=recent&pageSize=2')
     .set(auth)
     .expect(200);
   assert.deepEqual(
