@@ -143,23 +143,36 @@ export async function applyAfterSaleOpened(orderIdHex, { block = null } = {}) {
  * 结案落库（**唯一写入口**）。
  *
  * 与开案不对称的两点，都是刻意的：
- *  - 幂等守卫用 `after_sale_status <> 'closed'`（而不是 `= 'open'`）：**本地漏扫了开案事件**时，
- *    结案事件仍应把"曾开过案 + 结案说明"记下来（否则本地永远停在 `none`，一条真实的结案事实
- *    连同用户填的说明一起丢掉）；反过来，重复投递的同一条结案事件不会覆盖已有的说明与时刻。
- *  - 本地无此单 ⇒ 0 行（同其它分支）。
+ *  - 幂等守卫不是 `after_sale_status = 'open'`：**本地漏扫了开案事件**时，结案事件仍应把
+ *    "曾开过案 + 结案说明"记下来（否则本地永远停在 `none`，一条真实的结案事实连同用户填的
+ *    说明一起丢掉）；反过来，重复投递的同一条结案事件不会覆盖已有的说明与时刻。
+ *  - **说明永远不会被"没读到"清掉**：链上真值回填（`applyAfterSaleFromChain`）拿不到 note，
+ *    它的 note 是 null（"不知道"），不是 ''（"确认为空"）。所以这里用 `COALESCE(?, note)`：
+ *    null 保持原值、字符串才写。此前这条路径关案后，事件到达时被 `<> 'closed'` 挡住，
+ *    "事件补说明"的承诺并不成立——对账任务先关案（20 秒一轮）就永久丢了说明。
+ *    现在事件可以在已结案的行上**补写说明**（仅当原值为空），时刻不重写。
  *
  * 同样**不动 `orders.status` 与 `orders.updated_at`**（写入只落在 `order_chain`）。
  *
  * @param {string} orderIdHex 链上托管单号
- * @param {{note?: string|null}} opts note = 链上事件里的结案说明（截断见 AFTER_SALE_NOTE_MAX）
+ * @param {{note?: string|null}} opts note = 链上事件里的结案说明（截断见 AFTER_SALE_NOTE_MAX；null = 没读到）
  * @returns {Promise<number>} 受影响行数
  */
 export async function applyAfterSaleClosed(orderIdHex, { note = null } = {}) {
-  return (await getDb().run(`UPDATE order_chain
+  const noteValue = normalizeNote(note);
+  return (
+    await getDb().run(
+      `UPDATE order_chain
           SET after_sale_status = 'closed',
-              after_sale_closed_at = CURRENT_TIMESTAMP(3),
-              after_sale_note = ?
-        WHERE escrow_order_id = ? AND after_sale_status <> 'closed'`, normalizeNote(note), String(orderIdHex).toLowerCase())).foundRows;
+              after_sale_closed_at = COALESCE(after_sale_closed_at, CURRENT_TIMESTAMP(3)),
+              after_sale_note = COALESCE(?, after_sale_note)
+        WHERE escrow_order_id = ?
+          AND (after_sale_status <> 'closed' OR (? IS NOT NULL AND after_sale_note IS NULL))`,
+      noteValue,
+      String(orderIdHex).toLowerCase(),
+      noteValue
+    )
+  ).foundRows;
 }
 
 /**
@@ -167,8 +180,9 @@ export async function applyAfterSaleClosed(orderIdHex, { note = null } = {}) {
  *
  * 链上只有两个读数可用：`afterSaleOpen(orderId)`（bool）与 `afterSaleOpenedAtBlock(orderId)`
  * （uint64，0 = 无在途案件/已结案）。**没有** note——结案说明只存在于 `AfterSaleClosed` 事件里，
- * 所以这条路径关案时 `after_sale_note` 保持 null（如实：节点没拿到说明，不编造），
- * 事件到达时（watcher）才会补上说明与真实时刻。这是本路径已知的信息损失，写在这里免得被当成 bug。
+ * 所以这条路径关案时 `after_sale_note` 保持原值（空就是空）：如实，节点没拿到说明就不编造。
+ * 说明由事件路径补写：`applyAfterSaleClosed` 允许在**已结案但说明为空**的行上写 note
+ * （见其文件头），所以"兜底先关案、事件后到"不会永久丢掉说明；只有事件也漏扫了才会空着。
  *
  * **关案方向只对"本地正 open"的行生效**（`open=false` 与本地 `none` 的组合什么都不做）：
  * 一次链上快照分不清"从未开过案"与"开过又结了"（两者都是 afterSaleOpenedAtBlock == 0），

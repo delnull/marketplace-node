@@ -57,7 +57,7 @@ import { getDb, withTransaction } from './db.js';
 // node 单例行的唯一读入口（游标落在它上面；行由 db.js 的 initDb() 在启动期建立）
 import { nodeRow } from './shops.js';
 import { fetchOrderFor, fetchAfterSaleCase, chainParamsMatch, orderCreatedMatches } from './chainOrder.js';
-import { getEscrow, finalizedBlockTag } from './chain.js';
+import { getEscrow, finalizedBlockTag, penalizedByOrderTotalOf } from './chain.js';
 import { withRedisLock } from './redis.js';
 import {
   settleByRefundSplit,
@@ -279,14 +279,32 @@ async function repairRefundedAmountFromTruth(row, truth) {
   if (amount === null || chainRefunded > amount) return 0;
   const localRefunded = readRefundedWei(row.refunded_amount_wei) ?? 0n;
   if (chainRefunded <= localRefunded) return 0;
+  /*
+    **同一批**读回保证金赔付累计：`refunded_amount_wei` 有两个写入口（watcher 的事件回写与本函数），
+    而 `stake_paid_wei` 只能跟着它一起写——只写前者的后果是 watcher 随后的
+    `WHERE refunded_amount_wei <> ?` 不再命中，这一列永远停在 0（"其中多少来自保证金"永远是 0）。
+    读不到就**推迟本轮修复**（返回 0，下一轮再来），不拿旧值/0 冒充。
+  */
+  let stakePaid;
+  try {
+    stakePaid = await penalizedByOrderTotalOf(row.escrow_order_id);
+  } catch (e) {
+    console.warn(
+      `[chainReconcile] 保证金赔付读数不可用（本轮不修 ${String(row.order_no).slice(0, 8)}…）：${e?.message || e}`
+    );
+    return 0;
+  }
   let changed = 0;
   await withTransaction(async () => {
     changed = (await getDb().run(
-      `UPDATE order_chain SET refunded_amount_wei = GREATEST(COALESCE(refunded_amount_wei, 0), ?)
+      `UPDATE order_chain
+          SET refunded_amount_wei = GREATEST(COALESCE(refunded_amount_wei, 0), ?),
+              stake_paid_wei = COALESCE(?, stake_paid_wei)
         WHERE escrow_order_id = ?
           AND (refunded_amount_wei IS NULL OR refunded_amount_wei < ?)
           AND EXISTS (SELECT 1 FROM orders o WHERE o.id = order_chain.order_id AND o.status IN ${REFUND_BACKFILL_IN})`,
       chainRefunded.toString(),
+      stakePaid,
       row.escrow_order_id,
       chainRefunded.toString()
     )).foundRows;

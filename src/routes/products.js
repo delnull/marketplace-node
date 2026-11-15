@@ -865,7 +865,7 @@ async function rowToPublic(row) {
      * `utils/shopRowCode` 只在该节点**恰有一家店**时才敢回退，多店节点只能把卡片渲染成
      * 无店名、无链接的裸商品——同一件货在两列里并排出现，其中一列连店都指不出来。
      * 归属在库里本来就有（`products.shop_code`），在 DTO 这一层如实带出去，
-     * 卡片才能用目录行解析店名并构造 `/product/<店铺编号>/<slug>`。
+     * 卡片才能用目录行解析店名并构造 `/product/<nodeCode>/<shopCode>/<slug>`。
      *
      * 它**不进快照**：归属是发布位置，买了什么由快照回答；改归属不应让老订单报"内容被修改"。
      */
@@ -1461,7 +1461,7 @@ function validateProduct(v) {
  *    · 不带 `X-Mk-Shop` ⇒ 全节点在售商品（目录/首页）；
  *    · 带 `X-Mk-Shop` ⇒ **只返回该店铺自己的商品**，且该店必须当前可售（`listedShopScope` 对暂停店
  *      返回 409，与商品详情看不了的理由同源）。旧实现只校验头、不按 `shop_code` 过滤，于是
- *      `/shop/<code>` 会显示同节点其它店的商品——页面身份与商品归属对不上。
+ *      `/shop/<nodeCode>/<shopCode>` 会显示同节点其它店的商品——页面身份与商品归属对不上。
  *
  *  游标语义：newest/oldest 以 id 为 keyset 游标，方向相反（`id < cursor` / `id > cursor`）；
  *  composite 以 **offset** 为游标（排序键不是 id，keyset 无法直接表达）。`cursor=0` 表示首屏。

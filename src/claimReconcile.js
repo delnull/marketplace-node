@@ -22,6 +22,15 @@
  *
  * 代价：`ClaimPaid` 与 `ClaimClosed` 都漏扫、且链上确实有赔付时，本模块不会释放槽位
  * （保守方向正确）；需要事件重放/人工核对，但不会造成二次赔付。
+ *
+ * ## "零赔付结案"有两种，不能写成同一种
+ *
+ * `claimCase.closed` 只说明"结了"，结的方式有两个：委员会票决判店主无责（`ClaimClosed(0)`），
+ * 或节点主撤销了争议（`ClaimDisputeCancelled`）。**两种的本地终态不同**：前者是
+ * `rejected/closed`（判店主无责），后者是 `cancelled/cancelled`（双方和解、不是判决）。
+ * 只看 `closed + 零赔付` 会把撤销写成"判店主无责"（演示栈实际撞到过：watcher 还没消费
+ * 撤销事件，这一轮先把它写成了 rejected）。所以本函数每轮先扫一次 `ClaimDisputeCancelled`
+ * 日志，按**撤销证据**决定写哪一种；日志读不到就推迟本轮，不猜。
  */
 import config from './config.js';
 import { getDb } from './db.js';
@@ -29,7 +38,8 @@ import { getEscrow, finalizedBlockNumber } from './chain.js';
 import { withRedisLock } from './redis.js';
 import { expireOverdueClaims } from './nftClaim.js';
 
-const INTERVAL_MS = 5 * 60_000;
+/** 间隔可配（`MK_CLAIM_RECONCILE_MS`）：演示栈要它几秒一轮才能当场看到"窗口已过→expired" */
+const INTERVAL_MS = config.claimReconcile.intervalMs;
 const MIN_AGE_MS = 60_000;
 const LIMIT = 20;
 const RPC_TIMEOUT_MS = 15_000;
@@ -58,6 +68,39 @@ function withTimeout(promise, ms) {
       timer = setTimeout(() => reject(new Error(`claimReconcile RPC timeout > ${ms}ms`)), ms);
     }),
   ]).finally(() => clearTimeout(timer));
+}
+
+let claimScanWarned = false;
+
+/** 起点未配置时只提示一次（每轮都喊会把日志刷满） */
+function claimScanWarnOnce() {
+  if (claimScanWarned) return;
+  claimScanWarned = true;
+  console.warn(
+    '[claimReconcile] 未配置 MK_ESCROW_START_BLOCK：无法用有界范围证明"没有撤销事件"，' +
+      '零赔付结案只走事件路径（本地槽位暂不释放）。要恢复兜底，把它设成节点部署块。'
+  );
+}
+
+/**
+ * 本轮"链上撤销过"的 claimId 集合（`ClaimDisputeCancelled` 日志）。
+ *
+ * 每轮只扫一次、只读这一个事件的 topic：候选行每轮至多 20 条，逐行查日志会把 RPC 次数
+ * 放大 20 倍。起点取 `MK_ESCROW_START_BLOCK`（节点自己的部署块），与 watcher 的扫描面一致。
+ *
+ * 读失败**抛错**：调用方据此推迟本轮，而不是把"没读到撤销证据"当成"确实不是撤销"。
+ */
+async function readCancelledClaimIds(chain, toBlock, fromBlock) {
+  const logs = await withTimeout(
+    chain.queryFilter(chain.filters.ClaimDisputeCancelled(), fromBlock, toBlock),
+    RPC_TIMEOUT_MS
+  );
+  const ids = new Set();
+  for (const log of logs) {
+    const id = String(log?.args?.[0] ?? '').toLowerCase();
+    if (/^0x[0-9a-f]{64}$/.test(id)) ids.add(id);
+  }
+  return ids;
 }
 
 async function selectBatch(db, afterId, cutoff, limit) {
@@ -113,6 +156,30 @@ export async function reconcileClaims({
   const chain = escrow || getEscrow();
   const pinned = blockTag ?? (await finalizedBlockNumber());
   const overrides = { blockTag: pinned };
+  /*
+    撤销证据（本轮只需一份）：`queryFilter` 只有真合约才有——注入的 escrow（单测的替身）没有事件能力，
+    那种情况下按老判据走（把它们当"判店主无责"），不把"替身不支持"误解成"链上读不到"。
+
+    扫描起点必须是**有界**的：`MK_ESCROW_START_BLOCK`（节点自己的部署块）。
+    起点为 0 表示"没有配置"，此时**不猜**——扫全史会被 RPC 按范围拒绝/超时，而"没扫到撤销"
+    与"确实不是撤销"在没有证据时不可区分；这种部署只让事件路径写终态（槽位暂不释放，游标回放会补）。
+  */
+  let cancelledIds = null;
+  let cancelScanFailed = false;
+  const logScanFrom = Number(config.escrow.startBlock || 0);
+  if (typeof chain.queryFilter === 'function' && typeof chain.filters?.ClaimDisputeCancelled === 'function') {
+    if (logScanFrom <= 0) {
+      cancelScanFailed = true;
+      claimScanWarnOnce();
+    } else {
+      try {
+        cancelledIds = await readCancelledClaimIds(chain, pinned, logScanFrom);
+      } catch (e) {
+        cancelScanFailed = true;
+        console.warn(`[claimReconcile] 本轮读不到撤销事件（零赔付结案推迟到下一轮）：${e?.message || e}`);
+      }
+    }
+  }
   let closed = 0;
   let unreadable = 0;
   let missingSnapshot = 0;
@@ -139,17 +206,39 @@ export async function reconcileClaims({
       );
       if (chainPaid === null || chainPaid !== snapshot) continue;
 
-      const changed = (await db.run(
-        `UPDATE nft_claims
-            SET status = 'rejected',
-                dispute_state = 'closed',
-                dispute_closed_at = CURRENT_TIMESTAMP(3),
-                claim_amount_wei = NULL
-          WHERE id = ?
-            AND dispute_state IN ('none','opened')
-            AND status IN ('requested','approved','shipped')`,
-        row.id
-      )).foundRows;
+      /*
+        零赔付结案有两种（见文件头）：判店主无责 → rejected/closed；节点主撤销 → cancelled/cancelled。
+        撤销证据只在事件里（合约只留 closed 一个布尔），所以这里按 claimId 查本轮的撤销集合。
+        读不到撤销集合（cancelScanFailed）就**推迟**：写错一种就再也改不回来（终态）。
+      */
+      const wasCancelled = cancelledIds ? cancelledIds.has(String(row.dispute_claim_id).toLowerCase()) : false;
+      if (!wasCancelled && cancelScanFailed) {
+        unreadable += 1;
+        continue;
+      }
+      const changed = wasCancelled
+        ? (await db.run(
+            `UPDATE nft_claims
+                SET status = 'cancelled',
+                    dispute_state = 'cancelled',
+                    dispute_closed_at = CURRENT_TIMESTAMP(3),
+                    claim_amount_wei = NULL
+              WHERE id = ?
+                AND dispute_state IN ('none','opened')
+                AND status IN ('requested','approved','shipped')`,
+            row.id
+          )).foundRows
+        : (await db.run(
+            `UPDATE nft_claims
+                SET status = 'rejected',
+                    dispute_state = 'closed',
+                    dispute_closed_at = CURRENT_TIMESTAMP(3),
+                    claim_amount_wei = NULL
+              WHERE id = ?
+                AND dispute_state IN ('none','opened')
+                AND status IN ('requested','approved','shipped')`,
+            row.id
+          )).foundRows;
       if (changed > 0) closed += 1;
     } catch {
       // 单条读不到/链上暂时异常：保持本地原状，下一轮再试；不把异常解读成零赔付

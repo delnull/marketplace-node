@@ -894,6 +894,45 @@ export function ownerBindingStatus() {
   return { ..._ownerBinding };
 }
 
+/** Staking：本单的保证金赔付累计（普通罚没 + 提货赔付）。 */
+const STAKING_PAID_ABI = ['function penalizedByOrderTotal(bytes32 orderId) view returns (uint256)'];
+
+/**
+ * 读本单的**保证金赔付累计**（绝对读数；未配置 Staking 时返回 null）。
+ *
+ * 为什么收在这里而不是各自模块里：`order_chain.stake_paid_wei` 有**两个写入口**
+ * （事件回写的 escrowWatcher 与链上状态对账 chainReconcile），两处必须是同一个读数。
+ * 此前 watcher 自带一份、对账根本不写这一列，于是"谁先写 refunded_amount_wei，谁就决定
+ * stake_paid_wei 会不会落账"——对账先跑就会让这一列永远停在 0（演示栈实际撞到过）。
+ *
+ * 读失败**抛错**（不返回 0）：调用方要能区分"确证 0"与"没读到"；后者只能交给
+ * COALESCE 保留旧值，或干脆推迟本轮修复。
+ */
+export async function readPenalizedByOrderTotal(orderIdHex, { blockTag = 'latest', timeoutMs = 15_000 } = {}) {
+  const stakingAddress = String(config.chain.stakingAddress || '');
+  if (!stakingAddress) return null;
+  const provider = await getPinnedProvider();
+  const staking = new ethers.Contract(stakingAddress, STAKING_PAID_ABI, provider);
+  const overrides = blockTag === 'latest' ? {} : { blockTag };
+  const amount = await withTimeout(staking.penalizedByOrderTotal(orderIdHex, overrides), timeoutMs);
+  return String(amount);
+}
+
+/**
+ * 可注入的读法（**唯一缝**）：单测没有 RPC，由 setup.mjs 注入固定值；
+ * escrowWatcher 与 chainReconcile 都走这里，所以"注入一次、两处生效"。
+ */
+let penalizedByOrderTotalReader = readPenalizedByOrderTotal;
+
+export function setPenalizedByOrderTotalReaderForTest(fn) {
+  penalizedByOrderTotalReader = fn || readPenalizedByOrderTotal;
+}
+
+/** 读本单保证金赔付累计（抛错语义：读不到就抛，调用方自己决定保留旧值还是推迟） */
+export async function penalizedByOrderTotalOf(orderIdHex, opts) {
+  return await penalizedByOrderTotalReader(orderIdHex, opts);
+}
+
 export async function fetchOnchainOrder(orderIdHex, { blockTag = 'latest', timeoutMs = 15_000, provider = null } = {}) {
   const escrow = provider ? getEscrow(provider) : getEscrow();
   const overrides = blockTag === 'latest' ? {} : { blockTag };

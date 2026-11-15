@@ -565,8 +565,9 @@ export function createApp() {
   app.use('/api/claims', claimsRouter);
 
 /*
-  启动预热不需要任何东西：`/api/shop` 与 `/healthz` 只读库里那一行节点资料与本节点配置，
-  不再有"链上节点编号"这种要预热的展示字段（平台目录以 endpoint + operator 标识节点）。
+  启动预热不需要任何东西：`/api/shop` 与 `/healthz` 只读库里那一行节点资料与本节点配置；
+  节点的 URL 身份是链上 30 bit `nodeId` 编码出的 8 位 nodeCode（由 E/S 派生），
+  节点自己不读取 Registry，也不需要预热这个展示字段。
 */
 
   // 404

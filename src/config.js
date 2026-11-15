@@ -371,6 +371,16 @@ const config = {
     intervalMs: intEnv('MK_CHAIN_RECONCILE_MS', 600_000),
   },
 
+  /*
+    提货争议对账（src/claimReconcile.js）的间隔：它负责两件事——
+      · 把"窗口已过"的提货声明收口为 expired（按 claim_deadline_at 快照）；
+      · 把漏扫的零赔付结案/撤销写回终态。
+    间隔越短只是越早收口，代价是 RPC 次数与日志扫描；演示栈要几秒一轮才能当场看到 expired。
+  */
+  claimReconcile: {
+    intervalMs: intEnv('MK_CLAIM_RECONCILE_MS', 300_000),
+  },
+
   webhook: {
     // 通知 URL/签名密钥为经营参数（kv + 店铺设置网页维护，见 webhook.js 动态读取）；
     // 此处仅保留投递运行参数。

@@ -85,7 +85,7 @@ import { nodeRow } from './shops.js';
 // fetchOnchainOrder：非 OrderCreated 事件的「链上真值预取」（防诱饵单，见 pollOnce 头部说明）——
 // **必漏不可**：少了它，pollOnce 里那句 await 会抛 ReferenceError 被当成"链上真值未取到"，
 // 于是**所有**退款/争议/仲裁类事件每轮失败、回退重扫 3 次后被隔离，链上镜像静默停摆。
-import { getEscrow, getPinnedProvider, markPinnedProviderFailure, fetchOnchainOrder, invalidateCommitteeCache, rpcRequest } from './chain.js';
+import { getEscrow, getPinnedProvider, markPinnedProviderFailure, fetchOnchainOrder, invalidateCommitteeCache, rpcRequest, penalizedByOrderTotalOf, setPenalizedByOrderTotalReaderForTest } from './chain.js';
 // `chainParamsMatch` 住在 chainOrder.js——那里是「链上真值 → 要不要动钱/发货」这类判据的
 // 唯一实现地；本文件的轮询与 chainReconcile、三个交付入口共用同一份（见 chainOrder.js 的说明）
 import { chainParamsMatch } from './chainOrder.js';
@@ -102,35 +102,30 @@ import { alertOnceDelivered } from './alertAck.js';
 // 确认收货后的售后案件：本地镜像的**唯一写入口/判据**（事件路径、/sync、后台对账三者同源）
 import { applyAfterSaleOpened, applyAfterSaleClosed } from './afterSale.js';
 
-/** Staking 的“本单全部保证金赔付”累计（普通罚没 + 提货赔付）。 */
-const STAKING_PAID_ABI = ['function penalizedByOrderTotal(bytes32 orderId) view returns (uint256)'];
-
 /**
- * 读本单的保证金赔付累计（绝对读数）。
+ * 读本单的保证金赔付累计（**唯一实现**在 chain.js，对账任务共用同一读数）。
  *
  * 这是**派生镜像**（`stake_paid_wei` 只用于展示“其中有多少来自保证金”），
  * 读不到时由 `stakePaidOf` 返回 null、SQL 用 COALESCE 保留旧值；
  * 绝不能因为这一项读不到而阻断 `refunded_amount_wei` / `claim_paid_wei` 的链上事实落库。
  */
-async function readStakePaidFromChain(orderId) {
-  if (!config.chain.stakingAddress) throw new Error('未配置 Staking 地址，无法读保证金赔付累计');
-  const provider = await getPinnedProvider();
-  const c = new ethers.Contract(config.chain.stakingAddress, STAKING_PAID_ABI, provider);
-  return String(await c.penalizedByOrderTotal(orderId));
-}
+const readStakePaidFromChain = penalizedByOrderTotalOf;
 
-let stakePaidReader = readStakePaidFromChain;
-
-/** 测试桩：链上读取在单测里不可用，由 setup 注入固定值；生产不调用。 */
+/**
+ * 测试桩：链上读取在单测里不可用，由 setup 注入固定值；生产不调用。
+ *
+ * 注入转发到 chain.js 的那一处缝（`setPenalizedByOrderTotalReaderForTest`），
+ * 因此 watcher 与链上对账任务共用同一份替身——两处不会一个被替身接管、另一个还在真打 RPC。
+ */
 export function setStakePaidReaderForTest(fn) {
-  stakePaidReader = fn || readStakePaidFromChain;
+  setPenalizedByOrderTotalReaderForTest(fn);
 }
 
 let stakePaidWarned = false;
 
 async function stakePaidOf(orderId) {
   try {
-    return await stakePaidReader(orderId);
+    return await readStakePaidFromChain(orderId);
   } catch (e) {
     if (!stakePaidWarned) {
       stakePaidWarned = true;
@@ -911,13 +906,22 @@ async function applyClaimChainEvent(name, args) {
     )).foundRows;
   }
   if (name === 'ClaimDisputeCancelled') {
+    /*
+      撤销会**先**发 `ClaimClosed(claimId, 0)`（合约里 `_closeClaimCase` 在前、本事件在后），
+      而那条事件的处理器已经把本地写成 `rejected/closed`（"判店主无责"）。这里必须能把它
+      **纠正**成 `cancelled/cancelled`：两者是不同的事实（判决 vs 双方和解），而"先到的零赔付
+      结案"本身不携带"这是不是撤销"的信息——只按 `dispute_state <> 'closed'` 拦，就等于让事件
+      顺序决定本地记哪一种终态（演示栈上表现为 cancelled 永远产生不出来）。
+      合约保证撤销与票决结案互斥（已结案的案件不能撤销），所以按 claimId 覆盖那条 closed 不是
+      篡改事实；`status <> 'cancelled'` 只是重放时的幂等守卫。
+    */
     return (await db.run(
       `UPDATE nft_claims
           SET status = 'cancelled',
               dispute_state = 'cancelled',
               dispute_closed_at = CURRENT_TIMESTAMP(3),
               claim_amount_wei = NULL
-        WHERE dispute_claim_id = ? AND dispute_state <> 'closed'`,
+        WHERE dispute_claim_id = ? AND status <> 'cancelled'`,
       claimId
     )).foundRows;
   }

@@ -145,7 +145,7 @@ async function disputeToPublic(o, kind = 'dispute', { actor = null, delivered, e
       未登录的仲裁台看不到详情链接，需要先按本节点登录（前端 tokenOf(origin) 已有）。
     */
     orderNo: actor && o.escrow_order_id && (await isArbiterForOrder(actor, o.escrow_order_id)) ? o.order_no : null,
-    /* 订单详情的店铺维度；配合该节点 operator 才能构造 `/orders/<operator>:<code>/<orderNo>`。 */
+    /* 订单详情的店铺维度；配合该节点 8 位 nodeCode 才能构造 `/orders/<nodeCode>/<shopCode>/<orderNo>`。 */
     shopCode: o.shop_code || null,
     escrowOrderId: o.escrow_order_id,
     /*

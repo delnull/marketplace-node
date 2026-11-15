@@ -32,7 +32,14 @@ interface IERC1271 {
  * 只影响本目录的目录行，不影响节点自己的 Escrow/Staking。登记签名绑定本目录地址，
  * 多目录登记时每个目录各签一次，天然防跨目录重放。
  *
- * 平台只做登记与目录治理：节点登记/转移/停用/恢复/永久关闭、封禁已注销 operator、
+ * 每行带一个 30 bit `nodeId`：`keccak256(abi.encode(block.chainid, escrow, staking))` 的高 30 bit，
+ * **不含本合约地址**——同一 (chainId, E/S) 在任何目录都得到同一个 ID，`getNodeById` 按它反查。
+ * 链上只存整数：可见的 8 位 Crockford 码是**离链** codec 的表示，合约不存字符串、不做 Base32。
+ * 它是资金身份的派生值而不是计数器：换 E/S = 换 ID（旧 E/S 的反查随重登记清掉）；注销后重登记
+ * 同一 E/S 保留原 ID，所以跨目录引用不会因一次注销而断；同一 E/S 合法转移后重登记仍是同一 ID。
+ * 代价是 30 bit 只有 2^-30 量级碰撞：派生为 0 或撞上他人已占用的 ID 时 `NodeIdCollision` 拒绝登记。
+ *
+ * 平台只做登记与目录治理：节点登记/转移/停用/恢复/永久关闭、封禁已注销 operator、释放已注销行、
  * Escrow/Staking 实现白名单。没有地址封禁、没有店铺/商品/订单/费率/员工/仲裁——那些都在节点自己的库里。
  *
  * 登记签名绑定 (endpoint, escrow, staking, chainId, address(this))，防代注册时被换地址、
@@ -44,6 +51,7 @@ contract MarketplaceRegistry is Ownable2Step {
 
     struct NodeInfo {
         address operator; // 节点运营者（目录身份/endpoint 归属人；登记时校验为 E/S 的 owner）
+        uint64 nodeId; // 30 bit 派生 ID：keccak256(chainId, escrow, staking) 的高位；跨目录稳定
         address escrow; // 托管合约（节点部署）
         bytes32 escrowCodeHash; // 登记时钉住的全量 runtime 哈希（含 metadata）
         address staking; // 保证金合约（节点部署）
@@ -55,8 +63,11 @@ contract MarketplaceRegistry is Ownable2Step {
         bool suspended; // 平台停用（可恢复；从可发现集合剔除）
     }
 
-    /// @notice operator => 节点信息（唯一读法是 getNode）
+    /// @notice operator => 节点信息（读入口 getNode / getNodeById 同走 _readNode，active 判据一致）
     mapping(address => NodeInfo) internal nodes;
+
+    /// @notice nodeId => operator（30 bit 派生 ID 的反查表；注销保留、转移改绑、永久关闭/换 E/S 清掉）
+    mapping(uint64 => address) private _nodeIdOperator;
 
     /// @notice endpoint => 当前占用该端点的 operator（唯一性约束）
     mapping(string => address) private _endpointOwner;
@@ -106,6 +117,7 @@ contract MarketplaceRegistry is Ownable2Step {
     event NodeSuspended(address indexed operator, string endpoint, string reason);
     event NodeRestored(address indexed operator, string endpoint);
     event NodeForceClosed(address indexed operator, string endpoint, string reason);
+    event NodeRegistrationReleased(address indexed operator, uint64 nodeId, string endpoint);
     event EscrowImplementationApproved(bytes32 indexed codeHash, bool approved);
     event StakingImplementationApproved(bytes32 indexed codeHash, bool approved);
 
@@ -129,6 +141,8 @@ contract MarketplaceRegistry is Ownable2Step {
     error EscrowImmutable();
     error RoleConflict();
     error OperatorMismatch();
+    error NodeIdCollision();
+    error NodeNotDeregistered();
 
     constructor(address initialOwner, bytes32 initialEscrowCodeHash, bytes32 initialStakingCodeHash)
         Ownable(initialOwner)
@@ -149,6 +163,8 @@ contract MarketplaceRegistry is Ownable2Step {
 
     /**
      * @notice 注册节点 / 更新 endpoint / 注销后重新激活。
+     * @dev 行的 nodeId 由 (chainId, escrow, staking) 派生：首次登记与注销后重登记时写入；
+     *      重登记同一 E/S 保留原 ID，换 E/S 得到新 ID 并清掉旧 ID 的反查。
      * @param operator 目录身份/endpoint 归属人；登记时要求等于 Escrow/Staking 的 owner
      * @param endpoint 节点 API 根地址
      * @param escrow 节点部署的托管合约（命中 Escrow 白名单）
@@ -175,6 +191,18 @@ contract MarketplaceRegistry is Ownable2Step {
             // 注销后重新激活必须 operator 本人发交易；首次注册可代付（签名已绑定新地址）。
             if (!isNew && msg.sender != operator) revert OnlyOperator();
             _checkBinding(operator, escrow, staking);
+
+            uint64 nodeId = _deriveNodeId(escrow, staking);
+            address idOwner = _nodeIdOperator[nodeId];
+            // 碰撞与“同一 E/S 已被另一行占用”都不可表达：一个 ID 只能解析回一行。
+            if (idOwner != address(0) && idOwner != operator) revert NodeIdCollision();
+            // 重登记换了 E/S：旧 E/S 的 ID 反查必须随这次登记失效，否则旧 URL 仍能读到本行。
+            if (isReactive && n.nodeId != 0 && n.nodeId != nodeId) {
+                if (_nodeIdOperator[n.nodeId] == operator) delete _nodeIdOperator[n.nodeId];
+            }
+            n.nodeId = nodeId;
+            _nodeIdOperator[nodeId] = operator;
+
             _takeEndpoint(operator, endpoint, n.endpoint);
 
             n.operator = operator;
@@ -195,6 +223,8 @@ contract MarketplaceRegistry is Ownable2Step {
             if (msg.sender != operator) revert OnlyOperator();
             if (n.suspended) revert SuspendedNode();
             if (escrow != n.escrow || staking != n.staking) revert EscrowImmutable();
+            // E/S 不可变 ⇒ ID 不可变；仍按同一派生式核一次，保证行内 ID 与资金身份只有一份真相。
+            if (n.nodeId != _deriveNodeId(escrow, staking)) revert NodeIdCollision();
             // owner 已转移的旧行不再代表当前 operator；要求先转移登记身份。
             if (!_ownedBy(n.escrow, operator) || !_ownedBy(n.staking, operator)) revert OperatorMismatch();
             if (keccak256(bytes(n.endpoint)) != keccak256(bytes(endpoint))) {
@@ -220,6 +250,7 @@ contract MarketplaceRegistry is Ownable2Step {
         if (_endpointOwner[n.endpoint] == msg.sender) delete _endpointOwner[n.endpoint];
         if (_escrowOperator[n.escrow] == msg.sender) delete _escrowOperator[n.escrow];
         if (_stakingOperator[n.staking] == msg.sender) delete _stakingOperator[n.staking];
+        // nodeId 反查**不删**：注销后的行仍要能从旧 ID 读到（inactive 行），重登记同一 E/S 也沿用它。
         n.active = false;
         /*
           注销后清掉 suspended：走到这里它必然为 false（上面已拒绝 isSuspended）；这行保留
@@ -275,6 +306,7 @@ contract MarketplaceRegistry is Ownable2Step {
         _forgetOperator(previousOperator);
         _rememberOperator(newOperator);
 
+        _nodeIdOperator[moved.nodeId] = newOperator;
         _escrowOperator[moved.escrow] = newOperator;
         _stakingOperator[moved.staking] = newOperator;
         _endpointOwner[moved.endpoint] = newOperator;
@@ -312,15 +344,26 @@ contract MarketplaceRegistry is Ownable2Step {
     }
 
     /// @notice 永久关闭一个已注销的 operator（后果与 forceCloseNode 相同）
+    /// @dev 若该行登记的 E/S 仍归此 operator，_forceClose 会把 E/S 一并永久墓碑；要让接盘方复用
+    ///      这组 E/S，必须先转移 E/S 所有权、再调用本函数（治理确认层也写明这个顺序）。
     function banDeregisteredOperator(address operator, string calldata reason) external onlyOwner {
         // 已注销：行还在（registeredAtBlock != 0）、active=false；墓碑/从未注册都没有行。
         if (nodes[operator].registeredAtBlock == 0 || nodes[operator].active) revert NodeNotRegistered();
         _forceClose(operator, reason);
     }
 
-    function _forceClose(address operator, string calldata reason) private {
-        if (forceClosedOperator[operator]) revert OperatorForceClosed();
+    /**
+     * @notice 释放一个**已注销**的登记行：删除行并清掉 nodeId / endpoint / E/S 占用，
+     *         但**不**永久封禁该运营方、**不**把 E/S 写进墓碑。
+     * @dev 用于“节点栈转让”：旧运营方已注销、E/S 已转给接盘方，但旧行的 nodeId 还占着反查时，
+     *      平台用它释放 ID，让接盘方能用同一组 E/S 重新登记并复用同一 nodeCode。
+     *      只接受 storage.active=false 的已注销行；在册/停用/永久关闭行拒绝。
+     *      释放后旧运营方仍可重新登记（forceClosedOperator 不会被写入）；要永久封禁请走 ban。
+     */
+    function releaseDeregisteredRow(address operator) external onlyOwner {
         NodeInfo storage n = nodes[operator];
+        if (n.registeredAtBlock == 0 || n.active) revert NodeNotDeregistered();
+        uint64 nodeId = n.nodeId;
         string memory endpoint = n.endpoint;
         address escrow = n.escrow;
         address staking = n.staking;
@@ -329,6 +372,27 @@ contract MarketplaceRegistry is Ownable2Step {
         if (staking != address(0) && _stakingOperator[staking] == operator) delete _stakingOperator[staking];
         _removeActive(operator);
         delete nodes[operator];
+        // 只删仍指回本 operator 的反查：转移后的映射已经改绑到新行，不能误删。
+        if (nodeId != 0 && _nodeIdOperator[nodeId] == operator) delete _nodeIdOperator[nodeId];
+        delete _suspendedReason[operator];
+        _forgetOperator(operator);
+        emit NodeRegistrationReleased(operator, nodeId, endpoint);
+    }
+
+    function _forceClose(address operator, string calldata reason) private {
+        if (forceClosedOperator[operator]) revert OperatorForceClosed();
+        NodeInfo storage n = nodes[operator];
+        string memory endpoint = n.endpoint;
+        address escrow = n.escrow;
+        address staking = n.staking;
+        uint64 nodeId = n.nodeId;
+        if (_endpointOwner[endpoint] == operator) delete _endpointOwner[endpoint];
+        if (escrow != address(0) && _escrowOperator[escrow] == operator) delete _escrowOperator[escrow];
+        if (staking != address(0) && _stakingOperator[staking] == operator) delete _stakingOperator[staking];
+        _removeActive(operator);
+        delete nodes[operator];
+        // 墓碑行没有可读的 ID：反查一并清掉；只在仍指回本 operator 时删（转移后映射已改绑新行）。
+        if (nodeId != 0 && _nodeIdOperator[nodeId] == operator) delete _nodeIdOperator[nodeId];
         delete _suspendedReason[operator];
         _forgetOperator(operator);
         forceClosedOperator[operator] = true;
@@ -370,10 +434,14 @@ contract MarketplaceRegistry is Ownable2Step {
 
     /* ── 读入口 ─────────────────────────────────────────────────────── */
 
+    /// @notice operator => 节点信息（active 掩码在唯一读出口 `_readNode` 里做）
     function getNode(address operator) external view returns (NodeInfo memory) {
-        NodeInfo memory n = nodes[operator];
-        if (n.active && !_nodeActiveNow(n)) n.active = false;
-        return n;
+        return _readNode(operator);
+    }
+
+    /// @notice 30 bit nodeId => 节点信息；未登记、已永久关闭、已释放或换 E/S 前的旧 ID 返回全零结构
+    function getNodeById(uint64 id) external view returns (NodeInfo memory) {
+        return _readNode(_nodeIdOperator[id]);
     }
 
     /// @notice 当前仍有登记行的 operator 总数（注销/停用保留；永久关闭/转出已移除）
@@ -411,9 +479,8 @@ contract MarketplaceRegistry is Ownable2Step {
         if (take > limit) take = limit;
         result = new NodeInfo[](take);
         for (uint256 i = 0; i < take; ++i) {
-            result[i] = nodes[_activeOperators[offset + i]];
             // 白名单撤销或资金方 owner 变更后不再把该行当作 active 下发（分页下标保持不变）。
-            if (!_nodeActiveNow(result[i])) result[i].active = false;
+            result[i] = _readNode(_activeOperators[offset + i]);
         }
     }
 
@@ -455,6 +522,28 @@ contract MarketplaceRegistry is Ownable2Step {
     }
 
     /* ── 内部实现 ───────────────────────────────────────────────────── */
+
+    /**
+     * @dev 唯一的行读出口：返回前把“已不算 active”的行掩成 active=false
+     *      （白名单撤销/资金方 owner 变更后存储里的 active 仍是 true）。
+     *      getNode / getNodeById / getActiveNodes 都必须走这里，active 判据只在 `_nodeActiveNow` 一处。
+     */
+    function _readNode(address operator) private view returns (NodeInfo memory n) {
+        n = nodes[operator];
+        if (n.active && !_nodeActiveNow(n)) n.active = false;
+    }
+
+    /**
+     * @dev 30 bit nodeId 的唯一派生式：只吃 (chainId, escrow, staking)，**不含本合约地址**——
+     *      同一节点栈在多个 Registry 得到同一个 ID，消费端才能按 ID 而不是 operator 跨目录引用。
+     *      取 keccak 高 30 bit（>> 226）压进 uint64；0 保留给“无此行”的零结构，派生为 0 拒绝登记，
+     *      否则 `getNodeById(0)` 会假装存在一行。它是派生值不是计数器：不维护“分配后永不复用”的表。
+     *      代价：30 bit 只有 2^-30 量级碰撞，撞上已占用 ID 时拒绝登记（而不是覆盖别人的行）。
+     */
+    function _deriveNodeId(address escrow, address staking) private view returns (uint64 id) {
+        id = uint64(uint256(keccak256(abi.encode(block.chainid, escrow, staking))) >> 226); // 高 30 bit
+        if (id == 0) revert NodeIdCollision();
+    }
 
     /// @dev 登记行只有在“当前地址代码仍被本目录白名单认可”时才算 active
     function _codeStillApproved(NodeInfo memory n) private view returns (bool) {
@@ -636,7 +725,7 @@ contract MarketplaceRegistry is Ownable2Step {
         _operatorIndex[operator] = _operators.length;
     }
 
-    /// @dev 从枚举移除（swap-pop）；只用于永久关闭/转出后已删除登记行的地址
+    /// @dev 从枚举移除（swap-pop）；用于永久关闭/转出/释放注销行后已删除登记行的地址
     function _forgetOperator(address operator) private {
         uint256 idx = _operatorIndex[operator];
         if (idx == 0) return;

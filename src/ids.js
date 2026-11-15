@@ -25,7 +25,7 @@
  *
  * 店铺编号 = 7 位随机数据 + 2 位**加权校验** = **9 字符**（`newShopCode`）：
  *   · 店铺是**节点链下**的事实（平台目录只登记节点），编号由本节点铸造、写入 `shops.code`；
- *   · 校验位的形状契约在 `./shopCode.js`（前端在解析 `/shop/<code>` 前用它校验，
+ *   · 校验位的形状契约在 `./shopCode.js`（前端在解析 `/shop/<nodeCode>/<shopCode>` 的第二段前用它校验，
  *     单测 `test/shopCode.test.js` 会拿本函数生成的编号去过那份实现）。本文件只负责**铸造**，
  *     读路径从不解析编号里的任何含义——存在性只有库能回答。
  *
@@ -102,7 +102,7 @@ export function newClaimNo(now = Date.now()) {
  * 新店铺编号：7 位随机数据 + 2 位**加权校验**（`Σ 值×位权(1..7)`，写成两位 base32，不取模）。
  *
  * 店铺是节点链下的事实，编号由本节点铸造（平台 Registry 不认识"店"）。校验位的算法契约见
- * `./shopCode.js`：前端解析 `/shop/<code>` 前要过它，所以本函数**必须产出能通过那份校验**
+ * `./shopCode.js`：前端解析 `/shop/<nodeCode>/<shopCode>` 的第二段前要过它，所以本函数**必须产出能通过那份校验**
  * 的编号——`test/shopCode.test.js` 拿它生成的编号过 `verifyShopCode` 守住这条。
  */
 export function newShopCode() {
