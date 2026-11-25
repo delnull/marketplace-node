@@ -455,3 +455,154 @@ test('编辑保留同 key 的销量且不误改停售状态', async () => {
   assert.equal(row.active, 0, '停售生效');
   assert.equal(row.committed, 1, '未提交 committed，销量保留');
 });
+test('编辑：不限量 → 限量 按在途行补记占位；容量不够整笔拒绝；取消后回补（同一账本）', async () => {
+  const p = (await post(productPayload({
+    title: '切回限量',
+    specs: [{ name: '颜色', options: ['黑'] }],
+    skus: [{ key: '黑', priceMicro: 1_000_000, capacity: null }],
+  }))).body.data;
+  const buyer = newBuyer();
+  const d1 = (await draftAs(buyer, p.slug, '黑')).body.data;
+  assert.equal((await skuRow(p.slug, '黑')).committed, 0, '不限量期间不占位');
+
+  // 切回限量：这条在途承诺必须补记成占位（经路由，不是直接调内核）
+  assertOk(await patchProduct(p.slug, { skus: [{ key: '黑', capacity: 3 }] }));
+  assert.equal((await skuRow(p.slug, '黑')).committed, 1);
+  const held = await db.get(
+    'SELECT o.hold_qty FROM orders o JOIN products p ON p.id = o.product_id WHERE p.slug = ?',
+    p.slug
+  );
+  assert.equal(Number(held.hold_qty), 1);
+
+  // 限量后第二单正常占位 ⇒ 已占 2；此时把总量改成 1 必须整笔拒绝且不落库
+  assertOk(await draftAs(newBuyer(), p.slug, '黑'));
+  assert.equal((await skuRow(p.slug, '黑')).committed, 2);
+  const shrink = await patchProduct(p.slug, { skus: [{ key: '黑', capacity: 1 }] });
+  assert.notEqual(shrink.body.code, 0);
+  assert.match(shrink.body.message, /不能小于已占位 2 件/);
+  assert.equal((await skuRow(p.slug, '黑')).capacity, 3, '被拒后容量不变');
+
+  // 取消补记过的那一单 ⇒ 占位回到 1（补记与释放是同一本账）
+  const token = (await login(ctx, buyer)).token;
+  assertOk(
+    await request(app)
+      .post(`/api/orders/${d1.id}/cancel`)
+      .set('Authorization', `Bearer ${token}`).set('X-Mk-Shop', shopRef.value)
+      .expect(200)
+  );
+  assert.equal((await skuRow(p.slug, '黑')).committed, 1);
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   不改量收口（2026-11）：补记内核 / 改名缩容 / 改币种 / 起价同源 / 清池闸
+   ══════════════════════════════════════════════════════════════════════ */
+
+const patchProduct = (slug, body) =>
+  request(app)
+    .patch(`/api/products/${slug}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send(body)
+    .expect(200);
+
+test('补记内核：按锁到的在途行同时写 hold_qty 与 committed；容量不足时一个字都不写', async () => {
+  const { commitPromiseUnits } = await import('../src/stockHold.js');
+  const p = (await post(productPayload({
+    title: '补记内核',
+    specs: [{ name: '颜色', options: ['黑'] }],
+    skus: [{ key: '黑', priceMicro: 1_000_000, capacity: null }],
+  }))).body.data;
+  assertOk(await draftAs(newBuyer(), p.slug, '黑'));
+  assertOk(await draftAs(newBuyer(), p.slug, '黑'));
+  const pid = (await skuRow(p.slug, '黑')).product_id;
+  assert.equal((await skuRow(p.slug, '黑')).committed, 0, '不限量期间下单不占位');
+
+  const refused = await commitPromiseUnits(pid, new Map([['黑', { capacity: 1 }]]));
+  assert.equal(refused.ok, false, '2 件承诺放不进 1 件容量');
+  assert.match(refused.fail, /共需 2 件容量/);
+  assert.equal((await skuRow(p.slug, '黑')).committed, 0, '被拒时 committed 一个字都不动');
+  const heldZero = await db.all('SELECT o.hold_qty FROM orders o JOIN products p ON p.id = o.product_id WHERE p.slug = ?', p.slug);
+  assert.ok(heldZero.every((r) => Number(r.hold_qty) === 0), '被拒时 hold_qty 也不动（无部分生效）');
+
+  const done = await commitPromiseUnits(pid, new Map([['黑', { capacity: 2 }]]));
+  assert.deepEqual(done, { ok: true, held: 2, bySku: { 黑: 2 } });
+  assert.equal((await skuRow(p.slug, '黑')).committed, 2);
+  const rows = await db.all('SELECT o.hold_qty FROM orders o JOIN products p ON p.id = o.product_id WHERE p.slug = ?', p.slug);
+  assert.ok(rows.every((r) => Number(r.hold_qty) === 1), '逐单补记 hold_qty');
+
+  const again = await commitPromiseUnits(pid, new Map([['黑', { capacity: 2 }]]));
+  assert.deepEqual(again, { ok: true, held: 0, bySku: {} }, '幂等：没有可补的行就什么都不做');
+});
+
+test('编辑：改名 + 缩容 按「不能小于已占位」拒绝（可照做，而不是 500）', async () => {
+  const p = (await post(productPayload({
+    title: '改名缩容',
+    specs: [{ name: '颜色', options: ['黑'] }],
+    skus: [{ key: '黑', priceMicro: 1_000_000, capacity: 5 }],
+  }))).body.data;
+  // 改名前的账：该组合已有 2 件占位/已售（直接落 committed，等价于卖过两件）
+  await db.run('UPDATE product_skus SET committed = 2 WHERE product_id = (SELECT id FROM products WHERE slug = ?)', p.slug);
+
+  const renamed = await patchProduct(p.slug, {
+    specs: [{ name: '颜色', options: ['灰'] }],
+    skus: [{ key: '灰', priceMicro: 1_000_000, capacity: 1 }],
+  });
+  assert.notEqual(renamed.body.code, 0);
+  assert.match(renamed.body.message, /不能小于已占位 2 件/);
+  assert.doesNotMatch(String(renamed.body.message), /服务内部错误/, '必须是带原因的 400，而不是 500');
+
+  const sameKey = await patchProduct(p.slug, { skus: [{ key: '黑', capacity: 1 }] });
+  assert.match(sameKey.body.message, /不能小于已占位 2 件/, '同名缩容与改名缩容同一句判据');
+});
+
+test('改计价币种：不带每个组合价格被拒；带全则按新币种落库', async () => {
+  const p = (await post(productPayload({
+    title: '改币种',
+    specs: [{ name: '颜色', options: ['黑'] }],
+    skus: [{ key: '黑', priceMicro: 2_000_000, capacity: 5 }],
+  }))).body.data;
+  const bad = await patchProduct(p.slug, { priceCurrency: 'BTY' });
+  assert.notEqual(bad.body.code, 0);
+  assert.match(bad.body.message, /改计价币种必须同批提交每个组合的新价格/);
+  assert.equal((await skuRow(p.slug, '黑')).price_micro, 2_000_000, '被拒时不落库');
+
+  const good = await patchProduct(p.slug, { priceCurrency: 'BTY', skus: [{ key: '黑', priceMicro: 3_000_000 }] });
+  assertOk(good);
+  assert.equal(good.body.data.priceCurrency, 'BTY');
+  assert.equal((await skuRow(p.slug, '黑')).price_micro, 3_000_000, '新价格按新币种落库');
+});
+
+test('起价同源：管理列表与公开详情都只按「可买组合」取起价', async () => {
+  const p = (await post(productPayload({ title: '起价同源', kind: 'physical', specs: SPECS, skus: SKUS }))).body.data;
+  // 停掉最便宜的组合（黑|65 = 1.0 USDT）：可买组合的起价应变成 黑|80 = 1.1 USDT
+  assertOk(await patchProduct(p.slug, { skus: [{ key: '黑|65', active: false }] }));
+  const pub = await request(app).get(`/api/products/${p.slug}`).expect(200);
+  assert.equal(pub.body.data.priceMicro, 110_000_000);
+  const all = await request(app)
+    .get('/api/products/all?pageSize=100')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .expect(200);
+  const row = all.body.data.products.find((x) => x.slug === p.slug);
+  assert.equal(row.priceMicro, 110_000_000, '店主列表不能显示买家买不到的价');
+  // 节点管理列表（处置视图）此前在 SQL 里另算一次 MIN(price_micro)，含停售组合 ⇒ 两个页面两个价
+  const admin = await request(app)
+    .get(`/api/products/admin/all?q=${encodeURIComponent('起价同源')}`)
+    .set('Authorization', `Bearer ${ownerToken}`)
+    .expect(200);
+  const adminRow = admin.body.data.products.find((x) => x.slug === p.slug);
+  assert.equal(adminRow.priceMicro, 110_000_000, '节点管理列表与公开面同源');
+});
+
+test('清池闸：已交付（used）的码不再阻止改型；未使用的码仍然阻止', async () => {
+  const p = (await post(productPayload({ title: '清池闸', kind: 'digital' }))).body.data;
+  const pid = (await db.get('SELECT id FROM products WHERE slug = ?', p.slug)).id;
+  await db.run("INSERT INTO product_codes (product_id, code, status) VALUES (?, 'C1', 'unused')", pid);
+
+  const blocked = await patchProduct(p.slug, { kind: 'physical' });
+  assert.notEqual(blocked.body.code, 0);
+  assert.match(blocked.body.message, /还有未使用的兑换码/);
+
+  await db.run("UPDATE product_codes SET status = 'used' WHERE product_id = ?", pid);
+  const freed = await patchProduct(p.slug, { kind: 'physical' });
+  assertOk(freed);
+  assert.equal(freed.body.data.kind, 'physical', '只剩已交付墓碑时允许改型');
+});

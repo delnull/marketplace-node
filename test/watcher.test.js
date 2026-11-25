@@ -381,6 +381,34 @@ test('SellerRefunded：结算后退款按累计总额落库，重放不重复加
   );
 });
 
+test('stake_paid_wei：refunded 已被别的入口写成同一个值，保证金赔付仍要落账', async () => {
+  /*
+    `/sync` 的快照回填只写 refunded_amount_wei（另一个写入口）。若赔付累计跟 refunded 绑在
+    同一条 UPDATE 上，它的守卫 `refunded_amount_wei <> ?` 就不再命中，这一列永远停在 0——
+    原生单的买家退款虚高、店主净额虚低（见 routes/orders.js 的 buyerRefundedWei/sellerNetWei）。
+  */
+  const a = await insertOrder('settled');
+  const total = '250000000000000000';
+  await db.run('UPDATE order_chain SET refunded_amount_wei = ? WHERE order_id = ?', total, a.orderId);
+  setStakePaidReaderForTest(async () => '100000000000000000');
+  try {
+    assert.equal(
+      await applyEvent(
+        'SellerRefunded',
+        { orderId: a.escrowOrderId, amount: total, refundedTotal: total },
+        { block: 76 }
+      ),
+      0,
+      'refunded 值没变 ⇒ changed=0（"有没有新的退款事实"判据不变）'
+    );
+    const row = await db.get('SELECT refunded_amount_wei, stake_paid_wei FROM v_orders WHERE order_id = ?', a.orderId);
+    assert.equal(row.refunded_amount_wei, total);
+    assert.equal(row.stake_paid_wei, '100000000000000000', '赔付累计必须独立落账，不能被 refunded 的守卫连坐');
+  } finally {
+    setStakePaidReaderForTest(async () => '0');
+  }
+});
+
 test('保证金赔付读数不可用：退款额/提货赔付仍落账，只保留 stake_paid_wei 旧值', async () => {
   const a = await insertOrder('settled');
   setStakePaidReaderForTest(async () => {

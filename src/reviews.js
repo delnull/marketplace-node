@@ -22,7 +22,7 @@
  *    除法靠 JS 隐式转换恰好也能算对，但那是"碰巧"——凡是聚合结果当数字用，这里都显式表态。
  *    代价如实写：这是刻意选的（金额宁可响亮地失败），代价落在每一个消费聚合的调用点。
  */
-import { getDb } from './db.js';
+import { getDb, withTransaction } from './db.js';
 import { normalizeId } from './ids.js';
 import config from './config.js';
 import { findMedia } from './productMedia.js';
@@ -274,25 +274,120 @@ export async function clearReviewImages(orderId) {
  * 逐图下架（节点管理员）：JSON 里同步移除，随后**按全库引用**决定是否删盘
  * （同一份内容可能还被商品/订单快照/别的评价引用，共享文件保留）。
  * 返回 `remaining` 便于界面刷新；重复删除是 404 语义（图片已不在该评价里）。
+ *
+ * 读-改-写必须在同一个事务里并对行加锁：两个管理员同时删同一组的两张图时，
+ * 各自读到旧 JSON 再回写会**丢掉其中一次删除**（后写的覆盖先写的）。行锁让第二个
+ * 删除看到第一个的结果；同一张图被删两次则由第二次的"不在该评价里"给出 404。
+ * 删盘放在事务提交之后（文件系统不在事务里，失败只记日志/由孤儿清扫兜底）。
  */
 export async function removeReviewImage({ orderId, kind, url }) {
   const col = kind === 'followup' ? 'followup_images' : kind === 'review' ? 'images' : null;
   if (!col) return { error: '评价类型必须是评价或追评' };
-  const db = getDb();
-  const row = await db.get(`SELECT id, ${col} AS raw FROM reviews WHERE order_id = ?`, orderId);
-  if (!row) return { error: '该订单还没有评价' };
-  const images = parseReviewImages(row.raw);
   const target = String(url || '').trim();
-  if (!images.includes(target)) return { error: '该图片不在这条评价里（可能已被下架）', notFound: true };
-  const next = images.filter((u) => u !== target);
-  await db.run(`UPDATE reviews SET ${col} = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ?`, JSON.stringify(next), row.id);
+  const db = getDb();
+  const result = await withTransaction(async () => {
+    const row = await db.get(`SELECT id, ${col} AS raw FROM reviews WHERE order_id = ? FOR UPDATE`, orderId);
+    if (!row) return { error: '该订单还没有评价' };
+    const images = parseReviewImages(row.raw);
+    if (!images.includes(target)) return { error: '该图片不在这条评价里（可能已被下架）', notFound: true };
+    const next = images.filter((u) => u !== target);
+    await db.run(`UPDATE reviews SET ${col} = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE id = ?`, JSON.stringify(next), row.id);
+    return { ok: true, remaining: next.length };
+  });
+  if (result.error) return result;
   try {
     await removeMediaUrls([target]);
   } catch (e) {
     // 删盘失败不该把"已下架"回滚（DB 已是事实）；孤儿由每日清扫兜底
     console.error(`[reviews] 评价图删盘失败（留给孤儿清扫）：${e?.message || e}`);
   }
-  return { ok: true, remaining: next.length };
+  return { ok: true, remaining: result.remaining };
+}
+
+/**
+ * 评价图治理的读模型：一条评价 + 它所属订单/店铺/商品。
+ *
+ * 为什么以**评价**为父级而不是订单：评价图的存在性、两张图（首评/追评）与图片地址
+ * 都由 `reviews` 行回答；订单号只是报告里常见的搜索键。按订单读会让"在商品页看到一张图"
+ * 或"只拿到一张图链接"的场景无路可走（必须先去别处找订单号）。
+ *
+ * 选择列刻意不含 `buyer` / `content`：治理界面只需要"哪家店、哪件商品、哪些图、什么时候"。
+ * 订单号留在行里只供服务端写审计与通知，**不下发**给列表/详情。
+ */
+const REVIEW_IMAGE_COLUMNS = `
+  r.id, r.order_id, r.images, r.followup_images, r.created_at,
+  o.order_no, o.product_slug, o.shop_code, s.name AS shop_name,
+  p.title AS product_title`;
+
+const REVIEW_IMAGE_FROM = `
+  FROM reviews r
+  JOIN orders o ON o.id = r.order_id
+  JOIN shops s ON s.code = o.shop_code
+  LEFT JOIN products p ON p.id = r.product_id`;
+
+/** 评价图 DTO（列表与单条共用同一份：两处各拼一次必然在加字段时漂移） */
+export function reviewImageDto(row) {
+  return {
+    reviewId: Number(row.id),
+    at: row.created_at,
+    shop: { code: row.shop_code, name: row.shop_name || '' },
+    /* 商品被硬删除后 `products` 行不在，但订单里的 `product_slug` 是历史事实 */
+    product: { slug: row.product_slug || '', title: row.product_title || '' },
+    images: parseReviewImages(row.images),
+    followup: parseReviewImages(row.followup_images),
+  };
+}
+
+/** 按评价内部键读治理行；非法/不存在返回 null。 */
+export async function findReviewImageById(reviewId) {
+  const id = Number(reviewId);
+  if (!Number.isSafeInteger(id) || id <= 0) return null;
+  return (await getDb().get(`SELECT ${REVIEW_IMAGE_COLUMNS} ${REVIEW_IMAGE_FROM} WHERE r.id = ?`, id)) || null;
+}
+
+/**
+ * 有图评价队列（节点管理员）：按写入顺序倒序分页。
+ *
+ * 判据只看 `reviews` 的两组 JSON：至少一张图才进队列。**刻意不给"无图"行留位置**——
+ * 治理界面的每一行都该有一张能下架的图，否则翻页只是在看空行。
+ *
+ * 排序用 `r.id DESC` 而不是 `created_at DESC`：`reviews` 没有全局时间索引，而自增主键
+ * 本身就是写入顺序（一单一评，写入即提交）。代价是分页按主键倒序扫描、并按 JSON 判据过滤；
+ * 当前规模够用，数据量上来再补索引——不是为了它现在就多写一份派生列。
+ *
+ * 筛选：`shopCode` 走订单归属，`productSlug` 走订单快照里的标识（商品被删也能筛），
+ * `orderNo` 是报告入口。三者都只收已归一化的值；路由负责形状校验。
+ */
+export async function reviewImageQueue({ page = 1, pageSize = 10, shopCode, productSlug, orderNo } = {}) {
+  const where = ['(JSON_LENGTH(r.images) > 0 OR JSON_LENGTH(r.followup_images) > 0)'];
+  const params = [];
+  if (shopCode) {
+    where.push('o.shop_code = ?');
+    params.push(String(shopCode));
+  }
+  if (productSlug) {
+    where.push('o.product_slug = ?');
+    params.push(String(productSlug));
+  }
+  if (orderNo) {
+    where.push('o.order_no = ?');
+    params.push(String(orderNo));
+  }
+  const whereSql = `WHERE ${where.join(' AND ')}`;
+  const db = getDb();
+  const total = Number((await db.get(`SELECT COUNT(*) AS c ${REVIEW_IMAGE_FROM} ${whereSql}`, ...params)).c);
+  const lastPage = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(Math.max(1, page), lastPage);
+  if (total === 0) return { total: 0, page: 1, pageSize, items: [] };
+  const rows = await db.all(
+    `SELECT ${REVIEW_IMAGE_COLUMNS} ${REVIEW_IMAGE_FROM} ${whereSql}
+      ORDER BY r.id DESC
+      LIMIT ? OFFSET ?`,
+    ...params,
+    pageSize,
+    (safePage - 1) * pageSize
+  );
+  return { total, page: safePage, pageSize, items: rows.map(reviewImageDto) };
 }
 
 /**

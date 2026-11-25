@@ -106,8 +106,10 @@ import { applyAfterSaleOpened, applyAfterSaleClosed } from './afterSale.js';
  * 读本单的保证金赔付累计（**唯一实现**在 chain.js，对账任务共用同一读数）。
  *
  * 这是**派生镜像**（`stake_paid_wei` 只用于展示“其中有多少来自保证金”），
- * 读不到时由 `stakePaidOf` 返回 null、SQL 用 COALESCE 保留旧值；
+ * 读不到时返回 null，写入口（`setStakePaidMirror`）据此跳过、保留旧值；
  * 绝不能因为这一项读不到而阻断 `refunded_amount_wei` / `claim_paid_wei` 的链上事实落库。
+ *
+ * 调用点在 `applyEvent` 的**事务之外**（预取进 `meta.stakePaid`）：见那里的说明。
  */
 const readStakePaidFromChain = penalizedByOrderTotalOf;
 
@@ -529,9 +531,22 @@ async function recordEvent(escrowOrderId, ev) {
  * 所以提交后的循环逐个 `await`：不 await 的话它们的 rejection 会变成 unhandled rejection，
  * 而这段代码恰恰是"状态已落库、失败只影响通知"的那一层——错误必须落在它自己的 try 里。
  */
+/** 需要读保证金赔付累计的事件（读数在事务外预取，见 applyEvent） */
+const STAKE_PAID_EVENTS = new Set(['SellerRefunded', 'ClaimPaid']);
+
 export async function applyEvent(name, args, meta = {}) {
   const after = [];
   const m = { ...meta, afterCommit: after };
+  /*
+    保证金赔付累计是**链上读数**（RPC），必须在事务之外取：`withTransaction` 期间持有订单行锁，
+    把网络往返放进去，一次 Staking RPC 抖动就会把串行的事件应用拖过 `/healthz` 的停滞阈值
+    （同一条纪律见 chainReconcile 的说明：事务里只允许 SQL）。
+    取不到 = `null`，由 `setStakePaidMirror` 跳过（保留旧值），不影响退款额/提货赔付事实落库。
+  */
+  if (STAKE_PAID_EVENTS.has(name)) {
+    const id = String(args?.orderId || '');
+    if (id) m.stakePaid = await stakePaidOf(id);
+  }
   /* 状态迁移 + 占位释放/恢复 + 事件史**同一个事务**（`withTransaction` 的回调即作用域）。
      嵌套调用（release 系 / restock / autoDeliver 自己的事务）自动降级为 SAVEPOINT。 */
   const changed = await withTransaction(async () => applyEventCore(name, args, m));
@@ -657,6 +672,27 @@ export async function setRefundedAmount(db, orderId, amountWei, totalWei) {
     totalText
   );
   return result.foundRows;
+}
+
+/**
+ * 写 `order_chain.stake_paid_wei` 的**唯一出口**（绝对读数、幂等）。
+ *
+ * 为什么不跟 `refunded_amount_wei` 写进同一条 UPDATE：后者有三个写入口（事件、`/sync` 回填、
+ * 链上对账），每个都以"值有没有变"当守卫。两列绑在一条语句上时，"谁先写 refunded"就决定了
+ * "stake_paid 还会不会落账"——`/sync` 先按链上快照写入含保证金赔付的累计值后，事件的
+ * `WHERE refunded_amount_wei <> ?` 不再命中，这一列永远停在 0（原生单的买家退款虚高、
+ * 店主净额虚低，见 routes/orders.js 的 buyerRefundedWei/sellerNetWei）。
+ * 拆成独立语句后，顺序不再影响收敛：绝对值 + 只在不相等时写，重复事件与迟到事件都是空操作。
+ */
+async function setStakePaidMirror(db, orderId, stakePaidWei) {
+  if (stakePaidWei == null) return 0;
+  const v = String(stakePaidWei);
+  return (await db.run(
+    'UPDATE order_chain SET stake_paid_wei = ? WHERE order_id = ? AND stake_paid_wei <> ?',
+    v,
+    Number(orderId),
+    v
+  )).foundRows;
 }
 
 export async function settleByRefundSplit(db, orderId, refundWeiArg) {
@@ -1291,17 +1327,19 @@ async function applyEventCore(name, args, meta = {}) {
       if (local.claim_paid_wei != null && claimBig < BigInt(local.claim_paid_wei)) {
         throw new Error(`ClaimPaid claimPaidTotal=${claimTotal} 小于本地 ${local.claim_paid_wei}（不应回退）`);
       }
-      const stakePaid = await stakePaidOf(orderId);
+      const stakePaid = meta.stakePaid ?? null;
       changed = (await db.run(
-        `UPDATE order_chain SET refunded_amount_wei = ?, claim_paid_wei = ?, stake_paid_wei = COALESCE(?, stake_paid_wei)
+        `UPDATE order_chain SET refunded_amount_wei = ?, claim_paid_wei = ?
           WHERE order_id = ? AND (refunded_amount_wei <> ? OR claim_paid_wei <> ?)`,
         total,
         claimTotal,
-        stakePaid,
         local.order_id,
         total,
         claimTotal
       )).foundRows;
+      // 保证金赔付是派生镜像、与上面那条的守卫无关：单独写，才会在"refunded 已被别的入口
+      // 抢先写成同一个值"时仍然落账（见 setStakePaidMirror 的说明）。
+      await setStakePaidMirror(db, local.order_id, stakePaid);
       /*
         ClaimPaid 是赔付已发生的链上事实；ClaimClosed 通常紧跟着到，但两者不是原子消费的——
         若 ClaimClosed 漏扫/进程在两条事件之间退出，本地 claim 会永远停在 opened，占住
@@ -1339,15 +1377,16 @@ async function applyEventCore(name, args, meta = {}) {
           `SellerRefunded 的 refundedTotal=${total} 小于本地已记账 ${local.refunded_amount_wei}（链上退款额不应回退）`
         );
       }
-      const stakePaid = await stakePaidOf(orderId);
+      const stakePaid = meta.stakePaid ?? null;
       changed = (await db.run(
-        `UPDATE order_chain SET refunded_amount_wei = ?, stake_paid_wei = COALESCE(?, stake_paid_wei)
+        `UPDATE order_chain SET refunded_amount_wei = ?
           WHERE order_id = ? AND refunded_amount_wei <> ?`,
         total,
-        stakePaid,
         local.order_id,
         total
       )).foundRows;
+      // 同上：赔付累计必须独立落账，不能被"refunded 已相等"的守卫连坐。
+      await setStakePaidMirror(db, local.order_id, stakePaid);
       break;
     }
     case 'Arbitrated':

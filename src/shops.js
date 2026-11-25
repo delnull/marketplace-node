@@ -350,3 +350,14 @@ export function productPublicSql(alias = '') {
   const col = (name) => (alias ? `${alias}.${name}` : name);
   return `${productSellableSql(alias)} AND ${col('shop_code')} IN (SELECT code FROM shops WHERE listed = 1)`;
 }
+/**
+ * 店铺计数（`/healthz` 的公开读数用）。
+ *
+ * 为什么不复用 `listShopRows()` 再 length：探活是**匿名可打**的，把整张 shops 表搬进内存
+ * 只为了数两个数，等于给探活加了与店铺数成正比的成本。单条聚合 COUNT 走同一个索引，
+ * 形状仍是 `{ total, listed }`（与旧读数的字段逐字一致，消费端不用改）。
+ */
+export async function countShopRows() {
+  const r = await getDb().get('SELECT COUNT(*) AS total, COALESCE(SUM(listed = 1), 0) AS listed FROM shops');
+  return { total: Number(r?.total || 0), listed: Number(r?.listed || 0) };
+}

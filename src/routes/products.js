@@ -60,6 +60,7 @@ import { Router } from 'express';
 import { ethers } from 'ethers';
 import config from '../config.js';
 import { getDb, withTransaction, abortTx } from '../db.js';
+import { withDeadlockRetry } from '../dbErrors.js';
 import { getRates } from '../rates.js';
 import { verifySession } from '../auth.js';
 import { isAddress, isZeroAddress } from '../chain.js';
@@ -95,7 +96,7 @@ import { tryAutoDeliverPendingForProduct } from '../autoDeliver.js';
 import { goodsPriceMicroOf, priceOf, priceUnitOf } from '../money.js';
 // 「这一单还占着库存」的唯一谓词（2026-10-14）：改名守卫与 willRestrict 的补记核算共用它，
 // 不再各自拼状态白名单——状态集每加一个终态就会漏一次，而漏的后果是超卖。
-import { stockPromiseSql, uncommittedPromiseSql } from '../stockHold.js';
+import { stockPromiseSql, commitPromiseUnits } from '../stockHold.js';
 import { KIND_CHANGE_BLOCK_IN } from '../orderStatus.js';
 // 商品标签（类目）的键/展示形/归一化 —— **唯一实现**（两个写入入口、列表筛选与标签清单共用，见 src/tags.js 文件头）
 import { assertParsedJsonColumn, cleanLabel, normalizeTags, parseTagsColumn, tagKeyOf } from '../tags.js';
@@ -774,6 +775,28 @@ function parseSpecsColumn(row) {
   return Array.isArray(v) ? v : [];
 }
 
+/**
+ * 一对一改名时 `committed` 的**搬运映射**（唯一定义）：旧键消失、新键出现且旧行有已占位/已售时，
+ * 把旧键的 `committed` 搬到唯一的新键上。
+ *
+ * 为什么必须是单独一份：`saveSkus` 靠它决定"新行继承多少已售"，容量校验要靠它才知道
+ * "改名 + 缩容"到底会写入多少 `committed`。两处各写一份时，校验按**新 key** 查到 0 ⇒ 放行，
+ * 随后插入撞 `ck_skus_committed`（`committed <= capacity`）⇒ 事务回滚、客户端拿到 500
+ * 「服务内部错误」。同一件事故从"校验漏了"变成"服务坏了"，店主无从照着修。
+ *
+ * @param {Array<{sku_key: string, committed: unknown}>} prevRows 改名前的组合行
+ * @param {Array<{key: string}>} skus 本次提交的组合
+ * @returns {Map<string, number>} 新 key → 要搬过来的 committed
+ */
+function carriedCommittedOf(prevRows, skus) {
+  const newKeys = new Set((skus || []).map((s) => String(s.key ?? '')));
+  const disappeared = (prevRows || []).filter(
+    (r) => !newKeys.has(String(r.sku_key ?? '')) && Number(r.committed) > 0
+  );
+  if (disappeared.length !== 1 || (skus || []).length !== 1) return new Map();
+  return new Map([[String(skus[0].key ?? ''), Number(disappeared[0].committed) || 0]]);
+}
+
 /** 写库：全量替换某商品的 SKU 行（**保留同 key 的 committed** —— 编辑商品不该把已售数量清零） */
 async function saveSkus(productId, skus) {
   const db = getDb();
@@ -793,24 +816,51 @@ async function saveSkus(productId, skus) {
   return await withTransaction(async () => {
     const prevRows = await db.all('SELECT sku_key, committed FROM product_skus WHERE product_id = ?', productId);
     const prev = new Map(prevRows.map((r) => [r.sku_key, { committed: r.committed }]));
-    const newKeys = new Set(skus.map((s) => s.key));
     /*
       一对一改名（旧键消失、新键出现）不能把旧键的 committed 丢掉：
       已成交/已退款未回收的件数仍记在旧键上，丢了它 available 就会凭空变大。
       旧键到新键没有通用映射，只在“恰好一个旧键、一个新键”时搬运；其余形状由路由层拒绝。
     */
-    const disappeared = prevRows.filter((r) => !newKeys.has(r.sku_key) && Number(r.committed) > 0);
-    const carryCommitted =
-      disappeared.length === 1 && skus.length === 1 ? Number(disappeared[0].committed) || 0 : 0;
+    const carry = carriedCommittedOf(prevRows, skus);
     await db.run('DELETE FROM product_skus WHERE product_id = ?', productId);
     const insSql =
       'INSERT INTO product_skus (product_id, sku_key, specs_json, price_micro, image_url, capacity, committed, active, token_amount) ' +
       'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
     for (const s of skus) {
       const inherited = Number(prev.get(s.key)?.committed) || 0;
-      await db.run(insSql, productId, s.key, JSON.stringify(s.specs || {}), s.priceMicro, s.imageUrl || '', s.capacity, inherited + carryCommitted, s.active === false ? 0 : 1, s.tokenAmount ?? null);
+      const carriedHere = carry.get(String(s.key ?? '')) || 0;
+      await db.run(insSql, productId, s.key, JSON.stringify(s.specs || {}), s.priceMicro, s.imageUrl || '', s.capacity, inherited + carriedHere, s.active === false ? 0 : 1, s.tokenAmount ?? null);
     }
   });
+}
+
+/**
+ * DB 的 SKU 行 → 「起价」判据要的四个字段（唯一的形状适配；公开面传的是 DTO 形状）。
+ */
+function skuPriceFactsOf(skuRows) {
+  return (skuRows || []).map((s) => ({
+    priceMicro: Number(s.price_micro),
+    active: Number(s.active) === 1,
+    capacity: s.capacity === null ? null : Number(s.capacity),
+    committed: Number(s.committed) || 0,
+  }));
+}
+
+/**
+ * 「起价」的**唯一判据**：只从**当前可买**的组合里取最小值；全都不可买（停售/售罄）时退回
+ * 全部组合的最小标价（商品仍有价，列表上的售罄态由 soldOut/stock 字段表达）。
+ *
+ * 为什么必须单独一份：管理面（节点主复核 / 强制下架）原来在 SQL 里写 `MIN(price_micro)`，
+ * 把停售与售罄的组合也算进去 ⇒ 列表显示一个买家**永远买不到**的价格，与公开详情各说一个价，
+ * 而两边都不报错。
+ */
+function startingPriceMicroOf(skus) {
+  const list = skus || [];
+  const buyable = list.filter(
+    (s) => s.active && (s.capacity === null || Number(s.committed) < Number(s.capacity))
+  );
+  const basis = buyable.length ? buyable : list;
+  return basis.length ? Math.min(...basis.map((s) => Number(s.priceMicro))) : 0;
 }
 
 /** DB 行 → 对外字段（camelCase）。价格与库存**一律来自 Skus**，商品级字段只是汇总值：
@@ -849,13 +899,10 @@ async function rowToPublic(row) {
   const capacity = skus.length && !unlimited ? skus.reduce((n, s) => n + s.capacity, 0) : null;
   const committed = skus.reduce((n, s) => n + s.committed, 0);
   /*
-    商品级"起价"只从**当前可买**的组合里取：停售/售罄的低价组合不能作为列表上的起价，
-    否则用户点进来会发现那个价格对应的组合根本买不到。全都不可买时退回全部组合的 min
-    （商品仍有标价，但列表的售罄态由 soldOut/stock 字段表达）。
+    商品级"起价"只从**当前可买**的组合里取（判据见 `startingPriceMicroOf`：停售/售罄的低价
+    组合不能作为列表上的起价，否则用户点进来会发现那个价格对应的组合根本买不到）。
   */
-  const buyable = skus.filter((s) => s.active && (s.capacity === null || s.committed < s.capacity));
-  const priceBasis = buyable.length ? buyable : skus;
-  const minMicro = priceBasis.length ? Math.min(...priceBasis.map((s) => s.priceMicro)) : 0;
+  const minMicro = startingPriceMicroOf(skus);
   return {
     slug: r.slug,
     /**
@@ -1152,6 +1199,21 @@ function unknownKeysError(body, allowed, where) {
 }
 
 /**
+ * 低库存阈值归一（**唯一实现**）：空/0 ⇒ null（列 NULL = 不提醒；三态不落空串），
+ * 非整数/越界 ⇒ `{ok:false}`。
+ *
+ * 为什么必须是单独一份：单商品写入口（`validateProduct`）与批量入口原来各解析一次，
+ * 批量把 0 原样落库 ⇒ `/all` 的 `available <= alert` 变成"售罄才提醒"，而店主随后改一次标题，
+ * PATCH 带上这个 0 又被归一成 NULL ⇒ 阈值静默消失。同一列只能有一种语义。
+ */
+function normalizeStockAlertAt(raw) {
+  if (raw === undefined || raw === null || raw === '') return { ok: true, value: null };
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 10_000_000) return { ok: false, value: null };
+  return { ok: true, value: n === 0 ? null : n };
+}
+
+/**
  * 商品字段校验（POST 全量 / PATCH 基于现有行合并后全量校验）。
  * 返回 { errors: string[], value: 规范化后的写库字段 }
  */
@@ -1183,7 +1245,15 @@ function validateProduct(v) {
         const type = String(raw?.type || '');
         const url = normalizeMediaUrl(raw?.url);
         if (type === 'image') {
-          if (!url) return [];
+          /*
+            空地址与非法地址同一条拒绝（2026-11）：旧写法把 `url=''` 静默丢掉——店主以为存上了，
+            买家看到少一张图，而主图顺序跟着变（主图进快照）。本段其余分支（未知类型、视频缺 poster、
+            超出条数）都是先报错再裁剪，只有这一处曾静默。
+          */
+          if (!url) {
+            errors.push('图片地址不能为空（空项不会被静默丢弃）');
+            return [];
+          }
           if (!mediaUrlAllowed(url)) {
             errors.push('图片地址仅支持网页外链或本站上传路径');
             return [];
@@ -1281,15 +1351,12 @@ function validateProduct(v) {
     autoDeliver = Number(v.autoDeliver);
     if (![-1, 0, 1].includes(autoDeliver)) errors.push('自动发货设置只能是 -1（跟随全局）/ 0（关闭）/ 1（开启）');
   }
-  // 低库存提醒阈值：余量 ≤ 阈值时店主面板警示；空/0 视为不提醒（列是 NULL = 不提醒，三态不落空串）
-  let stockAlertAt = null;
-  if (v.stockAlertAt !== undefined && v.stockAlertAt !== null && v.stockAlertAt !== '') {
-    stockAlertAt = Number(v.stockAlertAt);
-    if (!Number.isInteger(stockAlertAt) || stockAlertAt < 0 || stockAlertAt > 10000000) {
-      errors.push('低库存阈值必须是 0 到 10000000 的整数，留空表示不提醒');
-    }
-    if (stockAlertAt === 0) stockAlertAt = null;
-  }
+  // 低库存提醒阈值：余量 ≤ 阈值时店主面板警示；空/0 视为不提醒（列是 NULL = 不提醒，三态不落空串）。
+  // 归一只有 `normalizeStockAlertAt` 一份——批量入口与这里共用（两处各写一份时，批量存的 0
+  // 会在下一次单商品编辑时被归一成 NULL，店主的阈值静默消失）。
+  const stockAlert = normalizeStockAlertAt(v.stockAlertAt);
+  const stockAlertAt = stockAlert.value;
+  if (!stockAlert.ok) errors.push('低库存阈值必须是 0 到 10000000 的整数，留空表示不提醒');
   let active = 1;
   if (v.active !== undefined && v.active !== null) {
     // 只接受布尔/0/1：字符串 "false" 曾被默认成 1，店主以为下架、实际仍在卖。
@@ -2166,8 +2233,7 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
   }
   const rows = await getDb().all(
     `SELECT p.id, p.slug, p.title, p.media, p.kind, p.price_currency, p.active, p.node_hidden, p.node_hidden_reason,
-            p.node_hidden_at, p.deleted_at, p.deleted_reason, p.updated_at, p.shop_code, s.name AS shop_name, s.listed AS shop_listed,
-            (SELECT MIN(k.price_micro) FROM product_skus k WHERE k.product_id = p.id) AS min_price
+            p.node_hidden_at, p.deleted_at, p.deleted_reason, p.updated_at, p.shop_code, s.name AS shop_name, s.listed AS shop_listed
        FROM products p JOIN shops s ON s.code = p.shop_code
       WHERE ${where.length ? where.join(' AND ') : '1 = 1'}
       ORDER BY p.id ${sort === 'recent' ? 'DESC' : 'ASC'} LIMIT ?`,
@@ -2176,8 +2242,13 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
   );
   const hasMore = rows.length > pageSize;
   const page = hasMore ? rows.slice(0, pageSize) : rows;
+  // 起价与公开面同源（`startingPriceMicroOf`）：这是节点主的处置视图，更要显示买得到的价。
+  const withSkuRows = await withSkusBatch(page);
   ok(res, {
-    products: page.map((r) => ({
+    products: withSkuRows.map((r) => {
+      const facts = skuPriceFactsOf(r.skus);
+      const micro = facts.length ? startingPriceMicroOf(facts) : null;
+      return {
       slug: r.slug,
       title: r.title,
       /**
@@ -2201,10 +2272,11 @@ router.get('/admin/all', nodeAdmin, wrap(async (req, res) => {
       deletedReason: String(r.deleted_reason || ''),
       deletedAt: r.deleted_at ?? null,
       priceCurrency: r.price_currency,
-      priceMicro: r.min_price === null ? null : Number(r.min_price),
-      price: r.min_price === null ? null : priceOf(r.min_price),
+      priceMicro: micro,
+      price: micro === null ? null : priceOf(micro),
       updatedAt: r.updated_at,
-    })),
+      };
+    }),
     nextCursor: hasMore && page.length ? page[page.length - 1].id : null,
   });
 }));
@@ -2531,9 +2603,11 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
   }
   if (b.active !== undefined && ![true, false, 0, 1].includes(b.active)) return fail(res, '上架状态必须是布尔值');
   if (b.autoDeliver !== undefined && ![-1, 0, 1].includes(Number(b.autoDeliver))) return fail(res, '自动发货设置只能是 -1、0 或 1');
-  if (b.stockAlertAt !== undefined && b.stockAlertAt !== null && b.stockAlertAt !== '') {
-    const n = Number(b.stockAlertAt);
-    if (!Number.isInteger(n) || n < 0 || n > 10000000) return fail(res, '库存提醒值必须是 0 到 10000000 的整数');
+  // 与单商品入口同一归一（0/空 ⇒ null）：两处各写一份时，批量存的 0 会在下一次单商品编辑时
+  // 被归一成 NULL，店主的阈值静默消失；而 0 落在列里又会被 /all 读成"售罄才提醒"。
+  const batchAlert = normalizeStockAlertAt(b.stockAlertAt);
+  if (b.stockAlertAt !== undefined && !batchAlert.ok) {
+    return fail(res, '库存提醒值必须是 0 到 10000000 的整数');
   }
   /*
     批量改价只能在同一计价币种内成立：100 USDT 与 100 BTY 的微单位数值相同但价值不同。
@@ -2576,12 +2650,7 @@ router.patch('/batch', staffOnly, wrap(async (req, res) => {
       if (row.deleted_at != null) return { failed: '商品已删除' };
       const nextActive = b.active !== undefined ? (b.active === false || b.active === 0 ? 0 : 1) : row.active;
       const nextAutoDeliver = b.autoDeliver !== undefined ? Number(b.autoDeliver) : row.auto_deliver;
-      const nextStockAlertAt =
-        b.stockAlertAt !== undefined
-          ? b.stockAlertAt === null || b.stockAlertAt === ''
-            ? null
-            : Number(b.stockAlertAt)
-          : row.stock_alert_at;
+      const nextStockAlertAt = b.stockAlertAt !== undefined ? batchAlert.value : row.stock_alert_at;
       /*
         先更新商品行并带 `deleted_at IS NULL` 守卫：若并发删除落在上面的读与这里之间，
         本次批量修改必须整体失败，不能把已删除商品重新写回"在售/改价"状态。
@@ -2716,6 +2785,31 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     await db.all('SELECT id FROM product_skus WHERE product_id = ? FOR UPDATE', row.id);
     const prevSkuRows = await loadSkus(row.id);
     const prevSkuMap = new Map(prevSkuRows.map((s) => [s.sku_key, s]));
+    /*
+      改计价币种 = 把**全部 SKU 的价格数字**按新单位重新解释（100 USDT 变成 100 BTY）。批量入口
+      早已拒绝"跨币种同一个数字"（见 PATCH /batch 的说明）；单商品入口如果只换币种、价格沿用，
+      就是一次**静默整单重定价**——金额可能差一个数量级，而审计只记 `priceCurrency` 变了。
+      判据落在"币种变了 且 有组合没同批给价"这一对上：要换币种就把每个组合的价格给全。
+    */
+    if (b.priceCurrency !== undefined && String(b.priceCurrency) !== String(row.price_currency)) {
+      const provided = new Map(
+        (Array.isArray(b.skus) ? b.skus : []).map((s) => [String(s?.key ?? '').trim(), s])
+      );
+      const missing = prevSkuRows
+        .filter((s) => {
+          const p = provided.get(String(s.sku_key ?? ''));
+          return !p || p.priceMicro === undefined;
+        })
+        .map((s) => s.sku_key || '默认');
+      if (missing.length) {
+        return abortTx({
+          fail:
+            '改计价币种必须同批提交每个组合的新价格（skus[].priceMicro）：' +
+            `同一个数字在不同币种下不是一回事，缺：${missing.join('、')}。` +
+            '只改币种会把整件商品静默重定价。',
+        });
+      }
+    }
     const mergeKind = b.kind !== undefined ? String(b.kind) : row.kind;
     const merged = {
       title: b.title !== undefined ? b.title : row.title,
@@ -2832,20 +2926,28 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
           fail: '该商品仍有未终结订单或在途池占位，不可变更类型；请等待这些订单交付/取消/终结，并清空池后再改',
         });
       }
+      /*
+        池的闸只看 **`unused` 行**：`used` 行是"永不复用"的墓碑（`product_codes`/`product_nft_tokens`
+        都只有 unused/used 两态，清池路由按设计只删 unused——删掉墓碑会让同一个码被再发一次）。
+        旧判据数**全池行**，于是只要卖出过一件，闸就永远为真；而唯一能清池的路由又删不掉 used 行
+        ⇒ "请先清空码池"是一句**没有任何路由能满足**的指令，店主从此改不了型。已交付的码/NFT
+        编号是冻结事实（凭证在交付子表），不随商品 kind 改变，所以它们不该拦住改型。
+      */
       if (row.kind === 'digital') {
-        const pool = await db.get('SELECT COUNT(*) AS c FROM product_codes WHERE product_id = ?', row.id);
-        if (Number(pool.c) > 0) return abortTx({ fail: '该数字商品已配置兑换码池，不可变更类型；请先清空码池' });
+        const pool = await db.get("SELECT COUNT(*) AS c FROM product_codes WHERE product_id = ? AND status = 'unused'", row.id);
+        if (Number(pool.c) > 0) return abortTx({ fail: '该数字商品还有未使用的兑换码，不可变更类型；请先清空未使用的码（已交付的码会保留）' });
       }
       if (row.kind === 'nft') {
-        const pool = await db.get('SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = ?', row.id);
-        if (Number(pool.c) > 0) return abortTx({ fail: '该 NFT 商品已配置交付池，不可变更类型；请先清空交付池' });
+        const pool = await db.get("SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = ? AND status = 'unused'", row.id);
+        if (Number(pool.c) > 0) return abortTx({ fail: '该 NFT 商品还有未交付的编号，不可变更类型；请先清空未交付的编号（已交付的会保留）' });
       }
     }
     // NFT 商品已建交付池后禁止变更 NFT 标准（交付核验语义与池内库存绑定，避免 erc721/erc1155 错配）
+    // 判据同上：只看**未交付**的池行——已交付的编号是墓碑，不再参与交付核验。
     if (row.kind === 'nft' && merged.kind === 'nft' && merged.nftStandard !== row.nft_standard) {
-      const pool = await db.get('SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = ?', row.id);
+      const pool = await db.get("SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = ? AND status = 'unused'", row.id);
       if (Number(pool.c) > 0) {
-        return abortTx({ fail: '该 NFT 商品已配置交付池，不可变更 NFT 标准（ERC721/ERC1155）；请先清空交付池' });
+        return abortTx({ fail: '该 NFT 商品还有未交付的编号，不可变更 NFT 标准（ERC721/ERC1155）；请先清空未交付的编号' });
       }
     }
     // NFT 商品中途更换合约地址同样禁止（与 nft_standard 同规则）：订单快照锁定旧合约、
@@ -2854,9 +2956,9 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
       row.kind === 'nft' && merged.kind === 'nft' &&
       String(merged.nftContract || '').toLowerCase() !== String(row.nft_contract || '').toLowerCase()
     ) {
-      const pool = await db.get('SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = ?', row.id);
+      const pool = await db.get("SELECT COUNT(*) AS c FROM product_nft_tokens WHERE product_id = ? AND status = 'unused'", row.id);
       if (Number(pool.c) > 0) {
-        return abortTx({ fail: '该 NFT 商品已配置交付池，不可更换 NFT 合约地址；请先清空交付池' });
+        return abortTx({ fail: '该 NFT 商品还有未交付的编号，不可更换 NFT 合约地址；请先清空未交付的编号' });
       }
     }
     const { errors, value } = validateProduct(merged);
@@ -2954,9 +3056,14 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     // 编辑的是总量，不是余量：每个组合的总量不得小于该组合的已占位数
     // （committed 只由订单生命周期驱动——取消/退款/超时自动释放，编辑不释放，
     // 改小即制造矛盾账目）
+    //
+    // **改名也要算进来**：一对一改名时旧键的 committed 会被搬到新键（`carriedCommittedOf`，
+    // 与 saveSkus 同一份定义）。只按新 key 查 prevSkuMap 会漏掉这笔搬运 ⇒ 校验放行、插入撞
+    // `ck_skus_committed` ⇒ 500。校验口径必须与落库口径同源。
     const prevSkus = prevSkuMap;
+    const carried = carriedCommittedOf(prevSkuRows, value.skus);
     for (const s of value.skus) {
-      const cm = prevSkus.get(s.key)?.committed || 0;
+      const cm = (prevSkus.get(s.key)?.committed || 0) + (carried.get(String(s.key ?? '')) || 0);
       if (s.capacity !== null && cm > s.capacity) {
         return abortTx({
           fail: `组合「${s.key || '默认'}」总库存不能小于已占位 ${cm} 件（占用量含未支付草稿，取消/退款/超时后释放；编辑不释放）`,
@@ -2975,53 +3082,18 @@ router.patch('/:slug', staffOnly, wrap(async (req, res) => {
     });
     if (willRestrict.length) {
       /*
-        在途/未回收的承诺量 = 「**还押着占位**」**且** `hold_qty = 0` 的行。
-        为什么必须带 `hold_qty = 0`：不限量期间下单的行从未占位，它们的承诺量没记进 `committed`，
-        切回限量时要现补（这是本段存在的理由）。而"已交付+退款+退货未收到"那类行的占位
-        **已经记在 `committed` 里**（只是没释放），把它算进来会重复计入 ⇒ `committed` 虚高 ⇒ 商品卖不出去。
-        两个谓词都来自 `stockHold` 的唯一实现，不在路由里手写状态白名单。
+        在途/未回收的承诺量 = 「**还押着占位**」**且** `hold_qty = 0` 的行。为什么必须带
+        `hold_qty = 0`：不限量期间下单的行从未占位，它们的承诺量没记进 `committed`，切回限量时
+        要现补；而"已交付+退款+退货未收到"那类行的占位**已经记在 `committed` 里**（只是没释放），
+        算进来会重复计入。两个谓词都来自 `stockHold` 的唯一实现，不在路由里手写状态白名单。
+
+        补记本身收在 `stockHold.commitPromiseUnits`：它先锁候选行、再按**锁到的集合**算件数并
+        同时写 `hold_qty` 与 `committed`。旧实现这里是"聚合读一次 + 加锁写一次"，两次读的不是
+        同一批订单（取消/超时/复活的窗口里会少卖或超卖），见该函数的说明。
       */
-      const IN_FLIGHT = `${uncommittedPromiseSql('o')} AND ${stockPromiseSql('o')}`;
-      // 先整体算一遍在途量，任一组合放不下就整体拒绝（不留部分生效）
-      const plans = [];
-      for (const s of willRestrict) {
-        /*
-          ⚠️ `COALESCE(SUM(quantity), 0)` 是 **DECIMAL ⇒ 字符串**（db.js 的 decimalNumbers:false）。
-          不转数字的话下面 `cm + inFlight` 会先拼成字符串（0 + "3" = "03"），
-          与容量比较时再被隐式转回数字——判断在多数取值上恰好成立，在边界上静默失效。
-          这正是"凡消费聚合的地方都必须显式 Number(...)"那条纪律的由来。
-        */
-        const inFlight = Number((await db.get(`SELECT COALESCE(SUM(quantity), 0) AS total FROM orders o WHERE o.product_id = ? AND o.sku_key = ? AND o.hold_qty = 0 AND ${IN_FLIGHT}`, row.id, s.key)).total);
-        const cm = prevSkus.get(s.key)?.committed || 0;
-        if (cm + inFlight > s.capacity) {
-          return abortTx({
-            fail: `组合「${s.key || '默认'}」切回限量失败：在途/待回收订单尚有 ${inFlight} 件，加已占位/已售 ${cm} 件共需 ${cm + inFlight} 件容量，超过你设置的 ${s.capacity} 件——请提高总量，或先处理在途订单（取消草稿/等待终结/确认回收退货）`,
-          });
-        }
-        plans.push({ key: s.key, inFlight });
-      }
-      /*
-        补记 hold_qty 与 committed 在**本事务内**（进程中断不留半写状态：只补 hold_qty 未加
-        committed 会造成占位虚高）。这两条判据的读数（`inFlight`）与写入现在同处一个事务，
-        并发的买家下单占位不可能落在它们之间。
-      */
-      const addCommittedSql = 'UPDATE product_skus SET committed = committed + ? WHERE product_id = ? AND sku_key = ?';
-      /*
-        补记 hold_qty 时**必须同时清 released_qty/released_at**（源码审计 2026-09 修复）：
-        `released_qty` 是逐件释放账本，`released_at` 是整单释放时刻；releaseCore 只处理
-        `released_qty < hold_qty` 的行（stockHold.js）。而 hold_qty=0 ∧ released_qty>0 这一组合是
-        restockOrder 在「组合当前不限量」分支下刻意产生的（占位作废但保留已释放语义）。若此处只补
-        hold_qty 不清标记，该行将永远无法再被释放：后续取消/退款/超时时 releaseCore 直接跳过，
-        committed 永久虚高（= 一件货再也卖不出去，且没有任何订单与之对应）。
-      */
-      const markHeldSql = `UPDATE orders AS o SET hold_qty = quantity, released_qty = 0, released_at = NULL
-        WHERE o.product_id = ? AND o.sku_key = ? AND o.hold_qty = 0 AND ${IN_FLIGHT}`;
-      for (const p of plans) {
-        if (p.inFlight > 0) {
-          await db.run(markHeldSql, row.id, p.key);
-          await db.run(addCommittedSql, p.inFlight, row.id, p.key);
-        }
-      }
+      const targets = new Map(willRestrict.map((s) => [s.key, { capacity: s.capacity }]));
+      const committed = await commitPromiseUnits(row.id, targets);
+      if (!committed.ok) return abortTx({ fail: committed.fail });
     }
 
     /*
@@ -3193,7 +3265,7 @@ router.post('/:slug/codes', staffOnly, wrap(async (req, res) => {
     那种"静默丢数据"换来的 0 分不清是重复还是写入失败。
     `created_at` 不传：列是 `DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)`，由服务器盖章。
   */
-  const imported0 = await withTransaction(async () => {
+  const imported0 = await withDeadlockRetry(() => withTransaction(async () => {
     /*
       事务内重读 kind：上面那次 `product.kind !== 'digital'` 的判定在事务**之外**，
       并发的 PATCH /:slug 可以在那之后把这个商品改成别的类型（那条路径的闸读的正是本池计数，
@@ -3217,7 +3289,7 @@ router.post('/:slug/codes', staffOnly, wrap(async (req, res) => {
       }
     }
     return { imported: n, stats: await codeStats(db, product.id) };
-  });
+  }));
   if (imported0.fail) return fail(res, imported0.fail);
   const { imported, stats } = imported0;
   // skipped = 去重后条目中未导入的（超长被过滤 + 与库内重复）
@@ -3428,7 +3500,7 @@ router.post('/:slug/tokens', staffOnly, wrap(async (req, res) => {
     tokenId"（这个计数印给店主看），而 `INSERT IGNORE` 会把外键/截断一并降级成警告。
     `created_at` 不传：列是 `DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)`，由服务器盖章。
   */
-  const imported0 = await withTransaction(async () => {
+  const imported0 = await withDeadlockRetry(() => withTransaction(async () => {
     /*
       事务内重读 kind：上面那次 `product.kind !== 'nft'` 的判定在事务**之外**，并发的
       PATCH /:slug 可以在那之后改类型/换合约（那条路径的闸读的正是本池计数，两者靠商品行上的锁串行）。
@@ -3450,7 +3522,7 @@ router.post('/:slug/tokens', staffOnly, wrap(async (req, res) => {
       }
     }
     return { imported: n, stats: await nftStats(db, product.id) };
-  });
+  }));
   if (imported0.fail) return fail(res, imported0.fail);
   const { imported, stats } = imported0;
   const skipped = values.length - imported;

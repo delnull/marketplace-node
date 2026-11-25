@@ -29,8 +29,9 @@
  * 或节点主撤销了争议（`ClaimDisputeCancelled`）。**两种的本地终态不同**：前者是
  * `rejected/closed`（判店主无责），后者是 `cancelled/cancelled`（双方和解、不是判决）。
  * 只看 `closed + 零赔付` 会把撤销写成"判店主无责"（演示栈实际撞到过：watcher 还没消费
- * 撤销事件，这一轮先把它写成了 rejected）。所以本函数每轮先扫一次 `ClaimDisputeCancelled`
- * 日志，按**撤销证据**决定写哪一种；日志读不到就推迟本轮，不猜。
+ * 撤销事件，这一轮先把它写成了 rejected）。所以本函数先读一次 `ClaimDisputeCancelled` 日志，
+ * 按**撤销证据**决定写哪一种。这次读取是**有界且可续扫**的（见 `scanCancelledClaimIds`）：
+ * 集合没覆盖到本轮链头时，"查不到撤销"只推迟、不当结论。
  */
 import config from './config.js';
 import { getDb } from './db.js';
@@ -43,6 +44,17 @@ const INTERVAL_MS = config.claimReconcile.intervalMs;
 const MIN_AGE_MS = 60_000;
 const LIMIT = 20;
 const RPC_TIMEOUT_MS = 15_000;
+/*
+  撤销证据的扫描粒度与单轮预算（2026-11）。
+
+  为什么必须分块：旧实现每轮把 `[部署块, finalized]` 一次 `queryFilter` 全扫。链龄一大，
+  这个范围必然被 RPC 按范围/结果上限拒绝——而失败只把"零赔付结案"推迟到下一轮，
+  于是**兜底从此永久静默失效**，唯一信号是一行 warn。
+  分块 + 进程内续扫后：每轮最多花 `SCAN_BUDGET_MS`，游标停在哪就从哪继续；追平后每轮只扫新增块。
+  块大小取 2000，与 `escrowWatcher` 的 `SCAN_LIMIT` 同档（同一批 RPC 端点实测能接受的范围）。
+*/
+const SCAN_CHUNK_BLOCKS = 2_000;
+const SCAN_BUDGET_MS = 8_000;
 
 /**
  * 每轮从上次的 id 之后继续，而不是永远取 `id ASC LIMIT 20`。
@@ -72,35 +84,63 @@ function withTimeout(promise, ms) {
 
 let claimScanWarned = false;
 
-/** 起点未配置时只提示一次（每轮都喊会把日志刷满） */
-function claimScanWarnOnce() {
+/** 起点未配置/高度不可分块时只提示一次（每轮都喊会把日志刷满） */
+function claimScanWarnOnce(reason) {
   if (claimScanWarned) return;
   claimScanWarned = true;
   console.warn(
-    '[claimReconcile] 未配置 MK_ESCROW_START_BLOCK：无法用有界范围证明"没有撤销事件"，' +
-      '零赔付结案只走事件路径（本地槽位暂不释放）。要恢复兜底，把它设成节点部署块。'
+    `[claimReconcile] ${reason}：无法用有界范围证明"没有撤销事件"，` +
+      '零赔付结案只走事件路径（本地槽位暂不释放）。要恢复兜底，把 MK_ESCROW_START_BLOCK 设成节点部署块。'
   );
 }
 
+/*
+  撤销事件的续扫状态（进程内）。三个变量共同表达一件事：**这个集合已经完整覆盖到哪个高度**。
+  未追平之前，`ids` 里"没有某个 claimId"不能推出"它没被撤销"——所以只看证据、不写 rejected。
+*/
+let scanFrom = null; // 集合的起点（= MK_ESCROW_START_BLOCK）
+let scanCursor = null; // 下一段要扫的块（null = 从起点开始）
+let scanIds = new Set(); // 已扫到的撤销 claimId
+let scanKnownTo = 0; // 集合完整覆盖到的高度（0 = 未完整）
+let scanHead = 0; // 上次看到的链头（用来识别链回退/换链）
+
 /**
- * 本轮"链上撤销过"的 claimId 集合（`ClaimDisputeCancelled` 日志）。
+ * 本轮"链上撤销过"的 claimId 集合——**有界、可续扫**。
  *
- * 每轮只扫一次、只读这一个事件的 topic：候选行每轮至多 20 条，逐行查日志会把 RPC 次数
- * 放大 20 倍。起点取 `MK_ESCROW_START_BLOCK`（节点自己的部署块），与 watcher 的扫描面一致。
+ * 只读这一个事件的 topic：候选行每轮至多 20 条，逐行查日志会把 RPC 次数放大 20 倍。
+ * 读失败**抛错**（含超时）：调用方据此推迟本轮，而不是把"没读到撤销证据"当成"确实不是撤销"。
+ * 链回退（`toBlock` 小于上次链头）或起点变了 ⇒ 清空集合从起点重扫：宁可推迟，
+ * 也不用一份来自旧链的集合去断言"这单没被撤销"。
  *
- * 读失败**抛错**：调用方据此推迟本轮，而不是把"没读到撤销证据"当成"确实不是撤销"。
+ * @returns {Promise<{ids: Set<string>, complete: boolean}>} `complete` = 集合覆盖到 `toBlock`
  */
-async function readCancelledClaimIds(chain, toBlock, fromBlock) {
-  const logs = await withTimeout(
-    chain.queryFilter(chain.filters.ClaimDisputeCancelled(), fromBlock, toBlock),
-    RPC_TIMEOUT_MS
-  );
-  const ids = new Set();
-  for (const log of logs) {
-    const id = String(log?.args?.[0] ?? '').toLowerCase();
-    if (/^0x[0-9a-f]{64}$/.test(id)) ids.add(id);
+async function scanCancelledClaimIds(chain, fromBlock, toBlock) {
+  if (scanFrom !== fromBlock || toBlock < scanHead) {
+    scanFrom = fromBlock;
+    scanCursor = fromBlock;
+    scanIds = new Set();
+    scanKnownTo = 0;
   }
-  return ids;
+  scanHead = Math.max(scanHead, toBlock);
+  const startedAt = Date.now();
+  let chunks = 0;
+  while (scanCursor <= toBlock) {
+    // 至少推进一块：否则预算边界上会一轮一轮白跑
+    if (chunks > 0 && Date.now() - startedAt >= SCAN_BUDGET_MS) break;
+    const to = Math.min(toBlock, scanCursor + SCAN_CHUNK_BLOCKS - 1);
+    const logs = await withTimeout(
+      chain.queryFilter(chain.filters.ClaimDisputeCancelled(), scanCursor, to),
+      RPC_TIMEOUT_MS
+    );
+    for (const log of logs) {
+      const id = String(log?.args?.[0] ?? '').toLowerCase();
+      if (/^0x[0-9a-f]{64}$/.test(id)) scanIds.add(id);
+    }
+    scanCursor = to + 1;
+    chunks += 1;
+  }
+  if (scanCursor > toBlock) scanKnownTo = toBlock;
+  return { ids: scanIds, complete: scanKnownTo >= toBlock };
 }
 
 async function selectBatch(db, afterId, cutoff, limit) {
@@ -126,7 +166,8 @@ async function selectBatch(db, afterId, cutoff, limit) {
  * 对一批本地未结/待开案的 claim 做一次链上终态核对。
  * 导出供周期任务与单测使用；传入 escrow 可替换链上读数，blockTag 可让测试跳过 RPC head。
  *
- * @param {{escrow?: object, now?: number, limit?: number, minAgeMs?: number, blockTag?: number|string}} [opts]
+ * @param {{escrow?: object, now?: number, limit?: number, minAgeMs?: number, blockTag?: number|string,
+ *          scanFromBlock?: number}} [opts] `scanFromBlock` 仅测试注入（生产取 MK_ESCROW_START_BLOCK）
  * @returns {Promise<{checked:number, closed:number, unreadable:number, missingSnapshot:number}>}
  */
 export async function reconcileClaims({
@@ -135,6 +176,7 @@ export async function reconcileClaims({
   limit = LIMIT,
   minAgeMs = MIN_AGE_MS,
   blockTag = null,
+  scanFromBlock = null,
 } = {}) {
   const db = getDb();
   /* 先清过期的未处理声明：纯本地状态、不依赖链上读数；失败不阻断下面的链上对账 */
@@ -161,21 +203,34 @@ export async function reconcileClaims({
     那种情况下按老判据走（把它们当"判店主无责"），不把"替身不支持"误解成"链上读不到"。
 
     扫描起点必须是**有界**的：`MK_ESCROW_START_BLOCK`（节点自己的部署块）。
-    起点为 0 表示"没有配置"，此时**不猜**——扫全史会被 RPC 按范围拒绝/超时，而"没扫到撤销"
-    与"确实不是撤销"在没有证据时不可区分；这种部署只让事件路径写终态（槽位暂不释放，游标回放会补）。
+    起点为 0 表示"没有配置"，此时**不猜**——"没扫到撤销"与"确实不是撤销"在没有证据时不可区分；
+    这种部署只让事件路径写终态（槽位暂不释放，游标回放会补）。高度不是数值（测试传 'latest'）同理：
+    分不了块就没有"覆盖到哪里"可言。
   */
   let cancelledIds = null;
-  let cancelScanFailed = false;
-  const logScanFrom = Number(config.escrow.startBlock || 0);
-  if (typeof chain.queryFilter === 'function' && typeof chain.filters?.ClaimDisputeCancelled === 'function') {
-    if (logScanFrom <= 0) {
-      cancelScanFailed = true;
-      claimScanWarnOnce();
+  const canScan =
+    typeof chain.queryFilter === 'function' && typeof chain.filters?.ClaimDisputeCancelled === 'function';
+  // 替身不支持事件 ⇒ 老判据（判店主无责）；此时"集合完整"退化为"不依赖证据"
+  let cancelKnown = !canScan;
+  const logScanFrom = Number(scanFromBlock ?? config.escrow.startBlock ?? 0);
+  if (canScan) {
+    if (logScanFrom <= 0 || !Number.isSafeInteger(pinned)) {
+      claimScanWarnOnce(
+        logScanFrom <= 0 ? '未配置 MK_ESCROW_START_BLOCK' : `链上高度不可分块（${String(pinned)}）`
+      );
     } else {
       try {
-        cancelledIds = await readCancelledClaimIds(chain, pinned, logScanFrom);
+        const scan = await scanCancelledClaimIds(chain, logScanFrom, pinned);
+        cancelledIds = scan.ids;
+        cancelKnown = scan.complete;
+        if (!cancelKnown) {
+          // 续扫中不是故障：本轮只写能证明的那一类（撤销），其余推迟到追平之后
+          console.log(
+            `[claimReconcile] 撤销事件续扫中：已覆盖到块 ${scanKnownTo}（链头 ${pinned}），本轮其余零赔付结案推迟`
+          );
+        }
       } catch (e) {
-        cancelScanFailed = true;
+        cancelKnown = false;
         console.warn(`[claimReconcile] 本轮读不到撤销事件（零赔付结案推迟到下一轮）：${e?.message || e}`);
       }
     }
@@ -208,11 +263,11 @@ export async function reconcileClaims({
 
       /*
         零赔付结案有两种（见文件头）：判店主无责 → rejected/closed；节点主撤销 → cancelled/cancelled。
-        撤销证据只在事件里（合约只留 closed 一个布尔），所以这里按 claimId 查本轮的撤销集合。
-        读不到撤销集合（cancelScanFailed）就**推迟**：写错一种就再也改不回来（终态）。
+        撤销证据只在事件里（合约只留 closed 一个布尔），所以这里按 claimId 查续扫集合。
+        集合**未覆盖到本轮高度**时，"不在集合里"不等于"没撤销"——推迟（unreadable），不猜。
       */
       const wasCancelled = cancelledIds ? cancelledIds.has(String(row.dispute_claim_id).toLowerCase()) : false;
-      if (!wasCancelled && cancelScanFailed) {
+      if (!wasCancelled && !cancelKnown) {
         unreadable += 1;
         continue;
       }

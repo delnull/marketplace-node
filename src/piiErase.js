@@ -346,8 +346,21 @@ export async function eraseOrderPii(orderNo) {
       没有收货信息行也要写锚点：事实是"这一单此刻确实没有个人数据了"（可能因为从未填写，
       也可能因为上一次已经擦过），而**"擦过"必须留下痕迹**——否则保留期扫描会反复选中它，
       每一轮都白跑一次事务。
+
+      **状态谓词就挂在这条锚点上**（而不是只在"有收货信息行"那一支里判一次）：
+      没有 shipping 行的订单（从没填过收货信息，或上一次已擦过）走不到上面那条 DELETE，
+      于是陈述墓碑化、附件删除、claim 清零会失去唯一的状态复核——一张被 watcher 从
+      cancelled 恢复成 escrowed 的在途单会在这里被销毁裁决证据。`foundRows=1` 才继续，
+      一条语句同时覆盖"有/无收货信息行"两条分支。
     */
-    await db.run('UPDATE orders SET pii_erased_at = CURRENT_TIMESTAMP(3) WHERE id = ?', orderId);
+    const anchor = await db.run(
+      `UPDATE orders SET pii_erased_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND status IN (${ERASABLE_MARKS})`,
+      orderId, ...PII_ERASABLE_STATUS
+    );
+    if (anchor.foundRows !== 1) {
+      const fresh = await db.get('SELECT status FROM orders WHERE id = ?', orderId);
+      return abortTx(fresh ? notTerminal(String(fresh.status)) : notFound());
+    }
     // 已终结的提货声明：清掉收货人与备注；claim_no/金额/链上争议结论保留为账目事实。
     counts.claimPii = (await db.run(
       `UPDATE nft_claims

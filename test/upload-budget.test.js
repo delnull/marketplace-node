@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { __setRedisClientForTest } from '../src/redis.js';
 import { createFakeRedis } from './fakeRedis.mjs';
-import { reserveUploadBytes, commitUploadBytes, releaseUploadBytes } from '../src/uploadBudget.js';
+import { reserveUploadBytes, settleUploadBytes } from '../src/uploadBudget.js';
 
 __setRedisClientForTest(createFakeRedis());
 
@@ -25,24 +25,32 @@ test('预留是原子判据：并发的第二笔不可能越过上限', async ()
   assert.equal((await reserveUploadBytes('bob', 100, LIMIT, WINDOW)).ok, true);
 });
 
-test('commit 下调为实际字节；只减不增，异常大的实际值被夹在预留内', async () => {
+test('settle 下调为实际字节；只减不增，异常大的实际值被夹在预留内', async () => {
   const r = await reserveUploadBytes('carol', 80, LIMIT, WINDOW);
   assert.equal(r.ok, true);
-  await commitUploadBytes(r.reservation, 10);
+  await settleUploadBytes(r.reservation, 10);
   assert.equal((await reserveUploadBytes('carol', 90, LIMIT, WINDOW)).ok, true, '10 + 90 = 100 恰好允许');
   assert.equal((await reserveUploadBytes('carol', 1, LIMIT, WINDOW)).ok, false);
 
   const r2 = await reserveUploadBytes('dave', 40, LIMIT, WINDOW);
-  await commitUploadBytes(r2.reservation, 9_999);
+  await settleUploadBytes(r2.reservation, 9_999);
   const r3 = await reserveUploadBytes('dave', 60, LIMIT, WINDOW);
   assert.equal(r3.ok, true, '实际值再大也只能占预留的 40，剩余 60 仍可用');
 });
 
-test('release 全额归还；失败的上传不吃额度', async () => {
+test('正常失败（临时文件已删）⇒ settle 0，等价于旧的全额归还', async () => {
   const r = await reserveUploadBytes('erin', 100, LIMIT, WINDOW);
   assert.equal((await reserveUploadBytes('erin', 1, LIMIT, WINDOW)).ok, false);
-  await releaseUploadBytes(r.reservation);
+  await settleUploadBytes(r.reservation, 0);
   assert.equal((await reserveUploadBytes('erin', 100, LIMIT, WINDOW)).ok, true);
+});
+
+test('失败但临时文件删不掉 ⇒ 按留在磁盘上的字节结算（不把磁盘白占当成 0 额度）', async () => {
+  const r = await reserveUploadBytes('gina', 100, LIMIT, WINDOW);
+  assert.equal(r.ok, true);
+  await settleUploadBytes(r.reservation, 30); // 30 字节留在磁盘上（discard 失败）
+  assert.equal((await reserveUploadBytes('gina', 70, LIMIT, WINDOW)).ok, true, '70 + 30 = 100 恰好允许');
+  assert.equal((await reserveUploadBytes('gina', 1, LIMIT, WINDOW)).ok, false, '漏掉的字节仍占额度');
 });
 
 test('窗口过期后额度自动归零（TTL 由 Redis 负责）', async () => {

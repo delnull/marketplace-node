@@ -91,6 +91,18 @@ test('active/claimable 非法值明确拒绝（不得静默转成"开启"）', a
     .expect(200);
   assert.notEqual(badClaimable.body.code, 0);
   assert.match(String(badClaimable.body.message), /是否支持提货/);
+
+  /*
+    空图片地址：旧实现静默丢掉这一项（店主以为存上了、买家少一张图、主图顺序跟着变）。
+    本段其余分支都是先报错再裁剪，所以这里钉住"带字段名拒绝"。
+  */
+  const blankImage = await request(app)
+    .post('/api/products')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send(productPayload({ media: [{ type: 'image', url: '   ' }] }))
+    .expect(200);
+  assert.notEqual(blankImage.body.code, 0, '空图片地址必须拒绝，不许静默丢弃');
+  assert.match(String(blankImage.body.message), /图片地址不能为空/);
 });
 
 test('草稿：POST 采纳 active=false；买家看不到、店主看得到；上架后立即公开', async () => {
@@ -266,4 +278,48 @@ test('在途承诺读数：下单占位后出现，取消后消失（改规格�
   assertOk(cancelled);
   const released = (await allProducts('限量一件')).find((x) => x.slug === p.slug);
   assert.deepEqual(released.pendingPromises, [], '取消释放占位后承诺结清，读数回到空');
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   库存提醒阈值：批量入口与单商品入口同一归一（2026-11）
+   ══════════════════════════════════════════════════════════════════════ */
+
+test('批量库存提醒：0 落 NULL（不是"售罄才提醒"）；阈值不会被下一次单商品编辑抹掉', async () => {
+  const p = await create(productPayload({ title: '提醒阈值·甲', stockAlertAt: 5 }));
+  assert.equal((await allProducts('提醒阈值·甲'))[0]?.stockAlertAt, 5);
+
+  const setThree = await request(app)
+    .patch('/api/products/batch')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ slugs: [p.slug], patch: { stockAlertAt: 3 } })
+    .expect(200);
+  assertOk(setThree);
+  assert.equal((await allProducts('提醒阈值·甲'))[0].stockAlertAt, 3, '批量设的阈值必须真的落库');
+
+  const setZero = await request(app)
+    .patch('/api/products/batch')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ slugs: [p.slug], patch: { stockAlertAt: 0 } })
+    .expect(200);
+  assertOk(setZero);
+  assert.equal(
+    (await allProducts('提醒阈值·甲'))[0].stockAlertAt,
+    null,
+    '0 必须是"不提醒"（NULL）：原样落 0 会变成"售罄才提醒"'
+  );
+
+  // 单商品改标题不得把刚设的阈值抹掉（三个入口共用同一归一）
+  const setFour = await request(app)
+    .patch('/api/products/batch')
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ slugs: [p.slug], patch: { stockAlertAt: 4 } })
+    .expect(200);
+  assertOk(setFour);
+  const renamed = await request(app)
+    .patch(`/api/products/${p.slug}`)
+    .set('Authorization', `Bearer ${ownerToken}`).set('X-Mk-Shop', shopRef.value)
+    .send({ title: '提醒阈值·乙' })
+    .expect(200);
+  assertOk(renamed);
+  assert.equal((await allProducts('提醒阈值·乙'))[0].stockAlertAt, 4, '改标题不得抹掉阈值');
 });

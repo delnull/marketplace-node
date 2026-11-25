@@ -195,12 +195,31 @@ test('提交 → 公开状态（无 PII）→ 我的提货行 → 一枚 token �
   assert.equal(row.orderNo, undefined, '公开面不下发订单号（详情页句柄）');
   assert.equal(row.note, undefined, '公开面不下发店主驳回理由');
   assert.equal(row.status, 'requested');
+  assert.equal(row.productTitle, '提货测试 NFT', '公开面也能看到买过的商品名');
+  assert.equal(row.productImage, 'https://example.com/a.jpg', '公开面返回商品首图');
+  assert.equal(row.shopCode, shopRef.value, '提货行能还原到店铺');
+  assert.ok('shopName' in row, '公开面带店铺名（测试店铺名为空时为 null）');
+  assert.ok(row.skuSpecs && typeof row.skuSpecs === 'object', '下单规格随提货行返回');
 
   // 我的提货行（含自己填的收货信息；订单号/备注只在持有人视角）
   const mine = await request(app).get('/api/claims/nft/mine').set('Authorization', `Bearer ${buyerToken}`).expect(200);
   assert.equal(mine.body.data.claims.length, 1);
+  assert.equal(mine.body.data.total, 1);
+  assert.equal(mine.body.data.page, 1);
+  assert.equal(mine.body.data.pageSize, 20);
   assert.equal(mine.body.data.claims[0].orderNo, order.id);
+  assert.equal(mine.body.data.claims[0].productTitle, '提货测试 NFT');
+  assert.equal(mine.body.data.claims[0].productImage, 'https://example.com/a.jpg');
+  assert.equal(mine.body.data.claims[0].shopCode, shopRef.value);
   assert.deepEqual(mine.body.data.claims[0].shipping, { name: '张三', phone: '13800000000', address: '北京市朝阳区 1 号' });
+  const paged = await request(app)
+    .get('/api/claims/nft/mine?page=2&pageSize=1')
+    .set('Authorization', `Bearer ${buyerToken}`)
+    .expect(200);
+  assert.equal(paged.body.data.total, 1);
+  assert.equal(paged.body.data.page, 2);
+  assert.equal(paged.body.data.pageSize, 1);
+  assert.deepEqual(paged.body.data.claims, [], '第二页为空时 total 仍说明总数');
 
   // 同一枚 token 再来一条 ⇒ 409（库里的函数唯一索引兜底，并发下也拦得住）
   const dup = await submit(buyerToken, body('1')).expect(200);

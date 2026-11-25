@@ -13,7 +13,7 @@ import { redisHealth } from './redis.js';
 import { verifyAuditChain } from './auditChain.js';
 // 节点叫什么由**节点资料**回答（`node` 单例行的 name/notice，与任何一家店无关）
 import { nodeNameOf } from './routes/shop.js';
-import { listShopRows, nodeRow, nodeOwnerOf } from './shops.js';
+import { countShopRows, nodeRow, nodeOwnerOf } from './shops.js';
 import { escrowWatcherStatus } from './escrowWatcher.js';
 import { piiRetentionStatus } from './piiErase.js';
 import { chainReconcileStatus } from './chainReconcile.js';
@@ -32,6 +32,7 @@ import returnsRouter from './routes/returns.js';
 import evidenceFilesRouter from './routes/evidenceFiles.js';
 import exportRouter from './routes/export.js';
 import auditRouter from './routes/audit.js';
+import reviewImagesRouter from './routes/reviewImages.js';
 import piiRouter from './routes/pii.js';
 import ratesRouter from './routes/rates.js';
 import arbitrationRouter from './routes/arbitration.js';
@@ -133,6 +134,16 @@ export function createApp() {
     默认 `false` 是刻意的：`true` 等于相信任意客户端伪造的来源地址。
   */
   app.set('trust proxy', config.trustProxy);
+  /*
+    Express 默认**大小写不敏感**：`/API/orders` 与 `/api/orders` 命中同一条路由。
+    但本进程里有一批准据是按 `req.path` 的**小写正则**写的（缓存判定、JSON 解析豁免、
+    上传路径、部分限流键）——大小写不敏感会让"同一个请求"在路由层与判据层得到不同答案，
+    而判据层沉默：例如 `/API/uploads` 绕过 `isFilesUpload` 的豁免，被 1MB JSON 解析器顶掉；
+    更一般地，任何"按路径判断该不该限流/该不该缓存"的地方都能被换个大小写绕开。
+    开启后非规范大小写直接 404，只有一条路径。代价：用大写路径调过接口的客户端会 404——
+    本项目按 greenfield 写，接口路径以文档/前端为唯一来源，不需要背这种历史形状。
+  */
+  app.set('case sensitive routing', true);
   /*
   CORS：`MK_CORS_ORIGIN=*` 默认只在**非生产**环境反射请求 Origin（本地/演示要跨端口）。
   生产环境不反射任意来源——未显式配置白名单时按"不开放跨域"处理（同源前端不受影响）。
@@ -262,13 +273,29 @@ export function createApp() {
   });
 
   // 简易请求日志（生产可去掉或接日志服务）；来源 IP 走 clientIp（唯一取值处，见 http.js）
+  /*
+    访问日志脱敏按 **query 键名**，不按路径逐条列举：`/api/favorites?address=`、
+    `/api/orders?address=`、`/api/auth/nonce?address=` 是同一个形状（钱包地址、令牌、签名）。
+    路径清单式的脱敏必然漏掉下一个带地址的端点，而地址进日志聚合之后就再也收不回来。
+  */
+  const REDACTED_QUERY_KEYS = new Set(['address', 'token', 'signature', 'sig', 'nonce', 'secret', 'key']);
+  const redactQuery = (originalUrl) => {
+    const s = String(originalUrl || '');
+    const qi = s.indexOf('?');
+    if (qi < 0) return s;
+    const params = new URLSearchParams(s.slice(qi + 1));
+    let touched = false;
+    for (const k of [...params.keys()]) {
+      if (!REDACTED_QUERY_KEYS.has(k.toLowerCase())) continue;
+      params.set(k, 'REDACTED');
+      touched = true;
+    }
+    return touched ? `${s.slice(0, qi)}?${params.toString()}` : s;
+  };
   app.use((req, res, next) => {
     const t0 = Date.now();
     res.on('finish', () => {
-      // 收藏 GET 的 query 是钱包地址 + 偏好，不能原样进访问日志。
-      const loggedUrl = /^\/api\/favorites\/?$/.test(String(req.path || '').toLowerCase())
-        ? `${req.path}?address=[redacted]`
-        : req.originalUrl;
+      const loggedUrl = redactQuery(req.originalUrl);
       console.log(`${clientIp(req)} ${req.method} ${loggedUrl} -> ${res.statusCode} (${Date.now() - t0}ms)`);
     });
     next();
@@ -282,15 +309,17 @@ export function createApp() {
     一个**看起来正常**的响应（`shops: {}`、`node: {}`），而健康检查照样绿。
   */
   /*
-    /healthz 是探活，不是免费的全量读数口：它每次都要读库、读 watcher 状态并拼 capabilities。
+    /healthz 是探活，不是免费的全量读数口：默认只算健康判据（watcher/Redis/资金方绑定）
+    与公开身份；整表店铺、审计链、媒体用量等只在节点主/员工的 `?full=1` 里读。
     编排/反代每秒一次足够；这里的上限远高于正常探活频率，但能挡住"用探活当免费全量查询"的滥用。
   */
   const healthLimiter = simpleRateLimit({ windowMs: 60_000, max: 300, message: '探活请求过于频繁' });
   app.get('/healthz', healthLimiter, wrap(async (req, res) => {
     try {
-    const shopRows = await listShopRows();
-    const node = await nodeRow();
-    const owner = nodeOwnerOf(node);
+    /*
+      判据只需要三样：watcher 状态 / Redis / 资金方绑定。公开读数再补身份、计数与游标；
+      `shops` 整表、媒体目录扫描、审计链校验只在 full 里读（见下方 publicReadings/fullReadings）。
+    */
     const watcher = await escrowWatcherStatus();
     /*
       ── 健康**判据**：不能是"进程在监听"（2026-10-16 收口）──────────────────────
@@ -370,26 +399,77 @@ export function createApp() {
           !redisOk ? 'Redis 不可用：限流/共享缓存无法工作（检查 MK_REDIS_URL 与 Redis 进程）' : null,
         ].filter(Boolean).join('；');
     /*
-      **200 与 503 的正文必须是同一份读数**（2026-11-04）。
-
-      为什么：界面把"响应里没有这个字段"渲染成"读不到"。此前 503 只回
-      `{healthy, reason, watcher, redis, node}`——于是节点因为 watcher 停摆而 503 时，
-      健康页会把审计链 / 委员会 / 合约锚点 / 保留期全印成"读不到"，把 Redis 印成"不可用"
-      （它其实在 top-level、页面读的是 capabilities.redis）。恰恰在出事、最需要读的时候，
-      给出的是一屏假话。所以先算同一份读数，再用 HTTP 码表达结论。
-      代价：不健康时也要多读一次审计链（30s 缓存）与媒体用量（60s 缓存）。
+      探活是**匿名可打**的：判据只依赖 watcher 状态 / Redis / 资金方绑定三样（已算在上面）。
+      其余读数（node 行明细、审计链校验、媒体目录扫描、能力探测）都是**按需**的：
+      只有节点主/员工带 `?full=1` + 会话令牌时才读（见下面的 full 判定）。
+      老写法把 fullReadings 整个算完再决定回哪一份——匿名请求每次都跑全表 + 扫媒体目录 +
+      校验审计链，等于把探活变成免费的全量读数口，也是不需要凭据的 DoS 面。
     */
-    const fullReadings = {
+    /*
+      先判"要不要 full"：只做会话校验 + 一次节点主判定（单行读），**放在任何昂贵读数之前**，
+      匿名请求就不会为别人的读数付代价。
+    */
+    const wantsFull = String(req.query.full || '') === '1' || /^Bearer\s+/i.test(String(req.headers.authorization || ''));
+    let full = false;
+    if (wantsFull) {
+      const t = bearerToken(req);
+      if (!t) return fail(res, '读取完整健康读数需要节点主/员工登录', 401, 401);
+      let payload;
+      try {
+        payload = await verifySession(t);
+      } catch {
+        return fail(res, '登录已过期：请重新登录后读取完整健康读数', 401, 401);
+      }
+      try {
+        full = await isNodeAdmin(payload.address);
+      } catch {
+        return fail(res, '节点管理权限暂时无法确认，请稍后再试', 503, 503);
+      }
+      if (!full) return fail(res, '只有节点主/员工可以读取完整健康读数', 403, 403);
+    }
+    const node = await nodeRow();
+    const owner = nodeOwnerOf(node);
+    /*
+      公开读数（200 与 503 同一份形状）：健康结论 + 可被联邦发现的身份 + watcher 游标。
+      `shops` 用单条聚合 COUNT —— 公开探活不需要把整张 shops 表搬进内存再 length。
+    */
+    const publicReadings = {
       healthy,
       ...(reason ? { reason } : {}),
       name: await nodeNameOf(),
       host: owner || null,
-      shops: { total: shopRows.length, listed: shopRows.filter((r) => Number(r.listed) === 1).length },
+      shops: await countShopRows(),
       escrowAddress: config.chain.escrowAddress || null,
       stakingAddress: config.chain.stakingAddress || null,
       version: config.version,
       /* 时刻是 `Date`（对外 JSON 为 ISO-8601）：与库列/接口的其余时间同一种形状 */
       now: new Date(),
+      /*
+        链上轮询器活性：游标存库、进展只进控制台的话，「轮询失败、游标落后链头、事件被隔离」
+        在运维侧完全不可见（docker healthcheck 照样绿），而界面上给用户的说法是
+        「节点 watcher 稍后回写」。这里把 cursor/lagBlocks/隔离数暴露出来，
+        监控与人工排查都能直接看到轮询器是否真的在推进。
+        ⚠️ 从 2026-10-16 起它同时是**健康判据的输入**（见上方 `healthy`）：
+        watcher 停滞或隔离数非零 ⇒ 本端点 503，探活会真的失败。
+      */
+      watcher,
+      /*
+        下单超时窗口自检的结论（2026-10-14）。为什么要暴露它：`checkOrderTimeoutBounds` 在启动期
+        只跑一次，而它的 `unknown` 档（读不到链上界 / 配置值本身非法）**刻意不阻断启动**——
+        否则一次 RPC 抖动就能停掉一个配置正确的节点。代价是"这次没校验成"必须有个地方能看见，
+        否则它随启动日志一起丢了，而越界的配置会让**每一笔下单**都在买家钱包里 revert。
+        从未跑过（例如未配置 MK_ESCROW_ADDRESS）时为 null。
+      */
+      orderTimeout: orderTimeoutSelfCheck(),
+    };
+    /*
+      full 读数 = 公开读数 + 只有节点主/员工才看得到的那几块。
+      用 `...publicReadings` 起头：两份回应永远同形，不会出现"公开有 watcher、full 没有"
+      或"full 多一个顶层 watcher"这种漂移。
+    */
+    let fullReadings = null;
+    if (full) fullReadings = {
+      ...publicReadings,
       /*
         **`node` 单例行的读数**（2026-10 重设计）：这些以前散在 kv 的两列字符串里，
         运维只能翻日志或猜。合约地址锚、watcher 游标（块号 + 块哈希）、对账游标
@@ -414,15 +494,6 @@ export function createApp() {
             updatedAt: node.updated_at ?? null,
           }
         : null,
-      /*
-        链上轮询器活性：游标存库、进展只进控制台的话，「轮询失败、游标落后链头、事件被隔离」
-        在运维侧完全不可见（docker healthcheck 照样绿），而界面上给用户的说法是
-        「节点 watcher 稍后回写」。这里把 cursor/lagBlocks/隔离数暴露出来，
-        监控与人工排查都能直接看到轮询器是否真的在推进。
-        ⚠️ 从 2026-10-16 起它同时是**健康判据的输入**（见上方 `healthy`）：
-        watcher 停滞或隔离数非零 ⇒ 本端点 503，探活会真的失败。
-      */
-      watcher,
       // 另两个后台任务的状态：reconcile 管镜像偏离的自动修复，piiRetention 管个人信息到期擦除。
       // 三者都只靠 console 日志时，容器里丢日志就等于没有信号——尤其 retention 是不可逆操作，
       // 静默失败会一直留着个人信息。
@@ -447,14 +518,7 @@ export function createApp() {
       committee: committeeStatus(),
       // 资金方身份漂移（Ownable2Step 之后 owner 不再相等/双向接线断开）：启动只查一次，
       // 运行期每 5 分钟复查；这里展示最近一次结论，不让它只活在日志里。
-      ownerBinding: ownerBindingStatus(),      /*
-        下单超时窗口自检的结论（2026-10-14）。为什么要暴露它：`checkOrderTimeoutBounds` 在启动期
-        只跑一次，而它的 `unknown` 档（读不到链上界 / 配置值本身非法）**刻意不阻断启动**——
-        否则一次 RPC 抖动就能停掉一个配置正确的节点。代价是"这次没校验成"必须有个地方能看见，
-        否则它随启动日志一起丢了，而越界的配置会让**每一笔下单**都在买家钱包里 revert。
-        从未跑过（例如未配置 MK_ESCROW_ADDRESS）时为 null。
-      */
-      orderTimeout: orderTimeoutSelfCheck(),
+      ownerBinding,
       /*
         商品媒体（upload dir）用量：孤儿媒体**刻意不删**（订单快照锁的是 URL 字符串），
         而视频把单个孤儿的成本从 2MB 抬到 50MB —— 磁盘是这个功能新引入的失败面，
@@ -487,40 +551,7 @@ export function createApp() {
       watcher 游标/隔离数/最近错误仍公开（连接页与 dev-stack 探活要据此判断“扫到哪、有没有卡住”）；
       DB 能力、媒体用量、审计链、委员会/绑定读数只给节点主/员工。
     */
-    const wantsFull = String(req.query.full || '') === '1' || /^Bearer\s+/i.test(String(req.headers.authorization || ''));
-    let full = false;
-    if (wantsFull) {
-      const t = bearerToken(req);
-      if (!t) return fail(res, '读取完整健康读数需要节点主/员工登录', 401, 401);
-      let payload;
-      try {
-        payload = await verifySession(t);
-      } catch {
-        return fail(res, '登录已过期：请重新登录后读取完整健康读数', 401, 401);
-      }
-      try {
-        full = await isNodeAdmin(payload.address);
-      } catch {
-        return fail(res, '节点管理权限暂时无法确认，请稍后再试', 503, 503);
-      }
-      if (!full) return fail(res, '只有节点主/员工可以读取完整健康读数', 403, 403);
-    }
-    const readings = full
-      ? fullReadings
-      : {
-          healthy: fullReadings.healthy,
-          ...(fullReadings.reason ? { reason: fullReadings.reason } : {}),
-          name: fullReadings.name,
-          host: fullReadings.host,
-          shops: fullReadings.shops,
-          version: fullReadings.version,
-          now: fullReadings.now,
-          watcher: fullReadings.watcher,
-          orderTimeout: fullReadings.orderTimeout,
-          /* 托管/保证金地址不是秘密：GET /api/shop 本来就公开它们；探活脚本据此核对节点身份。 */
-          escrowAddress: fullReadings.escrowAddress,
-          stakingAddress: fullReadings.stakingAddress,
-        };
+    const readings = full ? fullReadings : publicReadings;
     if (!healthy) {
       res.status(503);
       return fail(res, `节点不健康：${reason}`, 1, 503, readings);
@@ -553,6 +584,7 @@ export function createApp() {
   app.use('/api/shop', shopRouter);
   app.use('/api/shop/export', exportRouter); // P1-② CSV 导出（ownerOnly）
   app.use('/api/shop/audit', auditRouter); // P1-④ 管理审计（ownerOnly）
+  app.use('/api/shop', reviewImagesRouter); // 评价图治理：有图评价队列 + 评价级下架（nodeAdmin）
   app.use('/api/shop', piiRouter); // 个人信息删除/保留期（**权威随作用域**：erase-pii 擦一单 ⇒ ownerOnly；retention/run 跑一轮节点级擦除 ⇒ hostOnly）
   app.use('/api/uploads', uploadsRouter); // 商品图片上传/读取（上传仅 staff，读取公开）
   app.use('/api/products', productsRouter);

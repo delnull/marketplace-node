@@ -105,7 +105,7 @@ router.patch('/:orderNo/return/address', staffOnly, wrap(async (req, res) => {
   const order = await findOrderInShop(req.params.orderNo, req.shop.code);
   if (!order) return fail(res, '订单不存在', 404, 404);
   const returnRow = await getDb().get('SELECT * FROM order_returns WHERE order_id = ?', order.order_id);
-  const r = await setReturnAddress({ returnRow, address: req.body?.address });
+  const r = await setReturnAddress({ order, returnRow, address: req.body?.address });
   if (r.error) return fail(res, r.error);
   await audit(req, 'return.address', order.order_no, {});
   ok(res, returnToPublic(r.data), '退货地址已保存');

@@ -111,27 +111,26 @@ function finalize({
   label = '主图区',
 }) {
   if (!size) {
-    discard(tmp);
-    throw new MediaUploadError('empty', '上传内容为空');
+    throw leakOf(new MediaUploadError('empty', '上传内容为空'), discard(tmp), size);
   }
   const mime = sniffMediaMime(readHead(tmp));
   if (!mime || !allowedMimes.includes(mime)) {
-    discard(tmp);
     const hasVideo = allowedMimes.some((m) => MEDIA[m].kind === 'video');
-    throw new MediaUploadError(
+    const err = new MediaUploadError(
       'unsupported',
       `无法识别的文件内容：${label}只收 png / jpeg / webp / gif 图片` +
         (hasVideo ? '，或 mp4 / webm 视频' : '')
     );
+    throw leakOf(err, discard(tmp), size);
   }
   const spec = MEDIA[mime];
   if (spec.maxBytes && size > spec.maxBytes) {
-    discard(tmp);
     const what = spec.kind === 'video' ? '视频' : '图片';
-    throw new MediaUploadError(
+    const err = new MediaUploadError(
       'too_large',
       `${what}超过 ${MB(spec.maxBytes)}MB 上限（当前 ${(size / 1024 / 1024).toFixed(1)}MB）`
     );
+    throw leakOf(err, discard(tmp), size);
   }
   const stored = `${sha256}.${spec.ext}`;
   const dest = path.join(dir, stored);
@@ -149,17 +148,31 @@ function finalize({
     } catch {
       existing = false;
     }
-    if (!existing) throw e;
+    if (!existing) throw leakOf(e, false, size);
   }
   return { url: `${UPLOAD_URL_PREFIX}${stored}`, kind: spec.kind, mime, size, sha256 };
 }
 
+/**
+ * 删掉临时文件，返回"它是不是已经不在了"。
+ *
+ * 读取端按 UUID.ext 白名单取文件，`.tmp-*` 永远不会被下发——所以删不掉不影响**可读性**，
+ * 但占的磁盘是真的。返回值让调用方能把这段"删不掉的字节"挂到错误上（`leakedBytes`），
+ * 由额度内核按实际占用结算；旧实现删不掉也当没发生，于是磁盘被白占、额度却全额归还。
+ */
 function discard(disk) {
   try {
     fs.rmSync(disk, { force: true });
+    return true;
   } catch {
-    /* 删不掉就算了：临时文件是 `.tmp-*.part`，读取端按 UUID.ext 白名单取文件，永远不会被读到 */
+    return false;
   }
+}
+
+/** 失败时把"留在磁盘上的字节"挂在错误上：调用方按它结算额度（0 = 正常失败，不吃额度） */
+function leakOf(err, removed, size) {
+  if (!removed && size > 0) err.leakedBytes = size;
+  return err;
 }
 
 /**
@@ -192,9 +205,20 @@ export function storeMediaStream(stream, opts = {}) {
       settled = true;
       stream.unpipe?.(out);
       stream.destroy?.();
-      out.destroy();
-      discard(tmp);
-      reject(err);
+      /*
+        先把写句柄关掉再删：Windows 上对仍打开的句柄 `rmSync` 会 EBUSY，
+        旧实现在这里同步删、删不掉也不说话 ⇒ 半个 50MB 文件留在盘上而额度全额退还。
+        等 `close` 再删，删不掉才把字节数挂到错误上（由额度内核按实际占用结算）。
+      */
+      const settle = () => {
+        if (!discard(tmp) && size > 0) err.leakedBytes = size;
+        reject(err);
+      };
+      if (out.closed) settle();
+      else {
+        out.once('close', settle);
+        out.destroy();
+      }
     };
 
     stream.on('data', (chunk) => {

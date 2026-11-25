@@ -143,3 +143,74 @@ test('对账按 id 游标翻页：前 20 条一直 open 也不会饿死后面的
   }
   assert.equal(closed, 3);
 });
+
+/* ══════════════════════════════════════════════════════════════════════
+   撤销证据的**有界续扫**（2026-11）
+   ══════════════════════════════════════════════════════════════════════ */
+
+/** 带事件能力的假 escrow：`queryFilter` 按块范围返回给定日志，可注入失败/范围上限 */
+function scanChain({ logs = [], maxRange = 2000, failOnCall = 0 } = {}) {
+  let calls = 0;
+  return {
+    filters: { ClaimDisputeCancelled: () => ({}) },
+    async queryFilter(_filter, from, to) {
+      calls += 1;
+      if (failOnCall && calls === failOnCall) throw new Error('query returned more than 10000 results（注入）');
+      if (to - from + 1 > maxRange) throw new Error(`range too large（注入：${from}-${to}）`);
+      return logs.filter((l) => l.blockNumber >= from && l.blockNumber <= to);
+    },
+    calls: () => calls,
+  };
+}
+
+/** 把一个 claim 的链上读数与事件能力拼成 reconcileClaims 的 escrow 替身 */
+function escrowOf(fakeEscrow, chain) {
+  return { ...fakeEscrow, ...chain };
+}
+
+test('撤销证据：全史一次 queryFilter 会被 RPC 拒（旧形状），现在按块分页扫完并写出 rejected', async () => {
+  const { disputeId, order, fakeEscrow } = await makeClaim({ snapshot: '0', chainPaid: '0', closed: true });
+  const chain = scanChain({ maxRange: 2000 });
+  const fake = escrowOf(fakeEscrow, chain);
+  // 9000 块 / 每块 2000 ⇒ 5 次 queryFilter；任何一次超范围都会抛
+  const r = await reconcileClaims({ escrow: fake, minAgeMs: 0, blockTag: 9000, scanFromBlock: 101 });
+  assert.equal(r.closed, 1);
+  assert.equal(chain.calls(), 5, '扫描必须按 2000 块分页，而不是一次全扫');
+  const row = await db.get('SELECT status, dispute_state FROM nft_claims WHERE dispute_claim_id = ?', disputeId);
+  assert.equal(row.status, 'rejected');
+  assert.equal(row.dispute_state, 'closed');
+});
+
+test('续扫未追平：本轮不把"没查到撤销"当成"判店主无责"，下一轮从断点继续', async () => {
+  const { disputeId, fakeEscrow } = await makeClaim({ snapshot: '0', chainPaid: '0', closed: true });
+  const chain = scanChain({ failOnCall: 3, maxRange: 2000 });
+  const fake = escrowOf(fakeEscrow, chain);
+
+  const r1 = await reconcileClaims({ escrow: fake, minAgeMs: 0, blockTag: 9000, scanFromBlock: 201 });
+  assert.equal(r1.closed, 0, '集合未覆盖到链头时不得写终态');
+  assert.ok(r1.unreadable >= 1);
+  let row = await db.get('SELECT status, dispute_state FROM nft_claims WHERE dispute_claim_id = ?', disputeId);
+  assert.equal(row.status, 'requested');
+  assert.equal(row.dispute_state, 'opened');
+  assert.equal(chain.calls(), 3, '第 3 段失败 ⇒ 游标停在 4001，前两段不重扫');
+
+  // 下一轮：从断点续扫（不回到 1），追平后写 rejected
+  chain.failOnCall = 0;
+  const r2 = await reconcileClaims({ escrow: fake, minAgeMs: 0, blockTag: 9000, scanFromBlock: 201 });
+  assert.equal(r2.closed, 1);
+  assert.equal(chain.calls(), 3 + 3, '续扫 4001-9000 只需 3 段');
+  row = await db.get('SELECT status, dispute_state FROM nft_claims WHERE dispute_claim_id = ?', disputeId);
+  assert.equal(row.status, 'rejected');
+});
+
+test('撤销证据命中：写 cancelled/cancelled（不是"判店主无责"）', async () => {
+  const { order, disputeId, fakeEscrow } = await makeClaim({ snapshot: '0', chainPaid: '0', closed: true });
+  // 撤销事件落在扫描范围内；claimId 用 indexed args[0] 的形状
+  const chain = scanChain({ logs: [{ blockNumber: 1500, args: [disputeId] }] });
+  const fake = escrowOf(fakeEscrow, chain);
+  const r = await reconcileClaims({ escrow: fake, minAgeMs: 0, blockTag: 3000, scanFromBlock: 301 });
+  assert.equal(r.closed, 1);
+  const row = await db.get('SELECT status, dispute_state FROM nft_claims WHERE dispute_claim_id = ?', disputeId);
+  assert.equal(row.status, 'cancelled');
+  assert.equal(row.dispute_state, 'cancelled');
+});

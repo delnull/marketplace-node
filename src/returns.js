@@ -100,8 +100,16 @@ export async function fetchReturnsByOrderIds(orderIds) {
 /**
  * 店主填写/修改退货地址（买家发起退货申请后）。
  * 只允许 open 状态；已寄出/已收货再改地址没有意义，反而会让买家按旧地址寄丢。
+ *
+ * 擦除是终态：`createReturn` 已按 `order.pii_erased_at` 拒绝新建退货单，改地址这条写入口
+ * 必须在同一处判据上再判一次——否则擦除之后仍能往这一单写进新的收货信息，同一个语义
+ * 在"新建"与"修改"两支上给出两个答案。
  */
-export async function setReturnAddress({ returnRow, address }) {
+export async function setReturnAddress({ order, returnRow, address }) {
+  if (!order) return { error: '订单不存在', notFound: true };
+  if (order.pii_erased_at != null) {
+    return { error: '该订单的个人信息已按请求擦除：擦除是终态，不能再写入退货地址' };
+  }
   if (!returnRow) return { error: '退货单不存在（请先由买家发起退货申请）' };
   const addr = String(address ?? '').trim().slice(0, 300);
   if (!addr) return { error: '退货地址不能为空' };

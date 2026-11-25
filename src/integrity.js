@@ -38,8 +38,9 @@ import { verifyAuditChain } from './auditChain.js';
 /**
  * @param {{get: Function, all: Function}} [db] 查询门面（默认 `getDb()`）
  * @returns {Promise<{issues: Array<{kind:string, detail:string, orderId?:string|null, resource?:string|null, auditId?:number}>,
- *            counts: {codeDeliveredNotUsed:number, codeUsedWithoutDelivery:number, nftDeliveredNotUsed:number,
- *                     nftUsedWithoutDelivery:number, auditChainBroken:number,
+ *            unverifiable: Array<{kind:string, detail:string, orderId?:string|null, resource?:string|null}>,
+ *            counts: {codeDeliveredNotUsed:number, codeDeliveredWithoutPool:number, codeUsedWithoutDelivery:number,
+ *                     nftDeliveredNotUsed:number, nftUsedWithoutDelivery:number, auditChainBroken:number,
  *                     reservedCodesDrift:number, reservedTokensDrift:number, committedDrift:number,
  *                     holdQtyMismatch:number, holdWithoutSku:number, counterNotComparable:number},
  *            checked: {deliveryItems:number, codesUsed:number, nftUsed:number, auditEntries:number, auditUnhashed:number,
@@ -60,20 +61,41 @@ export async function findIntegrityIssues(db = getDb()) {
   //    假阳性比不报更糟）。`orders.product_id` 被设计成可空（商品硬删除后置 NULL，
   //    快照仍在，见 db.js 的列注释），所以这条路径是正常数据会走到的。
   const codeDeliveredNotUsed = await db.all(`SELECT di.order_id AS orderId, o.order_no AS orderNo, di.value AS code, o.product_id AS orderProductId,
-              pc.id AS codeId, pc.status AS codeStatus, pc.order_id AS codeOrderId, pc.product_id AS codeProductId
+              pc.id AS codeId, pc.status AS codeStatus, pc.order_id AS codeOrderId, pc.product_id AS codeProductId,
+              (SELECT COUNT(*) FROM product_codes k2 WHERE k2.code = di.value) AS codeAnywhere
          FROM order_delivery_items di
          JOIN orders o ON o.id = di.order_id
     LEFT JOIN product_codes pc ON pc.product_id <=> o.product_id AND pc.code = di.value
         WHERE di.kind = 'code'
           AND (pc.id IS NULL OR pc.status != 'used' OR NOT (pc.order_id <=> di.order_id))`);
+  /*
+    交付行有码、但**任何**码池里都没有这个码串 ⇒ **无法判定**，不是不一致（2026-11，演示栈实测）：
+    `deliverDigitalManual` 明确支持"池外自由文本（说明型交付）"，商品可以根本没有码池——
+    此时把交付行报成"池被重建/导入丢了"会让一个健康节点 `check:integrity` 退出码变 2，
+    而工具给出的处置建议是重建库（会误删正常数据）。判据是**这个码串在别的池里存不存在**：
+      · 在别的商品池里存在 ⇒ 串商品，仍按 issue 报（池/交付行真的错位了）；
+      · 哪里都没有 ⇒ 三态里的"无法判定"，进 unverifiable（打出来但不算不一致）。
+    NFT 不走这一档：NFT 交付入口要求 tokenId 必须在池里（orders.js 的核销），
+    所以"NFT 交付行没有池行"本身就是异常。
+  */
+  const unverifiable = [];
   for (const r of codeDeliveredNotUsed) {
+    if (r.codeId == null && Number(r.codeAnywhere) === 0) {
+      unverifiable.push({
+        kind: 'code-delivered-without-pool-row',
+        orderId: r.orderNo,
+        resource: r.code,
+        detail: `订单 ${r.orderNo} 的交付码 ${mask(r.code)} 在任何码池里都不存在：可能是手动交付的自由文本（无法与池对拍），也可能是池被重建丢了——请人工核对，**不要**按"不一致"处理`,
+      });
+      continue;
+    }
     issues.push({
       kind: pcKind(r),
       orderId: r.orderNo,
       resource: r.code,
       detail:
         r.codeId == null
-          ? `订单 ${r.orderNo} 有交付行（码 ${mask(r.code)}），但该商品的码池里**没有这个码**——池被重建/导入丢了，或交付行来自另一个商品`
+          ? `订单 ${r.orderNo} 有交付行（码 ${mask(r.code)}），但该商品的码池里**没有这个码**——池被重建/导入丢了，或交付行来自另一个商品（这个码在别处存在，所以不是纯文本交付）`
           : `订单 ${r.orderNo} 已交付码 ${mask(r.code)}，但池里它是 status=${r.codeStatus}、order_id=${r.codeOrderId ?? 'NULL'}——**恢复旧库后码回未用是最危险的一种**：它会被再发给别的买家`,
     });
   }
@@ -165,8 +187,11 @@ export async function findIntegrityIssues(db = getDb()) {
 
   return {
     issues,
+    /* 无法判定（不是不一致）：见 ① 的说明。调用方**不得**把它计入失败/退出码。 */
+    unverifiable,
     counts: {
       codeDeliveredNotUsed: countOf('code-delivered-not-used') + countOf('code-delivered-without-pool-row'),
+      codeDeliveredWithoutPool: unverifiable.length,
       codeUsedWithoutDelivery: countOf('code-used-without-delivery'),
       nftDeliveredNotUsed: countOf('nft-delivered-not-used') + countOf('nft-delivered-without-pool-row'),
       nftUsedWithoutDelivery: countOf('nft-used-without-delivery'),

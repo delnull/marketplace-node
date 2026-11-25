@@ -8,7 +8,7 @@
  */
 import { MediaUploadError, storeMediaStream } from './productMedia.js';
 import { MAX_UPLOAD_BYTES, PRODUCT_MEDIA_MIMES } from './mediaKinds.js';
-import { reserveUploadBytes, commitUploadBytes, releaseUploadBytes } from './uploadBudget.js';
+import { reserveUploadBytes, settleUploadBytes } from './uploadBudget.js';
 
 /** 默认每人每小时额度（商品媒体与头像共用同一份额度） */
 export const DEFAULT_UPLOAD_BYTES_PER_HOUR = 1024 * 1024 * 1024;
@@ -62,10 +62,14 @@ export async function storeRequestMedia(req, actor, opts = {}) {
   if (!reserved.ok) throw new UploadQuotaError(reserved.used, reserved.limitBytes, maxUploadBytes);
   try {
     const stored = await storeMediaStream(req, { maxUploadBytes, allowedMimes, label });
-    await commitUploadBytes(reserved.reservation, stored.size);
+    await settleUploadBytes(reserved.reservation, stored.size);
     return stored;
   } catch (e) {
-    await releaseUploadBytes(reserved.reservation);
+    /*
+      失败也要结算：`leakedBytes` = 临时文件删不掉、真正留在磁盘上的字节（正常失败是 0）。
+      全额归还是错的判据——磁盘有没有被占，不取决于"请求成没成功"。
+    */
+    await settleUploadBytes(reserved.reservation, e?.leakedBytes || 0);
     throw e;
   }
 }

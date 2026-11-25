@@ -7,6 +7,7 @@ import net from 'node:net';
 import { roleOf, isNodeAdmin, isHost, operatedShopCodes } from './auth.js';
 import { SHOP_HEADER, shopContextOf, shopRowByCode, shopSellable, notSellableReason } from './shops.js';
 import { redisHit } from './redis.js';
+import { isDeadlockError } from './dbErrors.js';
 
 /**
  * 是否"类生产"（未设 NODE_ENV 也算生产）。
@@ -69,7 +70,7 @@ export function wrap(fn) {
         也不能让客户端拿到一个含糊的 500 就放弃。回 503 + 明确"请重试"，由调用方/
         前端决定重试；没有静默重放（事务回调可能带业务副作用，不能在这里盲目重跑）。
       */
-      if (e?.code === 'ER_LOCK_DEADLOCK' || e?.code === 'ER_LOCK_WAIT_TIMEOUT' || Number(e?.errno) === 1213 || Number(e?.errno) === 1205) {
+      if (isDeadlockError(e)) {
         console.error(`[http] 数据库锁冲突（可重试）：${req.method} ${req.originalUrl}：${e?.message || e}`);
         fail(res, '请求与并发事务冲突，请稍后重试', 503, 503);
         return;

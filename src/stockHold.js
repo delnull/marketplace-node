@@ -86,6 +86,114 @@ export async function holdStock(productId, skuKey = '', quantity = 1) {
 }
 
 /**
+ * 「不限量 → 限量」切换时，把**从未占位**的在途承诺补记成占位（唯一内核）。
+ *
+ * 旧实现在商品编辑路由里分两步：先普通 `SELECT SUM(quantity)` 聚合出在途量，再按同一谓词做
+ * 一条加锁 `UPDATE` 补 `hold_qty`，最后按**聚合值**加 `committed`。两步的读视图不同——普通读
+ * 用的是事务快照，`UPDATE` 读的是最新已提交——于是"哪些订单算"出现两个答案：
+ *   · 窗口内某单被取消/超时 ⇒ 聚合算了它、UPDATE 没命中它 ⇒ `committed` 多记（**永久少卖**，
+ *     那些件数没有任何订单对应）；
+ *   · 窗口内某 cancelled 单被 watcher/sync 复活 ⇒ UPDATE 命中、聚合没算 ⇒ `committed` 少记（**超卖**）。
+ *
+ * 这里改成"锁住的集合就是全部"：先 `FOR UPDATE` 锁候选行，按锁到的行算件数，再按同一批 id
+ * 写 `hold_qty`、按同一份件数加 `committed`。容量不够时**整笔拒绝**（返回 `{ok:false}`，
+ * 调用方翻成 400），绝不留部分生效。
+ *
+ * 锁序：调用方（商品编辑事务）已经持有 products → product_skus 的行锁，本函数随后只取 orders
+ * 行（skus → orders）；`restockOrder` / `releaseCore` 是 orders → skus。与旧实现取锁的位置相同，
+ * MySQL 死锁检测最多回滚其中一笔。
+ *
+ * @param {number} productId
+ * @param {Map<string, {capacity: number|null}>} targets 要切回限量的组合 → 新总量（null = 仍不限量，忽略）
+ * @returns {Promise<{ok: true, held: number, bySku: Record<string, number>} | {ok: false, fail: string}>}
+ */
+export async function commitPromiseUnits(productId, targets) {
+  const wanted = new Map();
+  for (const [key, t] of targets instanceof Map ? targets : Object.entries(targets || {})) {
+    if (t && t.capacity !== null && t.capacity !== undefined) wanted.set(String(key), t);
+  }
+  if (!wanted.size) return { ok: true, held: 0, bySku: {} };
+  return await withTransaction(async () => {
+    const db = getDb();
+    const keys = [...wanted.keys()];
+    const marks = keys.map(() => '?').join(',');
+    const rows = await db.all(
+      `SELECT o.id, o.sku_key, o.quantity
+         FROM orders o
+        WHERE o.product_id = ?
+          AND o.sku_key IN (${marks})
+          AND ${uncommittedPromiseSql('o')}
+          AND ${stockPromiseSql('o')}
+        FOR UPDATE`,
+      productId,
+      ...keys
+    );
+    /** 组合 → 本批要补记的件数（只来自锁到的行） */
+    const bySku = new Map();
+    for (const r of rows) {
+      const key = String(r.sku_key ?? '');
+      if (!wanted.has(key)) continue;
+      bySku.set(key, (bySku.get(key) || 0) + Number(r.quantity || 0));
+    }
+    // 全部校验先做完，再动一个字节：容量不足时连一笔 UPDATE 都不发
+    for (const [key, add] of bySku) {
+      const capacity = Number(wanted.get(key).capacity);
+      const cur = await db.get(
+        'SELECT committed FROM product_skus WHERE product_id = ? AND sku_key = ? FOR UPDATE',
+        productId,
+        key
+      );
+      if (!cur) {
+        // 组合行不存在：补记 hold_qty 却没有可加计数的行 = 账目级异常，整笔拒绝而不是半写
+        return { ok: false, fail: `组合「${key || '默认'}」不存在（商品可能被并发修改），请刷新后重试` };
+      }
+      const committed = Number(cur.committed || 0);
+      if (!Number.isSafeInteger(capacity) || committed + add > capacity) {
+        return {
+          ok: false,
+          fail:
+            `组合「${key || '默认'}」切回限量失败：在途/待回收订单尚有 ${add} 件，` +
+            `加已占位/已售 ${committed} 件共需 ${committed + add} 件容量，超过你设置的 ${capacity} 件` +
+            '——请提高总量，或先处理在途订单（取消草稿/等待终结/确认回收退货）',
+        };
+      }
+    }
+    let held = 0;
+    for (const r of rows) {
+      if (!wanted.has(String(r.sku_key ?? ''))) continue;
+      /*
+        补记 hold_qty 时必须同时清 released_qty/released_at（源码审计 2026-09）：`released_qty`
+        是逐件释放账本、`released_at` 是整单释放时刻；`hold_qty=0 ∧ released_qty>0` 是 restockOrder
+        在"组合当前不限量"分支刻意产生的形状。只补 hold_qty 不清标记，这一行将永远无法再被释放
+        （releaseCore 直接跳过）⇒ committed 永久虚高。
+      */
+      const marked = await db.run(
+        'UPDATE orders SET hold_qty = quantity, released_qty = 0, released_at = NULL WHERE id = ? AND hold_qty = 0',
+        r.id
+      );
+      if (marked.foundRows !== 1) {
+        // 锁内不该发生（同一批行刚被 FOR UPDATE 锁住）；真发生了就整笔回滚，绝不留半写
+        return abortTx({ ok: false, fail: '在途订单在补记占位期间被并发修改，请重试' });
+      }
+      held += Number(r.quantity || 0);
+    }
+    for (const [key, add] of bySku) {
+      if (add > 0) {
+        await db.run(
+          'UPDATE product_skus SET committed = committed + ? WHERE product_id = ? AND sku_key = ?',
+          add,
+          productId,
+          key
+        );
+      }
+    }
+    const bySkuObj = {};
+    for (const [k, v] of bySku) bySkuObj[k] = v;
+    return { ok: true, held, bySku: bySkuObj };
+  });
+}
+
+/**
  * 「还有占位在册」的 SQL 谓词（**唯一拼法**）。
  *
  * 新形状以 `released_qty < hold_qty` 为准（支持多件订单部分退货）；`released_qty = 0 AND

@@ -45,16 +45,21 @@ export async function reserveUploadBytes(actor, bytes, limitBytes, windowMs = DE
   return { ok: true, used: r.used, limitBytes: limit, reservation: { actor: a, bytes: n, windowMs: win, bucket } };
 }
 
-/** 上传成功：把预留**下调**为实际字节（只减不增，异常大的值被夹在预留内）。 */
-export async function commitUploadBytes(reservation, actualBytes) {
+/**
+ * 结算一次上传的额度：把预留**下调为实际占用字节**（只减不增，异常大的值夹在预留内）。
+ *
+ * 成功与失败走**同一个**函数，是这份内核的形状要点。失败时传的是"留在磁盘上的字节数"
+ * （临时文件删不掉的那部分，见 productMedia.js 的 `discard` 返回值），而不是一律全额归还：
+ * 旧实现的失败分支固定 `-reservation.bytes`，于是只要临时文件没删掉（权限/IO/进程被杀），
+ * 这段磁盘就被白占而额度表归零——重复几次能把上传目录写到满盘，额度读数却还是 0。
+ * 正常失败（临时文件已删）传 0，等价于旧语义："失败的上传不吃额度"。
+ *
+ * @param {{actor:string,bytes:number,windowMs:number,bucket:number}|null} reservation
+ * @param {number} actualBytes 实际占用：成功 = 文件大小；失败 = 留在磁盘上的字节（通常 0）
+ */
+export async function settleUploadBytes(reservation, actualBytes) {
   if (!reservation) return;
   const actual = Math.max(0, Math.floor(Number(actualBytes) || 0));
   const delta = Math.min(0, actual - reservation.bytes);
   if (delta !== 0) await redisAdjustUpload(reservation.actor, delta, reservation.windowMs, reservation.bucket);
-}
-
-/** 上传失败：全额归还预留（不留下"上传失败却吃掉额度"的账）。 */
-export async function releaseUploadBytes(reservation) {
-  if (!reservation) return;
-  await redisAdjustUpload(reservation.actor, -reservation.bytes, reservation.windowMs, reservation.bucket);
 }

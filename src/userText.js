@@ -35,13 +35,6 @@ export function enumText(domain, value) {
   return table[String(value ?? '')] ?? UNKNOWN_VALUE;
 }
 
-/** 枚举值 → 中文；未知值返回 null（需要区分"未识别"的地方用） */
-export function enumTextOrNull(domain, value) {
-  const table = ENUMS[domain];
-  if (!table) throw new Error(`userText: 未知枚举域 ${domain}`);
-  return table[String(value ?? '')] ?? null;
-}
-
 /** 万分比 → 百分比（与前端同一口径：250 → 2.5%） */
 export function fmtBps(bps) {
   const n = Number(bps);

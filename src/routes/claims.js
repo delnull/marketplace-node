@@ -25,7 +25,7 @@
  */
 import { Router } from 'express';
 import config from '../config.js';
-import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit } from '../http.js';
+import { ok, fail, wrap, makeAuthMiddleware, simpleRateLimit, addressRateLimit } from '../http.js';
 import { verifySession, roleOf, isHost, isNodeStaffOf } from '../auth.js';
 import { nodeOwner } from '../shops.js';
 import { getDb } from '../db.js';
@@ -40,6 +40,8 @@ import {
   sellerClaimAction,
   holderCancelClaim,
   buildClaimDisputeCall,
+  CLAIM_ROW_SELECT,
+  CLAIM_ROW_FROM,
 } from '../nftClaim.js';
 
 const router = Router();
@@ -48,6 +50,17 @@ const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 // 公开状态查询是匿名可读的（买家/二级市场买家要能查），限流防脚本枚举 tokenId
 const byTokenLimiter = simpleRateLimit({ windowMs: 60_000, max: 120, message: '提货状态查询过于频繁，请稍后再试' });
 const exportLimiter = simpleRateLimit({ windowMs: 60_000, max: 10, message: '导出过于频繁（每分钟至多 10 次）：请稍后再试' });
+/*
+  用户请求触发的**链上读**（提货归属 `ownerOf`）必须共用一把预算：`addressRateLimit` 是
+  "RPC 放大闸"的唯一实现（订单面的 /paid、/sync 已在用）。没有它时，登录即可用 `POST /nft`
+  按任意 tokenId 消耗节点共用的 RPC 额度——打满后受影响的是 watcher/对账，不是攻击者自己。
+  上限与匿名查询同档（120/分/地址）：正常提货用不到，刷链会被挡住。
+*/
+const rpcAddressLimiter = addressRateLimit({
+  windowMs: 60_000,
+  max: 120,
+  message: '该地址的链上查询过于频繁，请稍后再试',
+});
 
 const CLAIM_STATUSES = ['requested', 'approved', 'shipped', 'fulfilled', 'rejected', 'cancelled', 'expired'];
 
@@ -144,13 +157,9 @@ router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
   const tokenId = String(req.query.tokenId ?? '').trim();
   if (!contract || !tokenId) return fail(res, '需要合约地址与 NFT 编号两个参数');
   const rows = await getDb().all(
-    `SELECT n.*, p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
-         (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
-         (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-       FROM nft_claims n
-       LEFT JOIN products p ON p.id = n.product_id
-       LEFT JOIN orders o ON o.id = n.order_id
-      WHERE n.token_contract = ? AND n.token_id = ? ORDER BY n.id DESC LIMIT 20`,
+    `SELECT ${CLAIM_ROW_SELECT}
+     ${CLAIM_ROW_FROM}
+     WHERE n.token_contract = ? AND n.token_id = ? ORDER BY n.id DESC LIMIT 20`,
     contract.toLowerCase(),
     tokenId
   );
@@ -160,17 +169,27 @@ router.get('/nft', byTokenLimiter, wrap(async (req, res) => {
 
 /** 我提交过的提货行（需登录；所有状态，新的在前） */
 router.get('/nft/mine', requireAuth, wrap(async (req, res) => {
+  const page = Math.min(1000, Math.max(1, Number.parseInt(String(req.query.page || '1'), 10) || 1));
+  const pageSize = Math.min(
+    200,
+    Math.max(1, Number.parseInt(String(req.query.pageSize || '20'), 10) || 20)
+  );
+  const total = Number(
+    (await getDb().get('SELECT COUNT(*) AS total FROM nft_claims n WHERE n.claimant = ?', req.auth.address))
+      ?.total || 0
+  );
   const rows = await getDb().all(
-    `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
-         p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
-         (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
-         (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
-            LEFT JOIN orders o ON o.id = n.order_id
-      WHERE n.claimant = ? ORDER BY n.id DESC LIMIT 200`,
+    `SELECT ${CLAIM_ROW_SELECT}
+     ${CLAIM_ROW_FROM}
+     WHERE n.claimant = ? ORDER BY n.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`,
     req.auth.address
   );
-  ok(res, { claims: rows.map((r) => claimDto(r, { as: 'holder' })) });
+  ok(res, {
+    claims: rows.map((r) => claimDto(r, { as: 'holder' })),
+    total,
+    page,
+    pageSize,
+  });
 }));
 
 /** 店主提货 CSV（当前筛选的全量，不分页；含收货信息，属店主私域） */
@@ -184,14 +203,10 @@ router.get('/nft/seller.csv', requireAuth, exportLimiter, wrap(async (req, res) 
     return fail(res, `当前筛选共 ${total} 条，超过单次导出上限 20000 条；请缩小日期或状态范围后重试`);
   }
   const rows = await getDb().all(
-    `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
-       p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
-       (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
-       (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
-            LEFT JOIN orders o ON o.id = n.order_id
-       ${where}
-      ORDER BY FIELD(n.status,'requested','approved','shipped','fulfilled','rejected','cancelled','expired'), n.id DESC`,
+    `SELECT ${CLAIM_ROW_SELECT}
+     ${CLAIM_ROW_FROM}
+     ${where}
+     ORDER BY FIELD(n.status,'requested','approved','shipped','fulfilled','rejected','cancelled','expired'), n.id DESC`,
     ...params
   );
   const headers = [
@@ -263,15 +278,11 @@ router.get('/nft/seller', requireAuth, wrap(async (req, res) => {
   const total = Number((await db.get(`SELECT COUNT(*) AS total FROM nft_claims n ${where}`, ...params))?.total || 0);
   const offset = (filter.page - 1) * filter.pageSize;
   const rows = await db.all(
-    `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
-       p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
-       (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
-       (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
-            LEFT JOIN orders o ON o.id = n.order_id
-       ${where}
-      ORDER BY FIELD(n.status,'requested','approved','shipped','fulfilled','rejected','cancelled','expired'), n.id DESC
-      LIMIT ${filter.pageSize} OFFSET ${offset}`,
+    `SELECT ${CLAIM_ROW_SELECT}
+     ${CLAIM_ROW_FROM}
+     ${where}
+     ORDER BY FIELD(n.status,'requested','approved','shipped','fulfilled','rejected','cancelled','expired'), n.id DESC
+     LIMIT ${filter.pageSize} OFFSET ${offset}`,
     ...params
   );
   ok(res, {
@@ -283,7 +294,7 @@ router.get('/nft/seller', requireAuth, wrap(async (req, res) => {
 }));
 
 /** 提交提货声明（持有人；token + 收货信息） */
-router.post('/nft', requireAuth, wrap(async (req, res) => {
+router.post('/nft', requireAuth, rpcAddressLimiter, wrap(async (req, res) => {
   const { nftContract, tokenId, shipping, note } = req.body || {};
   const r = await submitClaim({
     contract: nftContract,
@@ -309,7 +320,7 @@ router.post('/nft/:id/cancel', requireAuth, wrap(async (req, res) => {
  * 鉴权 = 该行的 `seller`（订单店主）**或** 那家店的店员（`roleOf`）；
  * `ship` 会在唯一实现里再查一次链上持有人（A-policy：转手了就拒绝发货，要求先取消）。
  */
-router.post('/nft/:id/seller', requireAuth, wrap(async (req, res) => {
+router.post('/nft/:id/seller', requireAuth, rpcAddressLimiter, wrap(async (req, res) => {
   const row = await claimRowByNo(req.params.id);
   if (!row) return fail(res, '声明不存在', 404, 404);
   const mine = String(row.seller) === String(req.auth.address);

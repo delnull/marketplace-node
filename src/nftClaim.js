@@ -37,6 +37,27 @@ import { getDb, withTransaction } from './db.js';
 import { getProvider, isAddress } from './chain.js';
 import { newClaimNo, normalizeId } from './ids.js';
 
+/**
+ * 提货行的统一 SQL 投影。
+ *
+ * 买家「我的提货」、公开 token 查询、店主列表/CSV 与单行回读都走这一份：
+ * 商品图、商品名、所选规格、店铺名是**同一件提货事实的展示面**，四份查询各拼一次
+ * 迟早出现「买家看得到图、店主看不到」或「公开查询没有商品名」。
+ * 不在这里选 `o.product_snapshot`（可能很大）：商品行的 `p.media` 已足够；
+ * 商品被软删时行仍在，图不会平白消失。
+ */
+export const CLAIM_ROW_SELECT = `n.*, p.title AS product_title, p.nft_standard AS nft_standard,
+  p.media AS product_media, p.claim_window_days AS claim_window_days,
+  sh.name AS shop_name, o.updated_at AS order_updated_at, o.sku_specs AS order_sku_specs,
+  (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
+  (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash`;
+
+export const CLAIM_ROW_FROM = `FROM nft_claims n
+  LEFT JOIN products p ON p.id = n.product_id
+  LEFT JOIN orders o ON o.id = n.order_id
+  LEFT JOIN shops sh ON sh.code = n.shop_code`;
+
+
 /** 仍占着"这枚 token 的提货权"的状态：seller 可操作、新声明不能插队 */
 export const CLAIM_OPEN_STATUSES = ['requested', 'approved', 'shipped'];
 
@@ -108,12 +129,9 @@ export async function claimRowByNo(claimNo) {
   const v = normalizeId(claimNo);
   if (!v) return undefined;
   return await getDb().get(
-    `SELECT n.*, p.title AS product_title, p.nft_standard AS nft_standard,
-              p.claim_window_days AS claim_window_days, o.updated_at AS order_updated_at,
-              (SELECT c.escrow_order_id FROM order_chain c WHERE c.order_id = n.order_id) AS escrow_order_id,
-              (SELECT d.tx_hash FROM order_delivery_items d WHERE d.order_id = n.order_id AND d.kind='nft' AND d.value = n.token_id ORDER BY d.id DESC LIMIT 1) AS delivery_tx_hash
-       FROM nft_claims n LEFT JOIN products p ON p.id = n.product_id
-            LEFT JOIN orders o ON o.id = n.order_id WHERE n.claim_no = ?`,
+    `SELECT ${CLAIM_ROW_SELECT}
+     ${CLAIM_ROW_FROM}
+     WHERE n.claim_no = ?`,
     v
   );
 }
@@ -128,6 +146,53 @@ export async function claimRowByNo(claimNo) {
  *  · `holder`：提交人本人（含自己填的收货信息）；
  *  · `seller`：本店店主/店员（含收货信息，发货要用）。
  */
+/**
+ * JSON 列/文本列 → 数组/对象。MySQL JSON 列由驱动解成对象，历史行或 SQLite 路径
+ * 可能是字符串；两者都认，坏值退化为空，不让一条提货行因为媒体 JSON 坏掉而 500。
+ */
+function jsonArrayOf(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v !== 'string' || !v.trim()) return [];
+  try {
+    const parsed = JSON.parse(v);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function jsonObjectOf(v) {
+  if (v && typeof v === 'object' && !Array.isArray(v)) return v;
+  if (typeof v !== 'string' || !v.trim()) return null;
+  try {
+    const parsed = JSON.parse(v);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 提货行的展示面：商品图/名/规格/店铺，与订单卡片看到的是同一件商品。 */
+function claimProductOf(row) {
+  const media = jsonArrayOf(row.product_media);
+  /* 首图 = media[0]（与商品卡片、订单行同一口径）；视频用它的封面 poster，不跳到后面的图片 */
+  const first = media[0];
+  const productImage =
+    first && first.type === 'image'
+      ? String(first.url || '') || null
+      : first && first.type === 'video'
+        ? String(first.poster || '') || null
+        : null;
+  const specs = jsonObjectOf(row.order_sku_specs);
+  return {
+    productSlug: row.product_slug || null,
+    shopCode: row.shop_code || null,
+    shopName: row.shop_name || null,
+    productImage,
+    skuSpecs: specs,
+  };
+}
+
 export function claimDto(row, { as = 'public' } = {}) {
   if (!row) return null;
   const base = {
@@ -138,6 +203,7 @@ export function claimDto(row, { as = 'public' } = {}) {
     /** 商品展示名/标准（店主列表与 CSV 用；公开行也可见） */
     productTitle: row.product_title || null,
     nftStandard: row.nft_standard || null,
+    ...claimProductOf(row),
     /**
      * 交付这枚 NFT 的链上托管单号（`Escrow.getOrder` 的键）。前端在签名
      * `openClaimDispute` 前必须用它复核订单的店主/状态，不能只信节点返回的 `args[1]`。
@@ -171,8 +237,6 @@ export function claimDto(row, { as = 'public' } = {}) {
       驳回理由同样是店主写给提货人的文本，公开匿名查询不下发。
     */
     orderNo: row.order_no,
-    shopCode: row.shop_code,
-    productSlug: row.product_slug,
     trackingNo: row.tracking_no || null,
     disputeOpenedAt: row.dispute_opened_at ?? null,
     disputeClosedAt: row.dispute_closed_at ?? null,
@@ -418,7 +482,6 @@ const SELLER_ACTIONS = {
   cancel: { from: ['requested', 'approved', 'shipped'], to: 'cancelled' },
 };
 
-export const SELLER_CLAIM_ACTIONS = Object.keys(SELLER_ACTIONS);
 
 /**
  * 店主推进/终结一条声明（approve / ship / fulfill / reject / cancel）。

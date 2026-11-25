@@ -10,7 +10,7 @@ bash deploy.sh --health       # 健康：一行；不健康才带原因
 docker logs -f marketplace-node
 ```
 
-`/healthz` 返回 200 且 `code=0` 才算健康。链上 watcher 停滞、数据库不可用、schema 不符都会让它返回非 0。Redis 是硬依赖：`capabilities.redis` 不是 `configured=true, connected=true` 时探活会是 503（见 `.env.example` 的 `MK_REDIS_URL`）。
+`/healthz` 返回 200 且 `code=0` 才算健康。链上 watcher 停滞、数据库不可用、schema 不符都会让它返回非 0。Redis 是硬依赖：未连接时探活返回 503（`capabilities.redis` 在完整读数里，而完整读数要带节点主/员工的 `Authorization: Bearer …` 与 `?full=1`——匿名请求只回健康判据与公开读数（身份 / 店铺数 / watcher 游标），见 `.env.example` 的 `MK_REDIS_URL`）。
 
 ## 2. 备份
 
@@ -89,7 +89,8 @@ bash deploy.sh --update
 
 会重建镜像，用同一个数据卷和同一套 MySQL 重建容器，数据不动。`--update` 默认只用安装目录里的代码；要拉公开仓最新版用 `bash deploy.sh --update --pull`（不要只重跑 `install.sh`：非更新模式会沿用现有代码目录重建镜像）。新容器健康检查失败时脚本会自动回滚到上一个镜像；回滚也失败时看上面的日志手工介入。
 
-本次升级把商品规格改为**恒至少有 1 个规格维度**。升级前先对既有库跑一次默认规格迁移（幂等；只补 `specs=[]` 的商品，并重算快照哈希）：
+商品规格**恒至少有 1 个维度**（上架/编辑提交空规格会被拒绝）。如果这个库是从"允许无规格商品"的
+旧版本升上来的，先对既有库跑一次默认规格迁移（幂等；只补 `specs=[]` 的商品，并重算快照哈希）：
 
 ```bash
 cd /data/app/marketplace-node   # 或安装目录
@@ -101,9 +102,7 @@ node --env-file=.env scripts/migrate-default-spec.mjs --apply  # 写入
 
 ## 5. 数据库结构
 
-节点启动时会把期望 schema 在临时库里执行一遍，再与真实库逐项对拍。缺列、缺索引、缺触发器、排序规则不符都会拒绝启动并打印差异。本仓不做结构迁移：全新项目没有历史数据，处置是删除并重建目标库。
-
-不要手工改表来“先跑起来”。全新项目不做结构迁移：删除并重建目标库，然后重新导入商品/订单。
+节点启动时会把期望 schema 在临时库里执行一遍，再与真实库逐项对拍。缺列、缺索引、缺触发器、排序规则不符都会拒绝启动并打印差异。本仓不做结构迁移：全新项目没有历史数据，处置是删除并重建目标库，然后重新导入商品/订单；不要手工改表来“先跑起来”。
 
 ## 6. 安全
 

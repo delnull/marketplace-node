@@ -132,7 +132,7 @@ import {
   PII_ERASABLE_STATUS,
   REFUND_BACKFILL_IN,
 } from '../orderStatus.js';
-import { verifySession, roleOf, isStaff, isHost } from '../auth.js';
+import { verifySession, roleOf, isStaff } from '../auth.js';
 // `eventsForDto`：事件史对外的唯一折算点（库里的 at 是毫秒，出口一律 ISO）
 import { eventsForDto } from '../reputation.js';
 import { logAudit } from '../audit.js';
@@ -155,11 +155,11 @@ import { ok, fail, wrap, bearerToken, makeAuthMiddleware, simpleRateLimit, addre
 // 金额展示口径的唯一实现（priceOf / goodsPriceMicroOf）——不要再手写 (micro/1e6).toFixed(2)
 import { goodsPriceMicroOf, priceOf, priceUnitOf } from '../money.js';
 import { priceCurrencyOfRow, refundPriceMicroOfRow } from '../stats.js';
-import { submitReview, replyReview, findReviewByOrder, findReviewsByOrderIds, reviewToPublic, parseReviewImages, reviewableAt, followupReview, removeReviewImage, REVIEWABLE_STATUS, reviewWriteRefusal } from '../reviews.js';
+import { submitReview, replyReview, findReviewByOrder, findReviewsByOrderIds, reviewToPublic, parseReviewImages, reviewableAt, followupReview, REVIEWABLE_STATUS, reviewWriteRefusal } from '../reviews.js';
 // 评价图上传：复用商品媒体的字节判定/落盘内核，但只收图片、上限更低
 import { storeMediaStream, MediaUploadError, REVIEW_IMAGE_MIMES } from '../productMedia.js';
 import { MEDIA } from '../mediaKinds.js';
-import { reserveUploadBytes, commitUploadBytes, releaseUploadBytes } from '../uploadBudget.js';
+import { reserveUploadBytes, settleUploadBytes } from '../uploadBudget.js';
 import { fetchReturnByOrder, fetchReturnsByOrderIds, returnToPublic } from '../returns.js';
 import {
   filesOfEvidenceMany,
@@ -207,7 +207,6 @@ const publicDetailLimiter = simpleRateLimit({ windowMs: 60_000, max: 240, messag
 
 const requireAuth = makeAuthMiddleware(verifySession);
 const ownerOnly = makeAuthMiddleware(verifySession, { ownerOnly: true });
-const nodeAdmin = makeAuthMiddleware(verifySession, { nodeAdmin: true });
 const staffOnly = makeAuthMiddleware(verifySession, { staffOnly: true }); // P1-⑤：经营面=店主+操作员
 // RPC 触碰型动作限流（按 IP）：paid 每次 = 1 次 eth_getTransactionReceipt、sync 每次 =
 // getOrder + queryFilter——防登录用户低频耗尽公共 RPC 配额（auth 端点另有专用限流）。
@@ -255,26 +254,6 @@ const audit = async (req, action, targetType, targetId, detail, shopCode) =>
       ? req.shopRole
       : await roleOf(req.auth?.address || '', shopCode),
     shopCode,
-    action,
-    targetType,
-    targetId,
-    detail,
-  });
-
-/**
- * **节点级**动作的审计（节点主 ∪ 员工：评价图下架这类平台治理）。
- *
- * 归属与角色都不能从 `req.shop`/`roleOf` 推：节点主不是租户店的经营人员，`roleOf` 在
- * 租户店上返回 `'user'`，而 `logAudit` 对 `'user'` 直接 return——旧实现正是这样把
- * **租户店的评价图下架**静默丢掉的（接口 200、审计表无行）。节点级动作只有两种角色：
- * 节点主 host、节点员工 staff。目标店写在 `detail.shopCode` 里（不把节点行改判给店铺）。
- */
-const nodeAudit = async (req, action, targetType, targetId, detail) =>
-  logAudit({
-    req,
-    actor: req.auth?.address,
-    actorRole: (await isHost(req.auth?.address)) ? 'host' : 'staff',
-    shopCode: null,
     action,
     targetType,
     targetId,
@@ -365,7 +344,17 @@ async function preloadOrderRelations(rows) {
   return { deliveries, tokenDeliveries, reviews, returns, shops };
 }
 
-/** DB 行 → 对外字段（金额均字符串化防精度丢失；快照还原商品字段供买家校验）
+/** 订单快照里的商品标题（审计类记录用）；快照缺失/畸形返回空串——调用方据此不写这个键 */
+function snapshotTitleOf(raw) {
+  try {
+    return String(JSON.parse(raw || '{}')?.title || '');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * DB 行 → 对外字段（金额均字符串化防精度丢失；快照还原商品字段供买家校验）
  *  opts.as: 'owner' 店主视角 / 'arbiter' 仲裁人视角（裁决证据，码全可见）；
  *  'buyer' 买家视角（仅已交付状态可见码）；默认不暴露码。
  *  opts.byOrderNo: 该请求以**不可枚举的订单号**为键（详情路由）——草稿的 escrowOrderId
@@ -1993,6 +1982,7 @@ router.delete('/:id/buyer', requireAuth, wrap(async (req, res) => {
     order.order_id
   );
   if (r.foundRows !== 1) return fail(res, '订单已被移除', 409, 409);
+  const title = snapshotTitleOf(order.product_snapshot);
   await logAudit({
     req,
     actor: req.auth.address,
@@ -2001,7 +1991,12 @@ router.delete('/:id/buyer', requireAuth, wrap(async (req, res) => {
     action: 'order.buyer_delete',
     targetType: 'order',
     targetId: order.order_no,
-    detail: { title: order.product_title || '' },
+    /*
+      商品标题从**下单时固化的快照**取（`v_orders` 没有 `product_title` 这一列；
+      旧写法 `order.product_title` 恒为 undefined，于是每条删除审计的商品标题都是空串）。
+      快照缺失就不写这个键，不拿空串冒充"标题为空"。
+    */
+    detail: title ? { title } : {},
   });
   ok(res, { id: order.order_no }, '订单已删除');
 }));
@@ -2328,6 +2323,14 @@ router.post('/:id/paid', requireAuth, rpcAddressLimiter, paidLimiter, wrap(async
             { id: order.order_no, status: order.status, paymentHashClaimedElsewhere: true }
           );
         }
+      } else {
+        /*
+          注释承诺的"校验失败仅告警"必须真的发出来：不写这一句，收据核验失败在**两侧都不留痕**
+          ——接口回 200「托管已确认」，凭证却永远补不上，店主只能看到「缺少链上支付凭证」。
+        */
+        console.warn(
+          `[paid] 托管已确认但支付哈希核验未通过（order=${order.order_no}）：${v.message || '收据校验失败'}——未补记凭证`
+        );
       }
     }
     ok(res, { id: order.order_no, status: order.status }, '托管已确认');
@@ -3951,11 +3954,12 @@ router.post('/:id/review/images', requireAuth, reviewImageLimiter, wrap(async (r
       label: '评价图',
     });
   } catch (e) {
-    await releaseUploadBytes(reserved.reservation);
+    /* 失败也按"真正留在磁盘上的字节"结算（e.leakedBytes，正常失败为 0），不无条件全额归还 */
+    await settleUploadBytes(reserved.reservation, e?.leakedBytes || 0);
     if (e instanceof MediaUploadError) return fail(res, e.message);
     throw e;
   }
-  await commitUploadBytes(reserved.reservation, stored.size);
+  await settleUploadBytes(reserved.reservation, stored.size);
   ok(res, stored, '评价图已上传');
 }));
 
@@ -3969,42 +3973,6 @@ router.post('/:id/review', requireAuth, wrap(async (req, res) => {
   notify('review.created', order.order_no); // 店主通知：买家评价（店主可回评）
   // 响应走公共投影（匿名短地址；不回吐原始行——避免把完整 buyer/内部主键等内部列带出）
   ok(res, reviewToPublic(await findReviewByOrder(order.order_id)), '评价成功');
-}));
-
-/** 节点管理员查看一单的评价图（只返回 URL，不含买家/正文；用于逐图治理） */
-router.get('/:id/review/images', nodeAdmin, wrap(async (req, res) => {
-  const order = await findOrder(req.params.id);
-  if (!order) return fail(res, '订单不存在', 404, 404);
-  const row = await findReviewByOrder(order.order_id);
-  if (!row) return fail(res, '该订单还没有评价', 404, 404);
-  ok(res, {
-    review: parseReviewImages(row.images),
-    followup: parseReviewImages(row.followup_images),
-  });
-}));
-
-/** 节点管理员逐图下架（评价图是公开内容，但节点仍需处理违法/侵权/PII 图） */
-router.delete('/:id/review/images', nodeAdmin, wrap(async (req, res) => {
-  const order = await findOrder(req.params.id);
-  if (!order) return fail(res, '订单不存在', 404, 404);
-  const { kind, url } = req.body || {};
-  const r = await removeReviewImage({ orderId: order.order_id, kind, url });
-  if (r.error) return fail(res, r.error, r.notFound ? 404 : 1, r.notFound ? 404 : 200);
-  /*
-    **节点级**动作：这是节点主/员工对公开内容（评价图）的处置，不属于那家店的经营动作。
-    旧实现走店铺级审计、角色由 `roleOf(addr, order.shop_code)` 算——对租户店恒为 'user'，
-    `logAudit` 直接 return：**删了图，却一条审计都没有**。改成节点级之后：
-      · 角色只有 host/staff（由 isHost 判，不再看那家店里的身份）；
-      · 目标店写在 `detail.shopCode`，节点主在店铺详情里能回看这家店被下架过哪张图
-        （auditWhere 的 targetShop 已认这个形状）。
-  */
-  await nodeAudit(req, 'review.image.remove', 'order', order.order_no, {
-    shopCode: order.shop_code,
-    orderNo: order.order_no,
-    kind: String(kind),
-    remaining: r.remaining,
-  });
-  ok(res, { remaining: r.remaining }, '评价图已下架');
 }));
 
 

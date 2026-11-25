@@ -550,10 +550,6 @@ export async function getPinnedProvider({ timeoutMs = 10_000 } = {}) {
 let _provider = null;
 let _chainIdDrift = null;
 
-/** 运行期端点换链的结论（`null` = 最近一次全量自检没有发现漂移）。 */
-export function chainIdStatus() {
-  return _chainIdDrift ? { ..._chainIdDrift } : null;
-}
 
 function assertNoChainIdDrift() {
   if (!_chainIdDrift) return;

@@ -100,13 +100,24 @@ test('交付行指向的码在池里被挂到别的订单 ⇒ 报"状态/归属�
   assert.match(hit.detail, new RegExp(`order_id=${itOwnerB.orderId}`));
 });
 
-test('池里没有这个码（交付行还在）⇒ 报"池被重建/导入丢了"', async () => {
+test('交付码在任何池里都不存在 ⇒ 无法判定（可能是手动交付的自由文本），不算不一致', async () => {
+  /*
+    演进（2026-11，演示栈实测）：`deliverDigitalManual` 明确支持"池外自由文本（说明型交付）"，
+    商品可以根本没有码池。旧判据把这种交付行报成"池被重建/导入丢了"，于是一个**健康**的演示世界
+    `check:integrity` 退出码 2，而工具的处置建议是重建库（会误删正常数据）——假阳性比不报更糟。
+    判据改成"这个码串在别的池里存不存在"：哪里都没有 ⇒ 三态里的"无法判定"，进 unverifiable。
+  */
   const itOrphan = await seed();
   await addDelivery(itOrphan.orderId, 'code', 'IT-NO-POOL-ROW');
-  const { issues } = await findIntegrityIssues(db);
-  const hit = issues.find((i) => i.kind === 'code-delivered-without-pool-row');
-  assert.ok(hit);
-  assert.match(hit.detail, /没有这个码/);
+  const { issues, unverifiable, counts } = await findIntegrityIssues(db);
+  assert.ok(
+    !issues.some((i) => i.resource === 'IT-NO-POOL-ROW'),
+    '手动交付的自由文本不得报成不一致（否则健康节点退出码变 2）'
+  );
+  const hit = unverifiable.find((i) => i.resource === 'IT-NO-POOL-ROW');
+  assert.ok(hit, '无法判定的一档必须照实打出来（不许静默丢弃）');
+  assert.match(hit.detail, /任何码池里都不存在/);
+  assert.ok(counts.codeDeliveredWithoutPool >= 1, '无法判定的条数要单独计数，不能混进不一致');
 });
 
 test('池里标了 used 但没有交付行 ⇒ 报"交付记录被回退"', async () => {

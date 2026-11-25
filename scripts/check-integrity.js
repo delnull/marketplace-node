@@ -89,7 +89,7 @@ try {
 
 try {
   const db = readonlyFacade(conn);
-  const { issues, counts, checked, auditChain } = await findIntegrityIssues(db);
+  const { issues, unverifiable, counts, checked, auditChain } = await findIntegrityIssues(db);
   const target = `${name} @ ${host}:${port}`;
 
   if (json) {
@@ -100,7 +100,7 @@ try {
       形状（test/check-integrity-json.test.js 拿它与本输出逐键对拍）。代价：JSON 会随函数增长，
       这是想要的（多一个键不该需要改两处）。
     */
-    console.log(JSON.stringify({ db: target, counts, checked, auditChain, issues }, null, 2));
+    console.log(JSON.stringify({ db: target, counts, checked, auditChain, unverifiable, issues }, null, 2));
   } else {
     console.log(`交付一致性体检（只读）：${target}`);
     console.log(
@@ -130,6 +130,15 @@ try {
     if (auditChain.hashed) {
       console.log(`  链头 head=${auditChain.head}`);
       console.log('    （把这一行抄到盘外留存：尾部被整段删掉时，只有它拦得住）');
+    }
+    /*
+      无法判定（不是不一致）：交付码在任何池里都找不到——可能是手动交付的自由文本（deliverDigitalManual 支持），
+      也可能是池被重建。把它算成不一致会让健康节点退出码变 2，而处置建议是重建库（会误删数据）。
+      所以这里单独一段：照实打出来，但**不影响退出码**。
+    */
+    if (unverifiable.length) {
+      console.log(`  · 无法判定（不是不一致）：${unverifiable.length} 条交付码在任何码池里都不存在`);
+      for (const it of unverifiable) console.log(`    · ${it.detail}`);
     }
     if (!issues.length) {
       console.log('  ✓ 没有发现不一致：交付行与池状态自洽');
